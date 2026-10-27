@@ -134,6 +134,7 @@ static int64_t br_rank = 0, br_size = 1;
 
 /* ============================================================ panics */
 static void br_flush(void) { fflush(stdout); }
+static void br_gpu_settle(void);
 
 void brine_panic_at(const char *loc, const char *msg) {
     br_flush();
@@ -142,6 +143,7 @@ void brine_panic_at(const char *loc, const char *msg) {
     else
         fprintf(stderr, "\npanic: %s\n  --> %s\n", msg, loc);
     fflush(stderr);
+    br_gpu_settle();
     exit(101);
 }
 
@@ -166,6 +168,7 @@ void brine_assert_fail(const char *loc, const char *src, brine_str *msg) {
 }
 void brine_exit(int64_t code) {
     br_flush();
+    br_gpu_settle();
     exit((int)code);
 }
 void brine_unreachable(void) {
@@ -2407,6 +2410,15 @@ static void br_gpu_start(const char *ptx) {
     }
 }
 
+/* Exiting while the CUDA driver starts up on its thread crashes in the
+ * driver, so the way out waits for that to finish. */
+static void br_gpu_settle(void) {
+    if (__atomic_load_n(&br_gpu.state, __ATOMIC_ACQUIRE) != BR_GS_INIT) return;
+    br_lock(&br_gpu.mu);
+    while (br_gpu.state == BR_GS_INIT) br_cond_wait(&br_gpu.cv, &br_gpu.mu);
+    br_unlock(&br_gpu.mu);
+}
+
 /* Waits until the device is ready or has failed. Holds br_gpu.mu. */
 static int br_gpu_wait(const char *ptx) {
     br_gpu_start(ptx);
@@ -3685,6 +3697,7 @@ static void br_procs_free(void);
 void brine_rt_shutdown(void) {
     br_procs_free();
     br_flush();
+    br_gpu_settle();
     if (br_size > 1) brine_world_barrier();
     br_flush();
     if (getenv("BRINE_LEAKCHECK")) fprintf(stderr, "brine: %lld live objects at exit\n", (long long)__atomic_load_n(&br_live, __ATOMIC_RELAXED));
