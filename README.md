@@ -56,7 +56,7 @@ fn main():
 | 🔒 **Rules can't be broken** | `requires`, `ensures`, `invariant` and `prove` are checked at compile time. Overflow, bad indexes and division by zero always stop the program with a clear message, unless the compiler proved they can't happen; then the check is removed. There is no `unsafe` and no flag to turn checks off. |
 | 🚀 **Fast** | Native code, no garbage collector, no VM. Values are copy-on-write and memory is freed deterministically. Dev builds on Linux and Windows go straight to machine code; `--release` builds go through an optimizing C compiler. |
 | 🐍 **Easy to read** | Python-like syntax, static types with local inference, structs, enums with `match`, generics, `Option`/`Result` with `?`. One obvious way to write things. |
-| 🤖 **Made for humans and agents** | One CLI. Every error has a code, a precise span, the reason and a fix. `--json` on every command, `brine explain <code>`, and `brine guide` prints the whole language on one page. |
+| 🤖 **Made for humans and agents** | One CLI. Every error has a code, a precise span, the reason and a fix. `--json` output for tools, `brine explain <code>`, and `brine guide` prints the whole language on one page. |
 | 🛠️ **Self-hosted** | The compiler is written in brine and builds itself. All it needs is a C compiler. |
 
 ## Installation
@@ -396,8 +396,8 @@ test result: ok. 2 passed; 0 failed; finished in 0.03s
 | `brine guide` | the whole language on one page |
 | `brine doctor` | check your toolchain |
 
-Every command takes `--json` for machine-readable output, one JSON object per
-line. New projects come with an `AGENTS.md`, so coding agents know how to work in
+Building, checking and testing take `--json` for machine-readable output, one
+JSON object per line. New projects come with an `AGENTS.md`, so coding agents know how to work in
 them from the start.
 
 ## Examples
