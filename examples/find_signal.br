@@ -1,0 +1,128 @@
+# Find which GPS satellites are in a noisy radio recording, and how far away
+# each one is. Every satellite sends its own code of +1/-1 chips, far weaker
+# than the noise. To find one, slide its code along the recording and, at
+# every offset, sum the products of code and signal (a matched filter): where
+# the code was sent it adds up, and the noise mostly cancels out. The offset
+# of the peak is the signal's delay, which a receiver turns into a distance.
+#
+# That's 2 billion multiply-adds per satellite, so `par` runs the searches on
+# the GPU when there is one (the first few run on the CPU while it starts).
+# Compare, and see where each `par` ran:
+#   brine run examples/find_signal.br --release
+#   BRINE_GPU=off brine run examples/find_signal.br --release
+#   BRINE_GPU_LOG=1 brine run examples/find_signal.br --release
+#
+# The contracts let the prover show that every array access in the search is
+# in range, so the hot loop runs with no checks: `brine check --report
+# examples/find_signal.br` shows that no runtime check is left at all.
+# Everything is f32, so this also runs on Apple GPUs (they have no f64).
+
+const SAMPLES = 1_048_576
+const CODE_LEN = 2_048
+const SATELLITES = 32
+
+# A pseudo-random number generator (a 31-bit LCG): the same numbers on every
+# machine, so every run finds the same thing. Only its high bits are random
+# enough to use; the low ones repeat after a short time.
+fn next(state: int) -> int:
+    requires 0 <= state < 2_147_483_648
+    ensures 0 <= result < 2_147_483_648
+    return (state * 1_103_515_245 + 12_345) % 2_147_483_648
+
+# Satellite `sat`'s code: CODE_LEN chips of +1 or -1.
+fn make_code(sat: int) -> [f32]:
+    requires 0 <= sat < 2_147_483_648
+    ensures len(result) == CODE_LEN
+    var s = sat
+    var code = [f32(0)] * CODE_LEN
+    for i in 0..CODE_LEN:
+        invariant 0 <= s < 2_147_483_648
+        s = next(s)
+        code[i] = f32(1) if s < 1_073_741_824 else f32(-1)
+    return code
+
+# Noise with a standard deviation of about 1: the sum of three uniform
+# numbers in [-1, 1).
+fn noise(seed: int) -> [f32]:
+    requires 0 <= seed < 2_147_483_648
+    ensures len(result) == SAMPLES
+    var s = seed
+    var sig = [f32(0)] * SAMPLES
+    for i in 0..SAMPLES:
+        invariant 0 <= s < 2_147_483_648
+        var v = f32(0)
+        for _ in 0..3:
+            invariant 0 <= s < 2_147_483_648
+            s = next(s)
+            v += f32(s / 1_048_576 - 1_024) / f32(1_024)
+        sig[i] = v
+    return sig
+
+# Add `code`, sent at sample `at`, to the recording.
+fn add(ref sig: [f32], code: [f32], at: int, amp: f32):
+    requires len(sig) == SAMPLES
+    requires 0 <= at
+    requires at + len(code) <= len(sig)
+    ensures len(sig) == SAMPLES
+    for k in 0..len(code):
+        sig[at + k] += amp * code[k]
+
+# The matched filter's output at one offset. The `requires` lines put the
+# burden on the caller, and with them every `sig[lag + k]` is proven in
+# range: the loop has no bounds checks, on the CPU or the GPU.
+fn score(sig: [f32], code: [f32], lag: int) -> f32:
+    requires 0 <= lag
+    requires lag + len(code) <= len(sig)
+    var acc = f32(0)
+    for k in 0..len(code):
+        acc += sig[lag + k] * code[k]
+    return acc
+
+fn argmax(xs: [f32]) -> int:
+    requires len(xs) > 0
+    ensures 0 <= result < len(xs)
+    var best = 0
+    for i in 1..len(xs):
+        invariant 0 <= best < len(xs)
+        if xs[i] > xs[best]:
+            best = i
+    return best
+
+# Where `code` best matches the recording, and how far that match stands out
+# from the noise.
+fn search(sig: [f32], code: [f32]) -> (int, f32):
+    requires 0 < len(code) <= len(sig)
+    # one output per offset at which the whole code fits
+    let lags = len(sig) - len(code) + 1
+    let scores = par [score(sig, code, lag) for lag in 0..lags]
+    let rms = sqrt(par sum(s * s for s in scores) / f32(lags))
+    let best = argmax(scores)
+    return (best, scores[best] / rms)
+
+fn main():
+    # Of GPS's 32 satellites, 4 are overhead; their signals arrive with
+    # different delays, each 4 times weaker than the noise.
+    var sig = noise(2_024)
+    let amp = f32(0.25)
+    add(ref sig, make_code(5), 12_345, amp)
+    add(ref sig, make_code(12), 400_000, amp)
+    add(ref sig, make_code(20), 400_900, amp)
+    add(ref sig, make_code(29), 1_000_000, amp)
+
+    let t0 = clock()
+    for sat in 0..SATELLITES:
+        let (at, strength) = search(sig, make_code(sat))
+        # the best of a million offsets of pure noise is about 5 x the noise
+        if strength > f32(8):
+            print(f"satellite {sat}: found at sample {at}, {strength:.1f} x the noise")
+        else:
+            print(f"satellite {sat}: not in the recording")
+    let t1 = clock()
+    print(f"searched {SATELLITES} codes x {len(sig)} samples in {(t1 - t0) * 1000.0:.0f} ms")
+
+test "a code is found where it was sent, and only there":
+    var sig = noise(3)
+    add(ref sig, make_code(1), 5_000, f32(1))
+    assert score(sig, make_code(1), 5_000) > f32(1_500)
+    assert score(sig, make_code(1), 5_001) < f32(500)
+    assert score(sig, make_code(2), 5_000) < f32(500)

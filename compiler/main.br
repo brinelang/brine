@@ -1,0 +1,988 @@
+# brine — the brine language toolchain, written in brine.
+#
+# Hidden commands, for looking at (and testing) each stage:
+#   brine lex [--comments] <file>       tokens
+#   brine parse <file>                  syntax tree
+#   brine emit-c [--tests] [--debug] <file> -o <out.c>   generated C
+import diag
+from diag import Diag, Colors, SourceMap, json_str, best_match
+import lexer
+import parser
+import astdump
+import driver
+from driver import FrontOpts, Frontend, Profile, display_path, VERSION
+import verify
+import project
+import fmt
+import explain
+
+const GUIDE = embed("../docs/QUICKREF.md")
+
+fn help_text() -> str:
+    return "\n".join(
+        ["brine — a verified, natively parallel systems language", "", "Usage: brine <command> [options]", "", "Project:", "  new <name>            Create a new project in ./<name>", "  init                  Create a project in the current directory", "", "Build and run:", "  run [file] [-- args]  Build and run (default: the current project)", "      --release           optimize more", "      --threads <n>       worker threads for `par` (default: all cores)", "      --ranks <n>         run <n> cooperating processes (the `world` module)", "  build [file]          Build a native executable", "      --release | --debug   optimization profile (default: dev)", "      -o <path>             output path", "      --emit-c              also write the generated C next to the output", "  check [file]          Type-check and verify without building (fastest)", "      --report              list every runtime check the prover could not remove", "  test [file] [filter]  Run `test \"...\":` blocks in parallel", "  debug [file] [-- args]  Debug build, then launch gdb or lldb", "", "Tools:", "  fmt [files] [--check] Format source files (default: the whole project)", "  explain <code>        Explain an error code, e.g. `brine explain E0601`", "  guide                 Print the language quick reference", "  doctor                Check that your toolchain works", "  version               Print the version", "", "Global options:", "  --json                Machine-readable output (one JSON object per line)", "  --color <when>        auto | always | never", "  -q, --quiet           Only print errors", ""]
+    )
+
+# Print text that already ends with a newline (`print` adds one).
+fn out_text(s: str):
+    if s.ends_with("\n"):
+        print(s[:len(s) - 1])
+    elif s != "":
+        print(s)
+
+fn err_text(s: str):
+    if s.ends_with("\n"):
+        eprint(s[:len(s) - 1])
+    elif s != "":
+        eprint(s)
+
+fn plural(n: int) -> str:
+    return "" if n == 1 else "s"
+
+# ================================================================ output
+
+struct G:
+    json: bool
+    color: bool
+    quiet: bool
+
+    fn c(self) -> Colors:
+        return Colors(on=self.color)
+
+    fn status(self, verb: str, msg: str):
+        if self.quiet or self.json:
+            return
+        let c = self.c()
+        eprint(f"{c.bold()}{c.green()}{verb:>10}{c.reset()} {msg}")
+
+    fn error(self, msg: str):
+        if self.json:
+            print("{\"severity\":\"error\",\"code\":null,\"message\":" + json_str(msg) + "}")
+        else:
+            let c = self.c()
+            eprint(f"{c.bold()}{c.red()}error{c.reset()}{c.bold()}: {msg}{c.reset()}")
+
+    fn diags(self, fe: Frontend):
+        self.diag_list(fe.diags, fe.sm)
+
+    fn diag_list(self, ds: [Diag], sm: SourceMap):
+        for d in ds:
+            if self.quiet and not d.is_error():
+                continue
+            if self.json:
+                print(diag.to_json(d, sm))
+            else:
+                err_text(diag.render(d, sm, self.color))
+        if not self.json:
+            var errs = 0
+            for d in ds:
+                if d.is_error():
+                    errs += 1
+            let warns = len(ds) - errs
+            if errs > 0:
+                let c = self.c()
+                let w = f" and {warns} warning{plural(warns)}" if warns > 0 else ""
+                eprint(
+                    f"{c.bold()}{c.red()}error{c.reset()}{c.bold()}: could not compile due to {errs} error{plural(errs)}{w}{c.reset()}"
+                )
+
+# ================================================================ arguments
+
+struct Args:
+    pos: [str]
+    flags: [(str, Option[str])]
+    rest: [str]
+
+    fn has(self, f: str) -> bool:
+        return any(k.0 == f for k in self.flags)
+
+    fn val(self, f: str) -> Option[str]:
+        var i = len(self.flags) - 1
+        while i >= 0:
+            if self.flags[i].0 == f:
+                return self.flags[i].1
+            i -= 1
+        return None
+
+    fn check_flags(self, allowed: [str]) -> Result[(), str]:
+        let global = ["--json", "--color", "-q", "--quiet"]
+        for kv in self.flags:
+            let k = kv.0
+            if k not in allowed and k not in global:
+                var all = allowed
+                all.extend(global)
+                var hint = ""
+                match best_match(k, all):
+                    case Some(m):
+                        hint = f" (did you mean `{m}`?)"
+                    case None:
+                        pass
+                return Err(f"unknown option `{k}`{hint}")
+        return Ok(())
+
+fn parse_args(raw: [str]) -> Result[Args, str]:
+    let value_flags = ["--ranks", "--threads", "-o", "--color"]
+    var a = Args(pos=[], flags=[], rest=[])
+    var i = 0
+    while i < len(raw):
+        let s = raw[i]
+        if s == "--":
+            a.rest = raw[i + 1:]
+            break
+        if s.starts_with("-") and len(s) > 1:
+            match s.find("="):
+                case Some(eq):
+                    a.flags.push((s[:eq], Some(s[eq + 1:])))
+                case None:
+                    if s in value_flags:
+                        if i + 1 >= len(raw):
+                            return Err(f"`{s}` needs a value")
+                        a.flags.push((s, Some(raw[i + 1])))
+                        i += 1
+                    else:
+                        a.flags.push((s, None))
+        else:
+            a.pos.push(s)
+        i += 1
+    return Ok(a)
+
+fn main() -> int:
+    var a = Args(pos=[], flags=[], rest=[])
+    match parse_args(args()):
+        case Ok(x):
+            a = x
+        case Err(e):
+            eprint(f"error: {e}")
+            return 2
+    var color = false
+    match a.val("--color"):
+        case Some("always"):
+            color = true
+        case Some("never"):
+            color = false
+        case _:
+            color = getenv("NO_COLOR").is_none() and os.is_terminal(2)
+    if color:
+        os.enable_ansi()
+    let g = G(json=a.has("--json"), color=color, quiet=a.has("-q") or a.has("--quiet"))
+    if len(a.pos) == 0:
+        if a.has("--version") or a.has("-V"):
+            print(f"brine {VERSION}")
+        else:
+            out_text(help_text())
+        return 0
+    let cmd = a.pos[0]
+    let rest = Args(pos=a.pos[1:], flags=a.flags, rest=a.rest)
+    var r: Result[int, str] = Ok(0)
+    if cmd == "new":
+        r = cmd_new(g, rest)
+    elif cmd == "init":
+        r = cmd_init(g, rest)
+    elif cmd == "run":
+        r = cmd_run(g, rest)
+    elif cmd == "build":
+        r = cmd_build(g, rest)
+    elif cmd == "check":
+        r = cmd_check(g, rest)
+    elif cmd == "test":
+        r = cmd_test(g, rest)
+    elif cmd == "debug":
+        r = cmd_debug(g, rest)
+    elif cmd == "fmt":
+        r = cmd_fmt(g, rest)
+    elif cmd == "explain":
+        r = explain.explain_cmd(first_pos(rest), g.json)
+    elif cmd == "guide":
+        out_text(GUIDE)
+    elif cmd == "doctor":
+        r = cmd_doctor(g)
+    elif cmd == "lex":
+        r = cmd_lex(rest)
+    elif cmd == "parse":
+        r = cmd_parse(rest)
+    elif cmd == "emit-c":
+        r = cmd_emit_c(g, rest)
+    elif cmd == "version" or cmd == "--version" or cmd == "-V":
+        if g.json:
+            print("{\"version\":" + json_str(VERSION) + "}")
+        else:
+            print(f"brine {VERSION}")
+    elif cmd == "help" or cmd == "--help" or cmd == "-h":
+        out_text(help_text())
+    else:
+        let cmds = [
+            "new",
+            "init",
+            "run",
+            "build",
+            "check",
+            "test",
+            "debug",
+            "fmt",
+            "explain",
+            "guide",
+            "doctor",
+            "version",
+            "help"
+        ]
+        var hint = ""
+        match best_match(cmd, cmds):
+            case Some(m):
+                hint = f"; did you mean `brine {m}`?"
+            case None:
+                pass
+        r = Err(f"unknown command `{cmd}`{hint} (see `brine help`)")
+    match r:
+        case Ok(code):
+            return max(0, min(code, 255))
+        case Err(e):
+            g.error(e)
+            return 2
+
+# ================================================================ targets
+
+struct Target:
+    entry: str
+    name: str
+    # project root, if any
+    root: Option[str]
+    # project version, if any
+    version: Option[str]
+    # every variable needs a written type
+    typed: bool
+
+    # `--typed` asks for written types even outside a typed project.
+    fn typed_if(self, a: Args) -> Target:
+        var t = self
+        t.typed = t.typed or a.has("--typed")
+        return t
+
+    fn cache_dir(self) -> str:
+        match self.root:
+            case Some(r):
+                return project.join(project.join(r, "target"), "cache")
+            case None:
+                return project.join(os.temp_dir(), "brine-cache")
+
+    fn out_dir(self, p: Profile) -> str:
+        match self.root:
+            case Some(r):
+                return project.join(project.join(r, "target"), driver.out_name(p))
+            case None:
+                let abs = os.abs_path(self.entry).unwrap_or(self.entry)
+                let base = project.join(os.temp_dir(), "brine-cache")
+                return project.join(
+                    project.join(base, driver.hex16(driver.fnv(abs))),
+                    driver.out_name(p)
+                )
+
+fn resolve(file: Option[str]) -> Result[Target, str]:
+    match file:
+        case Some(f):
+            if os.is_dir(f):
+                # a plain folder of .br files: run its main.br
+                if not file_exists(
+                    project.join(f, "brine.toml")
+                ) and os.is_file(project.join(f, "main.br")):
+                    var name = "main"
+                    match os.abs_path(f):
+                        case Ok(abs):
+                            name = project.file_name(abs).unwrap_or("main")
+                        case Err(_):
+                            pass
+                    return Ok(
+                        Target(entry=project.join(f, "main.br"), name=name, root=None, version=None, typed=false)
+                    )
+                match project.find(f):
+                    case Some(Ok(pr)):
+                        return Ok(
+                            Target(entry=pr.main, name=pr.name, root=Some(pr.root), version=Some(pr.version), typed=pr.typed)
+                        )
+                    case Some(Err(e)):
+                        return Err(e)
+                    case None:
+                        return Err(f"`{f}` is not a brine project (no brine.toml or main.br)")
+            if not file_exists(f):
+                var hint = ""
+                if not f.ends_with(".br") and file_exists(f + ".br"):
+                    hint = f"; did you mean `{f}.br`?"
+                return Err(f"file `{f}` not found{hint}")
+            var stem = driver.file_stem(f)
+            if stem == "":
+                stem = "main"
+            return Ok(Target(entry=f, name=stem, root=None, version=None, typed=false))
+        case None:
+            pass
+    let cwd = os.cwd()
+    match project.find(cwd):
+        case Some(Ok(pr)):
+            if not file_exists(pr.main):
+                return Err("the project's main file `" + display_path(pr.main) + "` does not exist")
+            var entry = pr.main
+            let n = len(cwd)
+            if len(entry) > n and entry[:n] == cwd and project.is_sep(entry[n]):
+                entry = entry[n + 1:]
+            return Ok(
+                Target(entry=entry, name=pr.name, root=Some(pr.root), version=Some(pr.version), typed=pr.typed)
+            )
+        case Some(Err(e)):
+            return Err(e)
+        case None:
+            return Err(
+                "no brine.toml found in this directory or any parent; pass a file (`brine run hello.br`) or create a project with `brine new <name>`"
+            )
+
+fn profile_of(a: Args) -> Profile:
+    if a.has("--release"):
+        return Profile.Release
+    if a.has("--debug"):
+        return Profile.Debug
+    return Profile.Dev
+
+fn first_pos(a: Args) -> Option[str]:
+    return Some(a.pos[0]) if len(a.pos) > 0 else None
+
+fn build(
+    g: G,
+    t: Target,
+    profile: Profile,
+    tests: bool,
+    out: Option[str],
+    emit_c: bool
+) -> Result[Option[str], str]:
+    let t0 = clock()
+    let fe = driver.frontend(t.entry, FrontOpts(verify=true, need_main=not tests, typed=t.typed))
+    g.diags(fe)
+    if fe.has_errors():
+        return Ok(None)
+    let code = driver.gen_code(fe, profile, tests)
+    let stem = t.name + "-tests" if tests else t.name
+    var exe = ""
+    match out:
+        case Some(o):
+            exe = o
+        case None:
+            exe = project.join(t.out_dir(profile), driver.exe_name(stem))
+    if emit_c:
+        let cp = driver.with_extension(exe, "c")
+        match project.parent(cp):
+            case Some(d):
+                if d != "":
+                    match os.make_dir(d):
+                        case _:
+                            pass
+            case None:
+                pass
+        write_file(cp, driver.gen_c(fe, profile, tests))?
+        g.status("Wrote", display_path(cp))
+    match driver.compile(code, exe, t.cache_dir(), profile):
+        case Ok(ran):
+            if ran or not tests:
+                var what = t.name
+                if tests:
+                    what = "tests"
+                else:
+                    match t.version:
+                        case Some(v):
+                            what = f"{t.name} v{v}"
+                        case None:
+                            pass
+                let verb = "Built" if ran else "Fresh"
+                g.status(verb, f"{what} [{profile.name()}] in {clock() - t0:.2f}s")
+            return Ok(Some(exe))
+        case Err(d):
+            g.diag_list([d], fe.sm)
+            return Ok(None)
+
+# ================================================================ commands
+
+fn cmd_new(g: G, a: Args) -> Result[int, str]:
+    a.check_flags([])?
+    if len(a.pos) == 0:
+        return Err("usage: brine new <name>")
+    let name = a.pos[0]
+    if not project.valid_name(name):
+        return Err(
+            f"`{name}` is not a valid project name (use letters, digits, `_` and `-`, starting with a letter)"
+        )
+    if file_exists(name):
+        return Err(f"`{name}` already exists")
+    project.create(name, name)?
+    if g.json:
+        print("{\"created\":" + json_str(name) + "}")
+    else:
+        g.status("Created", f"project `{name}`")
+        if not g.quiet:
+            eprint(f"\n    cd {name}\n    brine run\n")
+    return Ok(0)
+
+fn cmd_init(g: G, a: Args) -> Result[int, str]:
+    a.check_flags([])?
+    let cwd = os.cwd()
+    let raw = project.file_name(cwd).unwrap_or("app")
+    var mapped = ""
+    for c in raw.chars():
+        if project.is_ascii_alpha(c) or project.is_ascii_digit(c) or c == "_" or c == "-":
+            mapped += c
+        else:
+            mapped += "_"
+    let name = mapped if project.valid_name(mapped) else "app_" + mapped
+    let made = project.create(cwd, name)?
+    let list = ", ".join(made)
+    g.status("Created", f"project `{name}` ({list})")
+    return Ok(0)
+
+fn cmd_build(g: G, a: Args) -> Result[int, str]:
+    a.check_flags(["--release", "--debug", "-o", "--emit-c", "--typed"])?
+    let t = resolve(first_pos(a))?.typed_if(a)
+    var out: Option[str] = None
+    match a.val("-o"):
+        case Some(o):
+            var p = o
+            let n = project.file_name(p).unwrap_or("")
+            if driver.file_stem(p) == n and project.is_windows():
+                p = p + ".exe"
+            out = Some(p)
+        case None:
+            # single files build next to where you are, like a C compiler would
+            if t.root.is_none():
+                out = Some(driver.exe_name(t.name))
+    match build(g, t, profile_of(a), false, out, a.has("--emit-c"))?:
+        case Some(exe):
+            if g.json:
+                print("{\"built\":" + json_str(display_path(exe)) + "}")
+            else:
+                g.status("Output", display_path(exe))
+            return Ok(0)
+        case None:
+            return Ok(1)
+
+fn spawn_env(threads: Option[str]) -> {str: str}:
+    var env: {str: str} = {}
+    match threads:
+        case Some(t):
+            env["BRINE_THREADS"] = t
+        case None:
+            pass
+    return env
+
+fn run_exe(exe: str, argv: [str], threads: Option[str], ranks: int) -> Result[int, str]:
+    var cmd = [exe]
+    cmd.extend(argv)
+    if ranks <= 1:
+        match os.spawn(cmd, spawn_env(threads), false, true):
+            case Ok(p):
+                return Ok(os.wait(p))
+            case Err(e):
+                return Err("could not start " + exe + ": " + e)
+    var ports: [int] = []
+    match os.free_ports(ranks):
+        case Ok(ps):
+            ports = ps
+        case Err(e):
+            return Err(f"cannot reserve local ports: {e}")
+    let peers = ",".join([f"127.0.0.1:{p}" for p in ports])
+    var kids: [int] = []
+    for r in 0..ranks:
+        var env = spawn_env(threads)
+        env["BRINE_RANK"] = f"{r}"
+        env["BRINE_WORLD_SIZE"] = f"{ranks}"
+        env["BRINE_PEERS"] = peers
+        match os.spawn(cmd, env, false, r == 0):
+            case Ok(p):
+                kids.push(p)
+            case Err(e):
+                for k in kids:
+                    os.kill(k)
+                    os.wait(k)
+                return Err(f"could not start rank {r}: {e}")
+    var codes: [Option[int]] = [None] * ranks
+    var failed_at = -1.0
+    while true:
+        for i in 0..ranks:
+            if codes[i].is_none():
+                match os.poll(kids[i]):
+                    case Some(c):
+                        codes[i] = Some(c)
+                        if c != 0 and failed_at < 0.0:
+                            failed_at = clock()
+                    case None:
+                        pass
+        if all(c.is_some() for c in codes):
+            break
+        # if one rank failed, the others would wait for it forever: stop them
+        if failed_at >= 0.0 and clock() - failed_at > 0.5:
+            for i in 0..ranks:
+                if codes[i].is_none():
+                    os.kill(kids[i])
+                    os.wait(kids[i])
+                    codes[i] = Some(101)
+            break
+        os.sleep(0.005)
+    for c in codes:
+        let v = c.unwrap_or(0)
+        if v != 0:
+            return Ok(v)
+    return Ok(0)
+
+fn cmd_run(g: G, a: Args) -> Result[int, str]:
+    a.check_flags(["--release", "--debug", "--threads", "--ranks", "--typed"])?
+    let t = resolve(first_pos(a))?.typed_if(a)
+    var ranks = 1
+    match a.val("--ranks"):
+        case Some(v):
+            match parse_int(v):
+                case Some(n):
+                    if n < 1 or n > 1024:
+                        return Err("`--ranks` must be a number from 1 to 1024")
+                    ranks = n
+                case None:
+                    return Err("`--ranks` must be a number from 1 to 1024")
+        case None:
+            pass
+    match a.val("--threads"):
+        case Some(th):
+            match parse_int(th):
+                case Some(n):
+                    if n < 1 or n > 4294967295:
+                        return Err("`--threads` must be a positive number")
+                case None:
+                    return Err("`--threads` must be a positive number")
+        case None:
+            pass
+    var exe = ""
+    match build(g, t, profile_of(a), false, None, false)?:
+        case Some(x):
+            exe = x
+        case None:
+            return Ok(1)
+    var argv = a.pos[1:] if len(a.pos) > 0 else []
+    argv.extend(a.rest)
+    if not g.quiet and not g.json:
+        let c = g.c()
+        let extra = f" ({ranks} ranks)" if ranks > 1 else ""
+        let verb = "Running"
+        eprint(f"{c.bold()}{c.green()}{verb:>10}{c.reset()} {display_path(exe)}{extra}")
+    return run_exe(exe, argv, a.val("--threads"), ranks)
+
+# A plain unsigned decimal number (no sign, no spaces).
+fn parse_int(s: str) -> Option[int]:
+    if s == "" or len(s) > 18:
+        return None
+    var n = 0
+    for c in s.chars():
+        if not ("0" <= c <= "9"):
+            return None
+        n = n * 10 + (ord(c) - 48)
+    return Some(n)
+
+# gdb pretty-printers for brine values, written next to debug builds
+const GDB_PY = embed("../runtime/brine_gdb.py")
+
+fn find_debugger() -> Option[str]:
+    for d in ["gdb", "lldb"]:
+        if driver.runs_ok([d, "--version"]):
+            return Some(d)
+    return None
+
+fn cmd_debug(g: G, a: Args) -> Result[int, str]:
+    a.check_flags([])?
+    let t = resolve(first_pos(a))?
+    var exe = ""
+    match build(g, t, Profile.Debug, false, None, false)?:
+        case Some(x):
+            exe = x
+        case None:
+            return Ok(1)
+    var dbg = ""
+    match find_debugger():
+        case Some(d):
+            dbg = d
+        case None:
+            return Err(
+                "no debugger found (install gdb or lldb); the debug build is at " + display_path(exe)
+            )
+    var cmd = [dbg]
+    if dbg == "gdb":
+        cmd.push("-q")
+        # the pretty-printers need a gdb with Python; without it brine
+        # values print as their C layout
+        let dir = driver.dir_of(exe)
+        let py = (dir if dir != "" else ".") + "/brine-gdb.py"
+        let has_py = driver.runs_ok(["gdb", "-nx", "-batch", "-ex", "python import gdb"])
+        if has_py and write_file(py, GDB_PY).is_ok():
+            cmd.extend(["-x", py])
+        else:
+            cmd.extend(["-ex", "skip -gfi */brine_rt.c", "-ex", "skip -gfi */brine_rt.h"])
+        cmd.extend(["--args", exe])
+    else:
+        # don't step into the C runtime
+        let avoid = "settings set target.process.thread.step-avoid-regexp ^(brine_|br_)"
+        cmd.extend(["-O", avoid, "--", exe])
+    cmd.extend(a.rest)
+    match os.spawn(cmd, {}, false, true):
+        case Ok(p):
+            return Ok(os.wait(p))
+        case Err(e):
+            return Err(e)
+
+fn cmd_check(g: G, a: Args) -> Result[int, str]:
+    a.check_flags(["--report", "--typed"])?
+    let t = resolve(first_pos(a))?.typed_if(a)
+    let t0 = clock()
+    let fe = driver.frontend(t.entry, FrontOpts(verify=true, need_main=false, typed=t.typed))
+    g.diags(fe)
+    if fe.has_errors():
+        return Ok(1)
+    var proven = 0
+    var remaining: [(diag.Span, str)] = []
+    match fe.report:
+        case Some(r):
+            proven = r.proven
+            remaining = r.remaining
+        case None:
+            pass
+    if a.has("--report"):
+        for span, what in remaining:
+            let loc = fe.sm.loc(span)
+            let src = fe.sm.snippet(span)
+            if g.json:
+                print(
+                    "{\"runtime_check\":" + json_str(what) + ",\"location\":" + json_str(loc) + ",\"code\":" + json_str(src) + "}"
+                )
+            else:
+                print(loc + ": " + what + " `" + verify.split_ws(src) + "`")
+    if g.json:
+        print(
+            "{\"ok\":true,\"checks_proven\":" + f"{proven}" + ",\"checks_remaining\":" + f"{len(remaining)}" + "}"
+        )
+    else:
+        let see = "" if a.has("--report") or len(remaining) == 0 else " (see --report)"
+        g.status(
+            "Checked",
+            f"{t.name} in {clock() - t0:.2f}s — {proven} runtime check{plural(proven)} proven unnecessary, {len(remaining)} remain{see}"
+        )
+    return Ok(0)
+
+struct Running:
+    k: int
+    name: str
+    handle: int
+    start: float
+
+struct TestResult:
+    k: int
+    name: str
+    ok: bool
+    text: str
+    secs: float
+
+fn cmd_test(g: G, a: Args) -> Result[int, str]:
+    a.check_flags(["--release", "--typed"])?
+    # `brine test foo.br [filter]` or `brine test [filter]` inside a project
+    var file: Option[str] = None
+    var filter: Option[str] = None
+    if len(a.pos) > 0:
+        let f = a.pos[0]
+        if f.ends_with(".br") or os.is_dir(f):
+            file = Some(f)
+            if len(a.pos) > 1:
+                filter = Some(a.pos[1])
+        else:
+            filter = Some(f)
+    let t = resolve(file)?.typed_if(a)
+    let profile = Profile.Release if a.has("--release") else Profile.Dev
+    var exe = ""
+    match build(g, t, profile, true, None, false)?:
+        case Some(x):
+            exe = x
+        case None:
+            return Ok(1)
+    var lp = 0
+    match os.spawn([exe, "--list"], {}, true, false):
+        case Ok(p):
+            lp = p
+        case Err(e):
+            return Err(e)
+    os.wait(lp)
+    let (list, _) = os.output(lp)
+    var tests: [(str, str)] = []
+    for l in list.lines():
+        match l.find("\t"):
+            case Some(i):
+                let name = l[i + 1:]
+                var keep = true
+                match filter:
+                    case Some(fl):
+                        keep = fl in name
+                    case None:
+                        pass
+                if keep:
+                    tests.push((l[:i], name))
+            case None:
+                pass
+    let me = os.exe_path()
+    let t0 = clock()
+    let n = len(tests)
+    let workers = min(os.cpu_count(), max(n, 1))
+    # workers take jobs from the end of the queue; results are reported in order anyway
+    var queue = [i for i in 0..n]
+    var running: [Running] = []
+    var results: [TestResult] = [TestResult(k=0, name="", ok=false, text="", secs=0.0)] * n
+    while len(queue) > 0 or len(running) > 0:
+        while len(running) < workers and len(queue) > 0:
+            let k = queue.pop()
+            let (idx, name) = tests[k]
+            let start = clock()
+            # each test runs in its own process with one worker thread pool
+            match os.spawn([exe, "--run", idx], {"BRINE_THREADS": "2", "BRINE": me}, true, false):
+                case Ok(p):
+                    running.push(Running(k=k, name=name, handle=p, start=start))
+                case Err(e):
+                    results[k] = TestResult(k=k, name=name, ok=false, text=e, secs=clock() - start)
+        var still: [Running] = []
+        var finished = false
+        for r in running:
+            match os.poll(r.handle):
+                case Some(code):
+                    let (o, e) = os.output(r.handle)
+                    results[
+                        r.k
+                    ] = TestResult(k=r.k, name=r.name, ok=code == 0, text=o + e, secs=clock() - r.start)
+                    finished = true
+                case None:
+                    still.push(r)
+        running = still
+        if not finished and len(running) > 0:
+            os.sleep(0.002)
+    let c = g.c()
+    var failed: [(str, str)] = []
+    for r in results:
+        if g.json:
+            print(
+                "{\"test\":" + json_str(r.name) + f",\"ok\":{r.ok},\"seconds\":{r.secs:.3f},\"output\":" + json_str(r.text) + "}"
+            )
+        elif not g.quiet or not r.ok:
+            let st = f"{c.green()}ok{c.reset()}" if r.ok else f"{c.bold()}{c.red()}FAILED{c.reset()}"
+            print(f"test {r.name} ... {st}")
+        if not r.ok:
+            failed.push((r.name, r.text))
+    if not g.json:
+        for name, text in failed:
+            print(f"\n---- {name} ----\n{text.rstrip()}")
+        let passed = n - len(failed)
+        let res = f"{c.green()}ok{c.reset()}" if len(
+            failed
+        ) == 0 else f"{c.bold()}{c.red()}FAILED{c.reset()}"
+        print(
+            f"\ntest result: {res}. {passed} passed; {len(failed)} failed; finished in {clock() - t0:.2f}s"
+        )
+        if n == 0:
+            let m = " match the filter" if filter.is_some() else ""
+            print(f"(no tests{m}; add one with `test \"name\":`)")
+    return Ok(0 if len(failed) == 0 else 1)
+
+fn source_files(dir: str, ref out: [str]):
+    var names: [str] = []
+    match os.list_dir(dir):
+        case Ok(ns):
+            names = ns
+        case Err(_):
+            return
+    for name in names:
+        let p = project.join(dir, name)
+        if os.is_dir(p):
+            if name != "target" and not name.starts_with("."):
+                source_files(p, ref out)
+        elif name.ends_with(".br"):
+            out.push(p)
+
+fn cmd_fmt(g: G, a: Args) -> Result[int, str]:
+    a.check_flags(["--check"])?
+    var files: [str] = []
+    if len(a.pos) == 0:
+        let cwd = os.cwd()
+        var root = cwd
+        match project.find(cwd):
+            case Some(Ok(p)):
+                root = p.root
+            case _:
+                pass
+        source_files(root, ref files)
+    else:
+        for f in a.pos:
+            if os.is_dir(f):
+                source_files(f, ref files)
+            else:
+                files.push(f)
+    let check = a.has("--check")
+    var changed = 0
+    var errors = 0
+    for f in files:
+        let text = driver.read_source(f)?
+        match fmt.format(text):
+            case Ok(out):
+                if out != text:
+                    changed += 1
+                    if check:
+                        if g.json:
+                            print("{\"unformatted\":" + json_str(display_path(f)) + "}")
+                        else:
+                            print("would reformat " + display_path(f))
+                    else:
+                        write_file(f, out)?
+                        g.status("Formatted", display_path(f))
+            case Err(ds):
+                errors += 1
+                var sm = SourceMap.new()
+                sm.add(display_path(f), text)
+                g.diag_list(ds, sm)
+    if not g.json and not g.quiet:
+        let verb = "need formatting" if check else "reformatted"
+        eprint(f"{len(files)} file{plural(len(files))} checked, {changed} {verb}")
+    return Ok(1 if errors > 0 or (check and changed > 0) else 0)
+
+fn doctor_line(g: G, good: bool, what: str, detail: str) -> bool:
+    if g.json:
+        print(
+            "{\"check\":" + json_str(what) + f",\"ok\":{good},\"detail\":" + json_str(detail) + "}"
+        )
+    else:
+        let c = g.c()
+        let mark = f"{c.green()}✓{c.reset()}" if good else f"{c.red()}✗{c.reset()}"
+        print(f"  {mark} {what:<16} {detail}")
+    return good
+
+fn cmd_doctor(g: G) -> Result[int, str]:
+    let c = g.c()
+    var ok = true
+    ok = doctor_line(g, true, "brine", f"{VERSION} ({os.name()} {os.arch()})") and ok
+    let cc = driver.find_cc()
+    match cc:
+        case Some(x):
+            let v = driver.cc_version(x).unwrap_or("")
+            ok = doctor_line(g, true, "C compiler", f"{x} — {v}") and ok
+        case None:
+            ok = doctor_line(
+                g,
+                false,
+                "C compiler",
+                "not found — install clang or gcc, or set BRINE_CC"
+            ) and ok
+    ok = doctor_line(g, true, "parallelism", f"{os.cpu_count()} hardware threads") and ok
+    ok = doctor_line(
+        g,
+        os.free_ports(1).is_ok(),
+        "local sockets",
+        "needed for `brine run --ranks`"
+    ) and ok
+    if cc.is_some():
+        let dir = project.join(os.temp_dir(), "brine-doctor")
+        match os.make_dir(dir):
+            case _:
+                pass
+        let src = project.join(dir, "doctor.br")
+        match write_file(
+            src,
+            "fn main():\n    let n = par sum(i for i in 0..1000)\n    print(n)\n"
+        ):
+            case _:
+                pass
+        let t = Target(entry=src, name="doctor", root=None, version=None, typed=false)
+        let quiet = G(json=false, color=false, quiet=true)
+        var built: Option[str] = None
+        match build(
+            quiet,
+            t,
+            Profile.Dev,
+            false,
+            Some(project.join(dir, driver.exe_name("doctor"))),
+            false
+        ):
+            case Ok(Some(exe)):
+                built = Some(exe)
+            case _:
+                pass
+        match built:
+            case Some(exe):
+                var good = false
+                match os.spawn([exe], {}, true, false):
+                    case Ok(p):
+                        os.wait(p)
+                        let (out, _) = os.output(p)
+                        good = out.strip() == "499500"
+                    case Err(_):
+                        pass
+                let detail = "compiled and ran a parallel program" if good else "the test program gave the wrong output"
+                ok = doctor_line(g, good, "build + run", detail) and ok
+            case None:
+                ok = doctor_line(
+                    g,
+                    false,
+                    "build + run",
+                    "could not build a test program (see errors above)"
+                ) and ok
+    let dbg = find_debugger()
+    if not g.json:
+        let mark = f"{c.green()}✓{c.reset()}" if dbg.is_some() else f"{c.yellow()}-{c.reset()}"
+        let what = "debugger"
+        let detail = dbg.unwrap_or("none (optional, for `brine debug`)")
+        print(f"  {mark} {what:<16} {detail}")
+    return Ok(0 if ok else 1)
+
+# `brine lex [--comments] <file>` (hidden): one line per token, then one per error.
+fn cmd_lex(a: Args) -> Result[int, str]:
+    if len(a.pos) == 0:
+        return Err("usage: brine lex [--comments] <file>")
+    let path = a.pos[0]
+    var text = ""
+    match read_file(path):
+        case Ok(t):
+            text = t
+        case Err(e):
+            return Err(f"cannot read {path}: {e}")
+    let (toks, diags) = lexer.lex(text, 0, 0, a.has("--comments"), true)
+    var lines: [str] = []
+    for t in toks:
+        lines.push(f"{t.lo} {t.hi} {lexer.dump_tok(t.tok, text[t.lo:t.hi])}")
+    for d in diags:
+        lines.extend(diag.dump(d))
+    if len(lines) > 0:
+        print("\n".join(lines))
+    return Ok(0)
+
+# `brine parse <file>` (hidden): the parsed AST and the errors, as text.
+fn cmd_parse(a: Args) -> Result[int, str]:
+    if len(a.pos) == 0:
+        return Err("usage: brine parse <file>")
+    let path = a.pos[0]
+    var text = ""
+    match read_file(path):
+        case Ok(t):
+            text = t
+        case Err(e):
+            return Err(f"cannot read {path}: {e}")
+    let (m, diags) = parser.parse_module(text, 0, "main")
+    var lines = astdump.dump_module(m, text)
+    for d in diags:
+        lines.extend(diag.dump(d))
+    if len(lines) > 0:
+        print("\n".join(lines))
+    return Ok(0)
+
+# `brine emit-c [--tests] [--debug] <file> -o <out.c>` (hidden): the generated C.
+fn cmd_emit_c(g: G, a: Args) -> Result[int, str]:
+    if len(a.pos) == 0:
+        return Err("usage: brine emit-c [--tests] [--debug] <file> -o <out.c>")
+    let tests = a.has("--tests")
+    let fe = driver.frontend(a.pos[0], FrontOpts(verify=true, need_main=not tests, typed=false))
+    g.diags(fe)
+    if fe.has_errors():
+        return Ok(1)
+    let c = driver.gen_c(fe, profile_of(a), tests)
+    match a.val("-o"):
+        case Some(out):
+            write_file(out, c)?
+        case None:
+            out_text(c)
+    return Ok(0)

@@ -1,0 +1,421 @@
+# `brine fmt`: canonical formatting.
+#
+# Works on tokens, so comments and literal spellings are preserved exactly.
+# As a safety net the result is re-lexed and must produce the same tokens as
+# the input; otherwise the input is returned unchanged.
+from diag import Diag
+from lexer import Tok, Kw, Token, FPart, lex
+from parser import parse_module
+
+const WIDTH = 100
+const INDENT = "    "
+
+struct Line:
+    toks: [Token]
+    # original column of the first token
+    col: int
+    first_line: int
+    last_line: int
+    comment_only: bool
+
+fn format(src: str) -> Result[str, [Diag]]:
+    let (_, diags) = parse_module(src, 0, "fmt")
+    var errs: [Diag] = []
+    for d in diags:
+        if d.is_error() and d.code != "E0104":
+            errs.push(d)
+    if len(errs) > 0:
+        return Err(errs)
+    # tabs in indentation are the one error we fix rather than report
+    var fixed: [str] = []
+    for l in src.lines():
+        var ws = 0
+        while ws < len(l) and (l[ws] == " " or l[ws] == "\t"):
+            ws += 1
+        fixed.push(l[0:ws].replace("\t", INDENT) + l[ws:])
+    let detabbed = "\n".join(fixed)
+    let out = format_inner(detabbed)
+    if same_tokens(detabbed, out):
+        return Ok(out)
+    # the safety net: never change what a program means
+    return Ok(detabbed + "\n" if len(fixed) > 0 else detabbed)
+
+fn same_tokens(a: str, b: str) -> bool:
+    let (ta, _) = lex(a, 0, 0, true, true)
+    let (tb, _) = lex(b, 0, 0, true, true)
+    var code_a: [Tok] = []
+    var comments_a: [str] = []
+    split_comments(ta, ref code_a, ref comments_a)
+    var code_b: [Tok] = []
+    var comments_b: [str] = []
+    split_comments(tb, ref code_b, ref comments_b)
+    return code_a == code_b and comments_a == comments_b
+
+fn split_comments(toks: [Token], ref code: [Tok], ref comments: [str]):
+    for t in toks:
+        match t.tok:
+            case Tok.Comment(c):
+                comments.push(c)
+            case Tok.FStr(parts):
+                # where an f-string's expressions start moves when a line is reformatted
+                var ps: [FPart] = []
+                for p in parts:
+                    match p:
+                        case FPart.Expr(src, _, spec):
+                            ps.push(FPart.Expr(src, 0, spec))
+                        case _:
+                            ps.push(p)
+                code.push(Tok.FStr(ps))
+            case _:
+                code.push(t.tok)
+
+fn line_starts(src: str) -> [int]:
+    var v = [0]
+    var i = 0
+    for b in src.bytes():
+        if b == 10:
+            v.push(i + 1)
+        i += 1
+    return v
+
+# the index of the line holding byte `off`: the last start at or before it
+fn line_of(starts: [int], off: int) -> int:
+    var lo = 0
+    var hi = len(starts)
+    while hi - lo > 1:
+        let mid = (lo + hi) / 2
+        if starts[mid] <= off:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+fn is_comment(t: Tok) -> bool:
+    match t:
+        case Tok.Comment(_):
+            return true
+        case _:
+            return false
+
+fn is_keyword(t: Tok) -> bool:
+    match t:
+        case Tok.Keyword(_):
+            return true
+        case _:
+            return false
+
+fn is_ident(t: Tok) -> bool:
+    match t:
+        case Tok.Ident(_):
+            return true
+        case _:
+            return false
+
+fn is_str(t: Tok) -> bool:
+    match t:
+        case Tok.Str(_):
+            return true
+        case _:
+            return false
+
+fn opens(t: Tok) -> bool:
+    match t:
+        case Tok.LParen | Tok.LBracket | Tok.LBrace:
+            return true
+        case _:
+            return false
+
+fn closes(t: Tok) -> bool:
+    match t:
+        case Tok.RParen | Tok.RBracket | Tok.RBrace:
+            return true
+        case _:
+            return false
+
+fn value_end(t: Tok) -> bool:
+    match t:
+        case Tok.Ident(_) | Tok.Int(_) | Tok.Float(_) | Tok.Str(_) | Tok.FStr(_):
+            return true
+        case Tok.RParen | Tok.RBracket | Tok.RBrace | Tok.Question:
+            return true
+        case Tok.Keyword(k):
+            return k == Kw.True or k == Kw.False
+        case _:
+            return false
+
+fn starts_def(t: Tok) -> bool:
+    match t:
+        case Tok.Keyword(k):
+            return k == Kw.Fn or k == Kw.Struct or k == Kw.Test or k == Kw.Extern
+        case _:
+            return false
+
+# number of characters (not bytes) in `s`
+fn char_count(s: str) -> int:
+    var n = 0
+    for b in s.bytes():
+        if int(b) < 0x80 or int(b) >= 0xc0:
+            n += 1
+    return n
+
+# whether the text before byte `end`, without trailing line breaks, ends with `\`
+fn continued_before(bs: [u8], end: int) -> bool:
+    var i = end - 1
+    while i >= 0 and (int(bs[i]) == 10 or int(bs[i]) == 13):
+        i -= 1
+    return i >= 0 and int(bs[i]) == 92
+
+# group tokens into logical lines
+fn group_lines(src: str, starts: [int]) -> [Line]:
+    let (toks, _) = lex(src, 0, 0, true, false)
+    let bs = src.bytes()
+    var lines: [Line] = []
+    var cur = Line(toks=[], col=0, first_line=0, last_line=0, comment_only=false)
+    var have = false
+    var depth = 0
+    var prev_line = -1
+    for t in toks:
+        if t.tok == Tok.Eof:
+            continue
+        let ln = line_of(starts, t.lo)
+        let first_on_line = prev_line != ln
+        if depth <= 0 and first_on_line and not (ln > 0 and continued_before(bs, starts[ln])):
+            if have:
+                lines.push(cur)
+            let col = t.lo - starts[ln]
+            cur = Line(
+                toks=[],
+                col=col,
+                first_line=ln,
+                last_line=ln,
+                comment_only=is_comment(t.tok)
+            )
+            have = true
+        if opens(t.tok):
+            depth += 1
+        elif closes(t.tok):
+            depth -= 1
+        let end_ln = line_of(starts, max(max(t.hi - 1, 0), t.lo))
+        if have:
+            if not is_comment(t.tok):
+                cur.comment_only = false
+            cur.last_line = max(cur.last_line, end_ln)
+            cur.toks.push(t)
+        prev_line = end_ln
+    if have:
+        lines.push(cur)
+    return lines
+
+# whether the last code token of a line is `:`
+fn opens_block(l: Line) -> bool:
+    var k = len(l.toks) - 1
+    while k >= 0:
+        if not is_comment(l.toks[k].tok):
+            return l.toks[k].tok == Tok.Colon
+        k -= 1
+    return false
+
+# depth of each line
+fn line_depths(lines: [Line]) -> [int]:
+    let n = len(lines)
+    var depths = [0] * n
+    # code lines: the same algorithm as the lexer
+    var stack = [0]
+    for i in 0..n:
+        if lines[i].comment_only:
+            continue
+        let col = lines[i].col
+        while col < stack[len(stack) - 1]:
+            stack.pop()
+        if col > stack[len(stack) - 1]:
+            stack.push(col)
+        depths[i] = len(stack) - 1
+    # comment lines take the depth of the following code, unless they are
+    # indented deeper than it (then they belong to the end of the block above)
+    for j in 0..n:
+        if not lines[j].comment_only:
+            continue
+        var next = -1
+        for a in j + 1..n:
+            if not lines[a].comment_only:
+                next = a
+                break
+        var prev = -1
+        var b = j - 1
+        while b >= 0:
+            if not lines[b].comment_only:
+                prev = b
+                break
+            b -= 1
+        var pd = 0
+        if prev >= 0:
+            pd = depths[prev] + (1 if opens_block(lines[prev]) else 0)
+        if next >= 0 and prev >= 0 and lines[j].col > lines[next].col:
+            depths[j] = max(pd, depths[next])
+        elif next >= 0:
+            depths[j] = depths[next]
+        elif prev >= 0:
+            depths[j] = min(pd, lines[j].col / 4)
+        else:
+            depths[j] = 0
+    return depths
+
+fn format_inner(src: str) -> str:
+    let starts = line_starts(src)
+    let lines = group_lines(src, starts)
+    let depths = line_depths(lines)
+    var out: [str] = []
+    for i in 0..len(lines):
+        let l = lines[i]
+        let d = depths[i]
+        if i > 0:
+            let p = i - 1
+            let pl = lines[p]
+            let src_blank = max(l.first_line - (pl.last_line + 1), 0)
+            let prev_opens = pl.toks[len(pl.toks) - 1].tok == Tok.Colon
+            let is_def = starts_def(l.toks[0].tok)
+            let block_ended = d == 0 and depths[p] > 0
+            let attached_comment = pl.comment_only and depths[p] == d and src_blank == 0
+            var blank = min(src_blank, 1)
+            if prev_opens:
+                blank = 0
+            if d == 0 and (is_def or block_ended) and not attached_comment and not prev_opens:
+                blank = 1
+            for _ in 0..blank:
+                out.push("\n")
+        let ind = INDENT.repeat(d)
+        let nt = len(l.toks)
+        var interior_comment = false
+        for k in 0..nt:
+            if is_comment(l.toks[k].tok) and k + 1 < nt:
+                interior_comment = true
+        if interior_comment:
+            # keep the author's layout; only fix the indentation
+            for ln in l.first_line..l.last_line + 1:
+                let s = starts[ln]
+                let e = starts[ln + 1] - 1 if ln + 1 < len(starts) else len(src)
+                var raw = src[s:e]
+                while raw.ends_with("\r"):
+                    raw = raw[0:len(raw) - 1]
+                let body = raw.lstrip()
+                var shifted = ind + body
+                if ln != l.first_line:
+                    let rel = len(raw) - len(body) - l.col
+                    shifted = ind + " ".repeat(max(rel, 0)) + body
+                out.push(shifted.rstrip() + "\n")
+            continue
+        var code = l.toks
+        var cm = ""
+        let last = l.toks[nt - 1]
+        if is_comment(last.tok):
+            code = l.toks[0:nt - 1]
+            let sep = "" if len(code) == 0 else "  "
+            cm = sep + src[last.lo:last.hi].rstrip()
+        let spaces = spacing(code)
+        let joined = render(src, code, spaces, 0, len(code))
+        let full = ind + joined + cm
+        var done = false
+        if len(full) > WIDTH and char_count(full) > WIDTH:
+            done = explode(ref out, src, code, spaces, ind, cm)
+        if not done:
+            out.push(full.rstrip() + "\n")
+    var res = "".join(out)
+    if res.rstrip() == "":
+        return ""
+    while res.ends_with("\n\n"):
+        res = res[0:len(res) - 1]
+    return res
+
+fn render(src: str, code: [Token], spaces: [bool], a: int, b: int) -> str:
+    var parts: [str] = []
+    for k in a..b:
+        if k > a and spaces[k]:
+            parts.push(" ")
+        parts.push(src[code[k].lo:code[k].hi])
+    return "".join(parts)
+
+# Whether a space goes before each token.
+fn spacing(code: [Token]) -> [bool]:
+    let n = len(code)
+    var sp = [false] * n
+    var brackets: [Tok] = []
+    # a keyword after `.` is a field name (`f.requires`), spaced like one
+    var toks: [Tok] = []
+    for i in 0..n:
+        if is_keyword(code[i].tok) and i > 0 and code[i - 1].tok == Tok.Dot:
+            toks.push(Tok.Ident(""))
+        else:
+            toks.push(code[i].tok)
+    for k in 0..n:
+        let cur = toks[k]
+        if k > 0:
+            let prev = toks[k - 1]
+            let minus = prev == Tok.Minus or prev == Tok.Tilde
+            let unary_prev = minus and (k < 2 or not value_end(toks[k - 2]))
+            let nb = len(brackets)
+            let in_parens = nb > 0 and brackets[nb - 1] == Tok.LParen
+            let in_brackets = nb > 0 and brackets[nb - 1] == Tok.LBracket
+            var s = true
+            if closes(cur) or cur == Tok.Comma or cur == Tok.Dot or cur == Tok.Colon:
+                s = false
+            elif cur == Tok.Question:
+                s = false
+            elif opens(prev) or prev == Tok.Dot or unary_prev:
+                s = false
+            elif prev == Tok.Colon and in_brackets:
+                # a slice: `s[a:b]`
+                s = false
+            elif cur == Tok.DotDot or cur == Tok.DotDotEq or prev == Tok.DotDot or prev == Tok.DotDotEq:
+                s = false
+            elif (cur == Tok.Assign or prev == Tok.Assign) and in_parens:
+                s = false
+            elif cur == Tok.LParen:
+                let call = is_ident(prev) or prev == Tok.RParen or prev == Tok.RBracket
+                s = not (call or prev == Tok.Keyword(Kw.Par))
+            elif cur == Tok.LBracket:
+                let index = is_ident(prev) or prev == Tok.RParen or prev == Tok.RBracket
+                s = not (index or is_str(prev) or prev == Tok.Question)
+            sp[k] = s
+        if opens(cur):
+            brackets.push(cur)
+        elif closes(cur) and len(brackets) > 0:
+            brackets.pop()
+    return sp
+
+# Break a long line at its first top-level bracket: one element per line.
+fn explode(ref out: [str], src: str, code: [Token], spaces: [bool], ind: str, cm: str) -> bool:
+    let n = len(code)
+    var open = -1
+    for i in 0..n:
+        if opens(code[i].tok):
+            open = i
+            break
+    if open < 0:
+        return false
+    var depth = 0
+    var close = -1
+    var commas: [int] = []
+    for k in open..n:
+        let t = code[k].tok
+        if opens(t):
+            depth += 1
+        elif closes(t):
+            depth -= 1
+            if depth == 0:
+                close = k
+                break
+        elif depth == 1 and t == Tok.Comma:
+            commas.push(k)
+    if close < 0:
+        return false
+    if close == open + 1:
+        return false
+    out.push(ind + render(src, code, spaces, 0, open + 1) + "\n")
+    var a = open + 1
+    for c in commas:
+        out.push(ind + INDENT + render(src, code, spaces, a, c + 1) + "\n")
+        a = c + 1
+    if a < close:
+        out.push(ind + INDENT + render(src, code, spaces, a, close) + "\n")
+    out.push((ind + render(src, code, spaces, close, n) + cm).rstrip() + "\n")
+    return true

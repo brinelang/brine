@@ -1,0 +1,74 @@
+# Builds brine from the bootstrap seed, checks formatting, runs the tests and
+# packages a release archive on every platform we ship. Release builds come
+# from this same workflow (release.yml calls it), so what is tested is what
+# ships.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # a called run shares the caller's ref, so it gets its own group
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds use the oldest supported runners, for an older glibc
+          - { target: linux-x64, runner: ubuntu-22.04 }
+          - { target: linux-arm64, runner: ubuntu-22.04-arm }
+          - { target: macos-arm64, runner: macos-15 }
+          - { target: macos-x64, runner: macos-15-intel }
+          - { target: windows-x64, runner: windows-2025, shell: "msys2 {0}" }
+    defaults:
+      run:
+        shell: ${{ matrix.shell || 'bash' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install MinGW (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-gdb zip
+
+      - name: Install gdb (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q gdb
+
+      - name: Build from the bootstrap seed
+        run: sh scripts/dist.sh bootstrap
+
+      - name: Check formatting
+        run: ./brine fmt --check compiler examples tests/integration.br tests/update_syntax.br
+
+      - name: Test
+        run: ./brine test tests/integration.br
+
+      - name: Package
+        run: sh scripts/dist.sh package
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: brine-${{ matrix.target }}
+          path: |
+            target/dist/brine-${{ matrix.target }}.tar.gz
+            target/dist/brine-${{ matrix.target }}.zip
+          if-no-files-found: error
+          retention-days: 14

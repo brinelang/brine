@@ -1,0 +1,432 @@
+# Source spans and diagnostics, shared by every compiler stage.
+
+# A byte range in a source file: `lo` is the first byte, `hi` one past the last.
+# `file` is the file's index in the program's SourceMap.
+struct Span:
+    file: int
+    lo: int
+    hi: int
+
+    # The smallest span covering both.
+    fn to(self, other: Span) -> Span:
+        return Span(file=self.file, lo=min(self.lo, other.lo), hi=max(self.hi, other.hi))
+
+    fn show(self) -> str:
+        return f"{self.lo}:{self.hi}"
+
+struct Label:
+    span: Span
+    msg: str
+
+# A suggested edit: replace `span` with `replacement`.
+struct Fix:
+    span: Span
+    replacement: str
+    msg: str
+
+struct Diag:
+    # false for warnings
+    error: bool
+    code: str
+    msg: str
+    labels: [Label]
+    notes: [str]
+    help: [str]
+    fixes: [Fix]
+
+    fn label(self, span: Span, msg: str) -> Diag:
+        var d = self
+        d.labels.push(Label(span=span, msg=msg))
+        return d
+
+    fn note(self, msg: str) -> Diag:
+        var d = self
+        d.notes.push(msg)
+        return d
+
+    fn with_help(self, msg: str) -> Diag:
+        var d = self
+        d.help.push(msg)
+        return d
+
+    fn fix(self, span: Span, replacement: str, msg: str) -> Diag:
+        var d = self
+        d.fixes.push(Fix(span=span, replacement=replacement, msg=msg))
+        return d
+
+    fn is_error(self) -> bool:
+        return self.error
+
+    # The span of the first label (where the error is).
+    fn span(self) -> Span:
+        if len(self.labels) == 0:
+            return Span(file=0, lo=0, hi=0)
+        return self.labels[0].span
+
+fn error(code: str, msg: str) -> Diag:
+    return Diag(error=true, code=code, msg=msg, labels=[], notes=[], help=[], fixes=[])
+
+fn warning(code: str, msg: str) -> Diag:
+    return Diag(error=false, code=code, msg=msg, labels=[], notes=[], help=[], fixes=[])
+
+# A diagnostic as lines of text (the format of `brine lex` and `brine parse`).
+fn dump(d: Diag) -> [str]:
+    let sp = d.span()
+    var out = [f"error {d.code} {sp.lo} {sp.hi} {d.msg}"]
+    for l in d.labels:
+        out.push(f"  label {l.span.lo} {l.span.hi} {l.msg}")
+    for n in d.notes:
+        out.push("  note " + n)
+    for h in d.help:
+        out.push("  help " + h)
+    for f in d.fixes:
+        out.push(f"  fix {f.span.lo} {f.span.hi} {quote(f.replacement)} {f.msg}")
+    return out
+
+# `s` in double quotes, with `\`, `"` and control characters escaped
+# (the same format as `brine lex`).
+fn quote(s: str) -> str:
+    var parts = ["\""]
+    for c in s:
+        if c == "\\":
+            parts.push("\\\\")
+        elif c == "\"":
+            parts.push("\\\"")
+        elif c == "\n":
+            parts.push("\\n")
+        elif c == "\t":
+            parts.push("\\t")
+        elif c == "\r":
+            parts.push("\\r")
+        elif ord(c) < 0x20 or ord(c) == 0x7f:
+            parts.push("\\u{" + hex(ord(c)) + "}")
+        else:
+            parts.push(c)
+    parts.push("\"")
+    return "".join(parts)
+
+fn hex(n: int) -> str:
+    requires n >= 0
+    let digits = "0123456789abcdef"
+    if n < 16:
+        return digits[n]
+    return hex(n / 16) + digits[n % 16]
+
+# ---------------------------------------------------------------- source files
+
+# Source files, the source map, and diagnostics as text (`render`) or JSON
+# (`to_json`).
+
+# One source file: its display path, its text, and where each line starts.
+struct SourceFile:
+    path: str
+    text: str
+    # the text's bytes, to find character boundaries
+    bytes: [u8]
+    # byte offset of the start of each line (the first is 0)
+    line_starts: [int]
+
+    fn new(path: str, text: str) -> SourceFile:
+        let bs = text.bytes()
+        var starts = [0]
+        for i, b in enumerate(bs):
+            if b == 10:
+                starts.push(i + 1)
+        return SourceFile(path=path, text=text, bytes=bs, line_starts=starts)
+
+    # true if a character starts at byte `i` (or `i` is the end of the text)
+    fn is_char_boundary(self, i: int) -> bool:
+        if i == 0 or i == len(self.bytes):
+            return true
+        if i < 0 or i > len(self.bytes):
+            return false
+        let b = int(self.bytes[i])
+        return b < 0x80 or b >= 0xc0
+
+    # 1-based (line, column) for a byte offset; the column counts characters.
+    fn line_col(self, off: int) -> (int, int):
+        let o = min(off, len(self.text))
+        # the last line that starts at or before `o`
+        var lo = 0
+        var hi = len(self.line_starts)
+        while hi - lo > 1:
+            let mid = lo + (hi - lo) / 2
+            if self.line_starts[mid] <= o:
+                lo = mid
+            else:
+                hi = mid
+        let start = self.line_starts[lo]
+        var end = o
+        while end > start and not self.is_char_boundary(end):
+            end -= 1
+        var col = 1
+        for i in start..end:
+            let b = int(self.bytes[i])
+            if b < 0x80 or b >= 0xc0:
+                col += 1
+        return (lo + 1, col)
+
+    # The text of line `line1` (1-based) without its line ending; "" if there's no such line.
+    fn line_text(self, line1: int) -> str:
+        let n = len(self.line_starts)
+        if line1 <= 0 or line1 > n:
+            return ""
+        let start = self.line_starts[line1 - 1]
+        var end = len(self.text)
+        if line1 < n:
+            end = self.line_starts[line1]
+        while end > start and (self.bytes[end - 1] == 10 or self.bytes[end - 1] == 13):
+            end -= 1
+        return self.text[start:end]
+
+# Every source file of a program; a Span's `file` is an index into `files`.
+struct SourceMap:
+    files: [SourceFile]
+
+    fn new() -> SourceMap:
+        return SourceMap(files=[])
+
+    # Add a file and return its id.
+    fn add(ref self, path: str, text: str) -> int:
+        self.files.push(SourceFile.new(path, text))
+        return len(self.files) - 1
+
+    fn file(self, id: int) -> SourceFile:
+        return self.files[id]
+
+    fn has_file(self, id: int) -> bool:
+        return 0 <= id and id < len(self.files)
+
+    # The source text of `span` ("" if it doesn't fall on character boundaries).
+    fn snippet(self, span: Span) -> str:
+        let f = self.file(span.file)
+        let lo = min(span.lo, len(f.text))
+        let hi = max(min(span.hi, len(f.text)), lo)
+        if not f.is_char_boundary(lo) or not f.is_char_boundary(hi):
+            return ""
+        return f.text[lo:hi]
+
+    # "path:line:column" of the start of `span`.
+    fn loc(self, span: Span) -> str:
+        let f = self.file(span.file)
+        let (l, c) = f.line_col(span.lo)
+        return f.path + ":" + str(l) + ":" + str(c)
+
+# ---------------------------------------------------------------- rendering
+
+# ANSI color codes, or empty strings when color is off.
+struct Colors:
+    on: bool
+
+    fn s(self, code: str) -> str:
+        if self.on:
+            return code
+        return ""
+
+    fn red(self) -> str:
+        return self.s("\u{1b}[31m")
+
+    fn green(self) -> str:
+        return self.s("\u{1b}[32m")
+
+    fn yellow(self) -> str:
+        return self.s("\u{1b}[33m")
+
+    fn blue(self) -> str:
+        return self.s("\u{1b}[34m")
+
+    fn bold(self) -> str:
+        return self.s("\u{1b}[1m")
+
+    fn reset(self) -> str:
+        return self.s("\u{1b}[0m")
+
+# `s` right-aligned in `w` columns
+fn pad_left(s: str, w: int) -> str:
+    let n = len(s.chars())
+    if n >= w:
+        return s
+    return " ".repeat(w - n) + s
+
+# A diagnostic as text for people, in the style of rustc: the message, then each
+# label under its source line, then notes and help. Every line ends with "\n".
+fn render(d: Diag, sm: SourceMap, color: bool) -> str:
+    let c = Colors(on=color)
+    var out: [str] = []
+    var sev = "warning"
+    var sevcol = c.yellow()
+    if d.error:
+        sev = "error"
+        sevcol = c.red()
+    out.push(
+        c.bold() + sevcol + sev + "[" + d.code + "]" + c.reset() + c.bold() + ": " + d.msg + c.reset() + "\n"
+    )
+    # gutter width
+    var maxline = 1
+    for l0 in d.labels:
+        if sm.has_file(l0.span.file):
+            let (ln0, _) = sm.files[l0.span.file].line_col(l0.span.lo)
+            maxline = max(maxline, ln0)
+    let w = len(str(maxline))
+    let pad = " ".repeat(w)
+    let bar = pad + " " + c.blue() + "|" + c.reset()
+    let eq = pad + " " + c.blue() + "=" + c.reset() + " "
+    var last_file = -1
+    var last_line_file = -1
+    var last_line = -1
+    for i, l in enumerate(d.labels):
+        if not sm.has_file(l.span.file):
+            continue
+        let f = sm.files[l.span.file]
+        let (ln, col) = f.line_col(l.span.lo)
+        if last_file != l.span.file or i == 0:
+            let arrow = "-->" if i == 0 else ":::"
+            out.push(
+                pad + c.blue() + arrow + " " + f.path + ":" + str(ln) + ":" + str(col) + c.reset() + "\n"
+            )
+            out.push(bar + "\n")
+            last_file = l.span.file
+        let text = f.line_text(ln)
+        # labels on the same line share one copy of it
+        if last_line_file != l.span.file or last_line != ln:
+            out.push(c.blue() + pad_left(str(ln), w) + " |" + c.reset() + " " + text + "\n")
+            last_line_file = l.span.file
+            last_line = ln
+        let (eln, ecol) = f.line_col(l.span.hi)
+        let line_chars = len(text.chars())
+        let start = col - 1
+        var end = max(line_chars, col)
+        if eln == ln:
+            end = max(ecol - 1, col)
+        let n = max(end - start, 1)
+        var mark = "-"
+        var mcol = c.blue()
+        if i == 0:
+            mark = "^"
+            mcol = sevcol
+        out.push(
+            bar + " " + " ".repeat(start) + mcol + mark.repeat(n) + " " + l.msg + c.reset() + "\n"
+        )
+    if len(d.labels) > 0 and (len(d.notes) > 0 or len(d.help) > 0):
+        out.push(bar + "\n")
+    for nt in d.notes:
+        out.push(eq + c.bold() + "note" + c.reset() + ": " + nt + "\n")
+    for h in d.help:
+        out.push(eq + c.bold() + "help" + c.reset() + ": " + h + "\n")
+    out.push(eq + "run `brine explain " + d.code + "` for more about this error\n")
+    return "".join(out)
+
+# A diagnostic as one line of JSON (the format of `--json`).
+fn to_json(d: Diag, sm: SourceMap) -> str:
+    var o = ["{"]
+    let sev = "error" if d.error else "warning"
+    o.push(
+        "\"severity\":\"" + sev + "\",\"code\":\"" + d.code + "\",\"message\":" + json_str(d.msg)
+    )
+    if len(d.labels) > 0:
+        o.push("," + span_json(sm, d.labels[0].span) + ",\"label\":" + json_str(d.labels[0].msg))
+    o.push(",\"related\":[")
+    for i in 1..len(d.labels):
+        if i > 1:
+            o.push(",")
+        o.push(
+            "{" + span_json(sm, d.labels[i].span) + ",\"label\":" + json_str(d.labels[i].msg) + "}"
+        )
+    o.push("],\"notes\":[")
+    o.push(",".join([json_str(x) for x in d.notes]))
+    o.push("],\"help\":[")
+    o.push(",".join([json_str(x) for x in d.help]))
+    o.push("],\"fixes\":[")
+    for j, f in enumerate(d.fixes):
+        if j > 0:
+            o.push(",")
+        o.push(
+            "{" + span_json(sm, f.span) + ",\"replacement\":" + json_str(f.replacement) + ",\"message\":" + json_str(f.msg) + "}"
+        )
+    o.push("]}")
+    return "".join(o)
+
+fn span_json(sm: SourceMap, s: Span) -> str:
+    if not sm.has_file(s.file):
+        return "\"file\":null"
+    let f = sm.files[s.file]
+    let (l, c) = f.line_col(s.lo)
+    let (el, ec) = f.line_col(s.hi)
+    let start = ",\"line\":" + str(l) + ",\"column\":" + str(c)
+    let end = ",\"end_line\":" + str(el) + ",\"end_column\":" + str(ec)
+    return "\"file\":" + json_str(f.path) + start + end
+
+# `s` as a JSON string literal.
+fn json_str(s: str) -> str:
+    var parts = ["\""]
+    for ch in s:
+        if ch == "\"":
+            parts.push("\\\"")
+        elif ch == "\\":
+            parts.push("\\\\")
+        elif ch == "\n":
+            parts.push("\\n")
+        elif ch == "\r":
+            parts.push("\\r")
+        elif ch == "\t":
+            parts.push("\\t")
+        elif ord(ch) < 0x20:
+            let h = hex(ord(ch))
+            parts.push("\\u" + "0".repeat(4 - len(h)) + h)
+        else:
+            parts.push(ch)
+    parts.push("\"")
+    return "".join(parts)
+
+# ---------------------------------------------------------------- suggestions
+
+# Edit distance where inserting, deleting, replacing or swapping two adjacent
+# characters each cost 1 (so `bulid` is 1 away from `build`), for "did you mean".
+fn edit_distance(a: str, b: str) -> int:
+    let x = a.chars()
+    let y = b.chars()
+    let n = len(x)
+    let m = len(y)
+    # d[i * w + j] is the distance between the first i chars of a and the first j of b
+    let w = m + 1
+    var d = [0] * ((n + 1) * w)
+    for i in 0..n + 1:
+        d[i * w] = i
+    for j in 0..m + 1:
+        d[j] = j
+    for p in 1..n + 1:
+        for q in 1..m + 1:
+            var cost = 1
+            if x[p - 1] == y[q - 1]:
+                cost = 0
+            var v = min(
+                min(d[(p - 1) * w + q] + 1, d[p * w + q - 1] + 1),
+                d[(p - 1) * w + q - 1] + cost
+            )
+            if p > 1 and q > 1 and x[p - 1] == y[q - 2] and x[p - 2] == y[q - 1]:
+                v = min(v, d[(p - 2) * w + q - 2] + 1)
+            d[p * w + q] = v
+    return d[n * w + m]
+
+# The candidate closest to `name` (other than `name` itself), if it's close enough:
+# within a third of the name's length in bytes (at least 1). A candidate that differs
+# only in ASCII case counts as distance 0. Ties go to the earliest candidate.
+fn best_match(name: str, candidates: [str]) -> Option[str]:
+    var found = false
+    var best_d = 0
+    var best = ""
+    let limit = max(len(name) / 3, 1)
+    let lname = name.lower()
+    for c in candidates:
+        if c == name:
+            continue
+        var dist = edit_distance(name, c)
+        if c.lower() == lname:
+            dist = 0
+        if dist <= limit and (not found or dist < best_d):
+            found = true
+            best_d = dist
+            best = c
+    if found:
+        return Some(best)
+    return None

@@ -1,0 +1,668 @@
+# The compilation pipeline: load the modules, check, verify, generate code
+# and link.
+from diag import Span, Diag, SourceMap
+import diag
+from ast import Module, Program
+from parser import parse_module
+from types import Ty, IntTy
+from info import ProgramInfo, TryKind, try_kind, PRELUDE
+from check import new_checker
+import project
+import uniform
+import verify
+import lower
+import ir_c
+import x64
+import a64
+from verify import Report
+
+const PRELUDE_SRC = embed("../runtime/prelude.br")
+const RT_H = embed("../runtime/brine_rt.h")
+const RT_C = embed("../runtime/brine_rt.c")
+# The one place the version is set (semantic versioning; see AGENTS.md).
+const VERSION = "0.3.0"
+
+struct Frontend:
+    sm: SourceMap
+    diags: [Diag]
+    prog: Option[Program]
+    info: Option[ProgramInfo]
+    report: Option[Report]
+
+    fn has_errors(self) -> bool:
+        return any(d.is_error() for d in self.diags)
+
+fn has_errors(ds: [Diag]) -> bool:
+    return any(d.is_error() for d in ds)
+
+# Reads a source file with line endings normalized, so spans and output are
+# the same on every OS.
+fn read_source(path: str) -> Result[str, str]:
+    match read_file(path):
+        case Ok(text):
+            return Ok(text.replace("\r\n", "\n"))
+        case Err(e):
+            return Err(f"cannot read `{path}`: {e}")
+
+# Path for messages: relative to the current directory when it's inside it.
+fn display_path(p: str) -> str:
+    var s = p
+    if project.is_absolute(p):
+        let cwd = os.cwd()
+        let n = len(cwd)
+        if n > 0 and len(p) > n and p[:n] == cwd and project.is_sep(p[n]):
+            s = p[n + 1:]
+    s = s.replace("\\", "/")
+    if s.starts_with("./"):
+        return s[2:]
+    return s
+
+fn dir_of(p: str) -> str:
+    match project.parent(p):
+        case Some(d):
+            return d
+        case None:
+            return ""
+
+# Parses the entry file and every module it (transitively) imports.
+# `import a.b` loads `<root>/a/b.br`, where root is the entry file's directory.
+# An imported module: its source, or None when the file is missing.
+struct Found:
+    name: str
+    src: Option[str]
+    file: int
+
+fn parse_found(f: Found) -> (Module, [Diag]):
+    match f.src:
+        case Some(src):
+            return parse_module(src, f.file, f.name)
+        case None:
+            return (
+                Module(name=f.name, file=f.file, imports=[], fns=[], structs=[], enums=[], consts=[], tests=[]),
+                []
+            )
+
+fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
+    var root = dir_of(entry)
+    if root == "":
+        root = "."
+    var text = ""
+    match read_source(entry):
+        case Ok(t):
+            text = t
+        case Err(e):
+            diags.push(diag.error("E0701", e))
+            return None
+    var prog = Program(modules=[], main_module=0, import_targets=[])
+    var by_name: {str: int} = {}
+    let fid = sm.add(display_path(entry), text)
+    let (m, d) = parse_module(text, fid, "main")
+    diags.extend(d)
+    by_name["main"] = 0
+    prog.modules.push(m)
+    # Breadth first, a wave at a time: scanning the modules found so far
+    # numbers the new imports in the order they're seen, then the new files
+    # are parsed in parallel and appended in that order, so the numbering
+    # doesn't depend on the parallelism.
+    var i = 0
+    while i < len(prog.modules):
+        let first_new = len(prog.modules)
+        var found: [Found] = []
+        while i < first_new:
+            var targets: [int] = []
+            for imp in prog.modules[i].imports:
+                let name = ".".join(imp.path)
+                match by_name.get(name):
+                    case Some(t):
+                        targets.push(t)
+                        continue
+                    case None:
+                        pass
+                var p = root
+                for seg in imp.path:
+                    p = project.join(p, seg)
+                p += ".br"
+                let idx = first_new + len(found)
+                by_name[name] = idx
+                targets.push(idx)
+                match read_source(p):
+                    case Ok(src):
+                        found.push(
+                            Found(name=name, src=Some(src), file=sm.add(display_path(p), src))
+                        )
+                    case Err(_):
+                        diags.push(
+                            diag.error("E0701", f"module `{name}` not found").label(imp.span, "expected a file at `" + display_path(p) + "`").with_help("modules are `.br` files next to the main file; `import a.b` loads `a/b.br`")
+                        )
+                        # keeps the numbering: an empty module
+                        found.push(Found(name=name, src=None, file=prog.modules[i].file))
+            prog.import_targets.push(targets)
+            i += 1
+        let parsed = par [parse_found(f) for f in found]
+        for pm in parsed:
+            diags.extend(pm.1)
+            prog.modules.push(pm.0)
+    # the prelude (`Option`, `Result`) is part of every program
+    if PRELUDE not in by_name:
+        let f = sm.add("<prelude>", PRELUDE_SRC)
+        let (pm, pd) = parse_module(PRELUDE_SRC, f, PRELUDE)
+        diags.extend(pd)
+        prog.modules.push(pm)
+        prog.import_targets.push([])
+    prog.main_module = 0
+    return Some(prog)
+
+struct FrontOpts:
+    verify: bool
+    need_main: bool
+    # require a written type on every variable
+    typed: bool
+
+fn main_ok(info: ProgramInfo, id: int) -> bool:
+    if id < 0 or id >= len(info.fns):
+        return false
+    let sig = info.fns[id]
+    if len(sig.params) > 0:
+        return false
+    match sig.ret:
+        case Ty.Unit | Ty.Int(IntTy.I64):
+            return true
+        case _:
+            match try_kind(info, sig.ret):
+                case Some(TryKind.Res(_, _, ok, _)):
+                    return ok == Ty.Unit
+                case _:
+                    return false
+
+# `BRINE_TIMES=1` prints how long each phase takes.
+fn phase_time(t0: float, what: str) -> float:
+    let now = clock()
+    if getenv("BRINE_TIMES").is_some():
+        eprint(f"  {what:<10} {now - t0:.3f}s")
+    return now
+
+fn frontend(entry: str, opts: FrontOpts) -> Frontend:
+    var sm = SourceMap.new()
+    var diags: [Diag] = []
+    var t = clock()
+    let loaded = load(entry, ref sm, ref diags)
+    t = phase_time(t, "parse")
+    if loaded.is_none() or has_errors(diags):
+        return Frontend(sm=sm, diags=diags, prog=loaded, info=None, report=None)
+    var prog = loaded.unwrap()
+    var ck = new_checker()
+    ck.typed = opts.typed
+    # `embed("x")` reads `x` next to the file that contains the call
+    for m in prog.modules:
+        ck.src_dirs[m.file] = dir_of(sm.file(m.file).path)
+    ck.check_program(ref prog)
+    diags.extend(ck.diags)
+    t = phase_time(t, "check")
+    let info = ck.info
+    if opts.need_main and not has_errors(diags):
+        let m = prog.modules[prog.main_module]
+        var found = -1
+        for i, f in enumerate(m.fns):
+            if f.name == "main" and f.method_of.is_none():
+                found = i
+                break
+        if found < 0:
+            diags.push(
+                diag.error("E0703", "this program has no `main` function").label(Span(file=m.file, lo=0, hi=0), "add `fn main():` here").with_help("every program starts at `fn main():` in its main file")
+            )
+        else:
+            let f = m.fns[found]
+            if len(f.tparams) > 0 or not main_ok(info, f.id):
+                diags.push(
+                    diag.error("E0706", "`main` must take no parameters and return nothing, an `int` exit code, or `Result[(), E]`").label(f.name_span, "this `main`").with_help("command-line arguments come from `args()`; return `Result[(), str]` to use `?` in `main`")
+                )
+    if not has_errors(diags):
+        # deadlock freedom: every rank makes the same `world` calls
+        diags.extend(uniform.check(prog, info))
+        t = phase_time(t, "uniform")
+    var report: Option[Report] = None
+    if opts.verify and not has_errors(diags):
+        let r = verify.verify_program(ref prog, info, sm)
+        diags.extend(r.diags)
+        report = Some(r)
+        t = phase_time(t, "verify")
+    sort_diags(ref diags)
+    return Frontend(sm=sm, diags=diags, prog=Some(prog), info=Some(info), report=report)
+
+# Deterministic order: by file, then position, then code (stable).
+fn sort_diags(ref ds: [Diag]):
+    var keys: [(int, int, str)] = []
+    for d in ds:
+        if len(d.labels) > 0:
+            let s = d.labels[0].span
+            keys.push((s.file, s.lo, d.code))
+        else:
+            keys.push((4294967295, 0, d.code))
+    let order = merge_sort(keys, [i for i in 0..len(ds)])
+    ds = [ds[i] for i in order]
+
+fn key_less(a: (int, int, str), b: (int, int, str)) -> bool:
+    if a.0 != b.0:
+        return a.0 < b.0
+    if a.1 != b.1:
+        return a.1 < b.1
+    return a.2 < b.2
+
+# Stable: equal keys keep their order.
+fn merge_sort(keys: [(int, int, str)], idx: [int]) -> [int]:
+    if len(idx) <= 1:
+        return idx
+    let mid = len(idx) / 2
+    let l = merge_sort(keys, idx[:mid])
+    let r = merge_sort(keys, idx[mid:])
+    var out: [int] = []
+    var i = 0
+    var j = 0
+    while i < len(l) and j < len(r):
+        if key_less(keys[r[j]], keys[l[i]]):
+            out.push(r[j])
+            j += 1
+        else:
+            out.push(l[i])
+            i += 1
+    out.extend(l[i:])
+    out.extend(r[j:])
+    return out
+
+# ================================================================ C toolchain
+
+enum Profile:
+    Dev
+    Release
+    Debug
+
+    fn name(self) -> str:
+        match self:
+            case Profile.Dev:
+                return "dev"
+            case Profile.Release:
+                return "release"
+            case Profile.Debug:
+                return "debug"
+
+    fn cflags(self) -> [str]:
+        match self:
+            case Profile.Dev:
+                return ["-O2"]
+            case Profile.Release:
+                return ["-O3"]
+            case Profile.Debug:
+                return ["-O0", "-g"]
+
+# Does `cmd` start and exit successfully?
+fn runs_ok(cmd: [str]) -> bool:
+    match os.spawn(cmd, {}, true, false):
+        case Ok(p):
+            return os.wait(p) == 0
+        case Err(_):
+            return false
+
+fn find_cc() -> Option[str]:
+    for var_name in ["BRINE_CC", "CC"]:
+        match getenv(var_name):
+            case Some(v):
+                if v.strip() != "":
+                    return Some(v)
+            case None:
+                pass
+    for cand in ["clang", "gcc", "cc"]:
+        if runs_ok([cand, "--version"]):
+            return Some(cand)
+    return None
+
+fn cc_version(cc: str) -> Option[str]:
+    match os.spawn([cc, "--version"], {}, true, false):
+        case Ok(p):
+            os.wait(p)
+            let (out, _) = os.output(p)
+            let ls = out.lines()
+            if len(ls) == 0:
+                return None
+            return Some(ls[0].strip())
+        case Err(_):
+            return None
+
+fn no_cc_diag() -> Diag:
+    var hint = "install clang or gcc with your package manager, or set BRINE_CC"
+    if project.is_windows():
+        hint = "install one with `winget install LLVM.LLVM` or `scoop install mingw-winlibs`, or set BRINE_CC"
+    elif os.name() == "macos":
+        hint = "install one with `xcode-select --install`, or set BRINE_CC"
+    return diag.error(
+        "E0702",
+        "no C compiler found"
+    ).note("brine generates C and uses the system C compiler to produce native code").with_help(hint)
+
+# 64-bit FNV-1a.
+fn fnv(data: str) -> u64:
+    let mask: u128 = 18446744073709551615
+    let prime: u128 = 1099511628211
+    var h: u128 = 14695981039346656037
+    for b in data.bytes():
+        h = h ^ u128(b)
+        h = (h * prime) & mask
+    return u64(h)
+
+fn fnv_bytes(data: [u8]) -> u64:
+    var h: u128 = 14695981039346656037
+    for b in data:
+        h = ((h ^ u128(b)) * 1099511628211) & 18446744073709551615
+    return u64(h)
+
+fn hex16(h: u64) -> str:
+    return f"{h:016x}"
+
+fn exe_name(stem: str) -> str:
+    if project.is_windows():
+        return stem + ".exe"
+    return stem
+
+fn link_libs() -> [str]:
+    if project.is_windows():
+        return ["-lws2_32", "-lshell32"]
+    return ["-lm", "-lpthread", "-ldl"]
+
+fn run_cc(cmd: [str]) -> Result[(), str]:
+    var p = 0
+    match os.spawn(cmd, {}, true, false):
+        case Ok(h):
+            p = h
+        case Err(e):
+            return Err(f"could not run the C compiler: {e}")
+    let code = os.wait(p)
+    let (out, err) = os.output(p)
+    if code == 0:
+        return Ok(())
+    return Err(err + out)
+
+# The file name without its extension.
+fn file_stem(p: str) -> str:
+    let n = project.file_name(p).unwrap_or("")
+    var i = len(n) - 1
+    while i > 0:
+        if n[i] == ".":
+            return n[:i]
+        i -= 1
+    return n
+
+# `p` with its extension replaced (or added).
+fn with_extension(p: str, ext: str) -> str:
+    let n = project.file_name(p).unwrap_or("")
+    let base = p[:len(p) - len(n)]
+    return base + file_stem(p) + "." + ext
+
+fn io_diag(e: str) -> Diag:
+    return diag.error("E0704", f"cannot write build files: {e}")
+
+# Generated code, ready for the system toolchain.
+enum Code:
+    # C translation units, compiled in parallel and cached one by one
+    C(units: [str])
+    # a native object file (x64.br)
+    Obj(bytes: [u8])
+
+fn make_dirs(d: str) -> Result[(), Diag]:
+    match os.make_dir(d):
+        case Ok(_):
+            return Ok(())
+        case Err(e):
+            return Err(diag.error("E0704", f"cannot create `{d}`: {e}"))
+
+fn cc_failed(what: str, e: str) -> Diag:
+    let ls = e.strip().lines()
+    let first = ls[:min(30, len(ls))]
+    return diag.error(
+        "E0705",
+        what
+    ).note("this is a bug in the brine compiler, not in your program — please report it").note("\n".join(first))
+
+fn write_or_diag(path: str, text: str) -> Result[(), Diag]:
+    match write_file(path, text):
+        case Ok(_):
+            return Ok(())
+        case Err(e):
+            return Err(io_diag(e))
+
+# The runtime as an object file, cached by runtime source + C compiler + flags.
+# Returns its directory (it has brine_rt.h) and the object's path.
+fn runtime_object(cc: str, flags: [str], key: str, dir: str) -> Result[(str, str), Diag]:
+    let rt_dir = project.join(dir, "rt-" + hex16(fnv(RT_H + RT_C + key)))
+    let rt_obj = project.join(rt_dir, "brine_rt.o")
+    if file_exists(rt_obj):
+        return Ok((rt_dir, rt_obj))
+    make_dirs(rt_dir)?
+    # the directory name is a hash of the contents, so existing files are already right
+    # (and rewriting them could collide with a concurrent build reading them)
+    for name, text in [("brine_rt.h", RT_H), ("brine_rt.c", RT_C)]:
+        let f = project.join(rt_dir, name)
+        var same = false
+        match read_file(f):
+            case Ok(t):
+                same = len(t) == len(text)
+            case Err(_):
+                pass
+        if not same:
+            write_or_diag(f, text)?
+    let tmp = project.join(rt_dir, f"brine_rt.{os.pid()}.o")
+    var cmd = [cc]
+    cmd.extend(flags)
+    cmd.extend(["-c", project.join(rt_dir, "brine_rt.c"), "-o", tmp])
+    match run_cc(cmd):
+        case Ok(_):
+            pass
+        case Err(e):
+            return Err(
+                diag.error("E0705", "the C compiler failed on the brine runtime").note(e.strip())
+            )
+    match os.rename(tmp, rt_obj):
+        case _:
+            pass
+    return Ok((rt_dir, rt_obj))
+
+# Compile generated code to an executable. `dir` is a cache directory for
+# intermediate files. Returns Ok(true) if the C compiler actually ran.
+fn compile(code: Code, out_exe: str, dir: str, profile: Profile) -> Result[bool, Diag]:
+    var cc = ""
+    match find_cc():
+        case Some(x):
+            cc = x
+        case None:
+            return Err(no_cc_diag())
+    make_dirs(dir)?
+    var flags = ["-std=c11", "-fno-strict-aliasing", "-w"]
+    flags.extend(profile.cflags())
+    let key = cc + "|" + " ".join(flags) + "|" + VERSION
+    let (rt_dir, rt_obj) = runtime_object(cc, flags, key, dir)?
+
+    # objects are named by a hash of what they're made from, the runtime
+    # header included: its inline functions end up in them
+    let ukey = key + "|" + hex16(fnv(RT_H))
+    var units: [str] = []
+    var native: [u8] = []
+    var hashes: [str] = []
+    match code:
+        case Code.C(us):
+            units = us
+            for u in units:
+                hashes.push(hex16(fnv(u + ukey)))
+        case Code.Obj(b):
+            native = b
+            hashes.push(hex16(fnv_bytes(b)))
+    let prog_hash = fnv(" ".join(hashes) + rt_obj)
+    let stamp = with_extension(out_exe, "brine-hash")
+    if file_exists(out_exe):
+        match read_file(stamp):
+            case Ok(st):
+                if st.strip() == hex16(prog_hash):
+                    return Ok(false)
+            case Err(_):
+                pass
+    # one directory per output, so pruning never touches another build's objects
+    let obj_dir = project.join(dir, "obj-" + hex16(fnv(out_exe)))
+    make_dirs(obj_dir)?
+    var objs: [str] = []
+    var jobs: [(int, str, str, str)] = []
+    for i, u in enumerate(units):
+        let obj = project.join(obj_dir, hashes[i] + ".o")
+        # identical units (empty ones) are one object
+        if obj in objs:
+            continue
+        objs.push(obj)
+        if file_exists(obj):
+            continue
+        let c_path = project.join(obj_dir, f"{hashes[i]}.{os.pid()}.c")
+        write_or_diag(c_path, u)?
+        let tmp = project.join(obj_dir, f"{hashes[i]}.{os.pid()}.o")
+        var cmd = [cc]
+        cmd.extend(flags)
+        cmd.extend(["-I", rt_dir, "-c", c_path, "-o", tmp])
+        match os.spawn(cmd, {}, true, false):
+            case Ok(h):
+                jobs.push((h, c_path, tmp, obj))
+            case Err(e):
+                return Err(diag.error("E0705", f"could not run the C compiler: {e}"))
+    var t = clock()
+    if len(native) > 0:
+        let obj = project.join(obj_dir, hashes[0] + ".o")
+        objs.push(obj)
+        if not file_exists(obj):
+            let tmp = project.join(obj_dir, f"{hashes[0]}.{os.pid()}.o")
+            match os.write_bytes(tmp, native):
+                case Ok(_):
+                    pass
+                case Err(e):
+                    return Err(io_diag(e))
+            match os.rename(tmp, obj):
+                case _:
+                    pass
+    var failure = ""
+    for h, c_path, tmp, obj in jobs:
+        let rc = os.wait(h)
+        let (out, err) = os.output(h)
+        if rc != 0:
+            if failure == "":
+                failure = err + out
+        else:
+            match os.rename(tmp, obj):
+                case _:
+                    pass
+            match os.remove_file(c_path):
+                case _:
+                    pass
+    prune(obj_dir, objs)
+    if len(units) > 0:
+        t = phase_time(t, f"cc ({len(jobs)}/{len(units)})")
+    if failure != "":
+        return Err(cc_failed("the C compiler rejected the generated code", failure))
+    match project.parent(out_exe):
+        case Some(d):
+            if d != "":
+                make_dirs(d)?
+        case None:
+            pass
+    var link = [cc]
+    link.extend(objs)
+    link.extend([rt_obj, "-o", out_exe])
+    link.extend(link_libs())
+    match run_cc(link):
+        case Ok(_):
+            pass
+        case Err(e):
+            return Err(cc_failed("linking the program failed", e))
+    phase_time(t, "link")
+    match write_file(stamp, hex16(prog_hash)):
+        case _:
+            pass
+    return Ok(true)
+
+# Every edit leaves an object behind: past a limit, keep only this build's.
+fn prune(obj_dir: str, keep: [str]):
+    let fs = os.list_dir(obj_dir).unwrap_or([])
+    if len(fs) < 4 * len(keep) + 64:
+        return
+    for f in fs:
+        let p = project.join(obj_dir, f)
+        # finished objects only (`<hash>.o`), not another build's work in progress
+        if len(f) == 18 and f.ends_with(".o") and p not in keep:
+            match os.remove_file(p):
+                case _:
+                    pass
+
+# How many C translation units for a build: several for quick parallel dev
+# builds, one when the optimizer should see the whole program.
+fn unit_count(profile: Profile) -> int:
+    if profile == Profile.Release:
+        return 1
+    return min(max(os.cpu_count(), 1), 16)
+
+fn lowered(fe: Frontend, tests: bool, debug: bool) -> lower.Lowered:
+    return lower.lower(
+        fe.prog.unwrap(),
+        fe.info.unwrap(),
+        fe.sm,
+        lower.Options(tests=tests, debug=debug)
+    )
+
+# Native code for dev and debug builds where x64.br or a64.br knows the
+# platform; C for optimized builds and everywhere else. `BRINE_BACKEND=c` or `=native`
+# overrides.
+fn use_native(profile: Profile) -> bool:
+    match getenv("BRINE_BACKEND"):
+        case Some(b):
+            if b == "c":
+                return false
+            if b == "native":
+                return native_host()
+        case None:
+            pass
+    return default_native(profile)
+
+fn default_native(profile: Profile) -> bool:
+    return native_host() and profile != Profile.Release
+
+fn native_host() -> bool:
+    if os.arch() == "aarch64":
+        return os.name() == "linux"
+    return os.arch() == "x86_64" and (os.name() == "windows" or os.name() == "linux")
+
+# The folder a profile's executables go in. A build with `BRINE_BACKEND` set
+# gets its own, even when it picks the default backend, so it can't replace a
+# default build's executable while that one runs.
+fn out_name(profile: Profile) -> str:
+    if getenv("BRINE_BACKEND").is_none():
+        return profile.name()
+    return profile.name() + ("-native" if use_native(profile) else "-c")
+
+fn gen_code(fe: Frontend, profile: Profile, tests: bool) -> Code:
+    var t = clock()
+    let l = lowered(fe, tests, profile == Profile.Debug)
+    t = phase_time(t, "lower")
+    if use_native(profile):
+        let win = os.name() == "windows"
+        let arm = os.arch() == "aarch64"
+        let src = fe.sm.file(0).path
+        let prod = "brine " + VERSION
+        var b: [u8] = []
+        if arm and profile == Profile.Debug:
+            b = a64.emit_object_debug(l.m, src, os.cwd(), prod)
+        elif arm:
+            b = a64.emit_object(l.m)
+        elif profile == Profile.Debug:
+            b = x64.emit_object_debug(l.m, win, src, os.cwd(), prod)
+        else:
+            b = x64.emit_object(l.m, win)
+        phase_time(t, "aarch64" if arm else "x86-64")
+        return Code.Obj(b)
+    let n = unit_count(profile)
+    var units = [ir_c.emit_c(l)] if n == 1 else ir_c.emit_units(l, n)
+    phase_time(t, "emit C")
+    return Code.C(units)
+
+# The program as one C file (`brine emit-c`).
+fn gen_c(fe: Frontend, profile: Profile, tests: bool) -> str:
+    return ir_c.emit_c(lowered(fe, tests, profile == Profile.Debug))

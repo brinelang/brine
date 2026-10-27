@@ -1,0 +1,1858 @@
+# AArch64 machine code for the brine IR, for Linux (ELF64, see obj.br). The
+# same approach as x64.br: every vreg has a home in the frame, in canonical
+# form (integers sign- or zero-extended to 64 bits by their kind, Bool 0/1,
+# F32 in the low 4 bytes), and each instruction loads its operands into
+# scratch registers, computes and stores the result; the most used vregs live
+# in callee-saved registers instead (x19-x28, d8-d15) for the whole function.
+# Vregs set once by a Const, SlotAddr or Global get no home.
+#
+# Frame: x29 points at the saved x29 / x30 pair, the callee-saved registers
+# the function uses are right below it, and homes, stack slots and outgoing
+# arguments are addressed from sp, which doesn't move in the body.
+#
+# Scratch registers: x9-x12 and v0-v2 (caller-saved), x16 for addresses out of
+# an instruction's reach. Overflow and index checks branch to cold stubs after
+# the function body. Every function gets an .eh_frame entry.
+#
+# Debug builds (`emit_object_debug`) keep every vreg in its home and get DWARF
+# line and variable info (dwarf.br), as in x64.br.
+
+from ir import K, Op, Inst, Func, Module
+from opt import promote
+from dwarf import Dwarf, DFn, DRow, DLocal, new_dwarf, loc_breg, loc_deref, write_dwarf
+from obj import ObjFile, OSym, ORel, new_obj, write_elf, put16, put32, set32, uleb, sleb, log2
+from obj import SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, R_PC32, R_ABS64, ARCH_A64
+from obj import R_A64_CALL26, R_A64_PAGE, R_A64_LO12, R_A64_GOT_PAGE, R_A64_GOT_LO12
+from x64 import canon, fl_of, align_up, w128, wide_rt_helpers, emit_order
+
+const T0 = 9
+const T1 = 10
+const T2 = 11
+const T3 = 12
+const IP0 = 16
+const FP = 29
+const LR = 30
+# sp or xzr, by instruction
+const SP = 31
+const ZR = 31
+
+# condition codes
+const C_EQ = 0
+const C_NE = 1
+const C_HS = 2
+const C_LO = 3
+const C_MI = 4
+const C_VS = 6
+const C_HI = 8
+const C_LS = 9
+const C_GE = 10
+const C_LT = 11
+const C_GT = 12
+const C_LE = 13
+
+# how a vreg is folded away
+const F_NONE = 0
+const F_CONST = 1
+const F_SLOT = 2
+const F_GLOBAL = 3
+
+# call argument sources
+const A_VAL = 0
+const A_ADDR = 1
+const A_IMM = 2
+const A_SYM = 3
+const A_FRAME = 4
+
+# argument locations: x register i, v register 100 + i, stack 1000 + byte offset
+const L_V = 100
+const L_STACK = 1000
+
+# panic stubs
+const S_ADD = 0
+const S_SUB = 1
+const S_MUL = 2
+const S_IDX = 3
+
+# branch fields to patch: imm26 (b, bl), imm19 (b.cond, cbz), imm14 (tbz)
+const B26 = 0
+const B19 = 1
+const B14 = 2
+
+# memory access instructions, see `mop`
+const M_LDRX = 0
+const M_STRX = 1
+const M_LDRW = 2
+const M_STRW = 3
+const M_LDRSW = 4
+const M_LDRH = 5
+const M_LDRSH = 6
+const M_STRH = 7
+const M_LDRB = 8
+const M_LDRSB = 9
+const M_STRB = 10
+const M_LDRD = 11
+const M_STRD = 12
+const M_LDRS = 13
+const M_STRS = 14
+
+# (unsigned-offset encoding, unscaled encoding, access size)
+fn mop(m: int) -> (int, int, int):
+    match m:
+        case 0:
+            return (0xF9400000, 0xF8400000, 8)
+        case 1:
+            return (0xF9000000, 0xF8000000, 8)
+        case 2:
+            return (0xB9400000, 0xB8400000, 4)
+        case 3:
+            return (0xB9000000, 0xB8000000, 4)
+        case 4:
+            return (0xB9800000, 0xB8800000, 4)
+        case 5:
+            return (0x79400000, 0x78400000, 2)
+        case 6:
+            return (0x79800000, 0x78800000, 2)
+        case 7:
+            return (0x79000000, 0x78000000, 2)
+        case 8:
+            return (0x39400000, 0x38400000, 1)
+        case 9:
+            return (0x39800000, 0x38800000, 1)
+        case 10:
+            return (0x39000000, 0x38000000, 1)
+        case 11:
+            return (0xFD400000, 0xFC400000, 8)
+        case 12:
+            return (0xFD000000, 0xFC000000, 8)
+        case 13:
+            return (0xBD400000, 0xBC400000, 4)
+        case _:
+            return (0xBD000000, 0xBC000000, 4)
+
+# the load of kind k, in canonical form
+fn load_op(k: K) -> int:
+    match k:
+        case K.I8:
+            return M_LDRSB
+        case K.U8 | K.Bool:
+            return M_LDRB
+        case K.I16:
+            return M_LDRSH
+        case K.U16:
+            return M_LDRH
+        case K.I32:
+            return M_LDRSW
+        case K.U32 | K.F32:
+            return M_LDRW
+        case _:
+            return M_LDRX
+
+fn store_op(size: int) -> int:
+    if size == 1:
+        return M_STRB
+    if size == 2:
+        return M_STRH
+    if size == 4:
+        return M_STRW
+    return M_STRX
+
+struct CArg:
+    how: int
+    v: int
+    # 0: integer class, 1: f64, 2: f32
+    fl: int
+
+struct Stub:
+    # the b.cond to the stub
+    at: int
+    kind: int
+    a: int
+    b: int
+    c: int
+
+# Where (offsets in .text) a function's prologue steps end, for .eh_frame.
+struct Unw:
+    start: int
+    # after x29 is set
+    fp: int
+    # after the callee-saved registers are stored
+    pro_end: int
+    # after the `ldp x29, x30` of each epilogue (`ret` follows)
+    epis: [int]
+
+# The CIE of .eh_frame: on entry the CFA is sp and the return address is in
+# x30; FDEs give their code range pc-relative.
+fn a64_cie(ref out: [u8]):
+    put32(ref out, 0)
+    put32(ref out, 0)
+    # version 1, augmentation "zR"
+    out.extend([1, 122, 82, 0])
+    # code alignment 1, data alignment -8, return address register 30
+    uleb(ref out, 1)
+    sleb(ref out, -8)
+    uleb(ref out, 30)
+    uleb(ref out, 1)
+    # DW_EH_PE_pcrel | DW_EH_PE_sdata4
+    out.push(27)
+    # DW_CFA_def_cfa sp, 0
+    out.extend([12, 31, 0])
+    while len(out) % 8 != 0:
+        out.push(0)
+    set32(ref out, 0, len(out) - 4)
+
+struct A:
+    o: ObjFile
+    syms: {str: int}
+    wide_ret: {str: bool}
+    wide_rt: {str: bool}
+    text_sym: int
+    ovf: [int]
+    # the function being compiled
+    code: [Inst]
+    vk: [K]
+    nparams: int
+    # sp-relative home of each vreg
+    home: [int]
+    # the callee-saved register holding the vreg for the whole function, or -1
+    reg: [int]
+    freg: [int]
+    saved: [int]
+    fsaved: [int]
+    fold: [int]
+    fval: [int]
+    nuse: [int]
+    # sp-relative offset of each stack slot
+    slot_off: [int]
+    ploc: [int]
+    lpos: [int]
+    # branches to labels not placed yet: position, label, field
+    jat: [int]
+    jlab: [int]
+    jkind: [int]
+    stubs: [Stub]
+    # sp-relative home of the hidden pointer to a 128-bit result
+    retp: int
+    # a 16-byte frame slot for ignored 128-bit results
+    scratch: int
+    has_ret: bool
+    ret: K
+    cur: int
+    u: Unw
+    dbg: bool
+    dw: Dwarf
+    ipos: [int]
+    rows: [DRow]
+    entry_main: bool
+    entry: (int, int)
+
+    # ------------------------------------------------------------ bytes
+    fn w(ref self, ins: int):
+        put32(ref self.o.text, ins & 0xFFFFFFFF)
+
+    fn pos(self) -> int:
+        return len(self.o.text)
+
+    fn get32(self, at: int) -> int:
+        let t = self.o.text
+        return int(t[at]) | (int(t[at + 1]) << 8) | (int(t[at + 2]) << 16) | (int(t[at + 3]) << 24)
+
+    fn reloc(ref self, kind: int, sym: int, add: int):
+        self.o.trel.push(ORel(off=self.pos(), sym=sym, kind=kind, add=add))
+
+    # ------------------------------------------------------------ symbols
+    fn sym_ref(ref self, name: str) -> int:
+        match self.syms.get(name):
+            case Some(i):
+                return i
+            case None:
+                let i = len(self.o.syms)
+                self.o.syms.push(OSym(name=name, sec=SEC_UNDEF, off=0, global=false, func=false))
+                self.syms[name] = i
+                return i
+
+    fn sym_def(ref self, name: str, sec: int, off: int, global: bool, func: bool) -> int:
+        let i = self.sym_ref(name)
+        self.o.syms[i] = OSym(name=name, sec=sec, off=off, global=global, func=func)
+        return i
+
+    fn ovf_sym(ref self, kind: int) -> int:
+        if self.ovf[kind] < 0:
+            let names = ["addition", "subtraction", "multiplication"]
+            let off = len(self.o.rodata)
+            for c in names[kind].bytes():
+                self.o.rodata.push(u8(c))
+            self.o.rodata.push(0)
+            self.ovf[kind] = self.sym_def(f"__brx_ovf_{names[kind]}", SEC_RODATA, off, false, false)
+        return self.ovf[kind]
+
+    # ------------------------------------------------------------ instructions
+    fn mov_rr(ref self, d: int, s: int):
+        if d != s:
+            # orr d, xzr, s
+            self.w(0xAA0003E0 | (s << 16) | d)
+
+    fn mov_ri(ref self, r: int, v: int):
+        # movz with the chunks that aren't 0, or movn with those that aren't ffff
+        var zeros = 0
+        var ones = 0
+        for i in 0..4:
+            let c = (v >> (16 * i)) & 0xFFFF
+            if c == 0:
+                zeros += 1
+            elif c == 0xFFFF:
+                ones += 1
+        let neg = ones > zeros
+        let skip = 0xFFFF if neg else 0
+        var first = true
+        for i in 0..4:
+            let c = (v >> (16 * i)) & 0xFFFF
+            if c == skip and not (first and i == 3):
+                continue
+            if first:
+                if neg:
+                    # movn
+                    self.w(0x92800000 | (i << 21) | ((c ^ 0xFFFF) << 5) | r)
+                else:
+                    # movz
+                    self.w(0xD2800000 | (i << 21) | (c << 5) | r)
+                first = false
+            else:
+                # movk
+                self.w(0xF2800000 | (i << 21) | (c << 5) | r)
+
+    # d = n + v (d and n may be sp)
+    fn add_ri(ref self, d: int, n: int, v: int):
+        if v >= 0 and v < 4096:
+            self.w(0x91000000 | (v << 10) | (n << 5) | d)
+        elif v < 0 and v > -4096:
+            self.w(0xD1000000 | ((-v) << 10) | (n << 5) | d)
+        elif v > 0 and v < 16777216 and (v & 4095) == 0:
+            self.w(0x91400000 | ((v >> 12) << 10) | (n << 5) | d)
+        else:
+            self.mov_ri(IP0, v)
+            # add d, n, x16 (extended register: n may be sp)
+            self.w(0x8B206000 | (IP0 << 16) | (n << 5) | d)
+
+    # op d, n, m (shifted register; 31 is xzr)
+    fn rrr(ref self, op: int, d: int, n: int, m: int):
+        self.w(op | (m << 16) | (n << 5) | d)
+
+    # a load or store of register t at [base + disp] (base may be sp)
+    fn ldst(ref self, m: int, t: int, base: int, disp: int):
+        let (u, s, sz) = mop(m)
+        if disp >= 0 and disp % sz == 0 and disp / sz < 4096:
+            self.w(u | ((disp / sz) << 10) | (base << 5) | t)
+        elif disp >= -256 and disp < 256:
+            self.w(s | ((disp & 511) << 12) | (base << 5) | t)
+        else:
+            self.add_ri(IP0, base, disp)
+            self.w(u | (IP0 << 5) | t)
+
+    # brings r into canonical form for kind k
+    fn norm(ref self, r: int, k: K):
+        match k:
+            case K.I8:
+                self.w(0x93401C00 | (r << 5) | r)
+            case K.U8 | K.Bool:
+                self.w(0xD3401C00 | (r << 5) | r)
+            case K.I16:
+                self.w(0x93403C00 | (r << 5) | r)
+            case K.U16:
+                self.w(0xD3403C00 | (r << 5) | r)
+            case K.I32:
+                self.w(0x93407C00 | (r << 5) | r)
+            case K.U32:
+                self.w(0xD3407C00 | (r << 5) | r)
+            case _:
+                pass
+
+    # cmp n, v (an immediate when it fits)
+    fn cmp_ri(ref self, n: int, v: int):
+        if v >= 0 and v < 4096:
+            self.w(0xF100001F | (v << 10) | (n << 5))
+        elif v < 0 and v > -4096:
+            # cmn
+            self.w(0xB100001F | ((-v) << 10) | (n << 5))
+        else:
+            self.mov_ri(IP0, v)
+            self.rrr(0xEB000000, ZR, n, IP0)
+
+    fn cset(ref self, r: int, cc: int):
+        # csinc r, xzr, xzr, !cc
+        self.w(0x9A9F07E0 | ((cc ^ 1) << 12) | r)
+
+    # fmov between v registers (fl 1: d, 2: s)
+    fn fmov(ref self, fl: int, d: int, s: int):
+        if d != s:
+            self.w((0x1E604000 if fl == 1 else 0x1E204000) | (s << 5) | d)
+
+    # ------------------------------------------------------------ branches
+    fn patch(ref self, at: int, to: int, kind: int):
+        let off = (to - at) / 4
+        var ins = self.get32(at)
+        if kind == B26:
+            ins = ins | (off & 0x3FFFFFF)
+        elif kind == B19:
+            ins = ins | ((off & 0x7FFFF) << 5)
+        else:
+            ins = ins | ((off & 0x3FFF) << 5)
+        set32(ref self.o.text, at, ins & 0xFFFFFFFF)
+
+    # a branch (instruction `ins`, its offset field still 0) to label l
+    fn br_label(ref self, ins: int, kind: int, l: int):
+        let at = self.pos()
+        self.w(ins)
+        if self.lpos[l] >= 0:
+            self.patch(at, self.lpos[l], kind)
+        else:
+            self.jat.push(at)
+            self.jlab.push(l)
+            self.jkind.push(kind)
+
+    fn jmp_label(ref self, l: int):
+        self.br_label(0x14000000, B26, l)
+
+    fn bcc_label(ref self, cc: int, l: int):
+        self.br_label(0x54000000 | cc, B19, l)
+
+    # a forward branch inside one instruction's expansion: emit it, then
+    # `here` where it lands
+    fn fwd(ref self, ins: int) -> int:
+        self.w(ins)
+        return self.pos() - 4
+
+    fn here(ref self, at: int, kind: int):
+        self.patch(at, self.pos(), kind)
+
+    fn bcc_stub(ref self, cc: int, kind: int, a: int, b: int, c: int):
+        self.stubs.push(Stub(at=self.pos(), kind=kind, a=a, b=b, c=c))
+        self.w(0x54000000 | cc)
+
+    # ------------------------------------------------------------ vregs
+    fn imm(self, v: int) -> bool:
+        return self.fold[v] == F_CONST
+
+    # r = the address of symbol s
+    fn ld_sym(ref self, r: int, s: int):
+        if self.o.syms[s].sec != SEC_UNDEF:
+            self.reloc(R_A64_PAGE, s, 0)
+            self.w(0x90000000 | r)
+            self.reloc(R_A64_LO12, s, 0)
+            self.w(0x91000000 | (r << 5) | r)
+        else:
+            # through the GOT (PIE)
+            self.reloc(R_A64_GOT_PAGE, s, 0)
+            self.w(0x90000000 | r)
+            self.reloc(R_A64_GOT_LO12, s, 0)
+            self.w(0xF9400000 | (r << 5) | r)
+
+    # r = the value of v (64 bits, canonical; the low half of a 128-bit vreg)
+    fn ld(ref self, r: int, v: int):
+        let f = self.fold[v]
+        if f == F_NONE:
+            if self.reg[v] >= 0:
+                self.mov_rr(r, self.reg[v])
+            elif self.freg[v] >= 0:
+                # fmov x, d / fmov w, s
+                let k = self.vk[v]
+                self.w((0x9E660000 if k == K.F64 else 0x1E260000) | (self.freg[v] << 5) | r)
+            else:
+                self.ldst(M_LDRX, r, SP, self.home[v])
+        elif f == F_CONST:
+            self.mov_ri(r, self.fval[v])
+        elif f == F_SLOT:
+            self.add_ri(r, SP, self.slot_off[self.fval[v]])
+        else:
+            self.ld_sym(r, self.fval[v])
+
+    fn st(ref self, r: int, d: int):
+        if self.reg[d] >= 0:
+            self.mov_rr(self.reg[d], r)
+        elif self.freg[d] >= 0:
+            # fmov d, x / fmov s, w
+            let k = self.vk[d]
+            self.w((0x9E670000 if k == K.F64 else 0x1E270000) | (r << 5) | self.freg[d])
+        else:
+            self.ldst(M_STRX, r, SP, self.home[d])
+
+    # a register holding v: its own, or r after loading it there
+    fn use(ref self, r: int, v: int) -> int:
+        if self.fold[v] == F_NONE and self.reg[v] >= 0:
+            return self.reg[v]
+        self.ld(r, v)
+        return r
+
+    # the register to compute d in: its own, or T0
+    fn dst(self, d: int) -> int:
+        if self.reg[d] >= 0:
+            return self.reg[d]
+        return T0
+
+    fn set_v(ref self, d: int, v: int):
+        if self.reg[d] >= 0:
+            self.ld(self.reg[d], v)
+        else:
+            let r = self.use(T0, v)
+            self.st(r, d)
+
+    # v register x = float vreg v
+    fn fld(ref self, fl: int, x: int, v: int):
+        let r = self.freg[v]
+        if r >= 0:
+            self.fmov(fl, x, r)
+        else:
+            self.ldst(M_LDRD if fl == 1 else M_LDRS, x, SP, self.home[v])
+
+    fn fst(ref self, fl: int, v: int, x: int):
+        let r = self.freg[v]
+        if r >= 0:
+            self.fmov(fl, r, x)
+        else:
+            self.ldst(M_STRD if fl == 1 else M_STRS, x, SP, self.home[v])
+
+    # a v register holding float vreg v: its own, or x after loading it there
+    fn fuse(ref self, fl: int, x: int, v: int) -> int:
+        if self.freg[v] >= 0:
+            return self.freg[v]
+        self.fld(fl, x, v)
+        return x
+
+    # the v register to compute float d in
+    fn fdst(self, d: int) -> int:
+        if self.freg[d] >= 0:
+            return self.freg[d]
+        return 0
+
+    # The memory at pointer vreg p plus n: (base register, offset). May load
+    # p into r.
+    fn addr(ref self, p: int, n: int, r: int) -> (int, int):
+        if self.fold[p] == F_SLOT:
+            return (SP, self.slot_off[self.fval[p]] + n)
+        return (self.use(r, p), n)
+
+    fn copy16(ref self, db: int, dd: int, sb: int, sd: int):
+        self.ldst(M_LDRX, T2, sb, sd)
+        self.ldst(M_LDRX, T3, sb, sd + 8)
+        self.ldst(M_STRX, T2, db, dd)
+        self.ldst(M_STRX, T3, db, dd + 8)
+
+    # copies 128-bit vreg s to d
+    fn copy_v16(ref self, d: int, s: int):
+        self.copy16(SP, self.home[d], SP, self.home[s])
+
+    # ------------------------------------------------------------ calls
+    # Each argument's location (see L_*) and the bytes of stack arguments.
+    fn arg_locs(self, fls: [int]) -> ([int], int):
+        var out: [int] = []
+        var ni = 0
+        var nf = 0
+        var ns = 0
+        for fl in fls:
+            if fl != 0 and nf < 8:
+                out.push(L_V + nf)
+                nf += 1
+            elif fl == 0 and ni < 8:
+                out.push(ni)
+                ni += 1
+            else:
+                out.push(L_STACK + ns)
+                ns += 8
+        return (out, ns)
+
+    fn arg_int(ref self, r: int, a: CArg):
+        match a.how:
+            case 0:
+                self.ld(r, a.v)
+            case 1:
+                self.add_ri(r, SP, self.home[a.v])
+            case 2:
+                self.mov_ri(r, a.v)
+            case 3:
+                self.ld_sym(r, a.v)
+            case _:
+                self.add_ri(r, SP, a.v)
+
+    # calls symbol `sym` (or, with sym < 0, the pointer in vreg fp)
+    fn do_call(ref self, sym: int, fp: int, args: [CArg]):
+        var fls: [int] = []
+        for a in args:
+            fls.push(a.fl)
+        let (locs, _) = self.arg_locs(fls)
+        for i, a in enumerate(args):
+            let l = locs[i]
+            if l >= L_STACK:
+                if a.fl != 0:
+                    self.fld(a.fl, 0, a.v)
+                    self.ldst(M_STRD if a.fl == 1 else M_STRS, 0, SP, l - L_STACK)
+                else:
+                    self.arg_int(T0, a)
+                    self.ldst(M_STRX, T0, SP, l - L_STACK)
+        for i, a in enumerate(args):
+            let l = locs[i]
+            if l >= L_STACK:
+                pass
+            elif l >= L_V:
+                self.fld(a.fl, l - L_V, a.v)
+            else:
+                self.arg_int(l, a)
+        if sym >= 0:
+            self.reloc(R_A64_CALL26, sym, 0)
+            self.w(0x94000000)
+        else:
+            self.ld(T0, fp)
+            # blr x9
+            self.w(0xD63F0000 | (T0 << 5))
+
+    fn call_rt(ref self, name: str, args: [CArg]):
+        let s = self.sym_ref(name)
+        self.do_call(s, -1, args)
+
+    # stores the result of a call (in x0 / v0) to d
+    fn store_ret(ref self, d: int):
+        let k = self.vk[d]
+        if k.is_float():
+            self.fst(fl_of(k), d, 0)
+        elif not k.is_wide():
+            self.norm(0, k)
+            self.st(0, d)
+
+    # Does the call return a 128-bit value (through a hidden first argument)?
+    fn wide_call(self, x: Inst) -> bool:
+        if x.d >= 0:
+            return self.vk[x.d].is_wide()
+        if x.op == Op.CallInd:
+            return self.fold[x.a] == F_GLOBAL and self.o.syms[self.fval[x.a]].name in self.wide_ret
+        if x.b == 1:
+            return x.s in self.wide_rt
+        return x.s in self.wide_ret
+
+    # Reference counting inline, as in brine_rt.h: a negative count is
+    # immortal (strings and boxes), a count of 1 is ours alone, and changes
+    # are exclusive load / store loops.
+    fn inline_rc(ref self, x: Inst) -> bool:
+        let n = x.s
+        let retain = n == "brine_str_retain" or n == "brine_arr_retain" or n == "brine_map_retain" or n == "brine_box_retain"
+        var free = ""
+        if n == "brine_str_release":
+            free = "brine_str_free"
+        elif n == "brine_arr_release":
+            free = "brine_arr_free"
+        elif n == "brine_map_release":
+            free = "brine_map_free"
+        elif not retain and n != "brine_box_dec":
+            return false
+        let p = x.args[0]
+        let b = self.use(T1, p)
+        let immortal = n == "brine_str_retain" or n == "brine_str_release" or n == "brine_box_retain" or n == "brine_box_dec"
+        if retain:
+            var skip = -1
+            if immortal:
+                self.ldst(M_LDRX, T0, b, 0)
+                # tbnz x9, #63
+                skip = self.fwd(0xB7F80000 | T0)
+            let top = self.pos()
+            # ldxr x9, [b]; add x9, x9, #1; stxr w11, x9, [b]; cbnz w11, top
+            self.w(0xC85F7C00 | (b << 5) | T0)
+            self.w(0x91000400 | (T0 << 5) | T0)
+            self.w(0xC8007C00 | (T2 << 16) | (b << 5) | T0)
+            self.w(0x35000000 | ((((top - self.pos()) / 4) & 0x7FFFF) << 5) | T2)
+            if skip >= 0:
+                self.here(skip, B14)
+            return true
+        # ldar x9, [b]
+        self.w(0xC8DFFC00 | (b << 5) | T0)
+        var done: [int] = []
+        if immortal:
+            done.push(self.fwd(0xB7F80000 | T0))
+        var last = -1
+        if n != "brine_map_release":
+            # the only reference: no other thread can change the count
+            self.cmp_ri(T0, 1)
+            last = self.fwd(0x54000000 | C_EQ)
+        let top = self.pos()
+        # ldaxr x9, [b]; sub x9, x9, #1; stlxr w11, x9, [b]; cbnz w11, top
+        self.w(0xC85FFC00 | (b << 5) | T0)
+        self.w(0xD1000400 | (T0 << 5) | T0)
+        self.w(0xC800FC00 | (T2 << 16) | (b << 5) | T0)
+        self.w(0x35000000 | ((((top - self.pos()) / 4) & 0x7FFFF) << 5) | T2)
+        # cbnz x9, done
+        done.push(self.fwd(0xB5000000 | T0))
+        if last >= 0:
+            self.here(last, B19)
+        if n == "brine_box_dec":
+            self.mov_ri(T0, 1)
+            let over = self.fwd(0x14000000)
+            for at in done:
+                self.here(at, B14 if self.get32(at) >> 24 == 0xB7 else B19)
+            self.mov_ri(T0, 0)
+            self.here(over, B26)
+            if x.d >= 0:
+                self.st(T0, x.d)
+            return true
+        self.call_rt(free, [CArg(how=A_VAL, v=p, fl=0)])
+        for at in done:
+            self.here(at, B14 if self.get32(at) >> 24 == 0xB7 else B19)
+        return true
+
+    fn ir_call(ref self, x: Inst):
+        if x.op == Op.Call and x.b == 1 and self.inline_rc(x):
+            return
+        if x.op == Op.Call and x.b == 1 and (
+            x.s == "brine_f_sqrt" or x.s == "brine_f_sqrtf"
+        ) and x.d >= 0:
+            let fl = fl_of(self.vk[x.d])
+            let s = self.fuse(fl, 0, x.args[0])
+            let r = self.fdst(x.d)
+            # fsqrt
+            self.w((0x1E61C000 if fl == 1 else 0x1E21C000) | (s << 5) | r)
+            self.fst(fl, x.d, r)
+            return
+        var args: [CArg] = []
+        let ind = x.op == Op.CallInd
+        var name = x.s
+        if not ind and x.b == 1:
+            name = "brine_x_" + x.s[6:]
+        if self.wide_call(x):
+            if x.d >= 0:
+                args.push(CArg(how=A_ADDR, v=x.d, fl=0))
+            else:
+                args.push(CArg(how=A_FRAME, v=self.scratch, fl=0))
+        for a in x.args:
+            let k = self.vk[a]
+            if k.is_wide():
+                args.push(CArg(how=A_ADDR, v=a, fl=0))
+            else:
+                args.push(CArg(how=A_VAL, v=a, fl=fl_of(k)))
+        if not ind:
+            let s = self.sym_ref(name)
+            self.do_call(s, -1, args)
+        elif self.fold[x.a] == F_GLOBAL:
+            self.do_call(self.fval[x.a], -1, args)
+        else:
+            self.do_call(-1, x.a, args)
+        if x.d >= 0:
+            self.store_ret(x.d)
+
+    # stack argument bytes a call needs
+    fn call_stack(self, x: Inst) -> int:
+        var fls: [int] = []
+        if self.wide_call(x):
+            fls.push(0)
+        for a in x.args:
+            fls.push(fl_of(self.vk[a]))
+        let (_, n) = self.arg_locs(fls)
+        return n
+
+    # ------------------------------------------------------------ functions
+    fn func(ref self, f: Func):
+        let nv = len(f.vk)
+        self.code = f.code
+        self.vk = f.vk
+        self.nparams = f.nparams
+        self.has_ret = f.has_ret
+        self.ret = f.ret
+        self.fold = [0] * nv
+        self.fval = [0] * nv
+        self.home = [0] * nv
+        self.nuse = [0] * nv
+        self.lpos = [-1] * f.nlabels
+        self.jat = []
+        self.jlab = []
+        self.jkind = []
+        self.stubs = []
+        var ndef = [0] * nv
+        var dpos = [0] * nv
+        for i in 0..f.nparams:
+            ndef[i] = 1
+        let ncode = len(f.code)
+        for i in 0..ncode:
+            let x = f.code[i]
+            if x.d >= 0:
+                ndef[x.d] += 1
+                dpos[x.d] = i
+            if x.a >= 0 and x.a < nv:
+                self.nuse[x.a] += 1
+            if x.b >= 0 and x.b < nv:
+                self.nuse[x.b] += 1
+            if x.c >= 0 and x.c < nv:
+                self.nuse[x.c] += 1
+            if x.op == Op.Call or x.op == Op.CallInd:
+                for a in x.args:
+                    self.nuse[a] += 1
+        for v in f.nparams..nv:
+            if ndef[v] == 1:
+                let x = f.code[dpos[v]]
+                let k = f.vk[v]
+                if x.op == Op.Const and not k.is_float() and not k.is_wide():
+                    self.fold[v] = F_CONST
+                    self.fval[v] = canon(x.n, k)
+                elif x.op == Op.SlotAddr:
+                    self.fold[v] = F_SLOT
+                    self.fval[v] = x.a
+                elif x.op == Op.Global:
+                    self.fold[v] = F_GLOBAL
+                    self.fval[v] = self.sym_ref(x.s)
+        var out_bytes = 0
+        for x in f.code:
+            if x.op == Op.Call or x.op == Op.CallInd:
+                out_bytes = max(out_bytes, self.call_stack(x))
+        self.reg = [-1] * nv
+        self.freg = [-1] * nv
+        self.saved = []
+        self.fsaved = []
+        if not self.dbg:
+            self.alloc_regs(f, ndef)
+        let hidden = f.has_ret and f.ret.is_wide()
+        var fls: [int] = []
+        if hidden:
+            fls.push(0)
+        for i in 0..f.nparams:
+            let k = f.vk[i]
+            fls.push(0 if k.is_wide() else fl_of(k))
+        let (pl, _) = self.arg_locs(fls)
+        self.ploc = pl
+        # frame layout, from sp up: outgoing arguments, homes, slots
+        var off = align_up(out_bytes, 16)
+        if hidden:
+            self.retp = off
+            off += 8
+        for v in 0..nv:
+            if self.fold[
+                v
+            ] != F_NONE or self.reg[v] >= 0 or self.freg[v] >= 0 or (ndef[v] == 0 and self.nuse[v] == 0):
+                continue
+            if f.vk[v].is_wide():
+                off = align_up(off, 16)
+                self.home[v] = off
+                off += 16
+            else:
+                self.home[v] = off
+                off += 8
+        var realign = 16
+        self.slot_off = []
+        for s in f.slots:
+            let a = 1 << log2(max(s.align, 1))
+            off = align_up(off, a)
+            self.slot_off.push(off)
+            off += s.size
+            realign = max(realign, a)
+        off = align_up(off, 16)
+        self.scratch = off
+        off += 16
+        let nsave = len(self.saved) + len(self.fsaved)
+        let frame = align_up(off, 16) + align_up(8 * nsave, 16) + realign - 16
+        # prologue
+        while len(self.o.text) % 16 != 0:
+            # nop
+            self.w(0xD503201F)
+        self.sym_def(f.name, SEC_TEXT, self.pos(), f.public, true)
+        self.u = Unw(start=self.pos(), fp=0, pro_end=0, epis=[])
+        # stp x29, x30, [sp, #-16]!; mov x29, sp
+        self.w(0xA9BF7BFD)
+        self.w(0x910003FD)
+        self.u.fp = self.pos()
+        var rest = frame
+        if frame >= 4096:
+            # touch each page in order (the guard page below a thread's stack)
+            self.mov_ri(IP0, frame / 4096)
+            let top = self.pos()
+            # sub sp, sp, #4096; str xzr, [sp]; subs x16, x16, #1; b.ne top
+            self.w(0xD14007FF)
+            self.w(0xF90003FF)
+            self.w(0xF1000610)
+            self.w(0x54000000 | ((((top - self.pos()) / 4) & 0x7FFFF) << 5) | C_NE)
+            rest = frame % 4096
+        if rest > 0:
+            self.add_ri(SP, SP, -rest)
+        if realign > 16:
+            # mov x16, sp; and sp, x16, #-realign
+            self.w(0x910003F0)
+            let k = log2(realign)
+            self.w(0x92400000 | (((64 - k) & 63) << 16) | ((63 - k) << 10) | (IP0 << 5) | SP)
+        for i, r in enumerate(self.saved):
+            self.ldst(M_STRX, r, FP, -8 * (i + 1))
+        for j, r in enumerate(self.fsaved):
+            self.ldst(M_STRD, r, FP, -8 * (len(self.saved) + j + 1))
+        self.u.pro_end = self.pos()
+        self.store_params(f)
+        # body
+        self.ipos = [-1] * (ncode + 1)
+        self.rows = []
+        if self.dbg and f.dline > 0 and not f.dfile.starts_with("<"):
+            let fi = self.dw.file(f.dfile)
+            self.rows.push(DRow(pc=self.u.start, file=fi, line=f.dline))
+        var i = 0
+        while i < ncode:
+            self.cur = i
+            self.ipos[i] = self.pos()
+            i = self.inst(i)
+        self.ipos[ncode] = self.pos()
+        if ncode == 0 or not (
+            f.code[ncode - 1].op == Op.Ret or f.code[ncode - 1].op == Op.Jmp or f.code[ncode - 1].op == Op.Unreachable
+        ):
+            self.epilogue()
+        # cold stubs
+        for s in self.stubs:
+            self.here(s.at, B19)
+            if s.kind == S_IDX:
+                self.call_rt(
+                    "brine_panic_idx",
+                    [CArg(how=A_VAL, v=s.a, fl=0), CArg(how=A_VAL, v=s.b, fl=0), CArg(how=A_VAL, v=s.c, fl=0)]
+                )
+            else:
+                let msg = self.ovf_sym(s.kind)
+                self.call_rt(
+                    "brine_panic_ovf",
+                    [CArg(how=A_SYM, v=msg, fl=0), CArg(how=A_VAL, v=s.c, fl=0)]
+                )
+        for j in 0..len(self.jat):
+            self.patch(self.jat[j], self.lpos[self.jlab[j]], self.jkind[j])
+        self.unwind_elf()
+        if self.dbg:
+            self.debug_func(f)
+
+    fn epilogue(ref self):
+        for i, r in enumerate(self.saved):
+            self.ldst(M_LDRX, r, FP, -8 * (i + 1))
+        for j, r in enumerate(self.fsaved):
+            self.ldst(M_LDRD, r, FP, -8 * (len(self.saved) + j + 1))
+        # mov sp, x29; ldp x29, x30, [sp], #16
+        self.w(0x910003BF)
+        self.w(0xA8C17BFD)
+        self.u.epis.push(self.pos())
+        self.w(0xD65F03C0)
+
+    # ------------------------------------------------------------ unwind tables
+    # The function's FDE in .eh_frame (the CIE is at its start).
+    fn unwind_elf(ref self):
+        let u = self.u
+        let at = len(self.o.unwind)
+        put32(ref self.o.unwind, 0)
+        put32(ref self.o.unwind, at + 4)
+        self.o.urel.push(ORel(off=len(self.o.unwind), sym=self.text_sym, kind=R_PC32, add=u.start))
+        put32(ref self.o.unwind, 0)
+        put32(ref self.o.unwind, self.pos() - u.start)
+        self.o.unwind.push(0)
+        # after the stp: CFA = sp + 16, x29 and x30 saved below it
+        var loc = self.cfi_at(u.start, u.start + 4)
+        self.o.unwind.push(14)
+        uleb(ref self.o.unwind, 16)
+        self.cfi_saved(FP, 2)
+        self.cfi_saved(LR, 1)
+        # then CFA = x29 + 16
+        loc = self.cfi_at(loc, u.fp)
+        self.cfi_def_cfa(FP, 16)
+        loc = self.cfi_at(loc, u.pro_end)
+        for i, r in enumerate(self.saved):
+            self.cfi_saved(r, 3 + i)
+        for j, r in enumerate(self.fsaved):
+            self.cfi_saved(64 + r, 3 + len(self.saved) + j)
+        # between an epilogue's ldp and its ret, CFA = sp
+        for e in u.epis:
+            loc = self.cfi_at(loc, e)
+            self.o.unwind.push(10)
+            self.cfi_def_cfa(SP, 0)
+            loc = self.cfi_at(loc, e + 4)
+            self.o.unwind.push(11)
+        while len(self.o.unwind) % 8 != 0:
+            self.o.unwind.push(0)
+        set32(ref self.o.unwind, at, len(self.o.unwind) - at - 4)
+
+    fn cfi_at(ref self, loc: int, to: int) -> int:
+        let d = to - loc
+        if d == 0:
+            return to
+        if d < 64:
+            self.o.unwind.push(u8(64 | d))
+        elif d < 256:
+            self.o.unwind.push(2)
+            self.o.unwind.push(u8(d))
+        elif d < 65536:
+            self.o.unwind.push(3)
+            put16(ref self.o.unwind, d)
+        else:
+            self.o.unwind.push(4)
+            put32(ref self.o.unwind, d)
+        return to
+
+    fn cfi_def_cfa(ref self, r: int, n: int):
+        self.o.unwind.push(12)
+        uleb(ref self.o.unwind, r)
+        uleb(ref self.o.unwind, n)
+
+    # DW_CFA_offset (extended for DWARF registers past 63): r is at CFA - 8n
+    fn cfi_saved(ref self, r: int, n: int):
+        if r < 64:
+            self.o.unwind.push(u8(128 | r))
+        else:
+            self.o.unwind.push(5)
+            uleb(ref self.o.unwind, r)
+        uleb(ref self.o.unwind, n)
+
+    # ------------------------------------------------------------ debug info
+    fn line_row(ref self, x: Inst):
+        if x.s.starts_with("<"):
+            return
+        let fi = self.dw.file(x.s)
+        let row = DRow(pc=self.pos(), file=fi, line=x.n)
+        let n = len(self.rows)
+        if n > 0:
+            let last = self.rows[n - 1]
+            if last.line == x.n and last.file == fi:
+                return
+            if last.pc == row.pc:
+                self.rows[n - 1] = row
+                return
+        self.rows.push(row)
+
+    fn next_row(self, pc: int, hi: int) -> int:
+        for r in self.rows:
+            if r.pc > pc:
+                return min(r.pc, hi)
+        return hi
+
+    fn debug_func(ref self, f: Func):
+        let end = self.pos()
+        for j in 1..len(self.ipos):
+            if self.ipos[j] < 0:
+                self.ipos[j] = self.ipos[j - 1]
+        var file = -1
+        var line = 0
+        if f.dline > 0 and not f.dfile.starts_with("<"):
+            file = self.dw.file(f.dfile)
+            line = f.dline
+        var locals: [DLocal] = []
+        for v in f.dvars:
+            var loc: [u8] = []
+            if v.slot >= 0:
+                loc = loc_breg(SP, self.slot_off[v.slot])
+            elif self.fold[v.ptr] == F_SLOT:
+                loc = loc_breg(SP, self.slot_off[self.fval[v.ptr]])
+            elif self.fold[v.ptr] == F_NONE and self.reg[v.ptr] < 0:
+                loc = loc_deref(loc_breg(SP, self.home[v.ptr]))
+            else:
+                continue
+            var lo = -1
+            var hi = end
+            if not v.param:
+                if v.hi >= 0:
+                    hi = self.ipos[v.hi]
+                lo = self.next_row(self.ipos[v.lo], hi)
+            locals.push(DLocal(name=v.name, ty=v.ty, param=v.param, loc=loc, lo=lo, hi=hi))
+        if f.public and f.dname == "" and self.entry_main:
+            self.entry = (self.u.start, end)
+            return
+        let name = f.name if f.dname == "" else f.dname
+        var d = DFn(
+            name=name,
+            lo=self.u.start,
+            hi=end,
+            lo2=-1,
+            hi2=-1,
+            ret=f.dret,
+            file=file,
+            line=line,
+            rows=self.rows,
+            locals=locals
+        )
+        if f.name == "main__main" and self.entry.0 >= 0:
+            d.lo2 = self.entry.0
+            d.hi2 = self.entry.1
+        self.dw.fns.push(d)
+
+    # Keeps the most used vregs (uses in loops count more) in callee-saved
+    # registers for the whole function: integers in x19-x28, floats in d8-d15.
+    fn alloc_regs(ref self, f: Func, ndef: [int]):
+        let nv = len(f.vk)
+        let ncode = len(f.code)
+        var lat = [-1] * f.nlabels
+        for i in 0..ncode:
+            if f.code[i].op == Op.Label:
+                lat[f.code[i].n] = i
+        var depth = [0] * (ncode + 1)
+        var loops = false
+        for i in 0..ncode:
+            let x = f.code[i]
+            if x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot:
+                let l = lat[x.n]
+                if l >= 0 and l <= i:
+                    depth[l] += 1
+                    depth[i + 1] -= 1
+                    loops = true
+        var w = [0] * nv
+        var d = 0
+        for i in 0..ncode:
+            let x = f.code[i]
+            d += depth[i]
+            let u = 1 << (3 * min(d, 3))
+            if x.d >= 0:
+                w[x.d] += u
+            if x.a >= 0 and x.a < nv:
+                w[x.a] += u
+            if x.b >= 0 and x.b < nv:
+                w[x.b] += u
+            if x.c >= 0 and x.c < nv:
+                w[x.c] += u
+            if x.op == Op.Call or x.op == Op.CallInd:
+                for a in x.args:
+                    w[a] += u
+            elif x.op == Op.Eq or x.op == Op.Ne or x.op == Op.Lt or x.op == Op.Le or x.op == Op.Gt or x.op == Op.Ge:
+                # a compare fused into the next branch never lives anywhere
+                if i + 1 < ncode and self.nuse[x.d] == 1:
+                    let y = f.code[i + 1]
+                    if (y.op == Op.Br or y.op == Op.BrNot) and y.a == x.d:
+                        w[x.d] = -1000000000
+        let least = 3 if loops else 6
+        for r in 19..29:
+            var best = -1
+            var bw = least - 1
+            for v in 0..nv:
+                if w[
+                    v
+                ] > bw and self.reg[v] < 0 and self.fold[v] == F_NONE and (ndef[v] > 0 or v < f.nparams):
+                    let k = f.vk[v]
+                    if not k.is_float() and not k.is_wide():
+                        best = v
+                        bw = w[v]
+            if best < 0:
+                break
+            self.reg[best] = r
+            self.saved.push(r)
+        for r in 8..16:
+            var best = -1
+            var bw = least - 1
+            for v in 0..nv:
+                if w[
+                    v
+                ] > bw and self.freg[v] < 0 and self.fold[v] == F_NONE and (ndef[v] > 0 or v < f.nparams):
+                    if f.vk[v].is_float():
+                        best = v
+                        bw = w[v]
+            if best < 0:
+                break
+            self.freg[best] = r
+            self.fsaved.push(r)
+
+    fn store_params(ref self, f: Func):
+        let h = 1 if f.has_ret and f.ret.is_wide() else 0
+        if h == 1:
+            self.ldst(M_STRX, 0, SP, self.retp)
+        for i in 0..f.nparams:
+            let k = f.vk[i]
+            let l = self.ploc[i + h]
+            # incoming stack arguments start at the caller's sp, x29 + 16
+            if k.is_wide():
+                var r = T1
+                if l >= L_STACK:
+                    self.ldst(M_LDRX, T1, FP, 16 + l - L_STACK)
+                else:
+                    r = l
+                self.copy16(SP, self.home[i], r, 0)
+            elif l >= L_STACK:
+                if k.is_float():
+                    self.ldst(M_LDRD if k == K.F64 else M_LDRS, 0, FP, 16 + l - L_STACK)
+                    self.fst(fl_of(k), i, 0)
+                else:
+                    let r = self.dst(i)
+                    self.ldst(load_op(k), r, FP, 16 + l - L_STACK)
+                    if r == T0:
+                        self.st(T0, i)
+            elif l >= L_V:
+                self.fst(fl_of(k), i, l - L_V)
+            else:
+                self.norm(l, k)
+                self.st(l, i)
+
+    # ------------------------------------------------------------ instructions
+    # Compiles the instruction at i; returns the index of the next one.
+    fn inst(ref self, i: int) -> int:
+        let x = self.code[i]
+        if x.d >= 0 and self.fold[x.d] != F_NONE:
+            return i + 1
+        match x.op:
+            case Op.Const:
+                self.op_const(x)
+            case Op.FConst:
+                let k = self.vk[x.d]
+                self.mov_ri(T0, x.n & 0xFFFFFFFF if k == K.F32 else x.n)
+                self.st(T0, x.d)
+            case Op.Mov:
+                if x.d != x.a:
+                    let k = self.vk[x.d]
+                    if k.is_wide():
+                        self.copy_v16(x.d, x.a)
+                    elif k.is_float():
+                        let fl = fl_of(k)
+                        if self.freg[x.d] >= 0:
+                            self.fld(fl, self.freg[x.d], x.a)
+                        else:
+                            let fa = self.fuse(fl, 0, x.a)
+                            self.fst(fl, x.d, fa)
+                    else:
+                        self.set_v(x.d, x.a)
+            case Op.Add | Op.Sub | Op.Mul | Op.Div | Op.Rem | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
+                let k = self.vk[x.d]
+                if k.is_wide():
+                    self.wide_bin(x)
+                elif k.is_float():
+                    self.float_bin(x)
+                else:
+                    self.int_bin(x)
+            case Op.Neg | Op.Not:
+                self.unary(x)
+            case Op.Eq | Op.Ne | Op.Lt | Op.Le | Op.Gt | Op.Ge:
+                return self.compare(i, x)
+            case Op.Conv:
+                self.conv(x)
+            case Op.AddO | Op.SubO | Op.MulO:
+                self.checked(x)
+            case Op.IdxChk:
+                let ra = self.use(T0, x.a)
+                if self.imm(x.b):
+                    self.cmp_ri(ra, self.fval[x.b])
+                else:
+                    let rb = self.use(T1, x.b)
+                    self.rrr(0xEB000000, ZR, ra, rb)
+                self.bcc_stub(C_HS, S_IDX, x.a, x.b, x.c)
+                if x.d != x.a:
+                    self.st(ra, x.d)
+            case Op.SlotAddr:
+                let r = self.dst(x.d)
+                self.add_ri(r, SP, self.slot_off[x.a])
+                self.st(r, x.d)
+            case Op.Global:
+                let r = self.dst(x.d)
+                let s = self.sym_ref(x.s)
+                self.ld_sym(r, s)
+                self.st(r, x.d)
+            case Op.Load:
+                let k = self.vk[x.d]
+                let (b, o) = self.addr(x.a, x.n, T1)
+                if k.is_wide():
+                    self.copy16(SP, self.home[x.d], b, o)
+                elif self.freg[x.d] >= 0:
+                    self.ldst(M_LDRD if k == K.F64 else M_LDRS, self.freg[x.d], b, o)
+                else:
+                    let r = self.dst(x.d)
+                    self.ldst(load_op(k), r, b, o)
+                    self.st(r, x.d)
+            case Op.Store:
+                let k = self.vk[x.b]
+                let (b, o) = self.addr(x.a, x.n, T1)
+                if k.is_wide():
+                    self.copy16(b, o, SP, self.home[x.b])
+                elif self.freg[x.b] >= 0:
+                    self.ldst(M_STRD if k == K.F64 else M_STRS, self.freg[x.b], b, o)
+                else:
+                    # xzr for 0
+                    var r = ZR
+                    if not (self.imm(x.b) and self.fval[x.b] == 0):
+                        r = self.use(T0, x.b)
+                    self.ldst(store_op(k.size()), r, b, o)
+            case Op.Elem:
+                self.elem(x)
+            case Op.Copy:
+                self.copy_mem(x.a, x.b, x.n)
+            case Op.Zero:
+                self.zero_mem(x.a, x.n)
+            case Op.Call | Op.CallInd:
+                self.ir_call(x)
+            case Op.Label:
+                self.lpos[x.n] = self.pos()
+            case Op.Jmp:
+                # no jump to the next instruction
+                var j = i + 1
+                while j < len(self.code) and self.code[j].op == Op.Label:
+                    if self.code[j].n == x.n:
+                        return i + 1
+                    j += 1
+                self.jmp_label(x.n)
+            case Op.Br | Op.BrNot:
+                let want = x.op == Op.Br
+                if self.fold[x.a] == F_CONST:
+                    if (self.fval[x.a] != 0) == want:
+                        self.jmp_label(x.n)
+                else:
+                    let r = self.use(T0, x.a)
+                    # cbnz / cbz
+                    self.br_label((0xB5000000 if want else 0xB4000000) | r, B19, x.n)
+            case Op.Ret:
+                self.op_ret(x)
+            case Op.Unreachable:
+                self.call_rt("brine_unreachable", [])
+            case Op.Line:
+                if self.dbg:
+                    self.line_row(x)
+        return i + 1
+
+    fn op_const(ref self, x: Inst):
+        let k = self.vk[x.d]
+        if k.is_wide():
+            self.mov_ri(T0, x.n)
+            self.ldst(M_STRX, T0, SP, self.home[x.d])
+            self.mov_ri(T0, x.c)
+            self.ldst(M_STRX, T0, SP, self.home[x.d] + 8)
+        elif k.is_float():
+            self.mov_ri(T0, x.n)
+            # scvtf d0 / s0, x9
+            self.w((0x9E620000 if k == K.F64 else 0x9E220000) | (T0 << 5))
+            self.fst(fl_of(k), x.d, 0)
+        else:
+            let r = self.dst(x.d)
+            self.mov_ri(r, canon(x.n, k))
+            self.st(r, x.d)
+
+    fn op_ret(ref self, x: Inst):
+        if x.a >= 0 and self.has_ret:
+            let k = self.vk[x.a]
+            if k.is_wide():
+                self.ldst(M_LDRX, 0, SP, self.retp)
+                self.copy16(0, 0, SP, self.home[x.a])
+            elif k.is_float():
+                self.fld(fl_of(k), 0, x.a)
+            else:
+                self.ld(0, x.a)
+        self.epilogue()
+
+    fn int_bin(ref self, x: Inst):
+        let k = self.vk[x.d]
+        let r = self.dst(x.d)
+        let ra = self.use(T0, x.a)
+        match x.op:
+            case Op.Add | Op.Sub:
+                if self.imm(x.b) and self.fval[x.b] > -4096 and self.fval[x.b] < 4096:
+                    let v = self.fval[x.b]
+                    self.add_ri(r, ra, v if x.op == Op.Add else -v)
+                else:
+                    let rb = self.use(T1, x.b)
+                    self.rrr(0x8B000000 if x.op == Op.Add else 0xCB000000, r, ra, rb)
+                self.norm(r, k)
+            case Op.And | Op.Or | Op.Xor:
+                let rb = self.use(T1, x.b)
+                var op = 0x8A000000
+                if x.op == Op.Or:
+                    op = 0xAA000000
+                elif x.op == Op.Xor:
+                    op = 0xCA000000
+                self.rrr(op, r, ra, rb)
+            case Op.Mul:
+                let rb = self.use(T1, x.b)
+                # madd r, ra, rb, xzr
+                self.w(0x9B007C00 | (rb << 16) | (ra << 5) | r)
+                self.norm(r, k)
+            case Op.Div | Op.Rem:
+                let rb = self.use(T1, x.b)
+                let div = 0x9AC00C00 if k.is_signed() else 0x9AC00800
+                if x.op == Op.Div:
+                    self.rrr(div, r, ra, rb)
+                else:
+                    self.rrr(div, T2, ra, rb)
+                    # msub r, x11, rb, ra
+                    self.w(0x9B008000 | (rb << 16) | (ra << 10) | (T2 << 5) | r)
+            case _:
+                if self.imm(x.b):
+                    let n = self.fval[x.b] & 63
+                    if x.op == Op.Shl:
+                        # lsl: ubfm r, ra, #(-n % 64), #(63 - n)
+                        self.w(
+                            0xD3400000 | (((64 - n) & 63) << 16) | ((63 - n) << 10) | (ra << 5) | r
+                        )
+                    elif k.is_signed():
+                        # asr: sbfm r, ra, #n, #63
+                        self.w(0x9340FC00 | (n << 16) | (ra << 5) | r)
+                    else:
+                        # lsr: ubfm r, ra, #n, #63
+                        self.w(0xD340FC00 | (n << 16) | (ra << 5) | r)
+                else:
+                    let rb = self.use(T1, x.b)
+                    var op = 0x9AC02000
+                    if x.op == Op.Shr:
+                        op = 0x9AC02800 if k.is_signed() else 0x9AC02400
+                    self.rrr(op, r, ra, rb)
+                if x.op == Op.Shl:
+                    self.norm(r, k)
+        self.st(r, x.d)
+
+    fn float_bin(ref self, x: Inst):
+        let k = self.vk[x.d]
+        let fl = fl_of(k)
+        if x.op == Op.Rem:
+            let name = "brine_x_f_fmod" if fl == 1 else "brine_x_f_fmodf"
+            self.call_rt(name, [CArg(how=A_VAL, v=x.a, fl=fl), CArg(how=A_VAL, v=x.b, fl=fl)])
+            self.store_ret(x.d)
+            return
+        var op = 0x1E202800
+        if x.op == Op.Sub:
+            op = 0x1E203800
+        elif x.op == Op.Mul:
+            op = 0x1E200800
+        elif x.op == Op.Div:
+            op = 0x1E201800
+        if fl == 1:
+            op = op | 0x400000
+        let fa = self.fuse(fl, 0, x.a)
+        let fb = self.fuse(fl, 1, x.b)
+        let r = self.fdst(x.d)
+        self.rrr(op, r, fa, fb)
+        self.fst(fl, x.d, r)
+
+    # the two halves of 128-bit vreg v: x11, x12 (a) or x9, x10 (b)
+    fn ld16(ref self, lo: int, v: int):
+        self.ldst(M_LDRX, lo, SP, self.home[v])
+        self.ldst(M_LDRX, lo + 1, SP, self.home[v] + 8)
+
+    fn st16(ref self, lo: int, v: int):
+        self.ldst(M_STRX, lo, SP, self.home[v])
+        self.ldst(M_STRX, lo + 1, SP, self.home[v] + 8)
+
+    fn wide_bin(ref self, x: Inst):
+        let k = self.vk[x.d]
+        match x.op:
+            case Op.Add | Op.Sub | Op.And | Op.Or | Op.Xor:
+                # adds / adc, subs / sbc, and, orr, eor
+                var lo = 0xAB000000
+                var hi = 0x9A000000
+                if x.op == Op.Sub:
+                    lo = 0xEB000000
+                    hi = 0xDA000000
+                elif x.op == Op.And:
+                    lo = 0x8A000000
+                    hi = lo
+                elif x.op == Op.Or:
+                    lo = 0xAA000000
+                    hi = lo
+                elif x.op == Op.Xor:
+                    lo = 0xCA000000
+                    hi = lo
+                self.ld16(T0, x.a)
+                self.ld16(T2, x.b)
+                self.rrr(lo, T0, T0, T2)
+                self.rrr(hi, T1, T1, T3)
+                self.st16(T0, x.d)
+            case Op.Shl | Op.Shr:
+                let nm = "shl" if x.op == Op.Shl else "shr"
+                self.call_rt(
+                    f"brine_x_{w128(k)}_{nm}",
+                    [CArg(how=A_ADDR, v=x.d, fl=0), CArg(how=A_ADDR, v=x.a, fl=0), CArg(how=A_VAL, v=x.b, fl=0)]
+                )
+            case _:
+                var nm = "mul"
+                if x.op == Op.Div:
+                    nm = "div"
+                elif x.op == Op.Rem:
+                    nm = "rem"
+                self.call_rt(
+                    f"brine_x_{w128(k)}_{nm}",
+                    [CArg(how=A_ADDR, v=x.d, fl=0), CArg(how=A_ADDR, v=x.a, fl=0), CArg(how=A_ADDR, v=x.b, fl=0)]
+                )
+
+    fn unary(ref self, x: Inst):
+        let k = self.vk[x.d]
+        if k.is_wide():
+            self.ld16(T0, x.a)
+            if x.op == Op.Not:
+                # mvn
+                self.rrr(0xAA200000, T0, ZR, T0)
+                self.rrr(0xAA200000, T1, ZR, T1)
+            else:
+                # negs x9, x9; ngc x10, x10
+                self.rrr(0xEB000000, T0, ZR, T0)
+                self.rrr(0xDA000000, T1, ZR, T1)
+            self.st16(T0, x.d)
+            return
+        if k.is_float():
+            let fl = fl_of(k)
+            let fa = self.fuse(fl, 0, x.a)
+            let r = self.fdst(x.d)
+            # fneg
+            self.w((0x1E614000 if fl == 1 else 0x1E214000) | (fa << 5) | r)
+            self.fst(fl, x.d, r)
+            return
+        let r = self.dst(x.d)
+        let ra = self.use(T0, x.a)
+        if x.op == Op.Neg:
+            self.rrr(0xCB000000, r, ZR, ra)
+            self.norm(r, k)
+        elif k == K.Bool:
+            # eor r, ra, #1
+            self.w(0xD2400000 | (ra << 5) | r)
+        else:
+            self.rrr(0xAA200000, r, ZR, ra)
+            self.norm(r, k)
+        self.st(r, x.d)
+
+    # Sets the flags for a comparison; returns the condition that means true.
+    fn cmp_flags(ref self, x: Inst) -> int:
+        let k = self.vk[x.a]
+        let signed = k.is_signed()
+        if k.is_float():
+            let fl = fl_of(k)
+            let fa = self.fuse(fl, 0, x.a)
+            let fb = self.fuse(fl, 1, x.b)
+            # fcmp: unordered sets C and V, which every condition here rejects
+            # except NE
+            self.w((0x1E602000 if fl == 1 else 0x1E202000) | (fb << 16) | (fa << 5))
+            match x.op:
+                case Op.Eq:
+                    return C_EQ
+                case Op.Ne:
+                    return C_NE
+                case Op.Lt:
+                    return C_MI
+                case Op.Le:
+                    return C_LS
+                case Op.Gt:
+                    return C_GT
+                case _:
+                    return C_GE
+        if k.is_wide():
+            if x.op == Op.Eq or x.op == Op.Ne:
+                self.ld16(T0, x.a)
+                self.ld16(T2, x.b)
+                self.rrr(0xCA000000, T0, T0, T2)
+                self.rrr(0xCA000000, T1, T1, T3)
+                # orrs via cmp: orr x9, x9, x10; cmp x9, #0
+                self.rrr(0xAA000000, T0, T0, T1)
+                self.cmp_ri(T0, 0)
+                return C_EQ if x.op == Op.Eq else C_NE
+            # p - q, flags from subs / sbcs
+            var p = x.a
+            var q = x.b
+            if x.op == Op.Gt or x.op == Op.Le:
+                p = x.b
+                q = x.a
+            self.ld16(T0, p)
+            self.ld16(T2, q)
+            self.rrr(0xEB000000, ZR, T0, T2)
+            self.rrr(0xFA000000, ZR, T1, T3)
+            if x.op == Op.Lt or x.op == Op.Gt:
+                return C_LT if signed else C_LO
+            return C_GE if signed else C_HS
+        let ra = self.use(T0, x.a)
+        if self.imm(x.b):
+            self.cmp_ri(ra, self.fval[x.b])
+        else:
+            let rb = self.use(T1, x.b)
+            self.rrr(0xEB000000, ZR, ra, rb)
+        match x.op:
+            case Op.Eq:
+                return C_EQ
+            case Op.Ne:
+                return C_NE
+            case Op.Lt:
+                return C_LT if signed else C_LO
+            case Op.Le:
+                return C_LE if signed else C_LS
+            case Op.Gt:
+                return C_GT if signed else C_HI
+            case _:
+                return C_GE if signed else C_HS
+
+    fn compare(ref self, i: int, x: Inst) -> int:
+        let cc = self.cmp_flags(x)
+        # fuse with a branch right after that is the only use
+        if i + 1 < len(self.code) and self.nuse[x.d] == 1:
+            let y = self.code[i + 1]
+            if (y.op == Op.Br or y.op == Op.BrNot) and y.a == x.d:
+                self.bcc_label(cc if y.op == Op.Br else cc ^ 1, y.n)
+                return i + 2
+        let r = self.dst(x.d)
+        self.cset(r, cc)
+        self.st(r, x.d)
+        return i + 1
+
+    fn checked(ref self, x: Inst):
+        let k = self.vk[x.d]
+        var kind = S_ADD
+        if x.op == Op.SubO:
+            kind = S_SUB
+        elif x.op == Op.MulO:
+            kind = S_MUL
+        if k.is_wide():
+            let nm = ["add", "sub", "mul"][kind]
+            self.call_rt(
+                f"brine_x_{nm}_{w128(k)}",
+                [CArg(how=A_ADDR, v=x.d, fl=0), CArg(how=A_ADDR, v=x.a, fl=0), CArg(how=A_ADDR, v=x.b, fl=0), CArg(how=A_VAL, v=x.c, fl=0)]
+            )
+            return
+        let signed = k.is_signed()
+        let r = self.dst(x.d)
+        let ra = self.use(T0, x.a)
+        let rb = self.use(T1, x.b)
+        if k.size() == 8:
+            if kind == S_MUL:
+                # the high half first: r may be a's or b's register
+                if signed:
+                    self.w(0x9B407C00 | (rb << 16) | (ra << 5) | T2)
+                else:
+                    self.w(0x9BC07C00 | (rb << 16) | (ra << 5) | T2)
+                self.w(0x9B007C00 | (rb << 16) | (ra << 5) | r)
+                if signed:
+                    # cmp x11, r, asr #63
+                    self.w(0xEB80FC1F | (r << 16) | (T2 << 5))
+                else:
+                    self.cmp_ri(T2, 0)
+                self.bcc_stub(C_NE, kind, x.a, x.b, x.c)
+            else:
+                # adds / subs
+                self.rrr(0xAB000000 if kind == S_ADD else 0xEB000000, r, ra, rb)
+                var cc = C_VS
+                if not signed:
+                    cc = C_HS if kind == S_ADD else C_LO
+                self.bcc_stub(cc, kind, x.a, x.b, x.c)
+        else:
+            # exact in 64 bits; overflow iff the result isn't canonical
+            if kind == S_MUL:
+                self.w(0x9B007C00 | (rb << 16) | (ra << 5) | r)
+            else:
+                self.rrr(0x8B000000 if kind == S_ADD else 0xCB000000, r, ra, rb)
+            self.mov_rr(T2, r)
+            self.norm(T2, k)
+            self.rrr(0xEB000000, ZR, T2, r)
+            self.bcc_stub(C_NE, kind, x.a, x.b, x.c)
+        self.st(r, x.d)
+
+    fn elem(ref self, x: Inst):
+        let n = x.n
+        if n == 0:
+            self.set_v(x.d, x.a)
+            return
+        let r = self.dst(x.d)
+        if self.imm(x.b):
+            let off = self.fval[x.b] * n
+            if self.fold[x.a] == F_SLOT:
+                self.add_ri(r, SP, self.slot_off[self.fval[x.a]] + off)
+            else:
+                let ra = self.use(T0, x.a)
+                self.add_ri(r, ra, off)
+            self.st(r, x.d)
+            return
+        let ra = self.use(T0, x.a)
+        let rb = self.use(T1, x.b)
+        if (n & (n - 1)) == 0:
+            # add r, ra, rb, lsl #log2(n)
+            self.w(0x8B000000 | (rb << 16) | (log2(n) << 10) | (ra << 5) | r)
+        else:
+            self.mov_ri(T2, n)
+            # madd r, rb, x11, ra
+            self.w(0x9B000000 | (T2 << 16) | (ra << 10) | (rb << 5) | r)
+        self.st(r, x.d)
+
+    fn copy_mem(ref self, dst: int, src: int, n: int):
+        if n > 64:
+            self.call_rt(
+                "memcpy",
+                [CArg(how=A_VAL, v=dst, fl=0), CArg(how=A_VAL, v=src, fl=0), CArg(how=A_IMM, v=n, fl=0)]
+            )
+            return
+        let (db, dd) = self.addr(dst, 0, T2)
+        let (sb, sd) = self.addr(src, 0, T3)
+        var i = 0
+        for (
+            size,
+            ld,
+            st
+        ) in [(8, M_LDRX, M_STRX), (4, M_LDRW, M_STRW), (2, M_LDRH, M_STRH), (1, M_LDRB, M_STRB)]:
+            while i + size <= n:
+                self.ldst(ld, T0, sb, sd + i)
+                self.ldst(st, T0, db, dd + i)
+                i += size
+
+    fn zero_mem(ref self, dst: int, n: int):
+        if n > 64:
+            self.call_rt(
+                "memset",
+                [CArg(how=A_VAL, v=dst, fl=0), CArg(how=A_IMM, v=0, fl=0), CArg(how=A_IMM, v=n, fl=0)]
+            )
+            return
+        let (db, dd) = self.addr(dst, 0, T2)
+        var i = 0
+        for (size, st) in [(8, M_STRX), (4, M_STRW), (2, M_STRH), (1, M_STRB)]:
+            while i + size <= n:
+                self.ldst(st, ZR, db, dd + i)
+                i += size
+
+    # ------------------------------------------------------------ conversions
+    fn conv(ref self, x: Inst):
+        let ks = self.vk[x.a]
+        let kd = self.vk[x.d]
+        if ks == kd:
+            if kd.is_wide():
+                self.copy_v16(x.d, x.a)
+            elif kd.is_float():
+                let fl = fl_of(kd)
+                let fa = self.fuse(fl, 0, x.a)
+                self.fst(fl, x.d, fa)
+            else:
+                self.set_v(x.d, x.a)
+            return
+        if ks.is_float() and kd.is_float():
+            let fa = self.fuse(fl_of(ks), 0, x.a)
+            let r = self.fdst(x.d)
+            # fcvt d, s / fcvt s, d
+            self.w((0x1E22C000 if ks == K.F32 else 0x1E624000) | (fa << 5) | r)
+            self.fst(fl_of(kd), x.d, r)
+            return
+        if ks.is_wide():
+            if kd.is_wide():
+                self.copy_v16(x.d, x.a)
+            elif kd.is_float():
+                let nm = "f64" if kd == K.F64 else "f32"
+                self.call_rt(f"brine_x_{w128(ks)}_to_{nm}", [CArg(how=A_ADDR, v=x.a, fl=0)])
+                self.store_ret(x.d)
+            else:
+                self.ld16(T0, x.a)
+                if kd == K.Bool:
+                    self.rrr(0xAA000000, T0, T0, T1)
+                    self.cmp_ri(T0, 0)
+                    self.cset(T0, C_NE)
+                self.norm(T0, kd)
+                self.st(T0, x.d)
+            return
+        if kd.is_wide():
+            if ks.is_float():
+                let nm = "f64" if ks == K.F64 else "f32"
+                self.call_rt(
+                    f"brine_x_{w128(kd)}_from_{nm}",
+                    [CArg(how=A_ADDR, v=x.d, fl=0), CArg(how=A_VAL, v=x.a, fl=fl_of(ks))]
+                )
+            else:
+                let ra = self.use(T0, x.a)
+                self.ldst(M_STRX, ra, SP, self.home[x.d])
+                if ks.is_signed():
+                    # asr x10, ra, #63
+                    self.w(0x9340FC00 | (63 << 16) | (ra << 5) | T1)
+                    self.ldst(M_STRX, T1, SP, self.home[x.d] + 8)
+                else:
+                    self.ldst(M_STRX, ZR, SP, self.home[x.d] + 8)
+            return
+        if kd.is_float():
+            let ra = self.use(T0, x.a)
+            let r = self.fdst(x.d)
+            # scvtf / ucvtf
+            var op = 0x9E220000 if ks.is_signed() else 0x9E230000
+            if kd == K.F64:
+                op = op | 0x400000
+            self.w(op | (ra << 5) | r)
+            self.fst(fl_of(kd), x.d, r)
+            return
+        if ks.is_float():
+            let fa = self.fuse(fl_of(ks), 0, x.a)
+            let r = self.dst(x.d)
+            # fcvtzu for 64-bit unsigned results, fcvtzs for the rest (the
+            # lowering checks the range first)
+            var op = 0x9E390000 if kd == K.U64 or kd == K.Ptr else 0x9E380000
+            if ks == K.F64:
+                op = op | 0x400000
+            self.w(op | (fa << 5) | r)
+            self.norm(r, kd)
+            self.st(r, x.d)
+            return
+        # integer to integer
+        let r = self.dst(x.d)
+        let ra = self.use(T0, x.a)
+        if kd == K.Bool:
+            self.cmp_ri(ra, 0)
+            self.cset(r, C_NE)
+        else:
+            self.mov_rr(r, ra)
+            self.norm(r, kd)
+        self.st(r, x.d)
+
+# ================================================================ module
+
+fn emit_object(m: Module) -> [u8]:
+    return emit(m, false, "", "", "")
+
+# The same with DWARF debug info. `src` is the main source file, `comp_dir`
+# the directory relative source paths start from.
+fn emit_object_debug(m: Module, src: str, comp_dir: str, producer: str) -> [u8]:
+    return emit(m, true, src, comp_dir, producer)
+
+fn emit(m: Module, dbg: bool, src: str, comp_dir: str, producer: str) -> [u8]:
+    var dw = new_dwarf()
+    # DW_OP_reg29
+    dw.fbase = 80 + FP
+    var o = new_obj()
+    o.arch = ARCH_A64
+    var x = A(
+        o=o,
+        syms={},
+        wide_ret={},
+        wide_rt=wide_rt_helpers(),
+        text_sym=0,
+        ovf=[-1, -1, -1],
+        code=[],
+        vk=[],
+        nparams=0,
+        home=[],
+        reg=[],
+        freg=[],
+        saved=[],
+        fsaved=[],
+        fold=[],
+        fval=[],
+        nuse=[],
+        slot_off=[],
+        ploc=[],
+        lpos=[],
+        jat=[],
+        jlab=[],
+        jkind=[],
+        stubs=[],
+        retp=0,
+        scratch=0,
+        has_ret=false,
+        ret=K.I64,
+        cur=0,
+        u=Unw(start=0, fp=0, pro_end=0, epis=[]),
+        dbg=dbg,
+        dw=dw,
+        ipos=[],
+        rows=[],
+        entry_main=false,
+        entry=(-1, -1)
+    )
+    x.text_sym = x.sym_def("__brx_text", SEC_TEXT, 0, false, false)
+    a64_cie(ref x.o.unwind)
+    for f in m.funcs:
+        x.sym_def(f.name, SEC_TEXT, 0, f.public, true)
+        if f.has_ret and f.ret.is_wide():
+            x.wide_ret[f.name] = true
+    for d in m.data:
+        # read-only data with addresses in it goes to .data (PIE)
+        let ro = d.readonly and len(d.relocs) == 0
+        let a = max(d.align, 1)
+        var base = 0
+        if ro:
+            while len(x.o.rodata) % a != 0:
+                x.o.rodata.push(0)
+            x.o.rodata_align = max(x.o.rodata_align, a)
+            base = len(x.o.rodata)
+            x.sym_def(d.name, SEC_RODATA, base, false, false)
+            x.o.rodata.extend(d.bytes)
+        else:
+            while len(x.o.data) % a != 0:
+                x.o.data.push(0)
+            x.o.data_align = max(x.o.data_align, a)
+            base = len(x.o.data)
+            x.sym_def(d.name, SEC_DATA, base, false, false)
+            x.o.data.extend(d.bytes)
+        for r in d.relocs:
+            let rs = x.sym_ref(r.sym)
+            x.o.drel.push(ORel(off=base + r.off, sym=rs, kind=R_ABS64, add=r.add))
+    x.entry_main = dbg and any(f.name == "main__main" for f in m.funcs)
+    for f in emit_order(m.funcs, dbg):
+        x.func(f if dbg else promote(f))
+    # calls inside .text need no relocation
+    var keep: [ORel] = []
+    for r in x.o.trel:
+        let s = x.o.syms[r.sym]
+        if r.kind == R_A64_CALL26 and s.sec == SEC_TEXT:
+            x.patch(r.off, s.off + r.add, B26)
+        else:
+            keep.push(r)
+    x.o.trel = keep
+    if dbg:
+        write_dwarf(ref x.o, x.dw, m.dtypes, x.text_sym, src, comp_dir, producer)
+    return write_elf(ref x.o)

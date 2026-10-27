@@ -1,0 +1,630 @@
+# The syntax tree. The parser builds it; the checker
+# fills in the annotations (types, resolved names, locals) in place, and the
+# verifier marks the runtime checks it proved unnecessary.
+from diag import Span
+from types import Ty, Res, CallRes, LocalInfo
+
+# A type as written: `int`, `geo.Point`, `Option[int]`, `[T]`, `{str: int}`, `(int, str)`
+enum TypeExpr:
+    Named(path: [str], args: [TypeExpr], span: Span)
+    Array(elem: TypeExpr, span: Span)
+    Map(key: TypeExpr, val: TypeExpr, span: Span)
+    Tuple(elems: [TypeExpr], span: Span)
+
+    fn span(self) -> Span:
+        match self:
+            case TypeExpr.Named(_, _, s):
+                return s
+            case TypeExpr.Array(_, s):
+                return s
+            case TypeExpr.Map(_, _, s):
+                return s
+            case TypeExpr.Tuple(_, s):
+                return s
+
+enum BinOp:
+    Add
+    Sub
+    Mul
+    Div
+    Mod
+    BitAnd
+    BitOr
+    BitXor
+    Shl
+    Shr
+    And
+    Or
+
+    fn sym(self) -> str:
+        match self:
+            case BinOp.Add:
+                return "+"
+            case BinOp.Sub:
+                return "-"
+            case BinOp.Mul:
+                return "*"
+            case BinOp.Div:
+                return "/"
+            case BinOp.Mod:
+                return "%"
+            case BinOp.BitAnd:
+                return "&"
+            case BinOp.BitOr:
+                return "|"
+            case BinOp.BitXor:
+                return "^"
+            case BinOp.Shl:
+                return "<<"
+            case BinOp.Shr:
+                return ">>"
+            case BinOp.And:
+                return "and"
+            case BinOp.Or:
+                return "or"
+
+enum CmpOp:
+    Eq
+    Ne
+    Lt
+    Le
+    Gt
+    Ge
+
+    fn sym(self) -> str:
+        match self:
+            case CmpOp.Eq:
+                return "=="
+            case CmpOp.Ne:
+                return "!="
+            case CmpOp.Lt:
+                return "<"
+            case CmpOp.Le:
+                return "<="
+            case CmpOp.Gt:
+                return ">"
+            case CmpOp.Ge:
+                return ">="
+
+enum UnOp:
+    Neg
+    Not
+    BitNot
+
+# One piece of an f-string: literal text, or an expression and its format spec.
+enum FSeg:
+    Lit(text: str)
+    Part(e: Expr, spec: Option[str])
+
+# A call argument: `x`, `ref x` or `name=x`.
+struct Arg:
+    by_ref: bool
+    name: Option[(str, Span)]
+    expr: Expr
+
+enum CompKind:
+    # `[x for x in xs]`
+    List
+    # `sum(x for x in xs)`
+    Gen
+
+struct Expr:
+    kind: ExprKind
+    span: Span
+    # ---- annotations (filled in by the checker)
+    ty: Ty
+    # Ident, Field: what the name refers to
+    res: Res
+    # Call, MethodCall: what is called
+    cres: CallRes
+    # Field: the field's index
+    idx: int
+    # Binary, Index, Slice: the runtime check is still needed (cleared by the verifier)
+    checked: bool
+    # Comp: the loop variable
+    local: int
+    # Comp, ParTuple: outer variables a `par` body reads
+    caps: [int]
+
+    fn is_literal(self) -> bool:
+        match self.kind:
+            case ExprKind.Int(_) | ExprKind.UInt(_) | ExprKind.Float(_):
+                return true
+            case _:
+                return false
+
+fn mk(kind: ExprKind, span: Span) -> Expr:
+    return Expr(
+        kind=kind,
+        span=span,
+        ty=Ty.Unknown,
+        res=Res.Unresolved,
+        cres=CallRes.Unresolved,
+        idx=0,
+        checked=true,
+        local=0,
+        caps=[]
+    )
+
+# `[body for name in iter if filter]`, or a generator inside `sum(...)` and the like
+# A name a tuple is unpacked into: element `index` of the variable `parent`.
+# `for i, (a, b) in ...` unpacks the loop's hidden variable into `i` and a
+# hidden `tup'<offset>`, which is unpacked into `a` and `b` in turn.
+struct Unpack:
+    name: str
+    span: Span
+    parent: str
+    index: int
+    # the written type, if any
+    ty: Option[TypeExpr]
+
+struct Comp:
+    kind: CompKind
+    body: Expr
+    name: str
+    name_span: Span
+    # `[v for k, v in pairs]`: the names each element is unpacked into
+    # (`name` is then a hidden name)
+    unpack: [Unpack]
+    iter: Expr
+    filter: Option[Expr]
+    par: bool
+
+enum ExprKind:
+    Int(value: i128)
+    # a literal above the i128 range: only a `u128` holds it
+    UInt(value: u128)
+    Float(value: float)
+    Bool(value: bool)
+    Str(value: str)
+    FStr(segs: [FSeg])
+    Ident(name: str)
+    Unary(op: UnOp, e: Expr)
+    # `x?`
+    Try(e: Expr)
+    Binary(op: BinOp, l: Expr, r: Expr)
+    # `a < b <= c`
+    Compare(first: Expr, rest: [(CmpOp, Expr)])
+    # `a if cond else b`
+    IfElse(cond: Expr, then: Expr, els: Expr)
+    Call(callee: Expr, args: [Arg])
+    MethodCall(recv: Expr, name: str, name_span: Span, args: [Arg])
+    Field(e: Expr, name: str, name_span: Span)
+    Index(e: Expr, idx: Expr)
+    # `xs[lo:hi]`, either end optional
+    Slice(e: Expr, lo: Option[Expr], hi: Option[Expr])
+    Array(elems: [Expr])
+    Map(entries: [(Expr, Expr)])
+    # `x in c` / `x not in c`
+    Contains(item: Expr, coll: Expr, neg: bool)
+    Tuple(elems: [Expr])
+    Range(lo: Expr, hi: Expr, inclusive: bool)
+    Comp(c: Comp)
+    # `par(f(x), g(y))`
+    ParTuple(elems: [Expr])
+    # `[x] * n` (made by the checker)
+    Repeat(elem: Expr, count: Expr)
+    Error
+
+# ---------------------------------------------------------------- statements
+
+# The left side of `let`: a name, or names to unpack a tuple into.
+enum LetPat:
+    Name(name: str, span: Span)
+    Tuple(names: [(str, Span)])
+
+# A `case` pattern in a `match`.
+struct Pattern:
+    kind: PatKind
+    span: Span
+    # Bind: the variable
+    local: int
+    # Variant: the enum and variant, and after checking one pattern per field
+    vres: Option[(int, int)]
+    fields: [Pattern]
+
+fn pattern(kind: PatKind, span: Span) -> Pattern:
+    return Pattern(kind=kind, span=span, local=0, vres=None, fields=[])
+
+enum PatKind:
+    # `_`
+    Wild
+    # a name: matches anything and binds it
+    Bind(name: str)
+    Int(value: i128)
+    Str(value: str)
+    Bool(value: bool)
+    # `Shape.Circle(r)`, `Color.Red`, `geo.Shape.Rect(w=w)`; `args` is None without parentheses
+    Variant(path: [str], args: Option[[(Option[(str, Span)], Pattern)]])
+    Tuple(elems: [Pattern])
+    # `1 | 2 | 3`
+    Or(alts: [Pattern])
+
+struct Case:
+    pat: Pattern
+    guard: Option[Expr]
+    body: Block
+    span: Span
+
+enum ContractKind:
+    Requires
+    Ensures
+    Invariant
+
+    fn keyword(self) -> str:
+        match self:
+            case ContractKind.Requires:
+                return "requires"
+            case ContractKind.Ensures:
+                return "ensures"
+            case ContractKind.Invariant:
+                return "invariant"
+
+struct Stmt:
+    kind: StmtKind
+    span: Span
+    # ---- annotations
+    # Let: the declared variables
+    locals: [int]
+    # For: the loop variable
+    local: int
+    # For: outer variables a `par for` body reads, and the arrays it writes `xs[i]` of
+    caps: [int]
+    writes: [int]
+    # Assert: the verifier proved it always holds
+    proven: bool
+
+fn stmt(kind: StmtKind, span: Span) -> Stmt:
+    return Stmt(kind=kind, span=span, locals=[], local=0, caps=[], writes=[], proven=false)
+
+struct Block:
+    stmts: [Stmt]
+    span: Span
+
+enum StmtKind:
+    # `is_ref`: `let r = ref x` makes `r` another name for the variable `x`
+    Let(mutable: bool, pat: LetPat, ty: Option[TypeExpr], init: Expr, is_ref: bool)
+    # `op` is set for `+=` and the like
+    Assign(target: Expr, op: Option[BinOp], value: Expr)
+    ExprStmt(e: Expr)
+    If(branches: [(Expr, Block)], els: Option[Block])
+    While(cond: Expr, invariants: [Expr], body: Block)
+    # `for name: ty in iter:`
+    For(
+        name: str,
+        name_span: Span,
+        ty: Option[TypeExpr],
+        iter: Expr,
+        invariants: [Expr],
+        body: Block,
+        par: bool
+    )
+    Match(scrut: Expr, cases: [Case])
+    Return(value: Option[Expr])
+    Break
+    Continue
+    Pass
+    Assert(cond: Expr, msg: Option[Expr])
+    Prove(e: Expr)
+    Contract(kind: ContractKind, e: Expr)
+
+# ---------------------------------------------------------------- items
+
+struct Param:
+    name: str
+    span: Span
+    # None only for `self`
+    ty: Option[TypeExpr]
+    # `ref x: T`: changes are visible to the caller
+    by_ref: bool
+    # `mut x: T`: a local copy the function may change
+    mutable: bool
+
+struct FnDecl:
+    name: str
+    name_span: Span
+    params: [Param]
+    ret: Option[TypeExpr]
+    # `requires` and `ensures` contracts
+    requires: [Expr]
+    ensures: [Expr]
+    body: Block
+    # the signature
+    span: Span
+    is_extern: bool
+    # the struct or enum a method belongs to
+    method_of: Option[str]
+    # type parameters: `fn first[T](xs: [T]) -> T`
+    tparams: [(str, Span)]
+    test_name: Option[str]
+    # ---- annotations
+    id: int
+    locals: [LocalInfo]
+    param_locals: [int]
+    result_local: Option[int]
+
+struct FieldDecl:
+    name: str
+    span: Span
+    ty: TypeExpr
+
+struct StructDecl:
+    name: str
+    span: Span
+    tparams: [(str, Span)]
+    fields: [FieldDecl]
+
+struct VariantDecl:
+    name: str
+    span: Span
+    fields: [FieldDecl]
+
+struct EnumDecl:
+    name: str
+    span: Span
+    tparams: [(str, Span)]
+    variants: [VariantDecl]
+
+struct ConstDecl:
+    name: str
+    span: Span
+    ty: Option[TypeExpr]
+    value: Expr
+
+struct Import:
+    path: [str]
+    # the name the module is bound to; "" for `from a import x, y`
+    alias: str
+    # `from a import x, y`: the imported names
+    names: [(str, Span)]
+    span: Span
+
+struct Module:
+    name: str
+    file: int
+    imports: [Import]
+    fns: [FnDecl]
+    structs: [StructDecl]
+    enums: [EnumDecl]
+    consts: [ConstDecl]
+    tests: [FnDecl]
+
+struct Program:
+    modules: [Module]
+    main_module: int
+    # for each module, for each import: the index of the imported module
+    import_targets: [[int]]
+
+# ---------------------------------------------------------------- walking
+
+# The direct child expressions of `e`, in evaluation order.
+fn children(e: Expr) -> [Expr]:
+    match e.kind:
+        case ExprKind.FStr(segs):
+            var out: [Expr] = []
+            for s in segs:
+                match s:
+                    case FSeg.Part(x, _):
+                        out.push(x)
+                    case _:
+                        pass
+            return out
+        case ExprKind.Unary(_, x):
+            return [x]
+        case ExprKind.Try(x):
+            return [x]
+        case ExprKind.Field(x, _, _):
+            return [x]
+        case ExprKind.Binary(_, l, r):
+            return [l, r]
+        case ExprKind.Index(l, r):
+            return [l, r]
+        case ExprKind.Contains(l, r, _):
+            return [l, r]
+        case ExprKind.Repeat(l, r):
+            return [l, r]
+        case ExprKind.Range(l, r, _):
+            return [l, r]
+        case ExprKind.Compare(first, rest):
+            var out = [first]
+            for _, x in rest:
+                out.push(x)
+            return out
+        case ExprKind.IfElse(c, t, f):
+            return [c, t, f]
+        case ExprKind.Call(callee, args):
+            var out = [callee]
+            for a in args:
+                out.push(a.expr)
+            return out
+        case ExprKind.MethodCall(recv, _, _, args):
+            var out = [recv]
+            for a in args:
+                out.push(a.expr)
+            return out
+        case ExprKind.Slice(x, lo, hi):
+            var out = [x]
+            match lo:
+                case Some(v):
+                    out.push(v)
+                case None:
+                    pass
+            match hi:
+                case Some(v):
+                    out.push(v)
+                case None:
+                    pass
+            return out
+        case ExprKind.Array(es):
+            return es
+        case ExprKind.Tuple(es):
+            return es
+        case ExprKind.ParTuple(es):
+            return es
+        case ExprKind.Map(kvs):
+            var out: [Expr] = []
+            for k, v in kvs:
+                out.push(k)
+                out.push(v)
+            return out
+        case ExprKind.Comp(c):
+            var out = [c.iter]
+            match c.filter:
+                case Some(f):
+                    out.push(f)
+                case None:
+                    pass
+            out.push(c.body)
+            return out
+        case _:
+            return []
+
+# The expressions directly in statement `s` (not inside its blocks).
+fn stmt_exprs(s: Stmt) -> [Expr]:
+    match s.kind:
+        case StmtKind.Let(_, _, _, init, _):
+            return [init]
+        case StmtKind.Assign(t, _, v):
+            return [t, v]
+        case StmtKind.ExprStmt(e):
+            return [e]
+        case StmtKind.Prove(e):
+            return [e]
+        case StmtKind.Contract(_, e):
+            return [e]
+        case StmtKind.Return(e):
+            match e:
+                case Some(x):
+                    return [x]
+                case None:
+                    return []
+        case StmtKind.Assert(c, m):
+            match m:
+                case Some(x):
+                    return [c, x]
+                case None:
+                    return [c]
+        case StmtKind.If(branches, _):
+            return [b.0 for b in branches]
+        case StmtKind.While(c, invs, _):
+            var out = [c]
+            out.extend(invs)
+            return out
+        case StmtKind.For(_, _, _, c, invs, _, _):
+            var out = [c]
+            out.extend(invs)
+            return out
+        case StmtKind.Match(scrut, cases):
+            var out = [scrut]
+            for c in cases:
+                match c.guard:
+                    case Some(g):
+                        out.push(g)
+                    case None:
+                        pass
+            return out
+        case _:
+            return []
+
+# The blocks directly in statement `s`.
+fn stmt_blocks(s: Stmt) -> [Block]:
+    match s.kind:
+        case StmtKind.If(branches, els):
+            var out = [b.1 for b in branches]
+            match els:
+                case Some(b):
+                    out.push(b)
+                case None:
+                    pass
+            return out
+        case StmtKind.While(_, _, body):
+            return [body]
+        case StmtKind.For(_, _, _, _, _, body, _):
+            return [body]
+        case StmtKind.Match(_, cases):
+            return [c.body for c in cases]
+        case _:
+            return []
+
+# ================================================================ helpers for later stages
+
+# The local a plain variable read refers to.
+fn local_of(e: Expr) -> Option[int]:
+    match e.kind:
+        case ExprKind.Ident(_):
+            match e.res:
+                case Res.Local(id):
+                    return Some(id)
+                case _:
+                    return None
+        case _:
+            return None
+
+# The local variable at the root of a place expression (`a`, `a.x`, `a[i].y`).
+fn lvalue_root(e: Expr) -> Option[int]:
+    match e.kind:
+        case ExprKind.Ident(_):
+            return local_of(e)
+        case ExprKind.Field(x, _, _):
+            return lvalue_root(x)
+        case ExprKind.Index(x, _):
+            return lvalue_root(x)
+        case _:
+            return None
+
+# The format spec of an f-string field (`{x:>8.2f}`): `<`/`>` alignment, `0`
+# padding, a width, a precision and a kind (`f`, `e`, `x` or `b`).
+struct FmtSpec:
+    left: bool
+    zero: bool
+    width: int
+    prec: Option[int]
+    kind: Option[str]
+
+fn parse_fmt_spec(s: str) -> Option[FmtSpec]:
+    let cs = s.chars()
+    var i = 0
+    var f = FmtSpec(left=false, zero=false, width=0, prec=None, kind=None)
+    if i < len(cs) and cs[i] == "<":
+        f.left = true
+        i += 1
+    elif i < len(cs) and cs[i] == ">":
+        i += 1
+    if i < len(cs) and cs[i] == "0":
+        f.zero = true
+        i += 1
+    var w = ""
+    while i < len(cs) and cs[i].is_digit():
+        w += cs[i]
+        i += 1
+    if w != "":
+        # more digits than an int holds
+        if len(w) > 18:
+            return None
+        f.width = int(w)
+    if i < len(cs) and cs[i] == ".":
+        i += 1
+        var p = ""
+        while i < len(cs) and cs[i].is_digit():
+            p += cs[i]
+            i += 1
+        if p == "" or len(p) > 18:
+            return None
+        f.prec = Some(int(p))
+    if i < len(cs):
+        let k = cs[i]
+        i += 1
+        if k != "f" and k != "e" and k != "x" and k != "b":
+            return None
+        f.kind = Some(k)
+    if i < len(cs) or f.width > 1000:
+        return None
+    match f.prec:
+        case Some(p):
+            if p > 100:
+                return None
+            if f.kind.is_none():
+                f.kind = Some("f")
+        case None:
+            pass
+    return Some(f)

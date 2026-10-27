@@ -1,0 +1,1618 @@
+# Tests for the native backend (x64.br, obj.br): builds IR modules by hand,
+# compiles them to object files, links them with the runtime and checks what
+# the programs print.
+#
+#     brine run compiler/dev_native.br            # COFF on Windows, ELF elsewhere
+#     brine run compiler/dev_native.br -- --elf   # also write target/native/t.elf.o
+#     brine run compiler/dev_native.br -- --bench # time a large synthetic module
+#
+# Expected values come from brine's own arithmetic (wrapping emulated in i128).
+
+from ir import K, Op, Data, Reloc, Module, FB, new_func, inst, f64_bits, f32_bits, le_bytes, str_bytes
+from x64 import emit_object
+
+const P64: i128 = 18446744073709551616
+const DIR = "target/native"
+const LOC = "dev_native.br:1:1"
+
+# ================================================================ reference arithmetic
+
+fn kbits(k: K) -> int:
+    return k.size() * 8
+
+fn kmin(k: K) -> i128:
+    if k.is_signed():
+        return -(i128(1) << i128(kbits(k) - 1))
+    return 0
+
+fn kmax(k: K) -> i128:
+    if k.is_signed():
+        return (i128(1) << i128(kbits(k) - 1)) - 1
+    return (i128(1) << i128(kbits(k))) - 1
+
+# v as a value of the (at most 64-bit) kind k
+fn wrap(v: i128, k: K) -> i128:
+    if k == K.Bool:
+        return 0 if v == 0 else 1
+    let m = i128(1) << i128(kbits(k))
+    var r = v % m
+    if k.is_signed() and r > kmax(k):
+        r -= m
+    return r
+
+# the 64 bits of v as an int
+fn bits64(v: i128) -> int:
+    var r = v % P64
+    if r >= P64 / 2:
+        r -= P64
+    return int(r)
+
+fn mulw(a: i128, b: i128, k: K) -> i128:
+    let ua = u128(a % P64)
+    let ub = u128(b % P64)
+    let p = (ua * ub) % u128(P64)
+    return wrap(i128(p), k)
+
+fn tdiv(a: i128, b: i128) -> i128:
+    let q = abs(a) / abs(b)
+    if (a < 0) != (b < 0):
+        return -q
+    return q
+
+fn trem(a: i128, b: i128) -> i128:
+    return a - tdiv(a, b) * b
+
+fn int_kinds() -> [K]:
+    return [K.I8, K.I16, K.I32, K.I64, K.U8, K.U16, K.U32, K.U64]
+
+fn all_kinds() -> [K]:
+    return [
+        K.I8,
+        K.I16,
+        K.I32,
+        K.I64,
+        K.I128,
+        K.U8,
+        K.U16,
+        K.U32,
+        K.U64,
+        K.U128,
+        K.F32,
+        K.F64,
+        K.Ptr,
+        K.Bool
+    ]
+
+fn u128_max() -> u128:
+    let mx: i128 = 170141183460469231731687303715884105727
+    return u128(mx) * 2 + 1
+
+# an integer of kind k as the program prints it
+fn int_str(v: i128, k: K) -> str:
+    if k == K.U128 and v < 0:
+        return str(u128_max() - u128(-v) + 1)
+    if k.is_wide():
+        return str(v)
+    if k == K.Bool:
+        return bstr(v != 0)
+    return str(wrap(v, k))
+
+# a float truncated toward zero, as an integer
+fn trunc_str(x: float) -> str:
+    if x >= 1.0e38:
+        return str(u128(x))
+    return str(i128(x))
+
+fn join(xs: [str]) -> str:
+    return " ".join(xs)
+
+fn bstr(b: bool) -> str:
+    return "true" if b else "false"
+
+fn hash_u64(v: u64) -> u64:
+    let mask: u128 = 18446744073709551615
+    var x = u128(v)
+    x = x ^ (x >> 30)
+    x = (x * 13787848793156543929) & mask
+    x = x ^ (x >> 27)
+    x = (x * 10723151780598845931) & mask
+    x = x ^ (x >> 31)
+    return u64(x)
+
+# ================================================================ building tests
+
+struct T:
+    m: Module
+    fb: FB
+    # the string builder of the current function (a pointer vreg)
+    sb: int
+    # expected output, line by line
+    want: [str]
+    ndata: int
+    cstrs: {str: str}
+
+    fn begin(ref self, name: str, params: [K], has_ret: bool, ret: K):
+        self.fb = FB(f=new_func(name, params, has_ret, ret))
+        self.sb = self.fb.temp_mem(24, 8)
+
+    fn finish(ref self):
+        if not self.fb.ends():
+            self.fb.ret(-1)
+        self.m.funcs.push(self.fb.f)
+
+    fn data(ref self, bytes: [u8], relocs: [Reloc], align: int, ro: bool) -> str:
+        let name = f"d{self.ndata}"
+        self.ndata += 1
+        self.m.data.push(Data(name=name, align=align, bytes=bytes, relocs=relocs, readonly=ro))
+        return name
+
+    # a C string (read-only data)
+    fn cstr(ref self, s: str) -> str:
+        match self.cstrs.get(s):
+            case Some(n):
+                return n
+            case None:
+                var b: [u8] = []
+                str_bytes(ref b, s)
+                b.push(0)
+                let n = self.data(b, [], 1, true)
+                self.cstrs[s] = n
+                return n
+
+    # a brine string literal object {rc = -1, len, bytes, 0}
+    fn lit(ref self, s: str) -> str:
+        var b: [u8] = []
+        le_bytes(ref b, -1, 8)
+        le_bytes(ref b, len(s), 8)
+        str_bytes(ref b, s)
+        b.push(0)
+        return self.data(b, [], 8, false)
+
+    fn glob(ref self, name: str) -> int:
+        return self.fb.global(name)
+
+    fn loc(ref self) -> int:
+        let n = self.cstr(LOC)
+        return self.fb.global(n)
+
+    fn kc(ref self, k: K, v: int) -> int:
+        return self.fb.konst(k, v)
+
+    fn w(ref self, k: K, v: i128) -> int:
+        return self.fb.konst128(k, v)
+
+    # a op konst(k, c)
+    fn bk(ref self, op: Op, k: K, a: int, c: int) -> int:
+        let b = self.fb.konst(k, c)
+        return self.fb.bin(op, k, a, b)
+
+    fn set_const(ref self, d: int, v: int):
+        self.fb.emit(inst(Op.Const, d, -1, -1, 0 if v >= 0 else -1, v, "", []))
+
+    # a constant the backend can't fold (assigned twice)
+    fn opaque(ref self, k: K, v: int) -> int:
+        let d = self.fb.vreg(k)
+        self.set_const(d, 0)
+        self.set_const(d, v)
+        return d
+
+    fn val(ref self, k: K, v: i128, opaque: bool) -> int:
+        if opaque:
+            return self.opaque(k, bits64(v))
+        return self.fb.konst(k, bits64(v))
+
+    fn fval(ref self, k: K, x: float, opaque: bool) -> int:
+        let bits = f64_bits(x) if k == K.F64 else f32_bits(x)
+        if not opaque:
+            return self.fb.fconst(k, bits)
+        let d = self.fb.vreg(k)
+        self.fb.emit(inst(Op.FConst, d, -1, -1, -1, 0, "", []))
+        self.fb.emit(inst(Op.FConst, d, -1, -1, -1, bits, "", []))
+        return d
+
+    fn retc(ref self, k: K, v: int):
+        let r = self.fb.konst(k, v)
+        self.fb.ret(r)
+
+    fn assign(ref self, op: Op, d: int, a: int, b: int):
+        self.fb.emit(inst(op, d, a, b, -1, 0, "", []))
+
+    fn put(ref self, v: int):
+        let k = self.fb.f.vk[v]
+        match k:
+            case K.I8 | K.I16 | K.I32 | K.I64:
+                let x = self.fb.conv(K.I64, v)
+                self.fb.call_void("brine_sb_i64", [self.sb, x])
+            case K.U8 | K.U16 | K.U32 | K.U64 | K.Ptr:
+                let x = self.fb.conv(K.U64, v)
+                self.fb.call_void("brine_sb_u64", [self.sb, x])
+            case K.I128 | K.U128:
+                self.fb.rt_void(f"brine_sb_{k.name()}", [self.sb, v])
+            case K.F64:
+                self.fb.call_void("brine_sb_f64", [self.sb, v])
+            case K.F32:
+                self.fb.call_void("brine_sb_f32", [self.sb, v])
+            case K.Bool:
+                self.fb.call_void("brine_sb_bool", [self.sb, v])
+
+    # prints the values on one line; `want` is what it must print
+    fn line(ref self, vals: [int], want: str):
+        self.fb.call_void("brine_sb_init", [self.sb])
+        let sp = self.cstr(" ")
+        for i, v in enumerate(vals):
+            if i > 0:
+                let p = self.fb.global(sp)
+                let one = self.fb.konst(K.I64, 1)
+                self.fb.call_void("brine_sb_cat", [self.sb, p, one])
+            self.put(v)
+        self.fb.call_void("brine_print_sb", [self.sb])
+        self.want.push(want)
+
+    # loop header: `j` counts from 0 while j < n; returns (top, end) labels
+    fn loop_start(ref self, j: int, n: int) -> (int, int):
+        self.set_const(j, 0)
+        let top = self.fb.label()
+        let end = self.fb.label()
+        self.fb.place(top)
+        let lim = self.fb.konst(K.I64, n)
+        let c = self.fb.cmp(Op.Lt, j, lim)
+        self.fb.brnot(c, end)
+        return (top, end)
+
+    fn loop_end(ref self, j: int, top: int, end: int):
+        let one = self.fb.konst(K.I64, 1)
+        self.assign(Op.Add, j, j, one)
+        self.fb.jmp(top)
+        self.fb.place(end)
+
+    # p[j] = (j * 7 + 3) % 256 for j in 0..n
+    fn fill(ref self, p: int, n: int):
+        let j = self.fb.vreg(K.I64)
+        let (top, end) = self.loop_start(j, n)
+        let m = self.bk(Op.Mul, K.I64, j, 7)
+        let a = self.bk(Op.Add, K.I64, m, 3)
+        let r = self.bk(Op.Rem, K.I64, a, 256)
+        let q = self.fb.elem(p, j, 1)
+        let v = self.fb.conv(K.U8, r)
+        self.fb.store(q, 0, v)
+        self.loop_end(j, top, end)
+
+    # the sum of the n bytes at p
+    fn checksum(ref self, p: int, n: int) -> int:
+        let s = self.opaque(K.I64, 0)
+        let j = self.fb.vreg(K.I64)
+        let (top, end) = self.loop_start(j, n)
+        let q = self.fb.elem(p, j, 1)
+        let b = self.fb.load(K.U8, q, 0)
+        let x = self.fb.conv(K.I64, b)
+        self.assign(Op.Add, s, s, x)
+        self.loop_end(j, top, end)
+        return s
+
+# ================================================================ integer arithmetic
+
+fn pairs(k: K) -> [[i128]]:
+    var ps: [
+        [i128]
+    ] = [[kmax(k), 3], [kmin(k), 7], [100, 7], [kmax(k) - 5, kmax(k)], [kmax(k), kmax(k) - 1]]
+    if k.is_signed():
+        ps.push([-100, 7])
+        ps.push([-77, -5])
+        ps.push([kmin(k), 1])
+        ps.push([kmin(k) + 1, -1])
+    return ps
+
+fn t_int(ref t: T, name: str):
+    t.begin(name, [], false, K.I64)
+    for k in int_kinds():
+        for p in pairs(k):
+            let a = p[0]
+            let b = p[1]
+            let s = abs(b) % i128(kbits(k))
+            for mode in 0..3:
+                # 0: both in slots; 1: b an immediate; 2: a an immediate
+                let va = t.val(k, a, mode != 2)
+                let vb = t.val(k, b, mode != 1)
+                var vs = t.val(k, s, false)
+                if mode == 0:
+                    vs = t.val(K.I64, s, true)
+                elif mode == 1:
+                    vs = t.val(K.I64, s, false)
+                var vals: [int] = []
+                for op in [Op.Add, Op.Sub, Op.Mul, Op.Div, Op.Rem, Op.And, Op.Or, Op.Xor]:
+                    vals.push(t.fb.bin(op, k, va, vb))
+                vals.push(t.fb.bin(Op.Shl, k, va, vs))
+                vals.push(t.fb.bin(Op.Shr, k, va, vs))
+                vals.push(t.fb.un(Op.Neg, k, va))
+                vals.push(t.fb.un(Op.Not, k, va))
+                let want = [
+                    wrap(a + b, k),
+                    wrap(a - b, k),
+                    mulw(a, b, k),
+                    tdiv(a, b),
+                    trem(a, b),
+                    a & b,
+                    a | b,
+                    a ^ b,
+                    mulw(a, i128(1) << s, k),
+                    a >> s,
+                    wrap(-a, k),
+                    wrap(-a - 1, k)
+                ]
+                t.line(vals, join([str(x) for x in want]))
+    # Bool logic
+    for a in [0, 1]:
+        for b in [0, 1]:
+            let va = t.val(K.Bool, i128(a), true)
+            let vb = t.val(K.Bool, i128(b), b == 0)
+            let x1 = t.fb.bin(Op.And, K.Bool, va, vb)
+            let x2 = t.fb.bin(Op.Or, K.Bool, va, vb)
+            let x3 = t.fb.bin(Op.Xor, K.Bool, va, vb)
+            let x4 = t.fb.un(Op.Not, K.Bool, va)
+            t.line(
+                [x1, x2, x3, x4],
+                join([bstr(a == 1 and b == 1), bstr(a == 1 or b == 1), bstr(a != b), bstr(a == 0)])
+            )
+    t.finish()
+
+# ================================================================ 128-bit arithmetic
+
+fn t_wide(ref t: T):
+    t.begin("t_wide", [], false, K.I64)
+    let big: i128 = 85070591730234615865843651857942052864
+    let vals: [
+        [i128]
+    ] = [[12345678901234567890123, 987654321987], [-12345678901234567890123, 987654321987], [big, -3], [-1, 1], [18446744073709551615, 18446744073709551615], [-18446744073709551616, 7]]
+    for p in vals:
+        let a = p[0]
+        let b = p[1]
+        for mode in 0..2:
+            let va = t.w(K.I128, a)
+            let vb = t.w(K.I128, b)
+            var vs = t.kc(K.I64, 70)
+            if mode == 1:
+                vs = t.kc(K.I32, 3)
+            let sh = 70 if mode == 0 else 3
+            var out: [int] = []
+            for op in [Op.Add, Op.Sub, Op.Div, Op.Rem, Op.And, Op.Or, Op.Xor]:
+                out.push(t.fb.bin(op, K.I128, va, vb))
+            out.push(t.fb.bin(Op.Shr, K.I128, va, vs))
+            out.push(t.fb.un(Op.Not, K.I128, va))
+            out.push(t.fb.un(Op.Neg, K.I128, va))
+            # small enough not to overflow
+            let small = t.w(K.I128, 1000003)
+            out.push(t.fb.bin(Op.Mul, K.I128, vb, small))
+            let one = t.w(K.I128, 1)
+            out.push(t.fb.bin(Op.Shl, K.I128, one, vs))
+            let want = [
+                a + b,
+                a - b,
+                tdiv(a, b),
+                trem(a, b),
+                a & b,
+                a | b,
+                a ^ b,
+                a >> i128(sh),
+                -a - 1,
+                -a,
+                b * 1000003,
+                i128(1) << i128(sh)
+            ]
+            t.line(out, join([str(x) for x in want]))
+    # u128 with the top bit set
+    let m1 = t.w(K.U128, -1)
+    let three = t.w(K.U128, 3)
+    let ten = t.w(K.U128, 10)
+    let five = t.w(K.U128, 5)
+    let hundred = t.kc(K.I64, 100)
+    let q = t.fb.bin(Op.Div, K.U128, m1, three)
+    let r = t.fb.bin(Op.Rem, K.U128, m1, ten)
+    let sr = t.fb.bin(Op.Shr, K.U128, m1, hundred)
+    let ad = t.fb.bin(Op.Add, K.U128, m1, three)
+    let su = t.fb.bin(Op.Sub, K.U128, three, five)
+    let mu = t.fb.bin(Op.Mul, K.U128, m1, m1)
+    let um = u128_max()
+    t.line(
+        [m1, q, r, sr, ad, su, mu],
+        join([str(um), str(um / 3), str(um % 10), str(um >> 100), "2", str(um - 1), "1"])
+    )
+    # wrapping i128 add / mul
+    let mx = t.w(K.I128, 170141183460469231731687303715884105727)
+    let o1 = t.w(K.I128, 1)
+    let wa = t.fb.bin(Op.Add, K.I128, mx, o1)
+    let wm = t.fb.bin(Op.Mul, K.I128, mx, mx)
+    t.line([wa, wm], "-170141183460469231731687303715884105728 1")
+    t.finish()
+
+# ================================================================ comparisons
+
+fn cmp_ops() -> [Op]:
+    return [Op.Eq, Op.Ne, Op.Lt, Op.Le, Op.Gt, Op.Ge]
+
+fn ref_cmp(a: i128, b: i128) -> [bool]:
+    return [a == b, a != b, a < b, a <= b, a > b, a >= b]
+
+fn ref_fcmp(a: float, b: float) -> [bool]:
+    return [a == b, a != b, a < b, a <= b, a > b, a >= b]
+
+# Prints each comparison materialized, then fused with Br and with BrNot.
+fn cmp_line(ref t: T, va: int, vb: int, want: [bool]):
+    var out: [int] = []
+    var ws: [str] = []
+    for op in cmp_ops():
+        out.push(t.fb.cmp(op, va, vb))
+    for x in want:
+        ws.push(bstr(x))
+    for br in [true, false]:
+        for op in cmp_ops():
+            let r = t.fb.vreg(K.I64)
+            let yes = t.fb.label()
+            let done = t.fb.label()
+            let c = t.fb.cmp(op, va, vb)
+            if br:
+                t.fb.br(c, yes)
+            else:
+                t.fb.brnot(c, yes)
+            t.set_const(r, 0)
+            t.fb.jmp(done)
+            t.fb.place(yes)
+            t.set_const(r, 1)
+            t.fb.place(done)
+            out.push(r)
+        for x in want:
+            ws.push("1" if x == br else "0")
+    t.line(out, join(ws))
+
+fn t_cmp(ref t: T):
+    t.begin("t_cmp", [], false, K.I64)
+    for k in int_kinds():
+        let vs: [i128] = [kmin(k), -1 if k.is_signed() else kmax(k), 0, 5, kmax(k)]
+        for a in vs:
+            for b in [vs[1], vs[3]]:
+                for mode in 0..2:
+                    let va = t.val(k, a, true)
+                    let vb = t.val(k, b, mode == 0)
+                    cmp_line(ref t, va, vb, ref_cmp(a, b))
+    for k in [K.Ptr, K.Bool]:
+        for a in [0, 1]:
+            for b in [0, 1]:
+                let va = t.val(k, i128(a), true)
+                let vb = t.val(k, i128(b), true)
+                cmp_line(ref t, va, vb, ref_cmp(i128(a), i128(b)))
+    let p1 = t.val(K.Ptr, P64 - 8, true)
+    let p2 = t.val(K.Ptr, 8, true)
+    cmp_line(ref t, p1, p2, ref_cmp(P64 - 8, 8))
+    for k in [K.I128, K.U128]:
+        let vs: [i128] = [-5, 0, 7, 18446744073709551617, -18446744073709551617]
+        for a in vs:
+            for b in vs:
+                let va = t.w(k, a)
+                let vb = t.w(k, b)
+                if k == K.U128 and (a < 0) != (b < 0):
+                    # as unsigned, the negative one is the larger
+                    cmp_line(ref t, va, vb, ref_cmp(1 if a < 0 else 0, 1 if b < 0 else 0))
+                else:
+                    cmp_line(ref t, va, vb, ref_cmp(a, b))
+    let z = 0.0
+    let nan = z / z
+    for k in [K.F64, K.F32]:
+        let fs = [-2.5, -0.0, 0.0, 1.5, nan]
+        for a in fs:
+            for b in fs:
+                let va = t.fval(k, a, true)
+                let vb = t.fval(k, b, false)
+                cmp_line(ref t, va, vb, ref_fcmp(a, b))
+    t.finish()
+
+# ================================================================ conversions
+
+fn conv_kinds() -> [K]:
+    return [K.I8, K.I16, K.I32, K.I64, K.I128, K.U8, K.U16, K.U32, K.U64, K.U128]
+
+fn t_conv(ref t: T):
+    t.begin("t_conv", [], false, K.I64)
+    # integer to integer
+    for ks in conv_kinds():
+        var srcs: [i128] = [0, 1, 200, 70000, 5000000000]
+        if ks.is_signed():
+            srcs.push(-1)
+            srcs.push(-129)
+        if not ks.is_wide():
+            srcs.push(kmin(ks))
+            srcs.push(kmax(ks))
+        else:
+            srcs.push(-36893488147419103233)
+        var out: [int] = []
+        var ws: [str] = []
+        for s in srcs:
+            # the source value in its kind
+            let v = s if ks.is_wide() else wrap(s, ks)
+            var a = 0
+            if ks.is_wide():
+                a = t.w(ks, v)
+            else:
+                a = t.val(ks, v, true)
+            for kd in conv_kinds():
+                out.push(t.fb.conv(kd, a))
+                ws.push(int_str(v, kd))
+        t.line(out, join(ws))
+    # Bool to integers
+    for bv in [0, 1]:
+        let b = t.val(K.Bool, i128(bv), true)
+        var out: [int] = []
+        var ws: [str] = []
+        for kd in conv_kinds():
+            out.push(t.fb.conv(kd, b))
+            ws.push(str(bv))
+        out.push(t.fb.conv(K.F64, b))
+        ws.push(str(float(bv)))
+        t.line(out, join(ws))
+    # integers to Bool (not used by the lowering, but defined)
+    for ks in [K.I32, K.U64, K.I128]:
+        var a = 0
+        if ks.is_wide():
+            a = t.w(ks, 18446744073709551616)
+        else:
+            a = t.val(ks, 256, true)
+        let z = t.val(K.I64, 0, true)
+        let c1 = t.fb.conv(K.Bool, a)
+        let c2 = t.fb.conv(K.Bool, z)
+        t.line([c1, c2], "true false")
+    # integer to float
+    for ks in conv_kinds():
+        var srcs: [i128] = [0, 1, 12345]
+        if ks.is_wide():
+            srcs.push(170141183460469231731687303715884105727)
+        else:
+            srcs.push(kmax(ks))
+        if ks.is_signed():
+            srcs.push(-1)
+            if ks.is_wide():
+                srcs.push(-170141183460469231731687303715884105727)
+            else:
+                srcs.push(kmin(ks))
+        if ks == K.U64:
+            srcs.push(9223372036854775809)
+            srcs.push(9223372036854777856)
+            srcs.push(18446744073709551615)
+        var out: [int] = []
+        var ws: [str] = []
+        for s in srcs:
+            if ks.is_wide():
+                let a = t.w(ks, s)
+                out.push(t.fb.conv(K.F64, a))
+                out.push(t.fb.conv(K.F32, a))
+            else:
+                let a = t.val(ks, s, true)
+                let c = t.val(ks, s, false)
+                out.push(t.fb.conv(K.F64, a))
+                out.push(t.fb.conv(K.F32, a))
+                out.push(t.fb.conv(K.F64, c))
+                ws.push(str(float(wrap(s, ks))))
+                ws.push(str(f32(wrap(s, ks))))
+                ws.push(str(float(wrap(s, ks))))
+                continue
+            ws.push(str(float(s)))
+            ws.push(str(f32(s)))
+        t.line(out, join(ws))
+    # float to integer (in range)
+    for kd in conv_kinds():
+        var srcs = [0.0, 1.9, -0.9, 99.99]
+        if kd.is_signed():
+            srcs.push(-100.7)
+        if kd.size() >= 8 or kd == K.U32:
+            srcs.push(3000000000.5)
+        if kd.size() >= 8:
+            srcs.push(-9.2e18 if kd.is_signed() else 1.8e19)
+            srcs.push(9.2e18)
+        if kd.is_wide():
+            srcs.push(1.0e30)
+            srcs.push(-1.5e35 if kd.is_signed() else 3.0e38)
+        var out: [int] = []
+        var ws: [str] = []
+        for x in srcs:
+            if kd.size() < 4 and x > 99.999:
+                continue
+            if kd.is_signed() or x > -1.0:
+                let a = t.fval(K.F64, x, true)
+                out.push(t.fb.conv(kd, a))
+                ws.push(trunc_str(x))
+                let b = t.fval(K.F32, x, true)
+                out.push(t.fb.conv(kd, b))
+                let y = float(f32(x))
+                ws.push(trunc_str(y))
+        t.line(out, join(ws))
+    # float to float
+    var out: [int] = []
+    var ws: [str] = []
+    for x in [1.5, -0.1, 3.0e38, 1.0e-50, 123456789.123]:
+        let a = t.fval(K.F64, x, true)
+        let b = t.fb.conv(K.F32, a)
+        out.push(b)
+        out.push(t.fb.conv(K.F64, b))
+        ws.push(str(f32(x)))
+        ws.push(str(float(f32(x))))
+    t.line(out, join(ws))
+    t.finish()
+
+# ================================================================ floats
+
+fn t_float(ref t: T):
+    t.begin("t_float", [], false, K.I64)
+    let ps = [[1.5, 2.25], [-3.0, 0.1], [1.0e300, 1.0e300], [0.0, -2.0], [7.5, 2.0], [-7.5, 0.0]]
+    for p in ps:
+        let a = p[0]
+        let b = p[1]
+        for mode in 0..2:
+            let k = K.F64 if mode == 0 else K.F32
+            let va = t.fval(k, a, true)
+            let vb = t.fval(k, b, mode == 0)
+            var out: [int] = []
+            for op in [Op.Add, Op.Sub, Op.Mul, Op.Div]:
+                out.push(t.fb.bin(op, k, va, vb))
+            out.push(t.fb.un(Op.Neg, k, va))
+            out.push(t.fb.un(Op.Neg, k, vb))
+            if b != 0.0:
+                out.push(t.fb.bin(Op.Rem, k, va, vb))
+            var ws: [str] = []
+            if mode == 0:
+                for x in [a + b, a - b, a * b, a / b, -a, -b]:
+                    ws.push(str(x))
+                if b != 0.0:
+                    ws.push(str(a % b))
+            else:
+                let fa = f32(a)
+                let fb = f32(b)
+                for x in [fa + fb, fa - fb, fa * fb, fa / fb, -fa, -fb]:
+                    ws.push(str(x))
+                if b != 0.0:
+                    ws.push(str(fa % fb))
+            t.line(out, join(ws))
+    # math through the runtime (rt calls with float arguments)
+    let x = t.fval(K.F64, 2.0, true)
+    let s = t.fb.rt(K.F64, "brine_f_sqrt", [x])
+    let y = t.fval(K.F32, 2.0, true)
+    let sf = t.fb.rt(K.F32, "brine_f_sqrtf", [y])
+    let ten = t.fval(K.F64, 10.0, false)
+    let pw = t.fb.rt(K.F64, "brine_f_pow", [x, ten])
+    t.line([s, sf, pw], f"{sqrt(2.0)} {sqrt(f32(2.0))} 1024.0")
+    t.finish()
+
+# ================================================================ overflow checks (not overflowing)
+
+fn t_checked(ref t: T):
+    t.begin("t_checked", [], false, K.I64)
+    let loc = t.loc()
+    for k in int_kinds():
+        let cases: [[i128]] = [[kmax(k) - 10, 10], [kmin(k) + 3, 3], [kmin(k), 0]]
+        var out: [int] = []
+        var ws: [str] = []
+        for c in cases:
+            let a = c[0]
+            let b = c[1]
+            for mode in 0..2:
+                let va = t.val(k, a, true)
+                let vb = t.val(k, b, mode == 0)
+                out.push(t.fb.chk(Op.AddO, k, va, vb, loc))
+                ws.push(str(a + b))
+                let vab = t.val(k, a + b, true)
+                out.push(t.fb.chk(Op.SubO, k, vab, vb, loc))
+                ws.push(str(a))
+        # multiplication near the limits
+        let m = kmax(k) / 3
+        let vm = t.val(k, m, true)
+        let v3 = t.val(k, 3, true)
+        let c3 = t.val(k, 3, false)
+        out.push(t.fb.chk(Op.MulO, k, vm, v3, loc))
+        out.push(t.fb.chk(Op.MulO, k, vm, c3, loc))
+        ws.push(str(m * 3))
+        ws.push(str(m * 3))
+        if k.is_signed():
+            let n = kmin(k) / 2
+            let vn = t.val(k, n, true)
+            let v2 = t.val(k, 2, true)
+            out.push(t.fb.chk(Op.MulO, k, vn, v2, loc))
+            ws.push(str(n * 2))
+            let vneg = t.val(k, -1, true)
+            let vmax = t.val(k, kmax(k), true)
+            out.push(t.fb.chk(Op.MulO, k, vneg, vmax, loc))
+            ws.push(str(-kmax(k)))
+        t.line(out, join(ws))
+    for k in [K.I128, K.U128]:
+        let a = t.w(k, 1000000000000000000000)
+        let b = t.w(k, 999)
+        let s = t.fb.chk(Op.AddO, k, a, b, loc)
+        let d = t.fb.chk(Op.SubO, k, a, b, loc)
+        let p = t.fb.chk(Op.MulO, k, a, b, loc)
+        t.line([s, d, p], "1000000000000000000999 999999999999999999001 999000000000000000000000")
+    # index checks that pass
+    let i = t.opaque(K.I64, 4)
+    let n = t.opaque(K.I64, 5)
+    let c5 = t.kc(K.I64, 5)
+    let i2 = t.fb.chk(Op.IdxChk, K.I64, i, n, loc)
+    let i3 = t.fb.chk(Op.IdxChk, K.I64, i, c5, loc)
+    t.line([i2, i3], "4 4")
+    t.finish()
+
+# ================================================================ memory
+
+fn t_mem(ref t: T):
+    t.begin("t_mem", [], false, K.I64)
+    # stores and loads of every kind at an offset: through a slot address,
+    # a pointer in a vreg and a global
+    let buf = t.fb.temp_mem(64, 16)
+    let bp = t.fb.vreg(K.Ptr)
+    t.fb.mov(bp, buf)
+    t.fb.mov(bp, buf)
+    let dname = t.data([0] * 64, [], 16, false)
+    let g = t.glob(dname)
+    var out: [int] = []
+    var ws: [str] = []
+    for k in all_kinds():
+        var v = -1
+        var s = ""
+        if k.is_float():
+            v = t.fval(k, -1.25, true)
+            s = "-1.25"
+        elif k.is_wide():
+            v = t.w(k, -98765432109876543210)
+            s = int_str(-98765432109876543210, k)
+        elif k == K.Bool:
+            v = t.val(k, 1, true)
+            s = "true"
+        else:
+            v = t.val(k, wrap(-1000003, k), true)
+            s = str(wrap(-1000003, k))
+        for base in [buf, bp, g]:
+            t.fb.store(base, 16, v)
+            out.push(t.fb.load(k, base, 16))
+            ws.push(s)
+        # an immediate store
+        if not k.is_float() and not k.is_wide():
+            let c = t.kc(k, bits64(wrap(77, k)))
+            for base in [buf, bp, g]:
+                t.fb.store(base, 3, c)
+                out.push(t.fb.load(k, base, 3))
+                ws.push("true" if k == K.Bool else "77")
+    t.line(out, join(ws))
+    # elem with scales 1 2 4 8 12 24 and constant / variable indexes
+    let arr = t.fb.temp_mem(400, 8)
+    var eo: [int] = []
+    var ew: [str] = []
+    for sc in [1, 2, 4, 8, 12, 24]:
+        let idx = t.opaque(K.I64, 3)
+        let c3 = t.kc(K.I64, 3)
+        let p1 = t.fb.elem(arr, idx, sc)
+        let p2 = t.fb.elem(arr, c3, sc)
+        let p3 = t.fb.elem(bp, idx, sc)
+        let p4 = t.fb.elem(bp, c3, sc)
+        let v = t.val(K.I64, i128(sc * 1000), true)
+        t.fb.store(p1, 0, v)
+        eo.push(t.fb.load(K.I64, p2, 0))
+        ew.push(str(sc * 1000))
+        let i3 = t.fb.conv(K.I64, p3)
+        let i4 = t.fb.conv(K.I64, p4)
+        let ib = t.fb.conv(K.I64, bp)
+        eo.push(t.fb.bin(Op.Sub, K.I64, i3, ib))
+        eo.push(t.fb.bin(Op.Sub, K.I64, i4, ib))
+        ew.push(str(sc * 3))
+        ew.push(str(sc * 3))
+    t.line(eo, join(ew))
+    # copy and zero: small, odd and large sizes
+    for size in [1, 2, 3, 7, 13, 16, 64, 65, 200, 1000]:
+        let src = t.fb.temp_mem(size, 8)
+        let dst = t.fb.temp_mem(size, 8)
+        t.fill(src, size)
+        t.fb.copy(dst, src, size)
+        let s1 = t.checksum(dst, size)
+        t.fb.zero(src, size)
+        let s2 = t.checksum(src, size)
+        # heap memory through pointer vregs
+        let n = t.kc(K.I64, size)
+        let h1 = t.fb.call(K.Ptr, "brine_alloc", [n])
+        let h2 = t.fb.call(K.Ptr, "brine_alloc", [n])
+        t.fill(h1, size)
+        t.fb.copy(h2, h1, size)
+        let s3 = t.checksum(h2, size)
+        t.fb.zero(h2, size)
+        let s4 = t.checksum(h2, size)
+        t.fb.call_void("brine_free", [h1])
+        t.fb.call_void("brine_free", [h2])
+        var sum = 0
+        for j in 0..size:
+            sum += (j * 7 + 3) % 256
+        t.line([s1, s2, s3, s4], f"{sum} 0 {sum} 0")
+    t.finish()
+
+# ================================================================ calls
+
+fn many_params() -> [K]:
+    return [
+        K.I64,
+        K.F64,
+        K.I32,
+        K.F32,
+        K.U8,
+        K.F64,
+        K.I64,
+        K.I128,
+        K.F64,
+        K.I16,
+        K.F64,
+        K.I64,
+        K.F64,
+        K.F64,
+        K.F64,
+        K.F64,
+        K.U64,
+        K.Bool,
+        K.F64
+    ]
+
+fn many_args() -> [float]:
+    return [
+        1.0,
+        0.5,
+        -3.0,
+        0.25,
+        200.0,
+        0.125,
+        7.0,
+        1.0e20,
+        1.0e-3,
+        -300.0,
+        2.0,
+        11.0,
+        13.5,
+        14.5,
+        15.5,
+        16.5,
+        17.0,
+        1.0,
+        19.75
+    ]
+
+fn hot_params() -> [K]:
+    return [K.I64, K.I32, K.U8, K.I16, K.I64, K.I32, K.U16, K.I8, K.U32, K.Bool]
+
+fn hot_args() -> [int]:
+    return [5, -7, 200, -300, 1099511627776, -100000, 60000, -5, 4000000000, 1]
+
+# narrow parameters (many on the stack) compared in a loop, so they live in
+# registers: 3 * (how many of p > 0, p > p - 1, ... hold) + the sum of the parameters
+fn t_hot(ref t: T):
+    let ps = hot_params()
+    let vs = hot_args()
+    t.begin("hot", ps, true, K.I64)
+    let acc = t.fb.vreg(K.I64)
+    t.set_const(acc, 0)
+    let one = t.fb.konst(K.I64, 1)
+    let j = t.fb.vreg(K.I64)
+    let (top, end) = t.loop_start(j, 3)
+    var count = 0
+    for i, k in enumerate(ps):
+        var ths = [0, vs[i] - 1]
+        if k == K.Bool:
+            ths = [0, 0]
+        if i >= 6:
+            # used more: the stack-passed ones get registers
+            ths.push(vs[i] - 1)
+        for th in ths:
+            if vs[i] > th:
+                count += 1
+            let c = t.fb.konst(k, th)
+            let cond = t.fb.cmp(Op.Gt, i, c)
+            let skip = t.fb.label()
+            t.fb.brnot(cond, skip)
+            t.assign(Op.Add, acc, acc, one)
+            t.fb.place(skip)
+    t.loop_end(j, top, end)
+    var want = 3 * count
+    for i in 0..len(ps):
+        want += vs[i]
+        let c = t.fb.conv(K.I64, i)
+        t.assign(Op.Add, acc, acc, c)
+    t.fb.ret(acc)
+    t.finish()
+    t.begin("t_hot", [], false, K.I64)
+    var args: [int] = []
+    for i, k in enumerate(ps):
+        args.push(t.val(k, i128(vs[i]), i % 2 == 0))
+    let r = t.fb.call(K.I64, "hot", args)
+    t.line([r], f"{want}")
+    t.finish()
+
+# the arguments of `many` (many_args()), some opaque and some folded
+fn many_call_args(ref t: T) -> [int]:
+    var args: [int] = []
+    for i, k in enumerate(many_params()):
+        let x = many_args()[i]
+        if k.is_float():
+            args.push(t.fval(k, x, i % 2 == 0))
+        elif k.is_wide():
+            args.push(t.w(k, i128(x)))
+        else:
+            args.push(t.val(k, i128(x), i % 3 == 0))
+    return args
+
+# what `many` returns
+fn many_want() -> float:
+    var want = 0.0
+    for x in many_args():
+        want += x
+    return want
+
+fn t_calls(ref t: T):
+    let ps = many_params()
+    # the sum of the arguments as f64, in order
+    t.begin("many", ps, true, K.F64)
+    var acc = t.fb.conv(K.F64, 0)
+    for i in 1..len(ps):
+        let c = t.fb.conv(K.F64, i)
+        acc = t.fb.bin(Op.Add, K.F64, acc, c)
+    t.fb.ret(acc)
+    t.finish()
+    # narrow and 128-bit results
+    t.begin("ret_i8", [K.I64], true, K.I8)
+    let r8 = t.fb.conv(K.I8, 0)
+    t.fb.ret(r8)
+    t.finish()
+    t.begin("ret_u16", [K.I64], true, K.U16)
+    let r16 = t.fb.conv(K.U16, 0)
+    t.fb.ret(r16)
+    t.finish()
+    t.begin("wide_mul", [K.I128, K.I64, K.I128], true, K.I128)
+    let w1 = t.fb.bin(Op.Mul, K.I128, 0, 2)
+    let pa = t.fb.conv(K.I128, 1)
+    let w2 = t.fb.bin(Op.Sub, K.I128, w1, pa)
+    t.fb.ret(w2)
+    t.finish()
+    t.begin("t_calls", [], false, K.I64)
+    let args = many_call_args(ref t)
+    let want = many_want()
+    let r1 = t.fb.call(K.F64, "many", args)
+    let fp = t.glob("many")
+    let r2 = t.fb.call_ind(true, K.F64, fp, args)
+    let fp2 = t.fb.vreg(K.Ptr)
+    t.fb.mov(fp2, fp)
+    t.fb.mov(fp2, fp)
+    let r3 = t.fb.call_ind(true, K.F64, fp2, args)
+    t.line([r1, r2, r3], f"{want} {want} {want}")
+    let a = t.val(K.I64, 300, true)
+    let m1 = t.val(K.I64, -1, false)
+    let n1 = t.fb.call(K.I8, "ret_i8", [a])
+    let n2 = t.fb.call(K.U16, "ret_u16", [m1])
+    let wa = t.w(K.I128, -12345678901234567890)
+    let wb = t.w(K.I128, 1000)
+    let n3 = t.fb.call(K.I128, "wide_mul", [wa, a, wb])
+    t.fb.call_void("wide_mul", [wa, a, wb])
+    let gw = t.glob("wide_mul")
+    let n4 = t.fb.call_ind(true, K.I128, gw, [wa, a, wb])
+    t.line([n1, n2, n3, n4], "44 65535 -12345678901234567890300 -12345678901234567890300")
+    # 128-bit results nobody uses: a runtime helper and a call through a
+    # pointer to a module function (written through a hidden pointer that must
+    # not be the first argument)
+    let loc0 = t.loc()
+    t.fb.rt_void("brine_add_i128", [wa, wb, loc0])
+    t.fb.rt_void("brine_conv_u128_from_i64", [a, loc0])
+    t.fb.call_ind(false, K.I128, gw, [wa, a, wb])
+    t.line([wa, wb, a], "-12345678901234567890 1000 300")
+    # narrow results from C functions (their upper bits are garbage)
+    let loc = t.loc()
+    let a1 = t.val(K.I64, -100, true)
+    let a2 = t.val(K.I64, 65000, true)
+    let a3 = t.val(K.I64, -7, true)
+    let dot = t.lit(".")
+    let a4 = t.glob(dot)
+    let a5 = t.val(K.U64, 12345, true)
+    let a6 = t.val(K.I64, 3, true)
+    let a7 = t.val(K.I64, 9, true)
+    let c1 = t.fb.rt(K.I8, "brine_conv_i8_from_i64", [a1, loc])
+    let c2 = t.fb.rt(K.U16, "brine_conv_u16_from_i64", [a2, loc])
+    let c3 = t.fb.rt(K.I32, "brine_conv_i32_from_i64", [a3, loc])
+    let c4 = t.fb.call(K.Bool, "brine_os_is_dir", [a4])
+    let c5 = t.fb.rt(K.U64, "brine_hash_u64", [a5])
+    let c6 = t.fb.rt(K.I64, "brine_idx", [a6, a7, loc])
+    let c7 = t.fb.rt(K.I128, "brine_add_i128", [wa, wb, loc])
+    let c8 = t.fb.rt(K.I8, "brine_neg_i8", [a3, loc])
+    t.line(
+        [c1, c2, c3, c4, c5, c6, c7, c8],
+        f"-100 65000 -7 true {hash_u64(12345)} 3 -12345678901234566890 7"
+    )
+    t.finish()
+
+# ================================================================ callbacks and data
+
+fn t_callbacks(ref t: T):
+    # int cmp(const void *a, const void *b) on i64s, descending
+    t.begin("cmp_desc", [K.Ptr, K.Ptr], true, K.I32)
+    let x = t.fb.load(K.I64, 0, 0)
+    let y = t.fb.load(K.I64, 1, 0)
+    let lt = t.fb.label()
+    let gt = t.fb.label()
+    let c1 = t.fb.cmp(Op.Lt, x, y)
+    t.fb.br(c1, lt)
+    let c2 = t.fb.cmp(Op.Gt, x, y)
+    t.fb.br(c2, gt)
+    t.retc(K.I32, 0)
+    t.fb.place(lt)
+    t.retc(K.I32, 1)
+    t.fb.place(gt)
+    t.retc(K.I32, -1)
+    t.finish()
+    # void chunk(void *ctx, int64 chunk, int64 lo, int64 hi): out[i] = i * i
+    t.begin("chunk", [K.Ptr, K.I64, K.I64, K.I64], false, K.I64)
+    let i = t.fb.vreg(K.I64)
+    t.fb.mov(i, 2)
+    let top = t.fb.label()
+    let end = t.fb.label()
+    t.fb.place(top)
+    let c = t.fb.cmp(Op.Lt, i, 3)
+    t.fb.brnot(c, end)
+    let p = t.fb.elem(0, i, 8)
+    let sq = t.fb.bin(Op.Mul, K.I64, i, i)
+    t.fb.store(p, 0, sq)
+    let one = t.kc(K.I64, 1)
+    t.assign(Op.Add, i, i, one)
+    t.fb.jmp(top)
+    t.fb.place(end)
+    t.fb.ret(-1)
+    t.finish()
+    t.begin("fa", [K.I64], true, K.I64)
+    let ra = t.bk(Op.Add, K.I64, 0, 1000)
+    t.fb.ret(ra)
+    t.finish()
+    t.begin("fb", [K.I64], true, K.I64)
+    let rb = t.bk(Op.Mul, K.I64, 0, 1000)
+    t.fb.ret(rb)
+    t.finish()
+    t.begin("t_callbacks", [], false, K.I64)
+    let loc = t.loc()
+    # sort an array of 7 ints with a generated comparison
+    let n = 7
+    let null = t.kc(K.Ptr, 0)
+    let kn = t.kc(K.I64, n)
+    let k8 = t.kc(K.I64, 8)
+    let arr = t.fb.call(K.Ptr, "brine_arr_new", [kn, k8, null, null, loc])
+    let data = t.fb.load(K.Ptr, arr, 48)
+    let vals = [5, -3, 99, 0, 42, -100, 7]
+    for j, v in enumerate(vals):
+        let vv = t.val(K.I64, i128(v), j % 2 == 0)
+        t.fb.store(data, 8 * j, vv)
+    let slot = t.fb.temp_mem(8, 8)
+    t.fb.store(slot, 0, arr)
+    let cmpf = t.glob("cmp_desc")
+    t.fb.call_void("brine_arr_sort", [slot, cmpf])
+    let arr2 = t.fb.load(K.Ptr, slot, 0)
+    let data2 = t.fb.load(K.Ptr, arr2, 48)
+    var out: [int] = []
+    for j in 0..n:
+        out.push(t.fb.load(K.I64, data2, 8 * j))
+    t.line(out, "99 42 7 5 0 -3 -100")
+    t.fb.rt_void("brine_arr_release", [arr2])
+    # parallel chunks writing squares
+    let m = 10000
+    let bytes = t.kc(K.I64, 8 * m)
+    let buf = t.fb.call(K.Ptr, "brine_alloc", [bytes])
+    let lo = t.kc(K.I64, 0)
+    let hi = t.kc(K.I64, m)
+    let nch = t.kc(K.I64, 64)
+    let chf = t.glob("chunk")
+    t.fb.call_void("brine_par_run", [lo, hi, nch, chf, buf])
+    let acc = t.opaque(K.I64, 0)
+    let j2 = t.fb.vreg(K.I64)
+    let (ltop, lend) = t.loop_start(j2, m)
+    let ep = t.fb.elem(buf, j2, 8)
+    let e = t.fb.load(K.I64, ep, 0)
+    t.assign(Op.Add, acc, acc, e)
+    t.loop_end(j2, ltop, lend)
+    var total = 0
+    for q in 0..m:
+        total += q * q
+    t.line([acc], str(total))
+    t.fb.call_void("brine_free", [buf])
+    # a table of function pointers in read-only data
+    let tab = t.data(
+        [0] * 16,
+        [Reloc(off=0, sym="fa", add=0), Reloc(off=8, sym="fb", add=0)],
+        8,
+        true
+    )
+    let tg = t.glob(tab)
+    let f0 = t.fb.load(K.Ptr, tg, 0)
+    let f1 = t.fb.load(K.Ptr, tg, 8)
+    let arg = t.val(K.I64, 7, true)
+    let r0 = t.fb.call_ind(true, K.I64, f0, [arg])
+    let r1 = t.fb.call_ind(true, K.I64, f1, [arg])
+    t.line([r0, r1], "1007 7000")
+    # pointers into a string literal, with addends (writable and read-only data)
+    let s = t.lit("hello, native world")
+    var pb: [u8] = []
+    le_bytes(ref pb, 0, 8)
+    let pd = t.data(pb, [Reloc(off=0, sym=s, add=16 + 7)], 8, false)
+    let pr = t.data(pb, [Reloc(off=0, sym=s, add=16)], 8, true)
+    let gd = t.glob(pd)
+    let gr = t.glob(pr)
+    let q1 = t.fb.load(K.Ptr, gd, 0)
+    let q2 = t.fb.load(K.Ptr, gr, 0)
+    let six = t.kc(K.I64, 6)
+    let five = t.kc(K.I64, 5)
+    let gs = t.glob(s)
+    t.fb.call_void("brine_sb_init", [t.sb])
+    t.fb.call_void("brine_sb_cat", [t.sb, q1, six])
+    t.fb.call_void("brine_sb_cat", [t.sb, q2, five])
+    t.fb.call_void("brine_sb_str", [t.sb, gs])
+    t.fb.call_void("brine_print_sb", [t.sb])
+    t.want.push("nativehellohello, native world")
+    t.finish()
+
+# ================================================================ large frames
+
+fn t_big(ref t: T):
+    # a 200 KB slot
+    t.begin("big_slot", [K.I64], true, K.I64)
+    let s = t.fb.temp_mem(200000, 16)
+    t.fb.zero(s, 200000)
+    t.fb.store(s, 0, 0)
+    t.fb.store(s, 199992, 0)
+    let a = t.fb.load(K.I64, s, 0)
+    let b = t.fb.load(K.I64, s, 199992)
+    let c = t.fb.load(K.I64, s, 100000)
+    let ab = t.fb.bin(Op.Add, K.I64, a, b)
+    let abc = t.fb.bin(Op.Add, K.I64, ab, c)
+    t.fb.ret(abc)
+    t.finish()
+    # 12000 vregs with slots: ~96 KB
+    t.begin("many_vregs", [K.I64], true, K.I64)
+    var v = 0
+    for j in 0..12000:
+        v = t.bk(Op.Add, K.I64, v, j % 7)
+    t.fb.ret(v)
+    t.finish()
+    var w = 0
+    for j in 0..12000:
+        w += j % 7
+    t.begin("t_big", [], false, K.I64)
+    let x = t.val(K.I64, 21, true)
+    let r1 = t.fb.call(K.I64, "big_slot", [x])
+    let r2 = t.fb.call(K.I64, "many_vregs", [x])
+    t.line([r1, r2], f"42 {w + 21}")
+    t.finish()
+
+# Keeps vregs in callee-saved registers: a loop adding x to a new vreg three
+# times; returns it (3 * x).
+fn hot_loop(ref t: T, x: int) -> int:
+    let acc = t.opaque(K.I64, 0)
+    let j = t.fb.vreg(K.I64)
+    let (top, end) = t.loop_start(j, 3)
+    t.assign(Op.Add, acc, acc, x)
+    t.loop_end(j, top, end)
+    return acc
+
+# ================================================================ over-aligned slots
+
+fn t_align(ref t: T):
+    # slots aligned to more than 16 bytes, next to ordinary ones, in a function
+    # with stack arguments (incoming and outgoing), callee-saved registers and
+    # a frame big enough to touch page by page
+    let ps = hot_params()
+    let vs = hot_args()
+    t.begin("aligned", ps, true, K.I64)
+    let aligns = [32, 64, 16, 4096, 256, 8, 64]
+    let sizes = [40, 64, 16, 8, 300, 8, 100000]
+    var ptrs: [int] = []
+    var mis: [int] = []
+    for i, a in enumerate(aligns):
+        let p = t.fb.temp_mem(sizes[i], a)
+        ptrs.push(p)
+        let v = t.kc(K.I64, 1000 + i)
+        t.fb.store(p, 0, v)
+        t.fb.store(p, sizes[i] - 8, v)
+        let pi = t.fb.conv(K.I64, p)
+        mis.push(t.bk(Op.And, K.I64, pi, a - 1))
+    t.line(mis, join(["0" for _ in aligns]))
+    let margs = many_call_args(ref t)
+    let r = t.fb.call(K.F64, "many", margs)
+    var marks: [int] = [r]
+    var ws = [f"{many_want()}"]
+    for i, p in enumerate(ptrs):
+        marks.push(t.fb.load(K.I64, p, 0))
+        marks.push(t.fb.load(K.I64, p, sizes[i] - 8))
+        ws.push(f"{1000 + i} {1000 + i}")
+    t.line(marks, join(ws))
+    var pvals: [int] = []
+    for i in 0..len(ps):
+        pvals.push(t.fb.conv(K.I64, i))
+    t.line(pvals, join([str(v) for v in vs]))
+    let acc = hot_loop(ref t, 4)
+    t.fb.ret(acc)
+    t.finish()
+    # the same without saved registers or stack arguments
+    t.begin("aligned_small", [K.I64], true, K.I64)
+    let p = t.fb.temp_mem(32, 32)
+    t.fb.store(p, 24, 0)
+    let pi = t.fb.conv(K.I64, p)
+    let m = t.bk(Op.And, K.I64, pi, 31)
+    let back = t.fb.load(K.I64, p, 24)
+    let s = t.fb.bin(Op.Add, K.I64, m, back)
+    t.fb.ret(s)
+    t.finish()
+    t.begin("t_align", [], false, K.I64)
+    var args: [int] = []
+    for i, k in enumerate(ps):
+        args.push(t.val(k, i128(vs[i]), i % 2 == 0))
+    let r1 = t.fb.call(K.I64, "aligned", args)
+    let x = t.val(K.I64, 77, true)
+    let r2 = t.fb.call(K.I64, "aligned_small", [x])
+    t.line([r1, r2], f"{3 * vs[4]} 77")
+    t.finish()
+
+# ================================================================ unwinding
+
+# C helpers that walk the stack with the platform's unwinder, which reads the
+# unwind tables of the native code (.pdata / .xdata, .eh_frame)
+fn walk_c() -> str:
+    let lines = [
+        "#include <stdint.h>",
+        "#include <setjmp.h>",
+        "#ifdef _WIN32",
+        "#include <windows.h>",
+        "static int64_t walk(void **got, int64_t max) {",
+        "    CONTEXT c;",
+        "    RtlCaptureContext(&c);",
+        "    int64_t k = 0;",
+        "    while (k < max && c.Rip) {",
+        "        DWORD64 base;",
+        "        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &base, NULL);",
+        "        if (!f) break;",
+        "        got[k++] = (void *)(base + f->BeginAddress);",
+        "        void *hd;",
+        "        DWORD64 ef;",
+        "        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, &c, &hd, &ef, NULL);",
+        "    }",
+        "    return k;",
+        "}",
+        "#else",
+        "#include <unwind.h>",
+        "struct walk_st { void **got; int64_t k, max; };",
+        "static _Unwind_Reason_Code step(struct _Unwind_Context *c, void *p) {",
+        "    struct walk_st *w = p;",
+        "    if (w->k >= w->max) return _URC_END_OF_STACK;",
+        "    w->got[w->k++] = (void *)_Unwind_GetRegionStart(c);",
+        "    return _URC_NO_REASON;",
+        "}",
+        "static int64_t walk(void **got, int64_t max) {",
+        "    struct walk_st w = {got, 0, max};",
+        "    _Unwind_Backtrace(step, &w);",
+        "    return w.k;",
+        "}",
+        "#endif",
+        "/* how many of fns[0..n] (innermost first) are on the stack in a row */",
+        "int64_t brx_walk(void **fns, int64_t n) {",
+        "    void *got[64];",
+        "    int64_t k = walk(got, 64), i = 0, m = 0;",
+        "    while (i < k && got[i] != fns[0]) i++;",
+        "    while (i + m < k && m < n && got[i + m] == fns[m]) m++;",
+        "    return m;",
+        "}",
+        "/* longjmp out of native code (on Windows it unwinds the frames between) */",
+        "static jmp_buf jb;",
+        "void brx_throw(int64_t v) { longjmp(jb, (int)v); }",
+        "int64_t brx_catch(void (*f)(int64_t), int64_t a) {",
+        "    int r = setjmp(jb);",
+        "    if (r == 0) { f(a); return 0; }",
+        "    return r;",
+        "}"
+    ]
+    return "\n".join(lines) + "\n"
+
+# brine frames of every shape between the unwinder and main: an odd and an even
+# number of saved registers, none, over-aligned slots, a large frame
+fn t_unwind(ref t: T):
+    t.begin("uw3", [K.I64], true, K.I64)
+    let acc = hot_loop(ref t, 0)
+    let names = ["uw3", "uw2", "uw1", "t_unwind", "main"]
+    let fns = t.fb.temp_mem(8 * len(names), 8)
+    for i, nm in enumerate(names):
+        let g = t.glob(nm)
+        t.fb.store(fns, 8 * i, g)
+    let n = t.kc(K.I64, len(names))
+    let found = t.fb.call(K.I64, "brx_walk", [fns, n])
+    let r3 = t.fb.bin(Op.Add, K.I64, found, acc)
+    t.fb.ret(r3)
+    t.finish()
+    t.begin("uw2", [K.I64], true, K.I64)
+    let s = t.fb.temp_mem(20000, 64)
+    t.fb.store(s, 19992, 0)
+    let acc2 = hot_loop(ref t, 0)
+    let acc3 = hot_loop(ref t, acc2)
+    let r2 = t.fb.call(K.I64, "uw3", [acc3])
+    let back = t.fb.load(K.I64, s, 19992)
+    let r2b = t.fb.bin(Op.Add, K.I64, r2, back)
+    t.fb.ret(r2b)
+    t.finish()
+    t.begin("uw1", [K.I64], true, K.I64)
+    let r1 = t.fb.call(K.I64, "uw2", [0])
+    t.fb.ret(r1)
+    t.finish()
+    # longjmp from C across brine frames
+    t.begin("uwj2", [K.I64], false, K.I64)
+    let sj = t.fb.temp_mem(64, 128)
+    t.fb.store(sj, 0, 0)
+    let accj = hot_loop(ref t, 0)
+    t.fb.call_void("brx_throw", [accj])
+    t.finish()
+    t.begin("uwj1", [K.I64], false, K.I64)
+    t.fb.call_void("uwj2", [0])
+    t.finish()
+    t.begin("t_unwind", [], false, K.I64)
+    let x = t.val(K.I64, 2, true)
+    let r = t.fb.call(K.I64, "uw1", [x])
+    let fj = t.glob("uwj1")
+    let a = t.val(K.I64, 7, true)
+    let rj = t.fb.call(K.I64, "brx_catch", [fj, a])
+    # uw3 gets 3 * 3 * 2 = 18 and adds 3 * 18 to the 5 frames found; uw2 adds 2
+    t.line([r, rj], f"{5 + 54 + 2} 21")
+    t.finish()
+
+# ================================================================ panics
+
+# One function per panic; returns what each must print.
+fn panic_tests(ref t: T) -> [str]:
+    var whats: [str] = []
+    for pc in 0..11:
+        t.begin(f"panic{pc}", [], false, K.I64)
+        let loc = t.loc()
+        var what = ""
+        match pc:
+            case 0:
+                let a = t.val(K.I8, 100, true)
+                let b = t.val(K.I8, 28, true)
+                t.fb.chk(Op.AddO, K.I8, a, b, loc)
+                what = "integer overflow in addition"
+            case 1:
+                let a = t.val(K.U32, 0, true)
+                let b = t.val(K.U32, 1, false)
+                t.fb.chk(Op.SubO, K.U32, a, b, loc)
+                what = "integer overflow in subtraction"
+            case 2:
+                let a = t.val(K.I64, 4611686018427387904, true)
+                let b = t.val(K.I64, 2, true)
+                t.fb.chk(Op.MulO, K.I64, a, b, loc)
+                what = "integer overflow in multiplication"
+            case 3:
+                let a = t.val(K.U64, 4294967296, true)
+                let b = t.val(K.U64, 4294967296, true)
+                t.fb.chk(Op.MulO, K.U64, a, b, loc)
+                what = "integer overflow in multiplication"
+            case 4:
+                let a = t.val(K.U64, P64 - 1, true)
+                let b = t.val(K.U64, 1, false)
+                t.fb.chk(Op.AddO, K.U64, a, b, loc)
+                what = "integer overflow in addition"
+            case 5:
+                let a = t.val(K.I64, 5, true)
+                let b = t.val(K.I64, 5, true)
+                t.fb.chk(Op.IdxChk, K.I64, a, b, loc)
+                what = "index 5 is out of bounds for an array of length 5"
+            case 6:
+                let a = t.val(K.I64, -1, true)
+                let b = t.val(K.I64, 5, false)
+                t.fb.chk(Op.IdxChk, K.I64, a, b, loc)
+                what = "index -1 is out of bounds for an array of length 5"
+            case 7:
+                t.fb.unreachable()
+                what = "unreachable"
+            case 8:
+                let a = t.w(K.I128, 170141183460469231731687303715884105727)
+                let b = t.w(K.I128, 1)
+                t.fb.chk(Op.AddO, K.I128, a, b, loc)
+                what = "integer overflow in addition"
+            case 9:
+                let a = t.val(K.I16, 200, true)
+                let b = t.val(K.I16, 200, false)
+                t.fb.chk(Op.MulO, K.I16, a, b, loc)
+                what = "integer overflow in multiplication"
+            case _:
+                let a = t.val(K.I32, -2147483648, true)
+                let b = t.val(K.I32, 1, true)
+                t.fb.chk(Op.SubO, K.I32, a, b, loc)
+                what = "integer overflow in subtraction"
+        t.finish()
+        whats.push(what)
+    return whats
+
+# ================================================================ the program
+
+fn new_t() -> T:
+    return T(
+        m=Module(funcs=[], data=[], dtypes=[]),
+        fb=FB(f=new_func("", [], false, K.I64)),
+        sb=0,
+        want=[],
+        ndata=0,
+        cstrs={}
+    )
+
+fn tests() -> [str]:
+    return [
+        "t_int",
+        "t_wide",
+        "t_cmp",
+        "t_conv",
+        "t_float",
+        "t_checked",
+        "t_mem",
+        "t_calls",
+        "t_hot",
+        "t_callbacks",
+        "t_big",
+        "t_align",
+        "t_unwind"
+    ]
+
+fn build() -> (Module, [str], [str]):
+    var t = new_t()
+    t_int(ref t, "t_int")
+    t_wide(ref t)
+    t_cmp(ref t)
+    t_conv(ref t)
+    t_float(ref t)
+    t_checked(ref t)
+    t_mem(ref t)
+    t_calls(ref t)
+    t_hot(ref t)
+    t_callbacks(ref t)
+    t_big(ref t)
+    t_align(ref t)
+    t_unwind(ref t)
+    let panics = panic_tests(ref t)
+    # main(argc, argv): no arguments runs the tests; k arguments, panic test k - 1
+    t.begin("main", [K.I32, K.Ptr], true, K.I32)
+    t.fb.f.public = true
+    t.fb.call_void("brine_rt_init", [0, 1])
+    var labels: [int] = []
+    for i in 0..len(panics):
+        let l = t.fb.label()
+        labels.push(l)
+        let ki = t.kc(K.I32, i + 2)
+        let c = t.fb.cmp(Op.Eq, 0, ki)
+        t.fb.br(c, l)
+    for nm in tests():
+        t.fb.call_void(nm, [])
+    t.fb.call_void("brine_rt_shutdown", [])
+    t.retc(K.I32, 0)
+    for i, l in enumerate(labels):
+        t.fb.place(l)
+        t.fb.call_void(f"panic{i}", [])
+        t.retc(K.I32, 3)
+    t.finish()
+    return (t.m, t.want, panics)
+
+fn write(path: str, b: [u8]) -> bool:
+    match os.write_bytes(path, b):
+        case Ok(_):
+            return true
+        case Err(e):
+            eprint(f"cannot write {path}: {e}")
+            return false
+
+# runs a command: (exit code, stdout, stderr)
+fn run_cmd(cmd: [str]) -> (int, str, str):
+    match os.spawn(cmd, {}, true, false):
+        case Ok(p):
+            let code = os.wait(p)
+            let (out, err) = os.output(p)
+            return (code, out, err)
+        case Err(e):
+            return (-1, "", e)
+
+fn main() -> int:
+    let windows = os.name() == "windows"
+    let argv = args()
+    match os.make_dir(DIR):
+        case Ok(_):
+            pass
+        case Err(e):
+            eprint(e)
+            return 1
+    if "--bench" in argv:
+        return run_bench(windows)
+    let (m, want, panics) = build()
+    var nins = 0
+    for f in m.funcs:
+        nins += len(f.code)
+    let t0 = clock()
+    let obj = emit_object(m, windows)
+    let dt = clock() - t0
+    print(
+        f"{len(m.funcs)} functions, {nins} instructions -> {len(obj)} bytes of object in {dt:.3f} s"
+    )
+    if "--elf" in argv:
+        let eo = emit_object(m, false)
+        if not write(f"{DIR}/t.elf.o", eo):
+            return 1
+        print(f"wrote {DIR}/t.elf.o")
+    let ext = ".exe" if windows else ""
+    let objp = f"{DIR}/t.o"
+    let exe = f"{DIR}/t{ext}"
+    let rt = f"{DIR}/rt_{os.name()}.o"
+    if not write(objp, obj):
+        return 1
+    if not file_exists(rt):
+        let (
+            c,
+            o,
+            e
+        ) = run_cmd(["gcc", "-std=c11", "-O2", "-fno-strict-aliasing", "-w", "-Iruntime", "-c", "runtime/brine_rt.c", "-o", rt])
+        if c != 0:
+            eprint(f"runtime build failed: {o}{e}")
+            return 1
+    let walk_src = f"{DIR}/walk.c"
+    let walk = f"{DIR}/walk_{os.name()}.o"
+    match write_file(walk_src, walk_c()):
+        case Ok(_):
+            pass
+        case Err(e):
+            eprint(f"cannot write {walk_src}: {e}")
+            return 1
+    let (wc, wo, we) = run_cmd(["gcc", "-O2", "-w", "-c", walk_src, "-o", walk])
+    if wc != 0:
+        eprint(f"stack walker build failed: {wo}{we}")
+        return 1
+    var link = ["gcc", objp, walk, rt, "-o", exe]
+    if windows:
+        link.extend(["-lws2_32", "-lshell32"])
+    else:
+        link.extend(["-lm", "-lpthread", "-ldl"])
+    let (lc, lo, le) = run_cmd(link)
+    if lc != 0:
+        eprint(f"link failed: {lo}{le}")
+        return 1
+    let (code, out, err) = run_cmd([exe])
+    let got = out.lines()
+    var bad = 0
+    for i in 0..max(len(got), len(want)):
+        let g = got[i] if i < len(got) else "<missing>"
+        let w = want[i] if i < len(want) else "<extra>"
+        if g != w:
+            bad += 1
+            if bad <= 20:
+                print(f"line {i + 1}:\n  got:  {g}\n  want: {w}")
+    if code != 0:
+        bad += 1
+        print(f"exit code {code}, stderr: {err}")
+    print(f"{len(want)} lines checked, {bad} wrong")
+    # panic tests: run with i + 1 arguments
+    var pbad = 0
+    for i, what in enumerate(panics):
+        var cmd = [exe]
+        for _ in 0..i + 1:
+            cmd.push("x")
+        let (pc, pout, pe) = run_cmd(cmd)
+        let ok = what in pe and (what == "unreachable" or (pc == 101 and LOC in pe))
+        if not ok or pc == 0 or pout != "":
+            pbad += 1
+            print(f"panic test {i}: exit {pc}, stderr: {pe.strip()} (want `{what}`)")
+    print(f"{len(panics)} panic tests, {pbad} wrong")
+    return 0 if bad == 0 and pbad == 0 else 1
+
+# ================================================================ benchmark
+
+fn run_bench(windows: bool) -> int:
+    var t = new_t()
+    for fi in 0..40:
+        t_int(ref t, f"t_int{fi}")
+        t_cmp(ref t)
+        t.m.funcs[len(t.m.funcs) - 1].name = f"t_cmp{fi}"
+    var nins = 0
+    for f in t.m.funcs:
+        nins += len(f.code)
+    let t0 = clock()
+    let obj = emit_object(t.m, windows)
+    let dt = clock() - t0
+    let code = obj
+    print(
+        f"{nins} instructions -> {len(code)} bytes in {dt:.3f} s ({float(nins) / dt / 1.0e6:.2f} M instructions/s)"
+    )
+    return 0

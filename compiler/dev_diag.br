@@ -1,0 +1,153 @@
+# Unit tests for diag.br: name suggestions, positions, and rendering
+# diagnostics as text and JSON.
+from diag import SourceMap, Span, edit_distance, best_match
+import diag
+
+test "edit_distance basics":
+    assert edit_distance("", "") == 0
+    assert edit_distance("abc", "") == 3
+    assert edit_distance("", "abcd") == 4
+    assert edit_distance("abc", "abc") == 0
+    assert edit_distance("kitten", "sitting") == 3
+    assert edit_distance("flaw", "lawn") == 2
+
+test "edit_distance counts an adjacent swap as 1":
+    assert edit_distance("bulid", "build") == 1
+    assert edit_distance("ab", "ba") == 1
+    assert edit_distance("abc", "bca") == 2
+    # optimal string alignment: no edits inside a swapped pair
+    assert edit_distance("ca", "abc") == 3
+
+test "edit_distance counts characters, not bytes":
+    assert edit_distance("héllo", "hello") == 1
+    assert edit_distance("日本", "本日") == 1
+    assert edit_distance("é", "") == 1
+
+test "edit_distance is case sensitive":
+    assert edit_distance("Name", "name") == 1
+
+test "best_match picks the closest within a third of the length":
+    assert best_match("lenght", ["length", "len"]) == Some("length")
+    assert best_match("prnt", ["print", "eprint"]) == Some("print")
+    assert best_match("xyz", ["abc"]) == None
+    # limit is len / 3, at least 1
+    assert best_match("ab", ["cd"]) == None
+    assert best_match("ab", ["ac"]) == Some("ac")
+    assert best_match("abcdef", ["abxyef"]) == Some("abxyef")
+    assert best_match("abcdef", ["axxxef"]) == None
+
+test "best_match skips the name itself":
+    assert best_match("foo", ["foo"]) == None
+    assert best_match("foo", ["foo", "fob"]) == Some("fob")
+
+test "best_match ties go to the first candidate":
+    assert best_match("cat", ["bat", "rat", "hat"]) == Some("bat")
+    assert best_match("cat", ["cart", "bat"]) == Some("cart")
+    # a strictly closer later candidate wins
+    assert best_match("abcdefgh", ["abcdefxx", "abcdefgx"]) == Some("abcdefgx")
+
+test "best_match: ASCII case-insensitive equality counts as 0":
+    assert best_match("Point", ["Pont", "point"]) == Some("point")
+    assert best_match("POINT", ["point"]) == Some("point")
+    assert best_match("abc", ["abd", "ABC"]) == Some("ABC")
+
+test "best_match limit counts bytes":
+    # "héé" is 5 bytes: limit 1
+    assert best_match("héé", ["hee"]) == None
+    assert best_match("héé", ["hée"]) == Some("hée")
+    # "ééé" is 6 bytes: limit 2
+    assert best_match("ééé", ["eee"]) == None
+    assert best_match("ééé", ["eeé"]) == Some("eeé")
+
+test "best_match with no candidates":
+    let none: [str] = []
+    assert best_match("x", none) == None
+
+test "json_str escapes":
+    assert diag.json_str("") == "\"\""
+    assert diag.json_str("a\"b\\c") == "\"a\\\"b\\\\c\""
+    assert diag.json_str("\n\r\t") == "\"\\n\\r\\t\""
+    assert diag.json_str("\u{1}\u{1f}\u{0}") == "\"\\u0001\\u001f\\u0000\""
+    assert diag.json_str("\u{7f}é日") == "\"\u{7f}é日\""
+
+test "line_col counts characters":
+    var sm = SourceMap.new()
+    let id = sm.add("f.br", "aé日b\nxy\n")
+    let f = sm.file(id)
+    assert f.line_col(0) == (1, 1)
+    assert f.line_col(1) == (1, 2)
+    assert f.line_col(3) == (1, 3)
+    # inside a character: rounds down to its start
+    assert f.line_col(2) == (1, 2)
+    assert f.line_col(4) == (1, 3)
+    assert f.line_col(5) == (1, 3)
+    assert f.line_col(6) == (1, 4)
+    assert f.line_col(7) == (1, 5)
+    assert f.line_col(8) == (2, 1)
+    assert f.line_col(10) == (2, 3)
+    assert f.line_col(11) == (3, 1)
+    assert f.line_col(100) == (3, 1)
+    assert f.line_text(1) == "aé日b"
+    assert f.line_text(3) == ""
+    assert f.line_text(4) == ""
+    assert f.line_text(0) == ""
+    assert sm.loc(Span(file=id, lo=9, hi=10)) == "f.br:2:2"
+    assert sm.snippet(Span(file=id, lo=1, hi=6)) == "é日"
+    assert sm.snippet(Span(file=id, lo=2, hi=7)) == ""
+    assert sm.snippet(Span(file=id, lo=7, hi=3)) == ""
+    assert sm.snippet(Span(file=id, lo=8, hi=100)) == "xy\n"
+
+test "line_text trims every trailing CR and LF":
+    var sm = SourceMap.new()
+    let id = sm.add("f.br", "ab\r\r\ncd\r")
+    assert sm.file(id).line_text(1) == "ab"
+    assert sm.file(id).line_text(2) == "cd"
+
+test "render: warning with secondary labels, notes and help":
+    var sm = SourceMap.new()
+    let a = sm.add("a.br", "let x = 1\nlet y = x + 2\n")
+    let b = sm.add("b.br", "fn f():\n    pass\n")
+    var d = diag.warning("E0999", "something odd")
+    d = d.label(Span(file=a, lo=14, hi=15), "used here")
+    d = d.label(Span(file=a, lo=4, hi=5), "defined here")
+    d = d.label(Span(file=a, lo=18, hi=23), "and here")
+    d = d.label(Span(file=b, lo=3, hi=4), "elsewhere")
+    d = d.label(Span(file=7, lo=0, hi=1), "no such file")
+    d = d.note("a note").with_help("some help")
+    let want = "warning[E0999]: something odd\n" + " --> a.br:2:5\n" + "  |\n" + "2 | let y = x + 2\n" + "  |     ^ used here\n" + "1 | let x = 1\n" + "  |     - defined here\n" + "2 | let y = x + 2\n" + "  |         ----- and here\n" + " ::: b.br:1:4\n" + "  |\n" + "1 | fn f():\n" + "  |    - elsewhere\n" + "  |\n" + "  = note: a note\n" + "  = help: some help\n" + "  = run `brine explain E0999` for more about this error\n"
+    assert diag.render(d, sm, false) == want
+
+test "render: label spanning lines, and an empty label":
+    var sm = SourceMap.new()
+    let a = sm.add("a.br", "abc\ndef\n")
+    var d = diag.error("E0001", "m")
+    d = d.label(Span(file=a, lo=1, hi=6), "multi")
+    d = d.label(Span(file=a, lo=3, hi=3), "empty")
+    let want = "error[E0001]: m\n" + " --> a.br:1:2\n" + "  |\n" + "1 | abc\n" + "  |  ^^ multi\n" + "  |    - empty\n" + "  = run `brine explain E0001` for more about this error\n"
+    assert diag.render(d, sm, false) == want
+
+test "render: no labels, wide gutter, color":
+    var sm = SourceMap.new()
+    let d0 = diag.error("E0002", "nothing").note("n")
+    let want0 = "error[E0002]: nothing\n  = note: n\n  = run `brine explain E0002` for more about this error\n"
+    assert diag.render(d0, sm, false) == want0
+    let a = sm.add("a.br", "\n\n\n\n\n\n\n\n\nx\n")
+    let d = diag.error("E0003", "ten").label(Span(file=a, lo=9, hi=10), "here")
+    let want = "\u{1b}[1m\u{1b}[31merror[E0003]\u{1b}[0m\u{1b}[1m: ten\u{1b}[0m\n" + "  \u{1b}[34m--> a.br:10:1\u{1b}[0m\n" + "   \u{1b}[34m|\u{1b}[0m\n" + "\u{1b}[34m10 |\u{1b}[0m x\n" + "   \u{1b}[34m|\u{1b}[0m \u{1b}[31m^ here\u{1b}[0m\n" + "   \u{1b}[34m=\u{1b}[0m run `brine explain E0003` for more about this error\n"
+    assert diag.render(d, sm, true) == want
+
+test "to_json with related labels, fixes and a missing file":
+    var sm = SourceMap.new()
+    let a = sm.add("a\\b.br", "é = 1\n")
+    var d = diag.warning("E0004", "say \"hi\"")
+    d = d.label(Span(file=a, lo=0, hi=2), "x")
+    d = d.label(Span(file=a, lo=3, hi=4), "y")
+    d = d.label(Span(file=5, lo=0, hi=0), "z")
+    d = d.note("n1").note("n2").fix(Span(file=a, lo=0, hi=2), "e", "rename")
+    let want = "{\"severity\":\"warning\",\"code\":\"E0004\",\"message\":\"say \\\"hi\\\"\",\"file\":\"a\\\\b.br\",\"line\":1,\"column\":1,\"end_line\":1,\"end_column\":2,\"label\":\"x\",\"related\":[{\"file\":\"a\\\\b.br\",\"line\":1,\"column\":3,\"end_line\":1,\"end_column\":4,\"label\":\"y\"},{\"file\":null,\"label\":\"z\"}],\"notes\":[\"n1\",\"n2\"],\"help\":[],\"fixes\":[{\"file\":\"a\\\\b.br\",\"line\":1,\"column\":1,\"end_line\":1,\"end_column\":2,\"replacement\":\"e\",\"message\":\"rename\"}]}"
+    assert diag.to_json(d, sm) == want
+    let e = diag.error("E0005", "bare")
+    assert diag.to_json(
+        e,
+        sm
+    ) == "{\"severity\":\"error\",\"code\":\"E0005\",\"message\":\"bare\",\"related\":[],\"notes\":[],\"help\":[],\"fixes\":[]}"

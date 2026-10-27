@@ -1,0 +1,631 @@
+# Test driver for solver.br (the prover's decision procedure).
+#
+#   brine test compiler/dev_solver.br        run the tests below
+#   brine run compiler/dev_solver.br -- diff <file>
+#       each line is `expected | query`; report queries where prove_ disagrees
+#   brine run compiler/dev_solver.br -- eval <file>
+#       print 1 or 0 for each query line
+#
+# Query text: `R | G | F1 | F2 ...` where R is space-separated `atom:lo:hi`
+# ranges, G the goal and F1... the facts. Formulas: `true`, `false`,
+# `(ge c a:k ...)` (the raw F.Ge(Lin(c, [(a, k), ...]))), `(eq ...)`, `(ne ...)`,
+# `(b a 1)` / `(b a 0)`, `(and f ...)`, `(or f ...)` (raw F.And / F.Or) and
+# `(not f)` (= f.not_()). `diff` and `eval` make it easy to compare two versions
+# of the solver on many queries.
+import solver
+from solver import Lin, F, AtomSet, prove_, add_i128, mul_i128, neg_i128, I128_MAX, I128_MIN, ATOM_UNKNOWN
+
+struct Parser:
+    toks: [str]
+    i: int
+
+    fn next(ref self) -> str:
+        let t = self.toks[self.i]
+        self.i += 1
+        return t
+
+    fn peek(self) -> str:
+        return self.toks[self.i]
+
+    fn lin(ref self) -> Lin:
+        let c = i128(self.next())
+        var t: [(int, i128)] = []
+        while self.peek() != ")":
+            let w = self.next()
+            let parts = w.split(":")
+            t.push((int(parts[0]), i128(parts[1])))
+        return Lin(c=c, t=t)
+
+    fn form(ref self) -> F:
+        let t = self.next()
+        if t == "true":
+            return F.True
+        if t == "false":
+            return F.False
+        if t != "(":
+            panic("bad token " + t)
+        let head = self.next()
+        var r = F.True
+        if head == "ge":
+            r = F.Ge(self.lin())
+        elif head == "eq":
+            r = F.Eq(self.lin())
+        elif head == "ne":
+            r = F.Ne(self.lin())
+        elif head == "b":
+            let a = int(self.next())
+            let p = self.next() == "1"
+            r = F.B(a, p)
+        elif head == "and" or head == "or":
+            var xs: [F] = []
+            while self.peek() != ")":
+                xs.push(self.form())
+            if head == "and":
+                r = F.And(xs)
+            else:
+                r = F.Or(xs)
+        elif head == "not":
+            let inner = self.form()
+            r = inner.not_()
+        else:
+            panic("bad head " + head)
+        let close = self.next()
+        if close != ")":
+            panic("expected )")
+        return r
+
+fn parse_f(s: str) -> F:
+    var p = Parser(toks=s.replace("(", " ( ").replace(")", " ) ").split(), i=0)
+    let f = p.form()
+    if p.i != len(p.toks):
+        panic("trailing tokens in " + s)
+    return f
+
+struct Query:
+    ranges: [Option[(i128, i128)]]
+    goal: F
+    facts: [F]
+
+fn parse_query(line: str) -> Query:
+    let parts = line.split("|")
+    var ranges: [Option[(i128, i128)]] = []
+    for w in parts[0].split():
+        let v = w.split(":")
+        let a = int(v[0])
+        while len(ranges) <= a:
+            ranges.push(None)
+        ranges[a] = Some((i128(v[1]), i128(v[2])))
+    let goal = parse_f(parts[1].strip())
+    var facts: [F] = []
+    for x in parts[2:]:
+        if x.strip() != "":
+            facts.push(parse_f(x.strip()))
+    return Query(ranges=ranges, goal=goal, facts=facts)
+
+# Is the query proven?
+fn pr(line: str) -> bool:
+    let q = parse_query(line)
+    return prove_(q.facts, q.goal, q.ranges)
+
+fn main() -> int:
+    let a = args()
+    if len(a) == 1 and a[0] == "gen":
+        # the queries the tests build in code, for comparing solver versions
+        for g in generated():
+            print(g)
+        return 0
+    if len(a) != 2 or (a[0] != "diff" and a[0] != "eval"):
+        eprint("usage: dev_solver diff|eval <file> | gen")
+        return 2
+    match read_file(a[1]):
+        case Ok(text):
+            var n = 0
+            var bad = 0
+            var yes = 0
+            var skipped = 0
+            var secs = 0.0
+            for line in text.lines():
+                if line.strip() == "":
+                    continue
+                if a[0] == "eval":
+                    print(1 if pr(line) else 0)
+                    continue
+                let bar = line.find("|").unwrap()
+                if line[:bar].strip() == "P":
+                    # the expected answer was a panic: check those one at a time with `eval`
+                    skipped += 1
+                    continue
+                let want = line[:bar].strip() == "1"
+                let q = parse_query(line[bar + 1:])
+                let t0 = clock()
+                let got = prove_(q.facts, q.goal, q.ranges)
+                secs += clock() - t0
+                n += 1
+                if got:
+                    yes += 1
+                if got != want:
+                    bad += 1
+                    if bad <= 20:
+                        print(f"MISMATCH (expected {want}, got {got}): {line}")
+            if a[0] == "diff":
+                print(
+                    f"{n} queries, {yes} proven, {bad} mismatches, {skipped} skipped (expected a panic), {secs:.2f}s in prove_"
+                )
+            return 1 if bad > 0 else 0
+        case Err(e):
+            eprint("error:", e)
+            return 1
+
+# ------------------------------------------------------------ helpers for tests
+
+fn x() -> Lin:
+    return Lin.atom(0)
+
+fn y() -> Lin:
+    return Lin.atom(1)
+
+fn z() -> Lin:
+    return Lin.atom(2)
+
+fn none() -> [Option[(i128, i128)]]:
+    return []
+
+fn lin(c: i128, t: [(int, i128)]) -> Lin:
+    return Lin(c=c, t=t)
+
+fn ok(l: Option[Lin]) -> Lin:
+    return l.unwrap()
+
+# `k` disjunctions `x_i != 0` that are always satisfiable, then a 3-way
+# disjunction on x0 that contradicts `x0 <= 0` in every case. Being the
+# longest, it is split last, so the search visits 3 * 2^k contradictory cases.
+fn deep_split(k: int) -> str:
+    var s = " | false"
+    for i in 1..k + 1:
+        s += f" | (ne 0 {i}:1)"
+    return s + " | (or (ge -1 0:1) (ge -2 0:1) (ge -3 0:1)) | (ge 0 0:-1)"
+
+# Every constraint `Σ k_i·x_i + c >= 0` over atoms 0..n-1 with each k_i in `ks`.
+fn dense(n: int, ks: [int], c: int) -> str:
+    var out = ""
+    var idx = [0] * n
+    var done = false
+    while not done:
+        var l = f"(ge {c}"
+        for i in 0..n:
+            l += f" {i}:{ks[idx[i]]}"
+        out += " | " + l + ")"
+        var j = n - 1
+        var carry = true
+        while carry and j >= 0:
+            idx[j] += 1
+            if idx[j] == len(ks):
+                idx[j] = 0
+                j -= 1
+            else:
+                carry = false
+        if carry:
+            done = true
+    return out
+
+fn ks6() -> [int]:
+    return [-3, -2, -1, 1, 2, 3]
+
+# The queries the tests build in code (printed by `gen`).
+fn generated() -> [str]:
+    return [
+        deep_split(10),
+        " | false" + dense(4, ks6(), 100),
+        " | false" + dense(4, ks6(), 100) + " | (ge -1 0:1) | (ge 0 0:-1)",
+        " | false" + dense(3, [-1, 1], -1),
+        " | (ge 0 9:1) | (ge -1 9:1)" + dense(4, ks6(), 100),
+    ]
+
+# ------------------------------------------------------------ basic tests
+
+test "basic":
+    # x >= 1 ⇒ x >= 0
+    assert prove_([F.ge(ok(x().add_c(-1)))], F.ge(x()), none())
+    # x >= 0 ⇏ x >= 1
+    assert not prove_([F.ge(x())], F.ge(ok(x().add_c(-1))), none())
+    # x < y, y < x+1 contradicts over integers
+    let f = [F.lt(x(), y()), F.lt(y(), ok(x().add_c(1)))]
+    assert prove_(f, F.False, none())
+    # 2x == 1 has no integer solution
+    assert prove_([F.eq(ok(ok(x().scale(2)).add_c(-1)))], F.False, none())
+
+test "disjunction":
+    # (x >= 5 ∨ x <= -5) ⇒ x != 0
+    let f = [F.or_([F.ge(ok(x().add_c(-5))), F.le(x(), Lin.konst(-5))])]
+    assert prove_(f, F.ne(x()), none())
+    assert not prove_(f, F.ge(x()), none())
+
+test "midpoint":
+    # lo <= hi-1, m = lo + q, 2q <= hi-lo <= 2q+1 ⇒ lo <= m < hi
+    let lo = Lin.atom(0)
+    let hi = Lin.atom(1)
+    let q = Lin.atom(2)
+    let d = ok(hi.sub(lo))
+    let q2 = ok(q.scale(2))
+    let facts = [F.lt(lo, hi), F.le(q2, d), F.le(d, ok(q2.add_c(1)))]
+    let m = ok(lo.add(q))
+    assert prove_(facts, F.and_([F.le(lo, m), F.lt(m, hi)]), none())
+
+# ------------------------------------------------------------ i128 helpers
+
+test "add_i128 at the bounds":
+    assert add_i128(I128_MAX, 0) == Some(I128_MAX)
+    assert add_i128(I128_MAX, 1) == None
+    assert add_i128(I128_MIN, -1) == None
+    assert add_i128(I128_MIN, I128_MAX) == Some(-1)
+    assert add_i128(I128_MAX, I128_MAX) == None
+    assert add_i128(I128_MIN, I128_MIN) == None
+    assert add_i128(I128_MAX - 5, 5) == Some(I128_MAX)
+    assert add_i128(I128_MIN + 5, -5) == Some(I128_MIN)
+
+test "mul_i128 at the bounds":
+    let one: i128 = 1
+    let p63 = one << 63
+    let p64 = one << 64
+    assert mul_i128(I128_MAX, 1) == Some(I128_MAX)
+    assert mul_i128(I128_MIN, 1) == Some(I128_MIN)
+    assert mul_i128(I128_MIN, -1) == None
+    assert mul_i128(-1, I128_MIN) == None
+    assert mul_i128(I128_MAX, -1) == Some(-I128_MAX)
+    assert mul_i128(I128_MIN, 0) == Some(0)
+    assert mul_i128(p63, p63) == Some(one << 126)
+    assert mul_i128(p64, p63) == None
+    assert mul_i128(-p64, p63) == Some(I128_MIN)
+    assert mul_i128(p64, -p63) == Some(I128_MIN)
+    assert mul_i128(-p64, -p63) == None
+    assert mul_i128(I128_MAX / 3, 3) == Some(I128_MAX / 3 * 3)
+    assert mul_i128(I128_MAX / 3 + 1, 3) == None
+    assert mul_i128(2, I128_MIN / 2) == Some(I128_MIN)
+    assert mul_i128(-7, 6) == Some(-42)
+
+test "neg_i128 and truncating division":
+    assert neg_i128(I128_MIN) == None
+    assert neg_i128(I128_MAX) == Some(I128_MIN + 1)
+    assert solver.div_trunc(-7, 2) == -3
+    assert solver.rem_trunc(-7, 2) == -1
+    assert solver.div_trunc(7, -2) == -3
+    assert solver.rem_trunc(7, -2) == 1
+    assert solver.div_trunc(-6, 3) == -2
+    assert solver.rem_trunc(I128_MIN, 5) == -3
+    assert solver.wrapping_abs(I128_MIN) == I128_MIN
+    assert solver.wrapping_neg(I128_MIN) == I128_MIN
+
+test "gcd, including negative results":
+    assert solver.gcd(0, 6) == 6
+    assert solver.gcd(12, 18) == 6
+    # the remainder keeps the left side's sign, so gcd can come out negative
+    # once i128::MIN (whose wrapping abs is itself) is involved
+    assert solver.gcd(0, I128_MIN) == I128_MIN
+    assert solver.gcd(I128_MIN, 5) == -1
+    assert solver.gcd(I128_MIN, 4) == 4
+
+# ------------------------------------------------------------ Lin
+
+test "Lin add merges terms in atom order and drops zeros":
+    let a = lin(3, [(0, 1), (1, 2)])
+    let b = lin(4, [(0, -1), (1, 1), (2, 4)])
+    assert ok(a.add(b)) == lin(7, [(1, 3), (2, 4)])
+    assert ok(lin(0, [(3, 1)]).add(lin(0, [(1, 1), (5, 1)]))) == lin(0, [(1, 1), (3, 1), (5, 1)])
+    assert ok(x().sub(x())) == Lin.konst(0)
+
+test "Lin add overflow":
+    assert lin(0, [(0, I128_MAX)]).add(x()) == None
+    assert Lin.konst(I128_MIN).add(Lin.konst(-1)) == None
+    # coefficients that cancel can't overflow
+    assert ok(lin(0, [(0, I128_MAX)]).add(lin(0, [(0, -I128_MAX)]))) == Lin.konst(0)
+
+test "Lin scale and neg":
+    assert ok(lin(I128_MAX, [(0, I128_MAX)]).scale(0)) == Lin.konst(0)
+    assert ok(lin(1, [(0, 2)]).scale(-3)) == lin(-3, [(0, -6)])
+    assert lin(1, [(0, I128_MAX)]).scale(2) == None
+    assert Lin.konst(I128_MIN).neg() == None
+    assert lin(0, [(0, I128_MIN)]).neg() == None
+    assert ok(Lin.konst(I128_MAX).neg()) == Lin.konst(I128_MIN + 1)
+    assert x().sub(lin(0, [(0, I128_MIN)])) == None
+
+test "Lin add_c, coef, is_const":
+    assert Lin.konst(I128_MAX).add_c(1) == None
+    assert Lin.konst(I128_MIN).add_c(-1) == None
+    assert ok(x().add_c(-5)) == lin(-5, [(0, 1)])
+    let l = lin(2, [(0, 3), (4, -1)])
+    assert l.coef(0) == 3
+    assert l.coef(4) == -1
+    assert l.coef(2) == 0
+    assert l.is_const() == None
+    assert Lin.konst(9).is_const() == Some(9)
+
+test "Lin subst and gcd_coefs":
+    # (2x + y + 1)[x := y - 1] = 3y - 1
+    assert ok(lin(1, [(0, 2), (1, 1)]).subst(0, lin(-1, [(1, 1)]))) == lin(-1, [(1, 3)])
+    # no x: unchanged
+    assert ok(lin(1, [(1, 1)]).subst(0, Lin.konst(I128_MAX))) == lin(1, [(1, 1)])
+    # overflow while substituting
+    assert lin(0, [(0, 2)]).subst(0, lin(0, [(1, I128_MAX)])) == None
+    assert lin(5, [(0, 6), (1, -4)]).gcd_coefs() == 2
+    assert Lin.konst(5).gcd_coefs() == 0
+    assert lin(0, [(0, I128_MIN)]).gcd_coefs() == I128_MIN
+
+# ------------------------------------------------------------ F
+
+test "F constructors fold constants":
+    assert F.ge(Lin.konst(0)) == F.True
+    assert F.ge(Lin.konst(-1)) == F.False
+    assert F.eq(Lin.konst(0)) == F.True
+    assert F.eq(Lin.konst(3)) == F.False
+    assert F.ne(Lin.konst(3)) == F.True
+    assert F.ne(Lin.konst(0)) == F.False
+    assert F.ge(x()) == F.Ge(x())
+    assert F.from_bool(true) == F.True
+
+test "F le, lt, equal":
+    assert F.lt(x(), y()) == F.Ge(lin(-1, [(0, -1), (1, 1)]))
+    assert F.le(x(), y()) == F.Ge(lin(0, [(0, -1), (1, 1)]))
+    assert F.equal(x(), x()) == F.True
+    assert F.equal(x(), y()) == F.Eq(lin(0, [(0, 1), (1, -1)]))
+    assert F.le(x(), x()) == F.True
+    assert F.lt(x(), x()) == F.False
+    # overflow while building: the "unknown" marker
+    assert F.le(Lin.konst(I128_MIN), x()) == F.B(ATOM_UNKNOWN, true)
+    assert F.lt(Lin.konst(-1), lin(I128_MAX, [(0, 1)])) == F.B(ATOM_UNKNOWN, true)
+    assert F.lt(Lin.konst(0), lin(I128_MIN, [(0, 1)])) == F.B(ATOM_UNKNOWN, true)
+
+test "F and_ and or_ flatten one level":
+    let a = F.Ge(x())
+    let b = F.Eq(y())
+    let c = F.B(3, true)
+    assert F.and_([F.True, F.And([a, b]), c]) == F.And([a, b, c])
+    assert F.and_([a, F.False, b]) == F.False
+    assert F.and_([]) == F.True
+    assert F.and_([F.True, a]) == a
+    assert F.and_([F.Or([a, b]), c]) == F.And([F.Or([a, b]), c])
+    assert F.or_([F.False, F.Or([a, b]), c]) == F.Or([a, b, c])
+    assert F.or_([a, F.True]) == F.True
+    assert F.or_([F.False]) == F.False
+    assert F.or_([F.And([a, b])]) == F.And([a, b])
+
+test "F not_":
+    # ¬(x >= 0) is -x - 1 >= 0
+    assert F.Ge(x()).not_() == F.Ge(lin(-1, [(0, -1)]))
+    assert F.Ge(lin(0, [(0, I128_MIN)])).not_() == F.B(ATOM_UNKNOWN, true)
+    assert F.Ge(lin(I128_MIN, [(0, 1)])).not_() == F.B(ATOM_UNKNOWN, true)
+    assert F.Ge(lin(I128_MAX, [(0, 1)])).not_() == F.Ge(lin(I128_MIN, [(0, -1)]))
+    assert F.Eq(x()).not_() == F.Ne(x())
+    assert F.Ne(x()).not_() == F.Eq(x())
+    assert F.Eq(Lin.konst(0)).not_() == F.False
+    assert F.B(3, true).not_() == F.B(3, false)
+    assert F.B(ATOM_UNKNOWN, true).not_() == F.B(ATOM_UNKNOWN, true)
+    assert F.B(ATOM_UNKNOWN, false).not_() == F.B(ATOM_UNKNOWN, false)
+    assert F.And([F.Ge(x()), F.Eq(y())]).not_() == F.Or([F.Ge(lin(-1, [(0, -1)])), F.Ne(y())])
+    assert F.Or([F.Ne(x()), F.Ge(Lin.konst(-1))]).not_() == F.Eq(x())
+    assert F.Or([F.Ne(x()), F.Ge(Lin.konst(0))]).not_() == F.False
+
+test "F atoms and size":
+    let f = F.Or([F.Ge(lin(0, [(0, 1), (2, 1)])), F.And([F.B(1, true), F.Eq(x())]), F.True])
+    var s = AtomSet.new()
+    f.atoms(ref s)
+    assert s.xs == [0, 1, 2]
+    s.insert(ATOM_UNKNOWN)
+    assert s.contains(ATOM_UNKNOWN)
+    assert s.contains(1)
+    assert not s.contains(3)
+    assert f.size() == 6
+    assert F.True.size() == 1
+    assert solver.atoms_of(F.B(7, false)).xs == [7]
+
+# ------------------------------------------------------------ prove: integers
+
+test "2x = 1 and 3x + 6y = 2 have no integer solution":
+    assert pr(" | false | (eq -1 0:2)")
+    assert pr(" | false | (eq -2 0:3 1:6)")
+
+test "2x + 4y = 6 has integer solutions":
+    assert not pr(" | false | (eq -6 0:2 1:4)")
+
+test "2x + 4y = 6 implies x + 2y = 3":
+    assert pr(" | (eq -3 0:1 1:2) | (eq -6 0:2 1:4)")
+
+test "tightening: 2x >= 1 and 2x <= 1":
+    assert pr(" | false | (ge -1 0:2) | (ge 1 0:-2)")
+
+test "tightening: 1 <= 3x <= 2 is empty, 1 <= 3x <= 3 is not":
+    assert pr(" | false | (ge -1 0:3) | (ge 2 0:-3)")
+    assert not pr(" | false | (ge -1 0:3) | (ge 3 0:-3)")
+
+test "tightening: 2x + 2y >= 1 and x + y <= 0":
+    assert pr(" | false | (ge -1 0:2 1:2) | (ge 0 0:-1 1:-1)")
+
+test "tightening after elimination: y = 1/2 has no integer solution":
+    # x + 2y >= 1, x <= 0, 2y <= 1: rationally y = 1/2, x = 0
+    assert pr(" | false | (ge -1 0:1 1:2) | (ge 0 0:-1) | (ge 1 1:-2)")
+
+test "transitive chain x <= y <= z <= 5":
+    assert pr(" | (ge 5 0:-1) | (ge 0 0:-1 1:1) | (ge 0 1:-1 2:1) | (ge 5 2:-1)")
+    assert not pr(" | (ge 4 0:-1) | (ge 0 0:-1 1:1) | (ge 0 1:-1 2:1) | (ge 5 2:-1)")
+
+test "equality chain x = y + 1, y = z + 1, z = 0":
+    assert pr(" | (eq -2 0:1) | (eq -1 0:1 1:-1) | (eq -1 1:1 2:-1) | (eq 0 2:1)")
+    assert not pr(" | (eq -1 0:1) | (eq -1 0:1 1:-1) | (eq -1 1:1 2:-1) | (eq 0 2:1)")
+
+test "equality without a unit coefficient: 2x = 3y, 0 <= x <= 2":
+    assert pr(" | (ne -1 0:1) | (eq 0 0:2 1:-3) | (ge 0 0:1) | (ge 2 0:-1)")
+    assert not pr(" | (ne 0 0:1) | (eq 0 0:2 1:-3) | (ge 0 0:1) | (ge 3 0:-1)")
+
+# ------------------------------------------------------------ prove: case splits
+
+test "contradiction only after a split":
+    # x = 0 and (x >= 1 or x <= -1)
+    assert pr(" | false | (eq 0 0:1) | (or (ge -1 0:1) (ge -1 0:-1))")
+    assert not pr(" | false | (eq 0 0:1) | (or (ge -1 0:1) (ge 0 0:-1))")
+
+test "x != 0 with 0 <= x <= 0":
+    assert pr(" | false | (ne 0 0:1) | (ge 0 0:1) | (ge 0 0:-1)")
+
+test "x != 0, x != 1 with 0 <= x <= 1 and 0 <= x <= 2":
+    assert pr(" | false | (ne 0 0:1) | (ne -1 0:1) | (ge 0 0:1) | (ge 1 0:-1)")
+    assert not pr(" | false | (ne 0 0:1) | (ne -1 0:1) | (ge 0 0:1) | (ge 2 0:-1)")
+
+test "nested disjunctions inside conjunctions":
+    # (x >= 3 and (y >= 1 or y <= -1)) or x <= -3  ⇒  x != 0
+    let q = " | (ne 0 0:1) | (or (and (ge -3 0:1) (or (ge -1 1:1) (ge -1 1:-1))) (ge -3 0:-1))"
+    assert pr(q)
+    assert not pr(
+        " | (ne 0 1:1) | (or (and (ge -3 0:1) (or (ge -1 1:1) (ge 0 1:-1))) (ge -3 0:-1))"
+    )
+
+test "goal a disjunction: x >= 0 or x <= -1 always holds":
+    assert pr(" | (or (ge 0 0:1) (ge -1 0:-1))")
+    assert not pr(" | (or (ge 0 0:1) (ge -2 0:-1))")
+
+test "goal with not":
+    # ¬(x >= 1 and y >= 1) from x <= 0
+    assert pr(" | (not (and (ge -1 0:1) (ge -1 1:1))) | (ge 0 0:-1)")
+
+test "the search budget counts contradictory cases too":
+    # 3 * 2^8 contradictory cases fit in MAX_NODES; 3 * 2^12 don't
+    assert pr(deep_split(8))
+    assert not pr(deep_split(12))
+
+# ------------------------------------------------------------ prove: booleans
+
+test "boolean contradiction":
+    assert pr(" | false | (b 0 1) | (b 0 0)")
+    assert not pr(" | false | (b 0 1) | (b 1 0)")
+
+test "boolean modus ponens":
+    assert pr(" | (b 1 1) | (or (b 0 0) (b 1 1)) | (b 0 1)")
+    assert not pr(" | (b 1 1) | (or (b 0 0) (b 1 1))")
+
+test "booleans and integers mixed":
+    assert pr(" | (ge -5 1:1) | (or (b 0 0) (ge -5 1:1)) | (b 0 1)")
+    assert pr(" | (b 0 0) | (or (b 0 0) (ge -5 1:1)) | (ge 0 1:-1)")
+
+# ------------------------------------------------------------ prove: ranges
+
+test "ranges give bounds":
+    assert pr("0:0:10 | (ge 0 0:1)")
+    assert pr("0:0:10 | (ge 10 0:-1)")
+    assert not pr("0:0:10 | (ge 9 0:-1)")
+    assert not pr("1:0:10 | (ge 0 0:1)")
+
+test "ranges with an atom-free goal":
+    assert pr("0:0:1 | false | (ne 0 0:1) | (ne -1 0:1)")
+    assert not pr("0:0:2 | false | (ne 0 0:1) | (ne -1 0:1)")
+
+test "range bounds at the edge of i128 are left out":
+    # x >= -(2^127 - 1): needs the lower bound
+    assert not pr(
+        "0:-170141183460469231731687303715884105728:170141183460469231731687303715884105727 | (ge 170141183460469231731687303715884105727 0:1)"
+    )
+    assert pr(
+        "0:-170141183460469231731687303715884105727:170141183460469231731687303715884105727 | (ge 170141183460469231731687303715884105727 0:1)"
+    )
+    # x <= 2^127 - 2: needs the upper bound
+    assert not pr(
+        "0:0:170141183460469231731687303715884105727 | (ge 170141183460469231731687303715884105726 0:-1)"
+    )
+    assert pr(
+        "0:0:170141183460469231731687303715884105726 | (ge 170141183460469231731687303715884105726 0:-1)"
+    )
+
+test "range bounds passed as a list":
+    var r: [Option[(i128, i128)]] = [None, Some((2, 5))]
+    assert prove_([], F.ge(ok(y().add_c(-2))), r)
+    assert not prove_([], F.ge(ok(y().add_c(-3))), r)
+    assert not prove_([], F.ge(x()), r)
+    r[0] = Some((0, 0))
+    assert prove_([], F.eq(x()), r)
+
+# ------------------------------------------------------------ prove: facts
+
+test "a false fact proves anything":
+    assert pr(" | (ge -5 0:1) | false")
+    assert pr(" | (b 3 1) | (ge 0 0:1) | false")
+
+test "the goal true":
+    assert pr(" | true")
+    assert not pr(" | false")
+
+test "an atom-free raw fact is never used":
+    assert not pr(" | false | (ge -1)")
+    # the smart constructor turns it into `false`
+    assert prove_([F.ge(Lin.konst(-1))], F.False, none())
+
+test "contradictory facts unrelated to the goal are ignored":
+    assert not pr(" | (ge 0 0:1) | (ge -1 1:1) | (ge 0 1:-1)")
+    # ...unless they are linked through another fact
+    assert pr(" | (ge 0 0:1) | (ge -1 1:1) | (ge 0 1:-1) | (ge 0 0:1 1:1)")
+
+test "an unknown goal is never proven, even from false":
+    assert not pr(" | (ge -170141183460469231731687303715884105728 0:1) | false")
+    assert not prove_([F.False], F.B(ATOM_UNKNOWN, true), none())
+    # ...but an unknown part of a goal that is true anyway disappears
+    assert prove_([], F.Or([F.B(ATOM_UNKNOWN, false), F.True]), none())
+
+test "unknown parts of facts are dropped":
+    assert pr(" | (ge 0 0:1) | (b 4294967295 1) | (ge -1 0:1)")
+    # the known part of a fact is still used
+    assert pr(" | (ge -1 0:1) | (and (ge -1 0:1) (b 4294967295 1))")
+    assert not pr(" | (ge -1 0:1) | (or (ge -1 0:1) (b 4294967295 1))")
+    # an unknown fact never contradicts anything
+    assert not pr(" | false | (b 4294967295 1) | (b 4294967295 0)")
+
+# ------------------------------------------------------------ prove: overflow
+
+test "overflow expanding x != c gives don't know":
+    let base = " | false | (ge -1 0:1) | (ge 0 0:-1)"
+    assert pr(base)
+    assert not pr(base + " | (ne -170141183460469231731687303715884105728 0:1)")
+    assert not pr(base + " | (ne 0 0:-170141183460469231731687303715884105728)")
+    # c = MIN + 1 is fine: x + MIN + 1 - 1 doesn't overflow, nor does its negation
+    assert pr(base + " | (ne -170141183460469231731687303715884105727 0:1)")
+
+test "overflow in a Fourier–Motzkin combination gives don't know":
+    # P·x + y >= 1 and -P·x - y >= 0 is a contradiction (add them), but
+    # eliminating x first multiplies by P = 2^100 and overflows
+    assert not pr(
+        " | false | (ge -1 0:1267650600228229401496703205376 1:1) | (ge 0 0:-1267650600228229401496703205376 1:-1)"
+    )
+    # with the atoms swapped, x (coefficient 1) is eliminated first
+    assert pr(
+        " | false | (ge -1 0:1 1:1267650600228229401496703205376) | (ge 0 0:-1 1:-1267650600228229401496703205376)"
+    )
+
+test "overflow substituting an equality gives don't know":
+    # x = P·y, y = 0, P·x >= 1 is a contradiction, but substituting overflows
+    assert not pr(
+        " | false | (eq 0 0:1 1:-1267650600228229401496703205376) | (ge -1 0:1267650600228229401496703205376) | (ge 0 1:-1) | (ge 0 1:1)"
+    )
+    assert pr(" | false | (eq 0 0:1 1:-2) | (ge -1 0:2) | (ge 0 1:-1) | (ge 0 1:1)")
+
+test "split order decides whether an overflowing case is reached":
+    let ovf2 = "(or (ne -170141183460469231731687303715884105728 1:1) (ne -170141183460469231731687303715884105728 1:1))"
+    let ovf3 = "(or (ne -170141183460469231731687303715884105728 1:1) (ne -170141183460469231731687303715884105728 1:1) (ne -170141183460469231731687303715884105728 1:1))"
+    let two = "(or (ge -1 0:1) (ge -1 0:-1))"
+    let three = "(or (ge -1 0:1) (ge -1 0:-1) (ge -2 0:1))"
+    # the shorter disjunction is split first; its cases are all contradictory,
+    # so the overflowing one is never looked at
+    assert pr(" | false | (eq 0 0:1) | " + two + " | " + ovf3)
+    assert not pr(" | false | (eq 0 0:1) | " + three + " | " + ovf2)
+    # equal lengths: which one goes first depends on the order of the facts
+    assert pr(" | false | (eq 0 0:1) | " + two + " | " + ovf2)
+    assert not pr(" | false | (eq 0 0:1) | " + ovf2 + " | " + two)
+
+# ------------------------------------------------------------ prove: budgets
+
+test "a dense satisfiable system runs out of constraints":
+    assert not pr(" | false" + dense(4, ks6(), 100))
+
+test "a contradiction lost to the constraint budget":
+    assert pr(" | false | (ge -1 0:1) | (ge 0 0:-1)")
+    assert not pr(" | false" + dense(4, ks6(), 100) + " | (ge -1 0:1) | (ge 0 0:-1)")
+
+test "a small dense contradiction is proven":
+    assert pr(" | false" + dense(3, [-1, 1], -1))
+
+test "the relevance filter keeps a dense system out":
+    assert pr(" | (ge 0 9:1) | (ge -1 9:1)" + dense(4, ks6(), 100))

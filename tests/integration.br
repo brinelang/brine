@@ -1,0 +1,613 @@
+# End-to-end tests: real programs through the `brine` binary.
+#
+#   brine test tests/integration.br            from the repository root
+#
+# `$BRINE` (set by `brine test`) is the compiler under test. Needs a C compiler,
+# like `brine` itself. Scratch files go to target/it/.
+
+struct Out:
+    code: int
+    out: str
+    err: str
+
+    fn all(self) -> str:
+        return self.out + self.err
+
+fn brine_exe() -> str:
+    match getenv("BRINE"):
+        case Some(b):
+            return b
+        case None:
+            return "brine"
+
+fn exec(cmd: [str], env: {str: str}) -> Out:
+    var e = env
+    e["NO_COLOR"] = "1"
+    var h = 0
+    match os.spawn(cmd, e, true, false):
+        case Ok(p):
+            h = p
+        case Err(msg):
+            panic(f"cannot run {cmd[0]}: {msg}")
+    let code = os.wait(h)
+    let (o, er) = os.output(h)
+    return Out(code=code, out=o.replace("\r\n", "\n"), err=er.replace("\r\n", "\n"))
+
+fn brine_env(args: [str], env: {str: str}) -> Out:
+    var cmd = [brine_exe()]
+    cmd.extend(args)
+    return exec(cmd, env)
+
+fn brine(args: [str]) -> Out:
+    return brine_env(args, {})
+
+fn text(path: str) -> str:
+    match read_file(path):
+        case Ok(t):
+            return t.replace("\r\n", "\n")
+        case Err(e):
+            panic(e)
+
+# The `.out` file next to a program (or a project directory).
+fn expected(file: str) -> str:
+    let base = file[:len(file) - 3] if file.ends_with(".br") else file
+    return text(base + ".out")
+
+# Run `file` and compare its output; also checks that nothing leaked.
+fn run_ok(file: str, want: str, extra: [str]):
+    run_with(file, want, extra, {})
+
+# The same with extra environment variables (`BRINE_BACKEND`).
+fn run_with(file: str, want: str, extra: [str], env: {str: str}):
+    var args = ["run", file, "-q"]
+    args.extend(extra)
+    var e = env
+    e["BRINE_LEAKCHECK"] = "1"
+    let o = brine_env(args, e)
+    assert o.code == 0, f"{file} failed:\n{o.all()}"
+    assert o.out == want, f"unexpected output from {file}:\n{o.out}\nwanted:\n{want}"
+    if "--ranks" not in extra:
+        assert "brine: 0 live objects at exit" in o.err, f"{file} leaked memory:\n{o.err}"
+
+fn field(line: str, key: str) -> str:
+    let pat = "\"" + key + "\":"
+    match line.find(pat):
+        case Some(i):
+            var rest = line[i + len(pat):]
+            if rest.starts_with("\""):
+                rest = rest[1:]
+            var out = ""
+            for c in rest.chars():
+                if c == "," or c == "\"" or c == "}":
+                    break
+                out += c
+            return out
+        case None:
+            return ""
+
+# `code@line` for every error `brine check` reports.
+fn error_codes(file: str) -> [str]:
+    let o = brine(["check", file, "--json"])
+    assert o.code != 0, f"{file} has no errors"
+    var out: [str] = []
+    for l in o.out.lines():
+        if "\"severity\":\"error\"" in l:
+            out.push(field(l, "code") + "@" + field(l, "line"))
+    return out
+
+fn scratch(name: str) -> str:
+    let d = f"target/it/{name}-{os.pid()}"
+    match os.make_dir(d):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+    return d
+
+fn write(path: str, t: str):
+    match write_file(path, t):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+
+fn exe(path: str) -> str:
+    return path + ".exe" if os.name() == "windows" else path
+
+# ------------------------------------------------------------ programs
+
+test "examples run":
+    run_ok("examples/hello.br", "Hello, world!\n", [])
+    run_ok("examples/contracts.br", "10 0\n3 -1\n2.5 11\n", [])
+    run_ok(
+        "examples/shapes",
+        "Point(x=3.0, y=4.0) 5.0\n[6.0, 2.25] 8.25\nbig circle 3.14159\nShape.Square(side=2.0) 4.0\ndot\n",
+        []
+    )
+    run_ok(
+        "examples/parallel.br",
+        "average steps: 131.43, longest: 524\n[0.0, 1.0, 1.4142135623730951, 1.7320508075688772, 2.0, 2.23606797749979, 2.449489742783178, 2.6457513110645907]\n111 118\n",
+        []
+    )
+
+test "world programs run on several processes":
+    run_ok(
+        "examples/world.br",
+        "1 ranks, total = 499999500000, squares = [0]\nafter one lap: token->0\nrank 0 received [[0, 0]]\n",
+        []
+    )
+    run_ok(
+        "examples/world.br",
+        "4 ranks, total = 499999500000, squares = [0, 1, 4, 9]\nafter one lap: token->0->1->2->3\nrank 3 received [[0, 3], [1, 3], [2, 3], [3, 3]]\n",
+        ["--ranks", "4"]
+    )
+    run_ok(
+        "tests/programs/world_solver.br",
+        "converged after 22 iterations true\n",
+        ["--ranks", "3"]
+    )
+
+fn features() -> [str]:
+    return [
+        "tests/programs/features.br",
+        "tests/programs/ownership.br",
+        "tests/programs/proofs.br",
+        "tests/programs/division.br",
+        "tests/programs/references.br",
+        "tests/programs/enums.br",
+        "tests/programs/maps.br",
+        "tests/programs/strings.br",
+        "tests/programs/aliasing.br",
+        "tests/programs/try.br",
+        "tests/programs/wildcards.br",
+        "tests/programs/keyword_fields.br",
+        "tests/programs/generic_methods.br",
+        "tests/programs/int128.br",
+        "tests/programs/loop_types.br",
+        "tests/programs/os.br",
+        "tests/programs/embed.br",
+        "tests/programs/unpacking.br",
+        "tests/programs/loop_arrays.br",
+        "tests/programs/reductions.br",
+        "tests/programs/gpu.br"
+    ]
+
+test "language features":
+    for f in features():
+        run_ok(f, expected(f), [])
+
+# Dev builds are native where there is a native backend: the C backend gets
+# the same programs.
+test "language features through C":
+    for f in features():
+        run_with(f, expected(f), [], {"BRINE_BACKEND": "c"})
+    run_with(
+        "examples/parallel.br",
+        "average steps: 131.43, longest: 524\n[0.0, 1.0, 1.4142135623730951, 1.7320508075688772, 2.0, 2.23606797749979, 2.449489742783178, 2.6457513110645907]\n111 118\n",
+        [],
+        {"BRINE_BACKEND": "c"}
+    )
+
+# Debug builds compile without optimizations (each value in its stack slot,
+# for the debugger), so they get the programs too.
+test "language features in debug builds":
+    for f in features():
+        run_ok(f, expected(f), ["--debug"])
+
+fn gdb_ok(args: [str]) -> bool:
+    var cmd = ["gdb", "-nx", "-batch"]
+    cmd.extend(args)
+    match os.spawn(cmd, {}, true, false):
+        case Ok(p):
+            return os.wait(p) == 0
+        case Err(_):
+            return false
+
+# A debug build under gdb: brine files, lines, function names and values.
+# Passes without checking anything where gdb isn't installed.
+test "gdb debugs brine source":
+    if not gdb_ok(["--version"]):
+        return
+    let d = scratch("gdb")
+    let x = exe(d + "/debuggee")
+    let b = brine(["build", "--debug", "tests/programs/debuggee.br", "-q", "-o", x])
+    assert b.code == 0, b.all()
+    # the pretty-printers need a gdb built with Python
+    let py = gdb_ok(["-ex", "python import gdb"])
+    var cmd = ["gdb", "-nx", "-batch"]
+    if py:
+        cmd.extend(["-x", "runtime/brine_gdb.py"])
+    for c in [
+        "break debuggee.br:15",
+        "run",
+        "bt",
+        "info locals",
+        "print name",
+        "step",
+        "bt",
+        "next",
+        "info locals",
+        "finish",
+        "next"
+    ]:
+        cmd.extend(["-ex", c])
+    cmd.push(x)
+    let o = exec(cmd, {})
+    # elsewhere debug builds go through C: gdb sees the C names and values, so
+    # only the brine lines are checked
+    let native = os.name() == "linux" and (os.arch() == "x86_64" or os.arch() == "aarch64")
+    if not (native or (os.name() == "windows" and os.arch() == "x86_64")):
+        for w in ["debuggee.br, line 15.", "debuggee.br:15\n15\t    let a = area(p)\n"]:
+            assert w in o.out, f"gdb's output lacks {w}:\n{o.all()}"
+        return
+    var want = [
+        "debuggee.br, line 15.",
+        "#0  main () at ",
+        "debuggee.br:15\n15\t    let a = area(p)\n",
+        "p = {x = 3, y = 4}",
+        "area (p=...) at ",
+        "debuggee.br:7\n7\t    let a = p.x * p.y\n",
+        "#1  0x",
+        "\n8\t    return a\na = 12\n",
+        "Value returned is $2 = 12",
+        "\n16\t    print("
+    ]
+    if py:
+        want.extend(["name = \"brine\"", "xs = [1, 2, 3]", "o = Some(7)", "$1 = \"brine\""])
+    for w in want:
+        assert w in o.out, f"gdb's output lacks {w}:\n{o.all()}"
+
+test "imports and generics":
+    run_ok("tests/programs/imports", expected("tests/programs/imports"), [])
+    assert error_codes("tests/programs/imports/bad.br") == ["E0201@1", "E0202@1"]
+    run_ok("tests/programs/generics", expected("tests/programs/generics"), [])
+
+test "parallel results don't depend on the thread count":
+    var runs: [str] = []
+    for t in ["1", "3", "8"]:
+        let o = brine(["run", "tests/programs/parallel_det.br", "-q", "--threads", t])
+        assert o.code == 0, o.err
+        runs.push(o.out)
+        let r = brine(["run", "tests/programs/reductions.br", "-q", "--threads", t])
+        assert r.out == expected("tests/programs/reductions.br"), r.all()
+    assert runs[0] == runs[1] and runs[0] == runs[2]
+
+# GPU offload (brine_rt.c, "GPU"). BRINE_GPU=on runs every construct that can
+# run on a GPU there; without a usable GPU everything runs on the CPU, so the
+# output checks still apply and only the GPU-only ones are skipped.
+fn gpu_ready(err: str) -> bool:
+    return "brine gpu: " in err and " ready in " in err
+
+fn without_gpu_log(err: str) -> str:
+    var out = ""
+    for l in err.lines():
+        if not l.starts_with("brine gpu: "):
+            out += l + "\n"
+    return out
+
+test "par constructs give the same results on a GPU":
+    let f = "tests/programs/gpu.br"
+    for backend in ["native", "c"]:
+        let o = brine_env(
+            ["run", f, "-q"],
+            {"BRINE_GPU": "on", "BRINE_GPU_LOG": "1", "BRINE_BACKEND": backend}
+        )
+        assert o.code == 0, o.all()
+        assert o.out == expected(f), f"{backend}: unexpected output on the GPU:\n{o.out}"
+        # what can run on a GPU is decided when compiling: the same with or without one
+        # (Apple GPUs, through Metal, have no f64)
+        let metal = os.name() == "macos"
+        var cpu: [str] = []
+        var gpu = 0
+        let mine = "brine gpu: tests/programs/gpu.br:"
+        for l in o.err.lines():
+            # (the compiler's own constructs are logged too)
+            if not l.starts_with(mine):
+                continue
+            if "not GPU-eligible" in l:
+                if not (metal and "uses f64" in l):
+                    cpu.push(l[len(mine):].split(":")[0])
+            elif " -> gpu " in l:
+                gpu += 1
+        assert cpu == (["109", "113"] if metal else ["109", "111", "113"]), o.err
+        if gpu_ready(o.err):
+            assert gpu == (23 if metal else 50), o.err
+
+test "a check that fails on a GPU panics as on the CPU":
+    let f = "tests/programs/gpu_panic.br"
+    for which, msg in [
+        ("index", "index 100000 is out of bounds for an array of length 100000"),
+        ("assert", "assertion failed: x != 77_777"),
+        ("div", "division by zero"),
+        ("overflow", "integer overflow in multiplication"),
+        ("combine", "integer overflow in addition"),
+        ("convert", "float to integer conversion out of range (or NaN) for i32"),
+        ("shift", "shift amount out of range")
+    ]:
+        let off = brine_env(["run", f, "-q", "--", which], {"BRINE_GPU": "off"})
+        let on = brine_env(["run", f, "-q", "--", which], {"BRINE_GPU": "on", "BRINE_GPU_LOG": "1"})
+        assert off.code == 101 and msg in off.err, f"{which}: {off.all()}"
+        assert on.code == 101 and without_gpu_log(on.err) == off.err, f"{which}: {on.all()}"
+        if gpu_ready(on.err):
+            assert "a check failed on the GPU, running it on the CPU" in on.err, on.err
+
+test "panics are clear":
+    for f, msg in [
+        ("tests/programs/panic_assert.br", "x was 5"),
+        ("tests/programs/panic_index.br", "index 7 is out of bounds"),
+        ("tests/programs/panic_overflow.br", "overflow"),
+        ("tests/programs/panic_overflow128.br", "overflow in addition"),
+        ("tests/programs/panic_slice.br", "slice [1:8] is out of bounds")
+    ]:
+        let o = brine(["run", f, "-q"])
+        assert o.code == 101, f"{f}: exit {o.code}\n{o.err}"
+        assert msg in o.err, f"{f}: expected `{msg}` in:\n{o.err}"
+        assert f"--> {f}:" in o.err, f"{f}: no location in:\n{o.err}"
+
+test "main can return a Result":
+    let d = scratch("main")
+    write(
+        d + "/ok.br",
+        "fn main() -> Result[(), str]:\n    print(int(\"2\") + 1)\n    return Ok(())\n"
+    )
+    let o = brine(["run", d + "/ok.br", "-q"])
+    assert o.code == 0 and o.out == "3\n", o.all()
+    write(
+        d + "/bad.br",
+        "fn main() -> Result[(), str]:\n    let t = read_file(\"no/such/file.txt\")?\n    print(t)\n    return Ok(())\n"
+    )
+    let o2 = brine(["run", d + "/bad.br", "-q"])
+    assert o2.code == 1, o2.all()
+    assert "error: cannot read no/such/file.txt" in o2.err, o2.err
+    write(d + "/sig.br", "fn main(n: int) -> str:\n    return \"x\"\n")
+    let o3 = brine(["run", d + "/sig.br", "-q"])
+    assert "error[E0706]" in o3.err, o3.err
+
+# ------------------------------------------------------------ errors
+
+test "deadlocks are rejected":
+    assert error_codes(
+        "tests/programs/deadlock_errors.br"
+    ) == ["E0510@17", "E0510@21", "E0511@24", "E0511@26", "E0510@30", "E0510@34", "E0511@35", "E0510@38"]
+
+test "match errors":
+    let want = [
+        "E0320@11",
+        "E0320@18",
+        "E0320@25",
+        "E0302@33",
+        "E0201@35",
+        "E0201@37",
+        "E0302@39",
+        "E0302@45",
+        "E0302@46",
+        "E0206@47",
+        "E0302@48",
+        "E0205@48",
+        "E0205@49",
+        "E0301@51"
+    ]
+    assert error_codes("tests/programs/match_errors.br") == want
+
+test "generic errors":
+    let want = [
+        "E0305@15",
+        "E0332@18",
+        "E0334@19",
+        "E0334@20",
+        "E0332@20",
+        "E0332@21",
+        "E0334@22",
+        "E0332@23",
+        "E0334@24",
+        "E0301@26",
+        "E0301@27",
+        "E0320@28",
+        "E0206@31",
+        "E0201@32"
+    ]
+    assert error_codes("tests/programs/generic_errors.br") == want
+    assert error_codes(
+        "tests/programs/generic_method_errors.br"
+    ) == ["E0331@16", "E0334@21", "E0332@22", "E0334@23", "E0206@24", "E0334@26", "E0206@27"]
+
+test "typed projects require types":
+    assert error_codes(
+        "tests/programs/typed"
+    ) == ["E0337@6", "E0337@7", "E0337@12", "E0337@14", "E0337@16", "E0337@17", "E0337@23"]
+    # the same file is fine without `typed = true`, and a fully typed file passes `--typed`
+    let o = brine(["check", "tests/programs/typed/src/main.br"])
+    assert o.code == 0, o.err
+    let o2 = brine(["check", "--typed", "tests/programs/loop_types.br"])
+    assert o2.code == 0, o2.err
+
+test "map, string, try and alias errors":
+    let maps = [
+        "E0308@2",
+        "E0335@3",
+        "E0336@4",
+        "E0301@5",
+        "E0401@7",
+        "E0301@8",
+        "E0206@9",
+        "E0301@10",
+        "E0501@13",
+        "E0301@14",
+        "E0301@15",
+        "E0335@16"
+    ]
+    assert error_codes("tests/programs/map_errors.br") == maps
+    assert error_codes(
+        "tests/programs/string_errors.br"
+    ) == ["E0404@3", "E0304@4", "E0405@6", "E0305@8", "E0206@9", "E0301@10", "E0503@13", "E0301@14", "E0301@15", "E0302@16"]
+    assert error_codes(
+        "tests/programs/try_errors.br"
+    ) == ["E0341@5", "E0341@8", "E0340@12", "E0341@13", "E0342@13"]
+    assert error_codes(
+        "tests/programs/alias_errors.br"
+    ) == ["E0405@9", "E0405@10", "E0405@11", "E0405@12"]
+
+test "os and embed errors":
+    assert error_codes(
+        "tests/programs/os_errors.br"
+    ) == ["E0503@4", "E0503@5", "E0206@7", "E0310@8", "E0302@9", "E0301@9"]
+    # `os` results (except `os.name()`/`os.arch()`) differ between ranks
+    assert error_codes("tests/programs/os_deadlock_errors.br") == ["E0510@5", "E0510@6"]
+    assert error_codes(
+        "tests/programs/embed_errors.br"
+    ) == ["E0707@3", "E0707@4", "E0707@5", "E0707@6", "E0302@7"]
+
+test "proof errors":
+    assert error_codes(
+        "tests/programs/proof_errors.br"
+    ) == ["E0602@6", "E0603@15", "E0604@15", "E0601@20", "E0601@22", "E0605@24"]
+
+test "proofs remove runtime checks":
+    for f in ["examples/contracts.br", "examples/find_signal.br"]:
+        let o = brine(["check", f, "--report"])
+        assert o.code == 0, o.all()
+        assert "0 remain" in o.all(), o.all()
+
+test "every error code is explained":
+    for code in [
+        "E0101",
+        "E0305",
+        "E0320",
+        "E0331",
+        "E0332",
+        "E0333",
+        "E0334",
+        "E0335",
+        "E0336",
+        "E0340",
+        "E0341",
+        "E0342",
+        "E0501",
+        "E0601",
+        "E0606",
+        "E0702",
+        "E0706",
+        "E0707",
+        "W0002"
+    ]:
+        let o = brine(["explain", code])
+        assert o.code == 0, f"no explanation for {code}"
+        assert o.out.starts_with(code), o.out
+
+# ------------------------------------------------------------ tools
+
+test "the test command":
+    let o = brine(["test", "examples/contracts.br"])
+    assert o.code == 0, o.all()
+    assert "2 passed; 0 failed" in o.all(), o.all()
+    let s = brine(["test", "examples/find_signal.br"])
+    assert s.code == 0, s.all()
+    assert "1 passed; 0 failed" in s.all(), s.all()
+
+test "the formatter is stable":
+    var files: [str] = []
+    for dir in [
+        "examples",
+        "examples/shapes",
+        "tests",
+        "tests/programs",
+        "tests/programs/generics",
+        "tests/programs/imports",
+        "tests/programs/imports/shapes",
+        "tests/programs/typed/src",
+        "runtime",
+        "compiler"
+    ]:
+        match os.list_dir(dir):
+            case Ok(names):
+                for n in names:
+                    if n.ends_with(".br"):
+                        files.push(dir + "/" + n)
+            case Err(e):
+                panic(e)
+    var args = ["fmt", "--check"]
+    args.extend(files)
+    let o = brine(args)
+    assert o.code == 0, o.all()
+
+test "a new project works out of the box":
+    let d = scratch("new")
+    match os.set_cwd(d):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+    assert brine(["new", "app"]).code == 0
+    for f in ["brine.toml", "src/main.br", "AGENTS.md", ".gitignore"]:
+        assert file_exists("app/" + f), f"missing {f}"
+    match os.set_cwd("app"):
+        case Ok(_):
+            pass
+        case Err(e2):
+            panic(e2)
+    let o = brine(["run", "-q"])
+    assert o.out == "Hello, brine!\n[0, 1, 4, 9, 16, 25, 36, 49, 64, 81]\n", o.all()
+    assert brine(["test"]).code == 0
+    assert brine(["check"]).code == 0
+    assert brine(["fmt", "--check"]).code == 0
+
+# Each tests/syntax/NAME.br has NAME.lex and NAME.parse: the expected `brine lex`
+# and `brine parse` output (regenerate with `brine run tests/update_syntax.br`).
+test "lexer and parser output":
+    var names: [str] = []
+    match os.list_dir("tests/syntax"):
+        case Ok(ns):
+            names = ns
+        case Err(e):
+            panic(e)
+    var n = 0
+    for name in names:
+        if not name.ends_with(".br"):
+            continue
+        let f = "tests/syntax/" + name
+        let base = f[:len(f) - 3]
+        let lx = brine(["lex", f])
+        assert lx.code == 0, lx.err
+        assert lx.out == text(base + ".lex"), f"`brine lex {f}` changed"
+        let ps = brine(["parse", f])
+        assert ps.code == 0, ps.err
+        assert ps.out == text(base + ".parse"), f"`brine parse {f}` changed"
+        n += 1
+    assert n > 20
+
+test "the compiler's own unit tests":
+    for f in ["compiler/dev_solver.br", "compiler/dev_diag.br"]:
+        let o = brine(["test", f])
+        assert o.code == 0, o.all()
+    # the native backend's checks are a program: it compiles IR by hand,
+    # links it and compares what it prints (on the hosts it targets)
+    if os.arch() == "x86_64" and os.name() != "macos":
+        let o = brine(["run", "compiler/dev_native.br", "-q"])
+        assert o.code == 0, o.all()
+        assert "0 wrong" in o.out, o.all()
+
+# The compiler builds itself, and that build generates the same C again (a fixed point).
+test "the compiler builds itself":
+    let d = scratch("self")
+    let s1 = exe(d + "/stage1")
+    let s2 = exe(d + "/stage2")
+    let o = brine(["build", "compiler/main.br", "-q", "-o", s1])
+    assert o.code == 0, o.all()
+    let o2 = exec([s1, "build", "compiler/main.br", "-q", "-o", s2], {})
+    assert o2.code == 0, o2.all()
+    let o3 = exec([s1, "emit-c", "compiler/main.br", "-o", d + "/stage1.c"], {})
+    assert o3.code == 0, o3.all()
+    let o4 = exec([s2, "emit-c", "compiler/main.br", "-o", d + "/stage2.c"], {})
+    assert o4.code == 0, o4.all()
+    assert text(
+        d + "/stage1.c"
+    ) == text(d + "/stage2.c"), "the self-built compiler generates different C"
+    # a compiler built by the other backend (C, where dev builds are native) agrees
+    let s3 = exe(d + "/stage3")
+    let o5 = brine_env(["build", "compiler/main.br", "-q", "-o", s3], {"BRINE_BACKEND": "c"})
+    assert o5.code == 0, o5.all()
+    let o6 = exec([s3, "emit-c", "compiler/main.br", "-o", d + "/stage3.c"], {})
+    assert o6.code == 0, o6.all()
+    assert text(
+        d + "/stage1.c"
+    ) == text(d + "/stage3.c"), "the compilers built by the two backends disagree"

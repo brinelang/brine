@@ -1,0 +1,786 @@
+# A small, sound decision procedure for linear integer arithmetic with
+# booleans: case splitting over disjunctions plus Fourier–Motzkin elimination
+# with integer tightening.
+#
+# `prove` answers "definitely true" or "don't know". It never answers true
+# for a false claim. All arithmetic is overflow-checked; on overflow or when
+# a budget is exhausted the answer is "don't know".
+#
+# Atoms are `int`s. ATOM_UNKNOWN marks a formula that couldn't be built: it is
+# never proven, and as part of a fact it is replaced by `true`.
+
+const I128_MAX: i128 = 170141183460469231731687303715884105727
+const I128_MIN: i128 = -170141183460469231731687303715884105727 - 1
+const I64_BOUND: i128 = 9223372036854775807
+const ATOM_UNKNOWN = 4294967295
+const MAX_NODES = 4096
+const MAX_CONSTRAINTS = 3000
+
+# ------------------------------------------------------------ i128 arithmetic
+# Checked operations: None instead of overflowing.
+
+fn add_i128(a: i128, b: i128) -> Option[i128]:
+    if b > 0 and a > I128_MAX - b:
+        return None
+    if b < 0 and a < I128_MIN - b:
+        return None
+    return Some(a + b)
+
+fn neg_i128(a: i128) -> Option[i128]:
+    if a == I128_MIN:
+        return None
+    return Some(-a)
+
+# |a| as a u128 (|i128::MIN| = 2^127 fits).
+fn mag_u128(a: i128) -> u128:
+    if a == I128_MIN:
+        return u128(I128_MAX) + 1
+    if a < 0:
+        return u128(-a)
+    return u128(a)
+
+fn mul_i128(a: i128, b: i128) -> Option[i128]:
+    if a == 0 or b == 0:
+        return Some(0)
+    # fast path: |a|, |b| < 2^63, so |a·b| < 2^126
+    if -I64_BOUND <= a <= I64_BOUND and -I64_BOUND <= b <= I64_BOUND:
+        return Some(a * b)
+    let ma = mag_u128(a)
+    let mb = mag_u128(b)
+    let umax: u128 = u128(I128_MAX) * 2 + 1
+    if ma > umax / mb:
+        return None
+    let p = ma * mb
+    if (a < 0) == (b < 0):
+        if p > u128(I128_MAX):
+            return None
+        return Some(i128(p))
+    if p > u128(I128_MAX) + 1:
+        return None
+    if p == u128(I128_MAX) + 1:
+        return Some(I128_MIN)
+    return Some(-i128(p))
+
+# Wrapping operations.
+fn wrapping_abs(a: i128) -> i128:
+    if a == I128_MIN:
+        return a
+    return abs(a)
+
+fn wrapping_neg(a: i128) -> i128:
+    if a == I128_MIN:
+        return a
+    return -a
+
+# Division rounding toward zero (C's and Rust's `/`); i128::MIN / -1 panics.
+fn div_trunc(a: i128, b: i128) -> i128:
+    if a >= 0 and b > 0:
+        return a / b
+    if b == 0:
+        panic("attempt to divide by zero")
+    if a == I128_MIN and b == -1:
+        panic("attempt to divide with overflow")
+    var q = a / b
+    if a % b != 0 and (a < 0) != (b < 0):
+        q += 1
+    return q
+
+# The remainder of `div_trunc`: takes the sign of the left side; i128::MIN % -1 panics.
+fn rem_trunc(a: i128, b: i128) -> i128:
+    if a >= 0 and b > 0:
+        return a % b
+    if b == 0:
+        panic("attempt to calculate the remainder with a divisor of zero")
+    if a == I128_MIN and b == -1:
+        panic("attempt to calculate the remainder with overflow")
+    return a - b * div_trunc(a, b)
+
+fn gcd(a: i128, b: i128) -> i128:
+    if b == 0:
+        return a
+    return gcd(b, rem_trunc(a, b))
+
+# ------------------------------------------------------------ atom sets
+# A set of atoms: a sorted list without duplicates.
+struct AtomSet:
+    xs: [int]
+
+    fn new() -> AtomSet:
+        return AtomSet(xs=[])
+
+    # The index of the first element >= a.
+    fn lower_bound(self, a: int) -> int:
+        var lo = 0
+        var hi = len(self.xs)
+        while lo < hi:
+            let mid = lo + (hi - lo) / 2
+            if self.xs[mid] < a:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    fn contains(self, a: int) -> bool:
+        let i = self.lower_bound(a)
+        return i < len(self.xs) and self.xs[i] == a
+
+    # true if `a` was not there yet
+    fn insert(ref self, a: int) -> bool:
+        let i = self.lower_bound(a)
+        if i < len(self.xs) and self.xs[i] == a:
+            return false
+        self.xs.insert(i, a)
+        return true
+
+    fn extend(ref self, o: AtomSet):
+        for a in o.xs:
+            self.insert(a)
+
+    # the atoms of a linear form
+    fn insert_lin(ref self, l: Lin):
+        for p in l.t:
+            self.insert(p.0)
+
+    fn is_empty(self) -> bool:
+        return len(self.xs) == 0
+
+    fn len(self) -> int:
+        return len(self.xs)
+
+# ------------------------------------------------------------ linear forms
+# A linear form `c + Σ k·x`. Terms are sorted by atom with non-zero coefficients.
+struct Lin:
+    c: i128
+    t: [(int, i128)]
+
+    fn konst(c: i128) -> Lin:
+        return Lin(c=c, t=[])
+
+    fn atom(a: int) -> Lin:
+        let one: i128 = 1
+        return Lin(c=0, t=[(a, one)])
+
+    fn is_const(self) -> Option[i128]:
+        if len(self.t) == 0:
+            return Some(self.c)
+        return None
+
+    fn coef(self, a: int) -> i128:
+        for p in self.t:
+            if p.0 == a:
+                return p.1
+        return 0
+
+    fn add(self, o: Lin) -> Option[Lin]:
+        var t: [(int, i128)] = []
+        var i = 0
+        var j = 0
+        while i < len(self.t) or j < len(o.t):
+            if j >= len(o.t) or (i < len(self.t) and self.t[i].0 < o.t[j].0):
+                t.push(self.t[i])
+                i += 1
+            elif i >= len(self.t) or o.t[j].0 < self.t[i].0:
+                t.push(o.t[j])
+                j += 1
+            else:
+                let k = add_i128(self.t[i].1, o.t[j].1)?
+                if k != 0:
+                    t.push((self.t[i].0, k))
+                i += 1
+                j += 1
+        return Some(Lin(c=add_i128(self.c, o.c)?, t=t))
+
+    fn scale(self, k: i128) -> Option[Lin]:
+        if k == 0:
+            return Some(Lin.konst(0))
+        var t: [(int, i128)] = []
+        for p in self.t:
+            t.push((p.0, mul_i128(p.1, k)?))
+        return Some(Lin(c=mul_i128(self.c, k)?, t=t))
+
+    fn neg(self) -> Option[Lin]:
+        return self.scale(-1)
+
+    fn sub(self, o: Lin) -> Option[Lin]:
+        return self.add(o.neg()?)
+
+    fn add_c(self, c: i128) -> Option[Lin]:
+        var l = self
+        l.c = add_i128(l.c, c)?
+        return Some(l)
+
+    # Replace atom `a` by `e`.
+    fn subst(self, a: int, e: Lin) -> Option[Lin]:
+        let k = self.coef(a)
+        if k == 0:
+            return Some(self)
+        var rest = self
+        rest.t = [p for p in self.t if p.0 != a]
+        return rest.add(e.scale(k)?)
+
+    fn gcd_coefs(self) -> i128:
+        var g: i128 = 0
+        for p in self.t:
+            g = gcd(g, wrapping_abs(p.1))
+            if g == 1:
+                # gcd(1, k) is 1 for every k here (even the wrapped i128::MIN)
+                break
+        return g
+
+# ------------------------------------------------------------ formulas
+# `Ge(l)` means `l >= 0`, `Eq(l)` means `l == 0`, `Ne(l)` means `l != 0`.
+# `B(a, p)` is boolean atom `a` with polarity `p`.
+# (`and`, `or` and `not` are keywords, so the constructors are `and_`, `or_`, `not_`.)
+enum F:
+    True
+    False
+    Ge(l: Lin)
+    Eq(l: Lin)
+    Ne(l: Lin)
+    B(a: int, p: bool)
+    And(xs: [F])
+    Or(xs: [F])
+
+    fn ge(l: Lin) -> F:
+        match l.is_const():
+            case Some(c):
+                return F.from_bool(c >= 0)
+            case None:
+                return F.Ge(l)
+
+    fn eq(l: Lin) -> F:
+        match l.is_const():
+            case Some(c):
+                return F.from_bool(c == 0)
+            case None:
+                return F.Eq(l)
+
+    fn ne(l: Lin) -> F:
+        match l.is_const():
+            case Some(c):
+                return F.from_bool(c != 0)
+            case None:
+                return F.Ne(l)
+
+    fn from_bool(b: bool) -> F:
+        if b:
+            return F.True
+        return F.False
+
+    # `a <= b`
+    fn le(a: Lin, b: Lin) -> F:
+        match b.sub(a):
+            case Some(l):
+                return F.ge(l)
+            case None:
+                return F.unknown()
+
+    # `a < b`
+    fn lt(a: Lin, b: Lin) -> F:
+        match b.sub(a):
+            case Some(l):
+                match l.add_c(-1):
+                    case Some(l2):
+                        return F.ge(l2)
+                    case None:
+                        return F.unknown()
+            case None:
+                return F.unknown()
+
+    fn equal(a: Lin, b: Lin) -> F:
+        match a.sub(b):
+            case Some(l):
+                return F.eq(l)
+            case None:
+                return F.unknown()
+
+    # Placeholder used when arithmetic overflowed while building a formula:
+    # a formula we can't use.
+    fn unknown() -> F:
+        return F.B(ATOM_UNKNOWN, true)
+
+    fn and_(fs: [F]) -> F:
+        var out: [F] = []
+        for f in fs:
+            match f:
+                case F.True:
+                    pass
+                case F.False:
+                    return F.False
+                case F.And(xs):
+                    out.extend(xs)
+                case _:
+                    out.push(f)
+        if len(out) == 0:
+            return F.True
+        if len(out) == 1:
+            return out[0]
+        return F.And(out)
+
+    fn or_(fs: [F]) -> F:
+        var out: [F] = []
+        for f in fs:
+            match f:
+                case F.False:
+                    pass
+                case F.True:
+                    return F.True
+                case F.Or(xs):
+                    out.extend(xs)
+                case _:
+                    out.push(f)
+        if len(out) == 0:
+            return F.False
+        if len(out) == 1:
+            return out[0]
+        return F.Or(out)
+
+    fn not_(self) -> F:
+        match self:
+            case F.True:
+                return F.False
+            case F.False:
+                return F.True
+            case F.Ge(l):
+                # ¬(l >= 0)  ⇔  l <= -1  ⇔  -l - 1 >= 0
+                return not_ge(l)
+            case F.Eq(le):
+                return F.ne(le)
+            case F.Ne(ln):
+                return F.eq(ln)
+            case F.B(a, p):
+                if a == ATOM_UNKNOWN:
+                    return F.B(a, p)
+                return F.B(a, not p)
+            case F.And(xs):
+                return F.or_([x.not_() for x in xs])
+            case F.Or(ys):
+                return F.and_([y.not_() for y in ys])
+
+    fn atoms(self, ref out: AtomSet):
+        match self:
+            case F.True | F.False:
+                pass
+            case F.Ge(lg):
+                out.insert_lin(lg)
+            case F.Eq(le):
+                out.insert_lin(le)
+            case F.Ne(ln):
+                out.insert_lin(ln)
+            case F.B(a, _):
+                out.insert(a)
+            case F.And(xs):
+                for x in xs:
+                    x.atoms(ref out)
+            case F.Or(ys):
+                for y in ys:
+                    y.atoms(ref out)
+
+    fn size(self) -> int:
+        var n = 1
+        match self:
+            case F.And(xs):
+                for x in xs:
+                    n += x.size()
+            case F.Or(ys):
+                for y in ys:
+                    n += y.size()
+            case _:
+                pass
+        return n
+
+fn not_ge(l: Lin) -> F:
+    match l.neg():
+        case Some(n):
+            match n.add_c(-1):
+                case Some(m):
+                    return F.ge(m)
+                case None:
+                    return F.unknown()
+        case None:
+            return F.unknown()
+
+# The atoms of `f`.
+fn atoms_of(f: F) -> AtomSet:
+    var s = AtomSet.new()
+    f.atoms(ref s)
+    return s
+
+# ------------------------------------------------------------ prove
+
+# Is `goal` implied by `facts`? (`prove` is a keyword in brine.) `ranges[a]` gives the value
+# range of integer atom `a` (type bounds), which are always valid; atoms past the end of
+# `ranges` have none.
+fn prove_(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> bool:
+    let neg = goal.not_()
+    var rel = atoms_of(neg)
+    if rel.contains(ATOM_UNKNOWN):
+        return false
+    var fs: [F] = []
+    for f in facts:
+        if f == F.False:
+            return true  # unreachable code: anything holds
+        if f != F.True:
+            fs.push(f)
+    if rel.is_empty():
+        # an atom-free goal (e.g. `false`) can only follow from a contradiction somewhere
+        for f2 in fs:
+            add_atoms(f2, ref rel)
+    # Relevance: grow the set of atoms connected to the goal, then replace every literal
+    # outside it by `true`. Formulas are in negation normal form, so that only weakens
+    # the facts: it can lose a proof but never make a false claim provable.
+    while true:
+        let before = rel.len()
+        for f3 in fs:
+            grow(f3, ref rel)
+        if rel.len() == before:
+            break
+    var used: [F] = [neg]
+    for f4 in fs:
+        let w = weaken(f4, rel)
+        if w == F.False:
+            return true
+        if w != F.True:
+            used.push(w)
+    for x in rel.xs:
+        if x < len(ranges):
+            match ranges[x]:
+                case Some(r):
+                    let (lo, hi) = r
+                    let one: i128 = 1
+                    # a bound at the edge of i128 is too big to compute with: leave it out
+                    if lo != I128_MIN:
+                        used.push(F.ge(Lin(c=-lo, t=[(x, one)])))
+                    if hi != I128_MAX:
+                        used.push(F.ge(Lin(c=hi, t=[(x, -one)])))
+                case None:
+                    pass
+    var budget = MAX_NODES
+    var b = Branch.new()
+    return refute(ref b, used, ref budget) == Some(true)
+
+# Does literal `f` mention an atom in `rel`?
+fn touches(f: F, rel: AtomSet) -> bool:
+    match f:
+        case F.Ge(l):
+            return lin_touches(l, rel)
+        case F.Eq(l2):
+            return lin_touches(l2, rel)
+        case F.Ne(l3):
+            return lin_touches(l3, rel)
+        case F.B(a, _):
+            return rel.contains(a)
+        case _:
+            return false
+
+fn lin_touches(l: Lin, rel: AtomSet) -> bool:
+    for p in l.t:
+        if rel.contains(p.0):
+            return true
+    return false
+
+# `x == y + c`: how path merges define a variable's new value in each branch. These don't
+# select a branch, so they only become relevant through their atoms.
+fn is_def(f: F) -> bool:
+    match f:
+        case F.Eq(l):
+            if len(l.t) != 2:
+                return false
+            return (l.t[0].1 == 1 and l.t[1].1 == -1) or (l.t[0].1 == -1 and l.t[1].1 == 1)
+        case _:
+            return false
+
+fn add_atoms(f: F, ref rel: AtomSet):
+    var s = atoms_of(f)
+    for a in s.xs:
+        if a != ATOM_UNKNOWN:
+            rel.insert(a)
+
+# One relevance pass over `f`; true if `f` mentions a relevant atom. A literal that mentions
+# one is relevant. When a branch of a disjunction is relevant, the literals that select
+# each of its branches (everything but definitions) become relevant too.
+fn grow(f: F, ref rel: AtomSet) -> bool:
+    match f:
+        case F.True | F.False:
+            return false
+        case F.And(xs):
+            var hit = false
+            for x in xs:
+                if grow(x, ref rel):
+                    hit = true
+            return hit
+        case F.Or(ys):
+            var hit2 = false
+            for y in ys:
+                if grow(y, ref rel):
+                    hit2 = true
+            if hit2:
+                for z in ys:
+                    select(z, ref rel)
+            return hit2
+        case _:
+            if touches(f, rel):
+                add_atoms(f, ref rel)
+                return true
+            return false
+
+# Make the literals that select branch `f` of a disjunction relevant.
+fn select(f: F, ref rel: AtomSet):
+    match f:
+        case F.True | F.False | F.Or(_):
+            pass
+        case F.And(xs):
+            for x in xs:
+                match x:
+                    case F.And(_) | F.Or(_):
+                        pass
+                    case _:
+                        if not is_def(x):
+                            add_atoms(x, ref rel)
+        case _:
+            if not is_def(f):
+                add_atoms(f, ref rel)
+
+# `f` with every literal that mentions no relevant atom replaced by `true`.
+fn weaken(f: F, rel: AtomSet) -> F:
+    match f:
+        case F.True | F.False:
+            return f
+        case F.And(xs):
+            return F.and_([weaken(x, rel) for x in xs])
+        case F.Or(ys):
+            return F.or_([weaken(y, rel) for y in ys])
+        case _:
+            if touches(f, rel):
+                return f
+            return F.True
+
+struct Branch:
+    eqs: [Lin]
+    ges: [Lin]
+    pos: {int: bool}
+    neg: {int: bool}
+
+    fn new() -> Branch:
+        return Branch(eqs=[], ges=[], pos={}, neg={})
+
+# Stable sort, longest first.
+fn sort_longest_first(ors: [[F]]) -> [[F]]:
+    var lens: [int] = []
+    for o in ors:
+        if len(o) not in lens:
+            lens.push(len(o))
+    lens.sort()
+    var out: [[F]] = []
+    var k = len(lens)
+    while k > 0:
+        k -= 1
+        for o2 in ors:
+            if len(o2) == lens[k]:
+                out.push(o2)
+    return out
+
+# Some(true) if every case is contradictory, Some(false) if some case may be
+# satisfiable, None if the budget (a number of search nodes) ran out.
+fn refute(ref b: Branch, mut todo: [F], ref budget: int) -> Option[bool]:
+    budget -= 1
+    if budget < 0:
+        return None
+    # flatten conjunctions and literals first; collect disjunctions for later
+    var ors: [[F]] = []
+    var nes: [Lin] = []
+    while len(todo) > 0:
+        let f = todo.pop()
+        match f:
+            case F.True:
+                pass
+            case F.False:
+                return Some(true)
+            case F.Ge(lg):
+                b.ges.push(lg)
+            case F.Eq(le):
+                b.eqs.push(le)
+            case F.Ne(ln):
+                nes.push(ln)
+            case F.B(a, p):
+                if (p and a in b.neg) or (not p and a in b.pos):
+                    return Some(true)
+                if p:
+                    b.pos[a] = true
+                else:
+                    b.neg[a] = true
+            case F.And(xs):
+                todo.extend(xs)
+            case F.Or(ys):
+                ors.push(ys)
+    for l in nes:
+        # l != 0  ⇔  l >= 1  ∨  -l >= 1
+        let la = l.add_c(-1)?
+        let lc = l.neg()?.add_c(-1)?
+        ors.push([F.Ge(la), F.Ge(lc)])
+    if fm_unsat(b.eqs, b.ges)?:
+        return Some(true)
+    if len(ors) == 0:
+        return Some(false)
+    # split on the smallest disjunction
+    var sorted = sort_longest_first(ors)
+    let first = sorted.pop()
+    let rest: [F] = [F.Or(o) for o in sorted]
+    for alt in first:
+        var nb = b
+        var t = rest
+        t.push(alt)
+        let r = refute(ref nb, t, ref budget)
+        if r != Some(true):
+            return r
+    return Some(true)
+
+# Some(true) if the conjunction of `eqs == 0` and `ges >= 0` has no integer
+# solution (definitely), Some(false) if we couldn't show that.
+fn fm_unsat(eqs_in: [Lin], ges_in: [Lin]) -> Option[bool]:
+    var eqs = eqs_in
+    var ges = ges_in
+    # eliminate equalities
+    while len(eqs) > 0:
+        let e0 = eqs.pop()
+        if len(e0.t) == 0:
+            if e0.c != 0:
+                return Some(true)
+            continue
+        let g = e0.gcd_coefs()
+        if rem_trunc(e0.c, g) != 0:
+            return Some(true)
+        let e = Lin(c=div_trunc(e0.c, g), t=[(p.0, div_trunc(p.1, g)) for p in e0.t])
+        var unit = -1
+        for i in 0..len(e.t):
+            if wrapping_abs(e.t[i].1) == 1:
+                unit = i
+                break
+        if unit >= 0:
+            # k*x + r = 0  ⇒  x = -k*r
+            let x = e.t[unit].0
+            let k = e.t[unit].1
+            var r = e
+            r.t = [q for q in e.t if q.0 != x]
+            let val = r.scale(-k)?
+            for j in 0..len(eqs):
+                let s1 = eqs[j].subst(x, val)?
+                eqs[j] = s1
+            for j2 in 0..len(ges):
+                let s2 = ges[j2].subst(x, val)?
+                ges[j2] = s2
+        else:
+            ges.push(e)
+            ges.push(e.neg()?)
+    # normalize, tighten and run Fourier–Motzkin
+    var cur: [Lin] = []
+    var seen: {Lin: bool} = {}
+    for g0 in ges:
+        match tighten(g0):
+            case Tight.False:
+                return Some(true)
+            case Tight.True:
+                pass
+            case Tight.L(l):
+                if l not in seen:
+                    seen[l] = true
+                    cur.push(l)
+    while true:
+        # pick the atom with the fewest generated combinations
+        var atoms = AtomSet.new()
+        for l1 in cur:
+            for p1 in l1.t:
+                atoms.insert(p1.0)
+        if atoms.is_empty():
+            return Some(false)
+        var best_cost = -1
+        var x2 = 0
+        for a in atoms.xs:
+            var np = 0
+            var nn = 0
+            for l2 in cur:
+                let k2 = l2.coef(a)
+                if k2 > 0:
+                    np += 1
+                elif k2 < 0:
+                    nn += 1
+            let cost = np * nn
+            if best_cost < 0 or cost < best_cost:
+                best_cost = cost
+                x2 = a
+        var next: [Lin] = []
+        var pos: [Lin] = []
+        var neg: [Lin] = []
+        for l3 in cur:
+            let k3 = l3.coef(x2)
+            if k3 > 0:
+                pos.push(l3)
+            elif k3 < 0:
+                neg.push(l3)
+            else:
+                next.push(l3)
+        var seen2: {Lin: bool} = {}
+        for l4 in next:
+            seen2[l4] = true
+        var nks: [i128] = []
+        for nl0 in neg:
+            nks.push(wrapping_neg(nl0.coef(x2)))
+        for pl in pos:
+            let ca = pl.coef(x2)
+            for ni in 0..len(neg):
+                let nl = neg[ni]
+                let cb = nks[ni]
+                let comb = combine(pl, cb, nl, ca)?
+                match tighten(comb):
+                    case Tight.False:
+                        return Some(true)
+                    case Tight.True:
+                        pass
+                    case Tight.L(l5):
+                        if l5 not in seen2:
+                            seen2[l5] = true
+                            next.push(l5)
+                if len(next) > MAX_CONSTRAINTS:
+                    return None
+        cur = next
+    return Some(false)
+
+# `p·b + n·a`, the same as `p.scale(b)?.add(n.scale(a)?)`,
+# without building the two scaled forms (this is Fourier–Motzkin's inner loop).
+# `a` and `b` are never 0 here.
+fn combine(p: Lin, b: i128, n: Lin, a: i128) -> Option[Lin]:
+    var t: [(int, i128)] = []
+    var i = 0
+    var j = 0
+    while i < len(p.t) or j < len(n.t):
+        if j >= len(n.t) or (i < len(p.t) and p.t[i].0 < n.t[j].0):
+            t.push((p.t[i].0, mul_i128(p.t[i].1, b)?))
+            i += 1
+        elif i >= len(p.t) or n.t[j].0 < p.t[i].0:
+            t.push((n.t[j].0, mul_i128(n.t[j].1, a)?))
+            j += 1
+        else:
+            let k = add_i128(mul_i128(p.t[i].1, b)?, mul_i128(n.t[j].1, a)?)?
+            if k != 0:
+                t.push((p.t[i].0, k))
+            i += 1
+            j += 1
+    return Some(Lin(c=add_i128(mul_i128(p.c, b)?, mul_i128(n.c, a)?)?, t=t))
+
+enum Tight:
+    True
+    False
+    L(l: Lin)
+
+# Divide by the gcd of the coefficients, rounding the constant down
+# (valid for integers: Σ k·x is a multiple of g).
+fn tighten(l: Lin) -> Tight:
+    if len(l.t) == 0:
+        if l.c >= 0:
+            return Tight.True
+        return Tight.False
+    let g = l.gcd_coefs()
+    if g <= 1:
+        return Tight.L(l)
+    # g > 1, so rounding the constant down is brine's `/`
+    return Tight.L(Lin(c=l.c / g, t=[(p.0, div_trunc(p.1, g)) for p in l.t]))

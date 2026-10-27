@@ -1,0 +1,142 @@
+# What the checker learns about a program's items: its structs, enums,
+# function signatures and constants.
+from diag import Span
+from types import Ty
+
+struct StructInfo:
+    name: str
+    module: int
+    fields: [(str, Ty)]
+    methods: {str: int}
+    span: Span
+    c_name: str
+    # for instances of generic structs: the template and the type arguments
+    origin: Option[(int, [Ty])]
+
+struct VariantInfo:
+    name: str
+    fields: [(str, Ty)]
+    span: Span
+
+struct EnumInfo:
+    name: str
+    module: int
+    variants: [VariantInfo]
+    methods: {str: int}
+    span: Span
+    c_name: str
+    # for instances of generic enums: the template and the type arguments
+    origin: Option[(int, [Ty])]
+    # variants are written without the enum name (`Some(x)`, `None`)
+    bare: bool
+
+    # Enums whose variants carry data are stored in shared immutable boxes;
+    # plain enums (no variant has fields) are just a number.
+    fn has_payload(self) -> bool:
+        return any(len(v.fields) > 0 for v in self.variants)
+
+    # How variant `vi` is written in source: `Shape.Circle`, or `Some` for prelude enums.
+    fn variant_label(self, vi: int) -> str:
+        if self.bare:
+            return self.variants[vi].name
+        return self.name + "." + self.variants[vi].name
+
+struct ParamSig:
+    name: str
+    ty: Ty
+    # `ref` parameter: the callee works on the caller's variable
+    by_ref: bool
+
+struct FnSig:
+    name: str
+    module: int
+    idx: int
+    params: [ParamSig]
+    ret: Ty
+    c_name: str
+    is_extern: bool
+    # the struct or enum this is a method of
+    method_of: Option[Ty]
+    has_self: bool
+    span: Span
+
+enum ConstVal:
+    Int(v: i128)
+    # above the i128 range (a `u128`)
+    UInt(v: u128)
+    Float(v: float)
+    Bool(v: bool)
+    Str(v: str)
+
+struct ConstInfo:
+    name: str
+    module: int
+    ty: Ty
+    value: ConstVal
+    span: Span
+
+struct ProgramInfo:
+    structs: [StructInfo]
+    enums: [EnumInfo]
+    fns: [FnSig]
+    consts: [ConstInfo]
+    struct_names: [str]
+    enum_names: [str]
+    module_names: [str]
+
+    fn ty_name(self, t: Ty) -> str:
+        return t.name(self.struct_names, self.enum_names)
+
+fn new_info() -> ProgramInfo:
+    return ProgramInfo(
+        structs=[],
+        enums=[],
+        fns=[],
+        consts=[],
+        struct_names=[],
+        enum_names=[],
+        module_names=[]
+    )
+
+# What `x?` unwraps: `Option[inner]` (with the indexes of its `Some` and `None`
+# variants), or `Result[ok, err]`.
+enum TryKind:
+    Opt(some: int, none: int, inner: Ty)
+    Res(ok_v: int, err_v: int, ok: Ty, err: Ty)
+
+# Name of the module that is visible everywhere (`Option`, `Result`).
+const PRELUDE = "prelude"
+
+fn variant_pos(en: EnumInfo, name: str) -> int:
+    for i, v in enumerate(en.variants):
+        if v.name == name:
+            return i
+    return -1
+
+fn try_kind(info: ProgramInfo, t: Ty) -> Option[TryKind]:
+    match t:
+        case Ty.Enum(eid):
+            let en = info.enums[eid]
+            if not en.bare:
+                return None
+            let some = variant_pos(en, "Some")
+            let none = variant_pos(en, "None")
+            if some >= 0 and none >= 0:
+                if len(en.variants[some].fields) == 0:
+                    return None
+                return Some(TryKind.Opt(some, none, en.variants[some].fields[0].1))
+            let ok_v = variant_pos(en, "Ok")
+            let err_v = variant_pos(en, "Err")
+            if ok_v >= 0 and err_v >= 0:
+                if len(en.variants[ok_v].fields) == 0 or len(en.variants[err_v].fields) == 0:
+                    return None
+                return Some(
+                    TryKind.Res(ok_v, err_v, en.variants[ok_v].fields[0].1, en.variants[err_v].fields[0].1)
+                )
+            return None
+        case _:
+            return None
+
+# A module's name as it appears in generated symbols: `a.b` is `a_b`.
+fn mangle_module(name: str) -> str:
+    return name.replace(".", "_")

@@ -1,0 +1,688 @@
+# Deadlock freedom for `world`: every rank must reach the same communication
+# calls in the same order.
+#
+# All `world` communication is collective (every rank takes part), so the
+# program can only deadlock if some ranks skip a call that others make. This
+# pass rules that out. It tracks, for every value, whether it may differ
+# between ranks ("varying": derived from `world.rank()`, `clock()`, received
+# messages, C functions, ...) and which parameters of the current function it
+# depends on. A communication call is an error if the conditions that lead
+# to it may vary between ranks. Requirements on parameters become part of the
+# function's summary and are checked at every call site.
+from diag import Span, Diag
+import diag
+from types import Res, CallRes, Builtin, Reducer, WorldOp, world_ops
+from ast import BinOp, Arg, Comp, Expr, ExprKind, Pattern, PatKind, Stmt, StmtKind, Block, FnDecl, Program, children, stmt_exprs, stmt_blocks, lvalue_root
+from info import ProgramInfo
+
+# What a value or a condition depends on.
+struct Dep:
+    # may differ between ranks
+    vary: bool
+    # parameters (bit i = parameter i) it depends on
+    params: u64
+    # where the variation comes from, for messages
+    why: Option[Span]
+
+    fn join(self, o: Dep) -> Dep:
+        var why = self.why
+        if self.vary and self.why.is_some():
+            why = self.why
+        elif o.vary:
+            why = o.why if o.why.is_some() else self.why
+        return Dep(vary=self.vary or o.vary, params=self.params | o.params, why=why)
+
+    fn same(self, o: Dep) -> bool:
+        return self.vary == o.vary and self.params == o.params
+
+    # A branch condition: if it varies, blame the condition itself.
+    fn at(self, span: Span) -> Dep:
+        if self.vary:
+            return Dep(vary=self.vary, params=self.params, why=Some(span))
+        return self
+
+    # Add a reason span if there is none yet.
+    fn because(self, span: Span) -> Dep:
+        if self.vary and self.why.is_none():
+            return Dep(vary=self.vary, params=self.params, why=Some(span))
+        return self
+
+fn none() -> Dep:
+    return Dep(vary=false, params=u64(0), why=None)
+
+fn varying(why: Span) -> Dep:
+    return Dep(vary=true, params=u64(0), why=Some(why))
+
+fn param(i: int) -> Dep:
+    if 0 <= i < 64:
+        return Dep(vary=false, params=u64(1) << i, why=None)
+    return Dep(vary=true, params=u64(0), why=None)
+
+fn bit(i: int) -> u64:
+    return u64(1) << i
+
+struct Summary:
+    # the function (transitively) communicates
+    comm: bool
+    # where, for messages
+    comm_site: Option[Span]
+    # parameters that must be the same on every rank
+    need: u64
+    ret: Dep
+    # what each `ref` parameter may hold afterwards
+    outs: [Dep]
+
+    fn same(self, o: Summary) -> bool:
+        if self.comm != o.comm or self.need != o.need or not self.ret.same(
+            o.ret
+        ) or len(self.outs) != len(o.outs):
+            return false
+        for i in 0..len(self.outs):
+            if not self.outs[i].same(o.outs[i]):
+                return false
+        return true
+
+# Does any expression in `b` communicate (a `world` call other than rank/size)?
+fn block_comm(b: Block) -> bool:
+    for s in b.stmts:
+        for e in stmt_exprs(s):
+            if expr_comm(e):
+                return true
+        for sb in stmt_blocks(s):
+            if block_comm(sb):
+                return true
+    return false
+
+fn expr_comm(e: Expr) -> bool:
+    match e.cres:
+        case CallRes.World(op):
+            if op != WorldOp.Rank and op != WorldOp.Size:
+                return true
+        case _:
+            pass
+    for c in children(e):
+        if expr_comm(c):
+            return true
+    return false
+
+fn check(prog: Program, info: ProgramInfo) -> [Diag]:
+    # only communication can deadlock: most programs have none
+    var any = false
+    for m in prog.modules:
+        for f in m.fns:
+            if not f.is_extern and block_comm(f.body):
+                any = true
+        for t in m.tests:
+            if block_comm(t.body):
+                any = true
+    if not any:
+        return []
+    var decls: {int: FnDecl} = {}
+    for m in prog.modules:
+        for f in m.fns:
+            if not f.is_extern:
+                decls[f.id] = f
+    var sums: [Summary] = []
+    for s in info.fns:
+        var ret = none()
+        if s.is_extern:
+            # C code may return anything
+            ret = Dep(vary=true, params=u64(0), why=None)
+        sums.push(
+            Summary(comm=false, comm_site=None, need=u64(0), ret=ret, outs=[none()] * len(s.params))
+        )
+    var ids = decls.keys()
+    ids.sort()
+    # summaries only grow, so this reaches a fixpoint
+    for _ in 0..100:
+        var changed = false
+        for id in ids:
+            let f = decls[id]
+            var a = new_fa(info, sums, f, false)
+            a.run(f)
+            let s = a.summary(f, [p.by_ref for p in info.fns[id].params])
+            if not s.same(sums[id]):
+                sums[id] = s
+                changed = true
+        if not changed:
+            break
+    var diags: [Diag] = []
+    var seen: {str: bool} = {}
+    for m in prog.modules:
+        var all: [FnDecl] = [f for f in m.fns if not f.is_extern]
+        all.extend(m.tests)
+        for f in all:
+            var a = new_fa(info, sums, f, true)
+            a.run(f)
+            for d in a.diags:
+                var key = d.code
+                if len(d.labels) > 0:
+                    let s = d.labels[0].span
+                    key = f"{d.code} {s.file} {s.lo} {s.hi}"
+                if key not in seen:
+                    seen[key] = true
+                    diags.push(d)
+    return diags
+
+fn new_fa(info: ProgramInfo, sums: [Summary], f: FnDecl, report: bool) -> Fa:
+    var deps = [none()] * len(f.locals)
+    for i, l in enumerate(f.param_locals):
+        if 0 <= l < len(deps):
+            deps[l] = param(i)
+    return Fa(
+        info=info,
+        sums=sums,
+        deps=deps,
+        report=report,
+        diags=[],
+        ret_poison=none(),
+        loop_poison={},
+        loops=[],
+        ret=none(),
+        comm=false,
+        comm_site=None,
+        need=u64(0),
+        par=0
+    )
+
+# Analysis of one function.
+struct Fa:
+    info: ProgramInfo
+    sums: [Summary]
+    deps: [Dep]
+    report: bool
+    diags: [Diag]
+    # control dependence added by `return`s seen so far
+    ret_poison: Dep
+    # per loop (keyed by span): control dependence added by break/continue/return inside it
+    loop_poison: {Span: Dep}
+    loops: [Span]
+    ret: Dep
+    comm: bool
+    comm_site: Option[Span]
+    need: u64
+    par: int
+
+    fn run(ref self, f: FnDecl):
+        # variables are tracked flow-insensitively: iterate until nothing changes
+        let report = self.report
+        self.report = false
+        for _ in 0..50:
+            let before = self.deps
+            let lp = self.loop_poison.items()
+            self.ret_poison = none()
+            self.block(f.body, none())
+            var stable = true
+            for i in 0..len(before):
+                if not before[i].same(self.deps[i]):
+                    stable = false
+                    break
+            if stable:
+                for k, v in lp:
+                    match self.loop_poison.get(k):
+                        case Some(n):
+                            if not n.same(v):
+                                stable = false
+                                break
+                        case None:
+                            stable = false
+                            break
+            if stable:
+                break
+        if report:
+            self.report = true
+            self.ret_poison = none()
+            self.block(f.body, none())
+
+    fn summary(self, f: FnDecl, by_ref: [bool]) -> Summary:
+        var outs: [Dep] = []
+        for i in 0..min(len(f.param_locals), len(by_ref)):
+            let l = f.param_locals[i]
+            if by_ref[i] and 0 <= l < len(self.deps):
+                outs.push(self.deps[l])
+            else:
+                outs.push(none())
+        return Summary(
+            comm=self.comm,
+            comm_site=self.comm_site,
+            need=self.need,
+            ret=self.ret,
+            outs=outs
+        )
+
+    fn set(ref self, l: int, d: Dep):
+        if 0 <= l < len(self.deps):
+            self.deps[l] = self.deps[l].join(d)
+
+    # Control dependence in effect: the given context plus everything that
+    # makes some ranks leave the function or loop early.
+    fn eff(self, ctx: Dep) -> Dep:
+        var e = ctx.join(self.ret_poison)
+        for l in self.loops:
+            match self.loop_poison.get(l):
+                case Some(p):
+                    e = e.join(p)
+                case None:
+                    pass
+        return e
+
+    fn poison_loop(ref self, d: Dep, all: bool):
+        let k = len(self.loops)
+        let n = k if all else min(k, 1)
+        for l in self.loops[k - n:]:
+            let e = self.loop_poison.get(l, none())
+            self.loop_poison[l] = e.join(d)
+
+    # ------------------------------------------------------------ statements
+    fn block(ref self, b: Block, ctx: Dep):
+        for s in b.stmts:
+            self.stmt(s, ctx)
+
+    fn stmt(ref self, s: Stmt, ctx: Dep):
+        match s.kind:
+            case StmtKind.Let(_, _, _, init, _):
+                let v = self.expr(init, ctx)
+                let d = v.join(self.eff(ctx))
+                for l in s.locals:
+                    self.set(l, d)
+            case StmtKind.Assign(target, _, value):
+                let v = self.expr(value, ctx)
+                let pl = self.place(target, ctx)
+                let d = v.join(pl).join(self.eff(ctx))
+                match lvalue_root(target):
+                    case Some(r):
+                        self.set(r, d)
+                    case None:
+                        pass
+            case StmtKind.ExprStmt(e):
+                self.expr(e, ctx)
+            case StmtKind.If(branches, els):
+                var c = ctx
+                for cond, body in branches:
+                    let d = self.expr(cond, c).at(cond.span)
+                    c = c.join(d)
+                    self.block(body, c)
+                match els:
+                    case Some(b):
+                        self.block(b, c)
+                    case None:
+                        pass
+            case StmtKind.Match(scrut, cases):
+                # which case runs depends on the value, like an `if` chain
+                let d = self.expr(scrut, ctx).at(scrut.span)
+                var c = ctx.join(d)
+                for case_ in cases:
+                    self.bind_pattern(case_.pat, d.join(self.eff(ctx)))
+                    match case_.guard:
+                        case Some(g):
+                            let gd = self.expr(g, c).at(g.span)
+                            c = c.join(gd)
+                        case None:
+                            pass
+                    self.block(case_.body, c)
+            case StmtKind.While(cond, _, body):
+                self.loops.push(s.span)
+                let d = self.expr(cond, ctx).at(cond.span)
+                let inner = ctx.join(d)
+                self.block(body, inner)
+                # the condition is evaluated again after each iteration
+                self.expr(cond, inner)
+                self.loops.pop()
+            case StmtKind.For(_, _, _, iter, _, body, is_par):
+                let d = self.expr(iter, ctx).at(iter.span)
+                self.set(s.local, d.join(self.eff(ctx)))
+                self.loops.push(s.span)
+                if is_par:
+                    self.par += 1
+                self.block(body, ctx.join(d))
+                if is_par:
+                    self.par -= 1
+                self.loops.pop()
+            case StmtKind.Return(value):
+                var d = self.eff(ctx)
+                match value:
+                    case Some(e):
+                        d = d.join(self.expr(e, ctx))
+                    case None:
+                        pass
+                self.ret = self.ret.join(d)
+                let here = self.eff(ctx).because(s.span)
+                self.ret_poison = self.ret_poison.join(here)
+                self.poison_loop(here, true)
+            case StmtKind.Break:
+                let here = self.eff(ctx).because(s.span)
+                self.poison_loop(here, false)
+            case StmtKind.Continue:
+                let here = self.eff(ctx).because(s.span)
+                self.poison_loop(here, false)
+            case StmtKind.Assert(cond, msg):
+                self.expr(cond, ctx)
+                match msg:
+                    case Some(m):
+                        self.expr(m, ctx)
+                    case None:
+                        pass
+            case _:
+                pass
+
+    fn bind_pattern(ref self, p: Pattern, d: Dep):
+        match p.kind:
+            case PatKind.Bind(_):
+                self.set(p.local, d)
+            case PatKind.Tuple(ps):
+                for q in ps:
+                    self.bind_pattern(q, d)
+            case PatKind.Or(ps):
+                for q in ps:
+                    self.bind_pattern(q, d)
+            case PatKind.Variant(_, _):
+                for q in p.fields:
+                    self.bind_pattern(q, d)
+            case _:
+                pass
+
+    # Dependencies of the index expressions in an assignment target.
+    fn place(ref self, e: Expr, ctx: Dep) -> Dep:
+        match e.kind:
+            case ExprKind.Index(b, idx):
+                let a = self.place(b, ctx)
+                return a.join(self.expr(idx, ctx))
+            case ExprKind.Field(b, _, _):
+                return self.place(b, ctx)
+            case _:
+                return none()
+
+    # ------------------------------------------------------------ expressions
+    fn expr(ref self, e: Expr, ctx: Dep) -> Dep:
+        match e.kind:
+            case ExprKind.Int(
+                _
+            ) | ExprKind.UInt(_) | ExprKind.Float(_) | ExprKind.Bool(_) | ExprKind.Str(_) | ExprKind.Error:
+                return none()
+            # `x?` may return early, depending on `x`
+            case ExprKind.Try(x):
+                let d = self.expr(x, ctx)
+                let here = self.eff(ctx.join(d)).because(e.span)
+                self.ret = self.ret.join(here)
+                self.ret_poison = self.ret_poison.join(here)
+                self.poison_loop(here, true)
+                return d
+            case ExprKind.Ident(_):
+                match e.res:
+                    case Res.Local(l):
+                        if 0 <= l < len(self.deps):
+                            return self.deps[l]
+                        return none()
+                    case _:
+                        return none()
+            case ExprKind.Binary(op, l, r):
+                if op == BinOp.And or op == BinOp.Or:
+                    # the right side only runs on some ranks if the left side varies
+                    let a = self.expr(l, ctx)
+                    let b = self.expr(r, ctx.join(a.at(l.span)))
+                    return a.join(b)
+            case ExprKind.Compare(first, rest):
+                var d = self.expr(first, ctx)
+                for _, x in rest:
+                    let c = ctx.join(d)
+                    d = d.join(self.expr(x, c))
+                return d
+            case ExprKind.IfElse(cond, then, els):
+                let c = self.expr(cond, ctx).at(cond.span)
+                let inner = ctx.join(c)
+                let t = self.expr(then, inner)
+                let f = self.expr(els, inner)
+                return c.join(t).join(f)
+            case ExprKind.Comp(c):
+                return self.comp(c, e.local, None, ctx)
+            case ExprKind.ParTuple(elems):
+                self.par += 1
+                var d = none()
+                for x in elems:
+                    d = d.join(self.expr(x, ctx))
+                self.par -= 1
+                return d
+            case ExprKind.Call(_, args):
+                return self.call(e, None, args, ctx)
+            case ExprKind.MethodCall(recv, _, _, args):
+                return self.call(e, Some(recv), args, ctx)
+            case _:
+                pass
+        var d = none()
+        for c in children(e):
+            d = d.join(self.expr(c, ctx))
+        return d
+
+    fn comp(ref self, c: Comp, local: int, red: Option[Reducer], ctx: Dep) -> Dep:
+        let it = self.expr(c.iter, ctx).at(c.iter.span)
+        self.set(local, it.join(self.eff(ctx)))
+        var inner = ctx.join(it)
+        var d = it
+        match c.filter:
+            case Some(fl):
+                let f = self.expr(fl, inner).at(fl.span)
+                inner = inner.join(f)
+                d = d.join(f)
+            case None:
+                pass
+        if c.par:
+            self.par += 1
+        var b = none()
+        if red == Some(Reducer.Any) or red == Some(Reducer.All):
+            # any/all stop early, depending on the values themselves
+            let report = self.report
+            self.report = false
+            let b0 = self.expr(c.body, inner)
+            self.report = report
+            b = self.expr(c.body, inner.join(b0.because(c.body.span)))
+        else:
+            b = self.expr(c.body, inner)
+        if c.par:
+            self.par -= 1
+        return d.join(b)
+
+    fn args_deps(ref self, recv: Option[Expr], args: [Arg], ctx: Dep) -> [Dep]:
+        var out: [Dep] = []
+        match recv:
+            case Some(r):
+                out.push(self.expr(r, ctx))
+            case None:
+                pass
+        for a in args:
+            out.push(self.expr(a.expr, ctx))
+        return out
+
+    # `dep` (in terms of the callee's parameters) in terms of the arguments `ds`.
+    fn subst(self, dep: Dep, ds: [Dep], span: Span) -> Dep:
+        var out = Dep(vary=dep.vary, params=u64(0), why=Some(span) if dep.vary else None)
+        for i, d in enumerate(ds):
+            if i < 64 and dep.params & bit(i) != u64(0):
+                out = out.join(d)
+        return out
+
+    fn call(ref self, e: Expr, recv: Option[Expr], args: [Arg], ctx: Dep) -> Dep:
+        match e.cres:
+            case CallRes.Reduce(r):
+                if len(args) > 0:
+                    match args[0].expr.kind:
+                        case ExprKind.Comp(c):
+                            return self.comp(c, args[0].expr.local, Some(r), ctx)
+                        case _:
+                            pass
+                return join_all(self.args_deps(recv, args, ctx))
+            case CallRes.World(op):
+                # `world` itself is the receiver; only the arguments matter
+                let ds = self.args_deps(None, args, ctx)
+                match op:
+                    case WorldOp.Rank:
+                        return varying(e.span)
+                    case WorldOp.Size:
+                        return none()
+                    case _:
+                        self.communicate(e.span, ctx, "`world." + world_name(op) + "`", None)
+                        match op:
+                            case WorldOp.Broadcast:
+                                self.same_on_all(
+                                    args[0].expr,
+                                    ds[0],
+                                    "the root rank of `world.broadcast`"
+                                )
+                            case WorldOp.Shift:
+                                self.same_on_all(
+                                    args[1].expr,
+                                    ds[1],
+                                    "the distance of `world.shift`"
+                                )
+                            case _:
+                                pass
+                        match op:
+                            # each rank receives different values
+                            case WorldOp.Shift | WorldOp.Exchange:
+                                return varying(e.span)
+                            # collective results are identical on every rank
+                            case _:
+                                return none()
+            case CallRes.Os(op):
+                # `os` itself is the receiver; only the arguments matter
+                let ds = self.args_deps(None, args, ctx)
+                if op.uniform():
+                    return join_all(ds)
+                return varying(e.span)
+            case CallRes.Fn(id):
+                return self.call_fn(e, id, recv, args, ctx)
+            case CallRes.Method(id):
+                return self.call_fn(e, id, recv, args, ctx)
+            case CallRes.Builtin(b):
+                let ds = self.args_deps(recv, args, ctx)
+                let all = join_all(ds)
+                match b:
+                    case Builtin.Clock | Builtin.ReadFile | Builtin.FileExists | Builtin.Getenv | Builtin.Run:
+                        return varying(e.span)
+                    case _:
+                        if b.mutates_recv():
+                            match recv:
+                                case Some(r):
+                                    match lvalue_root(r):
+                                        case Some(root):
+                                            let d = all.join(self.eff(ctx))
+                                            self.set(root, d)
+                                        case None:
+                                            pass
+                                case None:
+                                    pass
+                        return all
+            case _:
+                return join_all(self.args_deps(recv, args, ctx))
+
+    fn call_fn(ref self, e: Expr, id: int, recv: Option[Expr], args: [Arg], ctx: Dep) -> Dep:
+        let ds = self.args_deps(recv, args, ctx)
+        let s = self.sums[id]
+        let sig = self.info.fns[id]
+        let name = sig.name
+        let has_recv = recv.is_some()
+        if s.comm:
+            self.communicate(
+                e.span,
+                ctx,
+                f"`{name}`, which communicates with other ranks",
+                s.comm_site
+            )
+            for i, d in enumerate(ds):
+                if i < 64 and s.need & bit(i) != u64(0):
+                    var ae = recv.unwrap() if has_recv and i == 0 else e
+                    if has_recv:
+                        if i > 0:
+                            ae = args[i - 1].expr
+                    else:
+                        ae = args[i].expr
+                    let pname = sig.params[i].name if i < len(sig.params) else ""
+                    self.same_on_all(ae, d, f"argument `{pname}` of `{name}`")
+        # `ref` arguments may come back changed
+        let eff = self.eff(ctx)
+        for i, p in enumerate(sig.params):
+            if not p.by_ref:
+                continue
+            var ae: Option[Expr] = None
+            if has_recv:
+                if i == 0:
+                    ae = recv
+                elif i - 1 < len(args):
+                    ae = Some(args[i - 1].expr)
+            elif i < len(args):
+                ae = Some(args[i].expr)
+            match ae:
+                case Some(x):
+                    match lvalue_root(x):
+                        case Some(root):
+                            let out = s.outs[i] if i < len(s.outs) else none()
+                            let d = self.subst(out, ds, e.span).join(eff)
+                            self.set(root, d)
+                        case None:
+                            pass
+                case None:
+                    pass
+        return self.subst(s.ret, ds, e.span)
+
+    # A communication call at `span`: every rank must get here.
+    fn communicate(ref self, span: Span, ctx: Dep, what: str, inner: Option[Span]):
+        self.comm = true
+        if self.comm_site.is_none():
+            self.comm_site = Some(span)
+        let c = self.eff(ctx)
+        self.need = self.need | c.params
+        if not self.report:
+            return
+        if self.par > 0:
+            self.diags.push(
+                diag.error("E0503", f"can't call {what} inside a `par` body").label(span, "communication inside a parallel section").with_help("communicate before or after the parallel section")
+            )
+            return
+        if c.vary:
+            var d = diag.error(
+                "E0510",
+                "some ranks might not reach this communication"
+            ).label(span, f"calls {what}")
+            match c.why:
+                case Some(w):
+                    d = d.label(w, "this may differ between ranks")
+                case None:
+                    pass
+            match inner:
+                case Some(i):
+                    d = d.label(i, "communicates here")
+                case None:
+                    pass
+            d = d.note(
+                "every rank must make the same `world` calls in the same order, otherwise the program could hang"
+            ).with_help("move the call out of the rank-dependent branch or loop; compute rank-specific values first, then communicate on every rank")
+            self.diags.push(d)
+
+    # `e` (with dependencies `d`) must have the same value on every rank.
+    fn same_on_all(ref self, e: Expr, d: Dep, what: str):
+        self.need = self.need | d.params
+        if self.report and d.vary:
+            var dg = diag.error(
+                "E0511",
+                f"{what} must be the same on every rank"
+            ).label(e.span, "might differ between ranks")
+            match d.why:
+                case Some(w):
+                    if w != e.span:
+                        dg = dg.label(w, "because this depends on which rank is running")
+                case None:
+                    pass
+            self.diags.push(
+                dg.with_help("compute it from values that are the same everywhere, e.g. `world.size()`, constants, or the result of `world.broadcast`")
+            )
+
+fn join_all(ds: [Dep]) -> Dep:
+    var d = none()
+    for x in ds:
+        d = d.join(x)
+    return d
+
+fn world_name(op: WorldOp) -> str:
+    for n, o in world_ops():
+        if o == op:
+            return n
+    return "?"
