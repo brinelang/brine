@@ -53,3 +53,23 @@ What the numbers say:
   The series sum would gain 2x, but this program ends before the device is ready.
 * **Exact rounding costs a little.** Kernels use IEEE `div.rn` and `sqrt.rn` and
   no fused multiply-adds, so that the results are the CPU's bits.
+
+## Apple silicon (Metal)
+
+Mac mini, M1 (4 performance and 4 efficiency cores, 8-core GPU), macOS 15. Apple
+GPUs have no f64, so only the f32 constructs can run there; the others stay on
+the CPU whatever the mode.
+
+| Benchmark | CPU warm | GPU cold | GPU warm | auto warm |
+|---|---:|---:|---:|---:|
+| nbody f32 | 58 | 149 | 63 | 58 (CPU) |
+| sum of [f32] | 7.2 | 228 | 31 | 7.4 (CPU) |
+
+The base M1's GPU is small next to its CPU, and exactness costs more there than
+on NVIDIA: `sqrt` and `/` use Metal's precise versions, and since Apple GPUs
+flush subnormal f32 values to zero, kernels check for a flushed value (once per
+loop iteration) and rerun the construct on the CPU if they find one. Without
+those, the n-body step takes 24 ms. Memory is shared with the CPU, so copies run
+at memcpy speed, but a sum still reads the array faster on the CPU. `auto`
+measures both and keeps these on the CPU; GPUs with more cores (M1 Pro and up)
+should move the n-body step over.
