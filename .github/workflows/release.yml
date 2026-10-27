@@ -1,0 +1,115 @@
+# Publishes a GitHub release when a version tag (vX.Y.Z) is pushed: checks the
+# tag against VERSION and CHANGELOG.md, builds and tests every platform through
+# ci.yml, uploads the archives with checksums and provenance attestations, then
+# installs the release with the one-line installers to prove they work.
+# See docs/RELEASING.md.
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  notes:
+    name: Check the version and write the notes
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the previous tag, for the compare link
+      - id: v
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          case "$version" in *-*) echo "prerelease=true" ;; *) echo "prerelease=false" ;; esac >> "$GITHUB_OUTPUT"
+      - run: sh scripts/release-notes.sh "${{ steps.v.outputs.version }}" > notes.md
+      - run: cat notes.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: notes.md
+
+  build:
+    needs: notes
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish the release
+    needs: [notes, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: brine-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum brine-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/brine-*
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.notes.outputs.version }}
+          PRERELEASE: ${{ needs.notes.outputs.prerelease }}
+        run: |
+          flags=""
+          if [ "$PRERELEASE" = true ]; then flags="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "brine $VERSION" \
+            --notes-file notes.md \
+            $flags
+
+  verify:
+    name: Install on ${{ matrix.runner }}
+    needs: [notes, publish]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, macos-15-intel, windows-2025]
+    env:
+      BRINE_VERSION: ${{ needs.notes.outputs.version }}
+    steps:
+      - name: Install with the one-line installer (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/install.sh" | sh
+          echo "$HOME/.brine/bin" >> "$GITHUB_PATH"
+      - name: Install with the one-line installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:GITHUB_REF_NAME/install.ps1" | iex
+          "$HOME\.brine\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Check the installed version
+        shell: bash
+        run: |
+          got="$(brine --version | tr -d '\r')"
+          echo "$got"
+          test "$got" = "brine $BRINE_VERSION"
+          printf 'fn main():\n    print("ok", par sum(i for i in 0..10))\n' > hello.br
+          brine check hello.br
