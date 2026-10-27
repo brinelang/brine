@@ -2323,7 +2323,7 @@ static struct {
     char err[256];
 } br_mtl;
 
-enum { BR_MTL_FAIL = 1, BR_MTL_STATUS_ERROR = 5, BR_MTL_KERNEL = 3 };
+enum { BR_MTL_FAIL = 1, BR_MTL_STATUS_ERROR = 5, BR_MTL_KERNEL = 3, BR_MTL_MATH_SAFE = 0, BR_MTL_FUNCTIONS_PRECISE = 1 };
 
 #define BR_OBJC(ret, ...) ((ret(*)(br_id, br_sel, ##__VA_ARGS__))br_mtl.msg)
 static br_id br_oc(br_id o, const char *s) { return BR_OBJC(br_id)(o, br_mtl.sel(s)); }
@@ -2393,10 +2393,13 @@ static int br_dev_open(const char *code, char *why, size_t nwhy) {
     br_mtl.flag_mem = (char *)br_oc(br_mtl.flag, "contents");
     /* exact arithmetic, as on the CPU */
     br_id opts = br_oc(br_oc(br_mtl.cls("MTLCompileOptions"), "alloc"), "init");
-    if (br_oc_has(opts, "setMathMode:"))
-        BR_OBJC(void, long)(opts, br_mtl.sel("setMathMode:"), 0);
-    else
+    /* (the safe math mode alone still has approximate sqrt and division) */
+    if (br_oc_has(opts, "setMathMode:") && br_oc_has(opts, "setMathFloatingPointFunctions:")) {
+        BR_OBJC(void, long)(opts, br_mtl.sel("setMathMode:"), BR_MTL_MATH_SAFE);
+        BR_OBJC(void, long)(opts, br_mtl.sel("setMathFloatingPointFunctions:"), BR_MTL_FUNCTIONS_PRECISE);
+    } else {
         BR_OBJC(void, _Bool)(opts, br_mtl.sel("setFastMathEnabled:"), 0);
+    }
     br_id err = NULL;
     br_mtl.lib = BR_OBJC(br_id, br_id, br_id, br_id *)(dev, br_mtl.sel("newLibraryWithSource:options:error:"), br_oc_str(code), opts, &err);
     BR_OBJC(void)(opts, br_mtl.sel("release"));
