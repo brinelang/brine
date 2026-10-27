@@ -211,7 +211,7 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
   are combined in a fixed order, so the output doesn't depend on the thread count.
 * **Timing:** `BRINE_TIMES=1` prints the time of each phase; `BRINE_TIMES=2` also
   names the functions the prover is slow on. `BRINE_BACKEND=c` or `=native` picks
-  the backend (a build with an overridden backend gets its own output folder).
+  the backend (a build with `BRINE_BACKEND` set gets its own output folder).
 
 ### Backends
 The **brine IR** (`compiler/ir.br`) sits between the verifier and code generation:
