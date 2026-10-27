@@ -13,6 +13,7 @@ brine check --typed            # also require a written type on every variable
 brine test                     # run test blocks      brine test "name filter"
 brine fmt                      # format               brine fmt --check
 brine run --ranks 4            # 4 cooperating processes (world module)
+brine debug file.br            # debug build in gdb/lldb: break file.br:12, step, print x
 brine explain E0601            # explain any error code
 ```
 Add `--json` to any command for one JSON object per line.
