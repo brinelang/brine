@@ -1,3 +1,5 @@
+<div align="center">
+
 <img alt="brine" src="docs/assets/banner.png" width="100%">
 
 **A compiled systems language with Python-like syntax, compile-time proofs, and
@@ -9,6 +11,8 @@ parallelism built into the language: every core, the GPU, and many machines.**
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
 
 [Install](#installation) · [Tour](#a-quick-tour) · [Language reference](docs/QUICKREF.md) · [Design](docs/DESIGN.md) · [Examples](examples/)
+
+</div>
 
 ---
 
