@@ -54,14 +54,14 @@ fn main():
 
 ## Highlights
 
-| | |
-|---|---|
-| ⚡ **Natively parallel** | `par` loops, maps, reductions and fork-join, data-race free by construction. Deterministic reductions. Automatic GPU offload (CUDA, Metal). MPI-style multi-process with the `world` module. |
-| 🔒 **Rules can't be broken** | `requires`, `ensures`, `invariant` and `prove` are checked at compile time. Overflow, bad indexes and division by zero always stop the program with a clear message, unless the compiler proved they can't happen; then the check is removed. There is no `unsafe` and no flag to turn checks off. |
-| 🚀 **Fast** | Native code, no garbage collector, no VM. Values are copy-on-write and memory is freed deterministically. Dev builds on Linux and Windows go straight to machine code; `--release` builds go through an optimizing C compiler. |
-| 🐍 **Easy to read** | Python-like syntax, static types with local inference, structs, enums with `match`, generics, `Option`/`Result` with `?`. One obvious way to write things. |
-| 🤖 **Made for humans and agents** | One CLI. Every error has a code, a precise span, the reason and a fix. `--json` output for tools, `brine explain <code>`, and `brine guide` prints the whole language on one page. |
-| 🛠️ **Self-hosted** | The compiler is written in brine and builds itself. All it needs is a C compiler. |
+<table>
+<tr><td>⚡ <b>Natively parallel</b></td><td><code>par</code> loops, maps, reductions and fork-join, data-race free by construction. Deterministic reductions. Automatic GPU offload (CUDA, Metal). MPI-style multi-process with the <code>world</code> module.</td></tr>
+<tr><td>🔒 <b>Rules can't be broken</b></td><td><code>requires</code>, <code>ensures</code>, <code>invariant</code> and <code>prove</code> are checked at compile time. Overflow, bad indexes and division by zero always stop the program with a clear message, unless the compiler proved they can't happen; then the check is removed. There is no <code>unsafe</code> and no flag to turn checks off.</td></tr>
+<tr><td>🚀 <b>Fast</b></td><td>Native code, no garbage collector, no VM. Values are copy-on-write and memory is freed deterministically. Dev builds on Linux and Windows go straight to machine code; <code>--release</code> builds go through an optimizing C compiler.</td></tr>
+<tr><td>🐍 <b>Easy to read</b></td><td>Python-like syntax, static types with local inference, structs, enums with <code>match</code>, generics, <code>Option</code>/<code>Result</code> with <code>?</code>. One obvious way to write things.</td></tr>
+<tr><td>🤖 <b>Made for humans and agents</b></td><td>One CLI. Every error has a code, a precise span, the reason and a fix. <code>--json</code> output for tools, <code>brine explain &lt;code&gt;</code>, and <code>brine guide</code> prints the whole language on one page.</td></tr>
+<tr><td>🛠️ <b>Self-hosted</b></td><td>The compiler is written in brine and builds itself. All it needs is a C compiler.</td></tr>
+</table>
 
 ## Installation
 
