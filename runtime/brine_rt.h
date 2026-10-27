@@ -443,22 +443,6 @@ void brine_world_shift(const char *d, const void *v, void *out, int64_t by, cons
 brine_arr *brine_world_exchange(const char *ed, brine_arr *xs, const char *loc);
 void brine_world_bcast(const char *d, const void *v, void *out, int64_t root, const char *loc);
 brine_arr *brine_world_gather(const char *ed, const void *v, const char *loc);
-/* by-value wrappers for generated code */
-static inline int64_t brine_world_shift_i64(const char *d, int64_t v, int64_t by, const char *loc) { int64_t o; brine_world_shift(d, &v, &o, by, loc); return o; }
-static inline int64_t brine_world_bcast_i64(const char *d, int64_t v, int64_t root, const char *loc) { int64_t o; brine_world_bcast(d, &v, &o, root, loc); return o; }
-static inline brine_arr *brine_world_gather_i64(const char *d, int64_t v, const char *loc) { return brine_world_gather(d, &v, loc); }
-static inline double brine_world_shift_f64(const char *d, double v, int64_t by, const char *loc) { double o; brine_world_shift(d, &v, &o, by, loc); return o; }
-static inline double brine_world_bcast_f64(const char *d, double v, int64_t root, const char *loc) { double o; brine_world_bcast(d, &v, &o, root, loc); return o; }
-static inline brine_arr *brine_world_gather_f64(const char *d, double v, const char *loc) { return brine_world_gather(d, &v, loc); }
-static inline bool brine_world_shift_bool(const char *d, bool v, int64_t by, const char *loc) { bool o; brine_world_shift(d, &v, &o, by, loc); return o; }
-static inline bool brine_world_bcast_bool(const char *d, bool v, int64_t root, const char *loc) { bool o; brine_world_bcast(d, &v, &o, root, loc); return o; }
-static inline brine_arr *brine_world_gather_bool(const char *d, bool v, const char *loc) { return brine_world_gather(d, &v, loc); }
-static inline brine_str * brine_world_shift_str(const char *d, brine_str * v, int64_t by, const char *loc) { brine_str * o; brine_world_shift(d, &v, &o, by, loc); return o; }
-static inline brine_str * brine_world_bcast_str(const char *d, brine_str * v, int64_t root, const char *loc) { brine_str * o; brine_world_bcast(d, &v, &o, root, loc); return o; }
-static inline brine_arr *brine_world_gather_str(const char *d, brine_str * v, const char *loc) { return brine_world_gather(d, &v, loc); }
-static inline brine_arr * brine_world_shift_arr(const char *d, brine_arr * v, int64_t by, const char *loc) { brine_arr * o; brine_world_shift(d, &v, &o, by, loc); return o; }
-static inline brine_arr * brine_world_bcast_arr(const char *d, brine_arr * v, int64_t root, const char *loc) { brine_arr * o; brine_world_bcast(d, &v, &o, root, loc); return o; }
-static inline brine_arr *brine_world_gather_arr(const char *d, brine_arr * v, const char *loc) { return brine_world_gather(d, &v, loc); }
 int64_t brine_world_reduce_i64(int64_t v, int op, const char *loc);
 double brine_world_reduce_f64(double v, int op, const char *loc);
 

@@ -1,0 +1,705 @@
+# The brine IR: a small, typed, low-level code representation between the
+# checked AST and the backends (C source, x86-64 machine code).
+#
+# The lowering (lower.br) turns a checked program into a Module. Everything
+# brine-specific is decided there: memory layouts, reference counting, checks,
+# helper functions (equality, hashing, formatting), `par` bodies. A backend
+# only maps these instructions onto its target.
+#
+# Values live in virtual registers ("vregs"), numbered per function. Each vreg
+# has one scalar kind (`Func.vk[v]`). Vregs are not SSA: an instruction may
+# assign a vreg that was assigned before. Aggregates (tuples, structs) never
+# live in vregs; they live in memory (stack slots or the heap) and are handled
+# through pointers, with `Load`, `Store`, `Copy` and `Zero`.
+#
+# Calls use the platform's C calling convention (Win64 or System V), so
+# generated functions can be passed to the runtime as callbacks. The native
+# backend passes 128-bit integer arguments and results by pointer (see `Op.Call`).
+#
+# Code is a flat list of instructions with labels. A function's first
+# `nparams` vregs are its parameters, in order.
+
+from num import u64_to_int
+
+enum K:
+    I8
+    I16
+    I32
+    I64
+    I128
+    U8
+    U16
+    U32
+    U64
+    U128
+    F32
+    F64
+    # a pointer (64 bits)
+    Ptr
+    # 0 or 1, stored in one byte
+    Bool
+
+    fn size(self) -> int:
+        match self:
+            case K.I8 | K.U8 | K.Bool:
+                return 1
+            case K.I16 | K.U16:
+                return 2
+            case K.I32 | K.U32 | K.F32:
+                return 4
+            case K.I128 | K.U128:
+                return 16
+            case _:
+                return 8
+
+    fn is_float(self) -> bool:
+        return self == K.F32 or self == K.F64
+
+    fn is_signed(self) -> bool:
+        match self:
+            case K.I8 | K.I16 | K.I32 | K.I64 | K.I128:
+                return true
+            case _:
+                return false
+
+    fn is_wide(self) -> bool:
+        return self == K.I128 or self == K.U128
+
+    fn name(self) -> str:
+        match self:
+            case K.I8:
+                return "i8"
+            case K.I16:
+                return "i16"
+            case K.I32:
+                return "i32"
+            case K.I64:
+                return "i64"
+            case K.I128:
+                return "i128"
+            case K.U8:
+                return "u8"
+            case K.U16:
+                return "u16"
+            case K.U32:
+                return "u32"
+            case K.U64:
+                return "u64"
+            case K.U128:
+                return "u128"
+            case K.F32:
+                return "f32"
+            case K.F64:
+                return "f64"
+            case K.Ptr:
+                return "ptr"
+            case K.Bool:
+                return "bool"
+
+# Instructions. `d` is the destination vreg, `a`, `b`, `c` operand vregs, `n`
+# an immediate, `s` a symbol; unused fields are -1 (or 0, "").
+# Kinds come from the vregs: `vk[d]` for results and loads, `vk[b]` for
+# stores, `vk[a]` for comparisons and the source of `Conv`.
+enum Op:
+    # d = n. For 128-bit kinds: d = (c << 64) | (the 64 bits of n, unsigned).
+    Const
+    # d = the float whose IEEE bits are n (F32: the low 32 bits)
+    FConst
+    # d = a (same kind)
+    Mov
+    # d = a op b, all of kind vk[d]. Integers wrap; floats are IEEE.
+    Add
+    Sub
+    Mul
+    # Integers: C's truncating `/` and `%`. The lowering guarantees b != 0 and no
+    # MIN / -1. Floats: `Div` only.
+    Div
+    Rem
+    # integers and Bool
+    And
+    Or
+    Xor
+    # b (any integer kind) is in [0, bits). `Shr` is arithmetic for signed kinds.
+    Shl
+    Shr
+    # d = -a (integers wrap)
+    Neg
+    # integers: bitwise not; Bool: logical not
+    Not
+    # d (Bool) = a cmp b, compared as vk[a]: signed, unsigned (also Ptr and Bool)
+    # or float (any comparison with NaN is false, except Ne which is true)
+    Eq
+    Ne
+    Lt
+    Le
+    Gt
+    Ge
+    # d = a converted from vk[a] to vk[d], like a C cast: integers truncate or
+    # extend (by the signedness of vk[a]); float to integer truncates toward
+    # zero (the lowering checks the range first); Bool to integer is 0 or 1.
+    # Integer to Bool is not used (compare with 0 instead).
+    Conv
+    # d = a op b of kind vk[d] (an integer kind); on overflow calls
+    # brine_panic_ovf("addition" / "subtraction" / "multiplication", c), where
+    # c is the location (a Ptr to a C string).
+    AddO
+    SubO
+    MulO
+    # d = a (I64) when 0 <= a < b (as unsigned: (u64)a < (u64)b), otherwise
+    # calls brine_panic_idx(a, b, c).
+    IdxChk
+    # d (Ptr) = the address of stack slot a
+    SlotAddr
+    # d (Ptr) = the address of symbol s (data or a function)
+    Global
+    # d = *(vk[d] *)(a + n)
+    Load
+    # *(vk[b] *)(a + n) = b
+    Store
+    # d (Ptr) = a + b * n, with b of kind I64
+    Elem
+    # memcpy(a, b, n): n bytes, the regions don't overlap
+    Copy
+    # memset(a, 0, n)
+    Zero
+    # d = s(args) (d = -1: no result, or the result is ignored).
+    # b = 1 marks a runtime helper `brine_<name>` that the C backend calls by
+    # name (it is `static inline` in brine_rt.h, or takes 128-bit integers) and
+    # the native backend calls as `brine_x_<name>`, an ordinary function in the
+    # runtime with the same parameters (128-bit ones by pointer, as below).
+    # Native code passes 128-bit integers by pointer, in every call: an I128 or
+    # U128 argument is passed as a pointer to its 16 bytes, and an I128 or U128
+    # result is written through a pointer passed as an extra first argument.
+    Call
+    # d = (*a)(args)
+    CallInd
+    # label n (0 <= n < Func.nlabels)
+    Label
+    # goto n
+    Jmp
+    # if a (Bool) goto n
+    Br
+    # if not a (Bool) goto n
+    BrNot
+    # return a (a = -1: return nothing)
+    Ret
+    # control never gets here: calls brine_unreachable()
+    Unreachable
+    # what follows comes from line n of source file s (debug builds); no code
+    Line
+
+    fn name(self) -> str:
+        match self:
+            case Op.Const:
+                return "const"
+            case Op.FConst:
+                return "fconst"
+            case Op.Mov:
+                return "mov"
+            case Op.Add:
+                return "add"
+            case Op.Sub:
+                return "sub"
+            case Op.Mul:
+                return "mul"
+            case Op.Div:
+                return "div"
+            case Op.Rem:
+                return "rem"
+            case Op.And:
+                return "and"
+            case Op.Or:
+                return "or"
+            case Op.Xor:
+                return "xor"
+            case Op.Shl:
+                return "shl"
+            case Op.Shr:
+                return "shr"
+            case Op.Neg:
+                return "neg"
+            case Op.Not:
+                return "not"
+            case Op.Eq:
+                return "eq"
+            case Op.Ne:
+                return "ne"
+            case Op.Lt:
+                return "lt"
+            case Op.Le:
+                return "le"
+            case Op.Gt:
+                return "gt"
+            case Op.Ge:
+                return "ge"
+            case Op.Conv:
+                return "conv"
+            case Op.AddO:
+                return "addo"
+            case Op.SubO:
+                return "subo"
+            case Op.MulO:
+                return "mulo"
+            case Op.IdxChk:
+                return "idxchk"
+            case Op.SlotAddr:
+                return "slot"
+            case Op.Global:
+                return "global"
+            case Op.Load:
+                return "load"
+            case Op.Store:
+                return "store"
+            case Op.Elem:
+                return "elem"
+            case Op.Copy:
+                return "copy"
+            case Op.Zero:
+                return "zero"
+            case Op.Call:
+                return "call"
+            case Op.CallInd:
+                return "callind"
+            case Op.Label:
+                return "label"
+            case Op.Jmp:
+                return "jmp"
+            case Op.Br:
+                return "br"
+            case Op.BrNot:
+                return "brnot"
+            case Op.Ret:
+                return "ret"
+            case Op.Unreachable:
+                return "unreachable"
+            case Op.Line:
+                return "line"
+
+struct Inst:
+    op: Op
+    d: int
+    a: int
+    b: int
+    c: int
+    n: int
+    s: str
+    args: [int]
+
+struct Slot:
+    size: int
+    align: int
+    # the brine variable that lives here ("" for temporaries), for debuggers
+    name: str
+    # holds a single scalar of kind `k`
+    typed: bool
+    k: K
+
+struct Func:
+    name: str
+    # vregs 0..nparams-1 are the parameters
+    nparams: int
+    has_ret: bool
+    ret: K
+    vk: [K]
+    slots: [Slot]
+    code: [Inst]
+    nlabels: int
+    # visible to the linker (only `main`); everything else is local to the object
+    public: bool
+
+# A pointer stored in data: the 8 bytes at `off` hold the address of `sym` + `add`.
+struct Reloc:
+    off: int
+    sym: str
+    add: int
+
+struct Data:
+    name: str
+    align: int
+    bytes: [u8]
+    relocs: [Reloc]
+    # never written (string literals and enum constants are written to: no)
+    readonly: bool
+
+struct Module:
+    funcs: [Func]
+    data: [Data]
+
+fn new_func(name: str, params: [K], has_ret: bool, ret: K) -> Func:
+    return Func(
+        name=name,
+        nparams=len(params),
+        has_ret=has_ret,
+        ret=ret,
+        vk=params,
+        slots=[],
+        code=[],
+        nlabels=0,
+        public=false
+    )
+
+fn inst(op: Op, d: int, a: int, b: int, c: int, n: int, s: str, args: [int]) -> Inst:
+    return Inst(op=op, d=d, a=a, b=b, c=c, n=n, s=s, args=args)
+
+# ================================================================ building
+
+# Appends to a function under construction.
+struct FB:
+    f: Func
+
+    fn vreg(ref self, k: K) -> int:
+        self.f.vk.push(k)
+        return len(self.f.vk) - 1
+
+    fn slot(ref self, size: int, align: int) -> int:
+        self.f.slots.push(
+            Slot(size=max(size, 1), align=max(align, 1), name="", typed=false, k=K.I64)
+        )
+        return len(self.f.slots) - 1
+
+    fn name_slot(ref self, s: int, name: str, typed: bool, k: K):
+        self.f.slots[s].name = name
+        self.f.slots[s].typed = typed
+        self.f.slots[s].k = k
+
+    fn label(ref self) -> int:
+        self.f.nlabels += 1
+        return self.f.nlabels - 1
+
+    fn emit(ref self, i: Inst):
+        self.f.code.push(i)
+
+    fn place(ref self, l: int):
+        self.f.code.push(inst(Op.Label, -1, -1, -1, -1, l, "", []))
+
+    fn jmp(ref self, l: int):
+        self.f.code.push(inst(Op.Jmp, -1, -1, -1, -1, l, "", []))
+
+    fn br(ref self, c: int, l: int):
+        self.f.code.push(inst(Op.Br, -1, c, -1, -1, l, "", []))
+
+    fn brnot(ref self, c: int, l: int):
+        self.f.code.push(inst(Op.BrNot, -1, c, -1, -1, l, "", []))
+
+    fn konst(ref self, k: K, v: int) -> int:
+        let d = self.vreg(k)
+        self.f.code.push(inst(Op.Const, d, -1, -1, 0 if v >= 0 else -1, v, "", []))
+        return d
+
+    fn konst128(ref self, k: K, v: i128) -> int:
+        let d = self.vreg(k)
+        let lo = v & 18446744073709551615
+        let hi = v >> 64
+        self.f.code.push(inst(Op.Const, d, -1, -1, int(hi), u64_to_int(u64(lo)), "", []))
+        return d
+
+    fn fconst(ref self, k: K, bits: int) -> int:
+        let d = self.vreg(k)
+        self.f.code.push(inst(Op.FConst, d, -1, -1, -1, bits, "", []))
+        return d
+
+    fn mov(ref self, d: int, a: int):
+        self.f.code.push(inst(Op.Mov, d, a, -1, -1, 0, "", []))
+
+    fn copy_of(ref self, a: int) -> int:
+        let d = self.vreg(self.f.vk[a])
+        self.mov(d, a)
+        return d
+
+    # d = a op b with a new d of kind k
+    fn bin(ref self, op: Op, k: K, a: int, b: int) -> int:
+        let d = self.vreg(k)
+        self.f.code.push(inst(op, d, a, b, -1, 0, "", []))
+        return d
+
+    fn chk(ref self, op: Op, k: K, a: int, b: int, loc: int) -> int:
+        let d = self.vreg(k)
+        self.f.code.push(inst(op, d, a, b, loc, 0, "", []))
+        return d
+
+    fn un(ref self, op: Op, k: K, a: int) -> int:
+        let d = self.vreg(k)
+        self.f.code.push(inst(op, d, a, -1, -1, 0, "", []))
+        return d
+
+    fn cmp(ref self, op: Op, a: int, b: int) -> int:
+        let d = self.vreg(K.Bool)
+        self.f.code.push(inst(op, d, a, b, -1, 0, "", []))
+        return d
+
+    fn conv(ref self, k: K, a: int) -> int:
+        if self.f.vk[a] == k:
+            return a
+        let d = self.vreg(k)
+        self.f.code.push(inst(Op.Conv, d, a, -1, -1, 0, "", []))
+        return d
+
+    fn slot_addr(ref self, s: int) -> int:
+        let d = self.vreg(K.Ptr)
+        self.f.code.push(inst(Op.SlotAddr, d, s, -1, -1, 0, "", []))
+        return d
+
+    # a new stack slot and its address
+    fn temp_mem(ref self, size: int, align: int) -> int:
+        let s = self.slot(size, align)
+        return self.slot_addr(s)
+
+    fn global(ref self, sym: str) -> int:
+        let d = self.vreg(K.Ptr)
+        self.f.code.push(inst(Op.Global, d, -1, -1, -1, 0, sym, []))
+        return d
+
+    fn load(ref self, k: K, p: int, off: int) -> int:
+        let d = self.vreg(k)
+        self.f.code.push(inst(Op.Load, d, p, -1, -1, off, "", []))
+        return d
+
+    fn load_to(ref self, d: int, p: int, off: int):
+        self.f.code.push(inst(Op.Load, d, p, -1, -1, off, "", []))
+
+    fn store(ref self, p: int, off: int, v: int):
+        self.f.code.push(inst(Op.Store, -1, p, v, -1, off, "", []))
+
+    # p + off as a new pointer
+    fn offset(ref self, p: int, off: int) -> int:
+        if off == 0:
+            return p
+        let i = self.konst(K.I64, off)
+        let d = self.vreg(K.Ptr)
+        self.f.code.push(inst(Op.Elem, d, p, i, -1, 1, "", []))
+        return d
+
+    fn elem(ref self, p: int, i: int, size: int) -> int:
+        let d = self.vreg(K.Ptr)
+        self.f.code.push(inst(Op.Elem, d, p, i, -1, size, "", []))
+        return d
+
+    fn copy(ref self, dst: int, src: int, size: int):
+        if size > 0:
+            self.f.code.push(inst(Op.Copy, -1, dst, src, -1, size, "", []))
+
+    fn zero(ref self, dst: int, size: int):
+        if size > 0:
+            self.f.code.push(inst(Op.Zero, -1, dst, -1, -1, size, "", []))
+
+    # a call with a result of kind k
+    fn call(ref self, k: K, sym: str, args: [int]) -> int:
+        let d = self.vreg(k)
+        self.f.code.push(inst(Op.Call, d, -1, 0, -1, 0, sym, args))
+        return d
+
+    fn call_void(ref self, sym: str, args: [int]):
+        self.f.code.push(inst(Op.Call, -1, -1, 0, -1, 0, sym, args))
+
+    # runtime helpers that are `static inline` in brine_rt.h (see `Op.Call`)
+    fn rt(ref self, k: K, sym: str, args: [int]) -> int:
+        let d = self.vreg(k)
+        self.f.code.push(inst(Op.Call, d, -1, 1, -1, 0, sym, args))
+        return d
+
+    fn rt_void(ref self, sym: str, args: [int]):
+        self.f.code.push(inst(Op.Call, -1, -1, 1, -1, 0, sym, args))
+
+    fn call_ind(ref self, has: bool, k: K, fp: int, args: [int]) -> int:
+        var d = -1
+        if has:
+            d = self.vreg(k)
+        self.f.code.push(inst(Op.CallInd, d, fp, -1, -1, 0, "", args))
+        return d
+
+    fn ret(ref self, v: int):
+        self.f.code.push(inst(Op.Ret, -1, v, -1, -1, 0, "", []))
+
+    fn line(ref self, n: int, file: str):
+        self.f.code.push(inst(Op.Line, -1, -1, -1, -1, n, file, []))
+
+    fn unreachable(ref self):
+        self.f.code.push(inst(Op.Unreachable, -1, -1, -1, -1, 0, "", []))
+
+    # Is the last instruction one that never falls through?
+    fn ends(self) -> bool:
+        let n = len(self.f.code)
+        if n == 0:
+            return false
+        let op = self.f.code[n - 1].op
+        return op == Op.Jmp or op == Op.Ret or op == Op.Unreachable
+
+# ================================================================ data
+
+fn le_bytes(ref out: [u8], v: int, size: int):
+    var x = v
+    for _ in 0..size:
+        out.push(u8(x & 255))
+        x = x >> 8
+
+fn le_bytes128(ref out: [u8], v: i128, size: int):
+    var x = v
+    for _ in 0..size:
+        out.push(u8(x & 255))
+        x = x >> 8
+
+fn str_bytes(ref out: [u8], s: str):
+    for b in s.bytes():
+        out.push(u8(b))
+
+# ================================================================ float bits
+
+# IEEE 754 bits of a float, as the 64 bits of an int.
+fn f64_bits(v: float) -> int:
+    let qnan: u64 = 9221120237041090560
+    let top: u64 = 9223372036854775808
+    let inf: u64 = 9218868437227405312
+    let hidden: u64 = 4503599627370496
+    if v != v:
+        return u64_to_int(qnan)
+    let neg = v < 0.0 or (v == 0.0 and f"{v}".starts_with("-"))
+    var sign: u64 = 0
+    if neg:
+        sign = top
+    var a = -v if v < 0.0 else v
+    if a == 0.0:
+        return u64_to_int(sign)
+    if a - a != a - a:
+        return u64_to_int(sign | inf)
+    # a = m * 2^e with 1 <= m < 2
+    var e = 0
+    while a >= 2.0:
+        a = a / 2.0
+        e += 1
+    while a < 1.0 and e > -1022:
+        a = a * 2.0
+        e -= 1
+    if a < 1.0:
+        # subnormal: a * 2^-1022, exponent field 0
+        for _ in 0..52:
+            a = a * 2.0
+        return u64_to_int(sign | u64(a))
+    for _ in 0..52:
+        a = a * 2.0
+    let m = u64(a) - hidden
+    let ex = u64(e + 1023) << 52
+    return u64_to_int(sign | ex | m)
+
+# IEEE 754 bits of `v` rounded to f32 (as C's `(float)v` does).
+fn f32_bits(v: float) -> int:
+    if v != v:
+        return 2143289344
+    let r = float(f32(v))
+    let neg = r < 0.0 or (r == 0.0 and f"{v}".starts_with("-"))
+    let sign = 2147483648 if neg else 0
+    var a = -r if r < 0.0 else r
+    if a == 0.0:
+        return sign
+    if a - a != a - a:
+        return sign | 2139095040
+    var e = 0
+    while a >= 2.0:
+        a = a / 2.0
+        e += 1
+    while a < 1.0 and e > -126:
+        a = a * 2.0
+        e -= 1
+    if a < 1.0:
+        for _ in 0..23:
+            a = a * 2.0
+        return sign | int(a)
+    for _ in 0..23:
+        a = a * 2.0
+    let m = int(a) - 8388608
+    return sign | ((e + 127) << 23) | m
+
+# ================================================================ text form
+
+fn vname(v: int) -> str:
+    return f"%{v}"
+
+fn dump_func(f: Func) -> str:
+    var o = ""
+    let pub = "pub " if f.public else ""
+    var ps: [str] = []
+    for i in 0..f.nparams:
+        ps.push(f"%{i}: {f.vk[i].name()}")
+    let rt = f" -> {f.ret.name()}" if f.has_ret else ""
+    let pl = ", ".join(ps)
+    o += f"{pub}fn {f.name}({pl}){rt}\n"
+    for i, s in enumerate(f.slots):
+        o += f"  slot {i}: {s.size} align {s.align}\n"
+    for x in f.code:
+        o += dump_inst(f, x)
+        o += "\n"
+    return o
+
+fn dump_inst(f: Func, x: Inst) -> str:
+    var d = ""
+    if x.d >= 0:
+        d = f"%{x.d}: {f.vk[x.d].name()} = "
+    let nm = x.op.name()
+    match x.op:
+        case Op.Label:
+            return f"L{x.n}:"
+        case Op.Jmp:
+            return f"  jmp L{x.n}"
+        case Op.Br | Op.BrNot:
+            return f"  {nm} %{x.a}, L{x.n}"
+        case Op.Const:
+            if f.vk[x.d].is_wide():
+                return f"  {d}const {x.n} hi {x.c}"
+            return f"  {d}const {x.n}"
+        case Op.FConst:
+            return f"  {d}fconst bits {x.n}"
+        case Op.Mov | Op.Neg | Op.Not | Op.Conv:
+            return f"  {d}{nm} %{x.a}"
+        case Op.SlotAddr:
+            return f"  {d}slot {x.a}"
+        case Op.Global:
+            return f"  {d}global {x.s}"
+        case Op.Load:
+            return f"  {d}load [%{x.a} + {x.n}]"
+        case Op.Store:
+            return f"  store [%{x.a} + {x.n}], %{x.b}"
+        case Op.Elem:
+            return f"  {d}elem %{x.a} + %{x.b} * {x.n}"
+        case Op.Copy:
+            return f"  copy %{x.a}, %{x.b}, {x.n}"
+        case Op.Zero:
+            return f"  zero %{x.a}, {x.n}"
+        case Op.AddO | Op.SubO | Op.MulO | Op.IdxChk:
+            return f"  {d}{nm} %{x.a}, %{x.b} loc %{x.c}"
+        case Op.Call:
+            let rt = " rt" if x.b == 1 else ""
+            let args = ", ".join([vname(a) for a in x.args])
+            return f"  {d}call{rt} {x.s}({args})"
+        case Op.CallInd:
+            let args = ", ".join([vname(a) for a in x.args])
+            return f"  {d}callind %{x.a}({args})"
+        case Op.Ret:
+            if x.a < 0:
+                return "  ret"
+            return f"  ret %{x.a}"
+        case Op.Unreachable:
+            return "  unreachable"
+        case Op.Line:
+            return f"  line {x.n} {x.s}"
+        case _:
+            return f"  {d}{nm} %{x.a}, %{x.b}"
+
+fn dump_data(x: Data) -> str:
+    let ro = "const " if x.readonly else ""
+    var o = f"{ro}data {x.name} align {x.align} ["
+    for i, b in enumerate(x.bytes):
+        if i > 0:
+            o += " "
+        o += f"{int(b):02x}"
+    o += "]"
+    for r in x.relocs:
+        o += f" @{r.off}={r.sym}+{r.add}"
+    return o + "\n"
+
+fn dump(m: Module) -> str:
+    var o = ""
+    for x in m.data:
+        o += dump_data(x)
+    for f in m.funcs:
+        o += "\n"
+        o += dump_func(f)
+    return o
