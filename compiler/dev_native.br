@@ -922,6 +922,26 @@ fn t_hot(ref t: T):
     t.line([r], f"{want}")
     t.finish()
 
+# the arguments of `many` (many_args()), some opaque and some folded
+fn many_call_args(ref t: T) -> [int]:
+    var args: [int] = []
+    for i, k in enumerate(many_params()):
+        let x = many_args()[i]
+        if k.is_float():
+            args.push(t.fval(k, x, i % 2 == 0))
+        elif k.is_wide():
+            args.push(t.w(k, i128(x)))
+        else:
+            args.push(t.val(k, i128(x), i % 3 == 0))
+    return args
+
+# what `many` returns
+fn many_want() -> float:
+    var want = 0.0
+    for x in many_args():
+        want += x
+    return want
+
 fn t_calls(ref t: T):
     let ps = many_params()
     # the sum of the arguments as f64, in order
@@ -948,17 +968,8 @@ fn t_calls(ref t: T):
     t.fb.ret(w2)
     t.finish()
     t.begin("t_calls", [], false, K.I64)
-    var args: [int] = []
-    var want = 0.0
-    for i, k in enumerate(ps):
-        let x = many_args()[i]
-        want += x
-        if k.is_float():
-            args.push(t.fval(k, x, i % 2 == 0))
-        elif k.is_wide():
-            args.push(t.w(k, i128(x)))
-        else:
-            args.push(t.val(k, i128(x), i % 3 == 0))
+    let args = many_call_args(ref t)
+    let want = many_want()
     let r1 = t.fb.call(K.F64, "many", args)
     let fp = t.glob("many")
     let r2 = t.fb.call_ind(true, K.F64, fp, args)
@@ -978,6 +989,14 @@ fn t_calls(ref t: T):
     let gw = t.glob("wide_mul")
     let n4 = t.fb.call_ind(true, K.I128, gw, [wa, a, wb])
     t.line([n1, n2, n3, n4], "44 65535 -12345678901234567890300 -12345678901234567890300")
+    # 128-bit results nobody uses: a runtime helper and a call through a
+    # pointer to a module function (written through a hidden pointer that must
+    # not be the first argument)
+    let loc0 = t.loc()
+    t.fb.rt_void("brine_add_i128", [wa, wb, loc0])
+    t.fb.rt_void("brine_conv_u128_from_i64", [a, loc0])
+    t.fb.call_ind(false, K.I128, gw, [wa, a, wb])
+    t.line([wa, wb, a], "-12345678901234567890 1000 300")
     # narrow results from C functions (their upper bits are garbage)
     let loc = t.loc()
     let a1 = t.val(K.I64, -100, true)
@@ -1160,6 +1179,182 @@ fn t_big(ref t: T):
     t.line([r1, r2], f"42 {w + 21}")
     t.finish()
 
+# Keeps vregs in callee-saved registers: a loop adding x to a new vreg three
+# times; returns it (3 * x).
+fn hot_loop(ref t: T, x: int) -> int:
+    let acc = t.opaque(K.I64, 0)
+    let j = t.fb.vreg(K.I64)
+    let (top, end) = t.loop_start(j, 3)
+    t.assign(Op.Add, acc, acc, x)
+    t.loop_end(j, top, end)
+    return acc
+
+# ================================================================ over-aligned slots
+
+fn t_align(ref t: T):
+    # slots aligned to more than 16 bytes, next to ordinary ones, in a function
+    # with stack arguments (incoming and outgoing), callee-saved registers and
+    # a frame big enough to touch page by page
+    let ps = hot_params()
+    let vs = hot_args()
+    t.begin("aligned", ps, true, K.I64)
+    let aligns = [32, 64, 16, 4096, 256, 8, 64]
+    let sizes = [40, 64, 16, 8, 300, 8, 100000]
+    var ptrs: [int] = []
+    var mis: [int] = []
+    for i, a in enumerate(aligns):
+        let p = t.fb.temp_mem(sizes[i], a)
+        ptrs.push(p)
+        let v = t.kc(K.I64, 1000 + i)
+        t.fb.store(p, 0, v)
+        t.fb.store(p, sizes[i] - 8, v)
+        let pi = t.fb.conv(K.I64, p)
+        mis.push(t.bk(Op.And, K.I64, pi, a - 1))
+    t.line(mis, join(["0" for _ in aligns]))
+    let margs = many_call_args(ref t)
+    let r = t.fb.call(K.F64, "many", margs)
+    var marks: [int] = [r]
+    var ws = [f"{many_want()}"]
+    for i, p in enumerate(ptrs):
+        marks.push(t.fb.load(K.I64, p, 0))
+        marks.push(t.fb.load(K.I64, p, sizes[i] - 8))
+        ws.push(f"{1000 + i} {1000 + i}")
+    t.line(marks, join(ws))
+    var pvals: [int] = []
+    for i in 0..len(ps):
+        pvals.push(t.fb.conv(K.I64, i))
+    t.line(pvals, join([str(v) for v in vs]))
+    let acc = hot_loop(ref t, 4)
+    t.fb.ret(acc)
+    t.finish()
+    # the same without saved registers or stack arguments
+    t.begin("aligned_small", [K.I64], true, K.I64)
+    let p = t.fb.temp_mem(32, 32)
+    t.fb.store(p, 24, 0)
+    let pi = t.fb.conv(K.I64, p)
+    let m = t.bk(Op.And, K.I64, pi, 31)
+    let back = t.fb.load(K.I64, p, 24)
+    let s = t.fb.bin(Op.Add, K.I64, m, back)
+    t.fb.ret(s)
+    t.finish()
+    t.begin("t_align", [], false, K.I64)
+    var args: [int] = []
+    for i, k in enumerate(ps):
+        args.push(t.val(k, i128(vs[i]), i % 2 == 0))
+    let r1 = t.fb.call(K.I64, "aligned", args)
+    let x = t.val(K.I64, 77, true)
+    let r2 = t.fb.call(K.I64, "aligned_small", [x])
+    t.line([r1, r2], f"{3 * vs[4]} 77")
+    t.finish()
+
+# ================================================================ unwinding
+
+# C helpers that walk the stack with the platform's unwinder, which reads the
+# unwind tables of the native code (.pdata / .xdata, .eh_frame)
+fn walk_c() -> str:
+    let lines = [
+        "#include <stdint.h>",
+        "#include <setjmp.h>",
+        "#ifdef _WIN32",
+        "#include <windows.h>",
+        "static int64_t walk(void **got, int64_t max) {",
+        "    CONTEXT c;",
+        "    RtlCaptureContext(&c);",
+        "    int64_t k = 0;",
+        "    while (k < max && c.Rip) {",
+        "        DWORD64 base;",
+        "        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &base, NULL);",
+        "        if (!f) break;",
+        "        got[k++] = (void *)(base + f->BeginAddress);",
+        "        void *hd;",
+        "        DWORD64 ef;",
+        "        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, &c, &hd, &ef, NULL);",
+        "    }",
+        "    return k;",
+        "}",
+        "#else",
+        "#include <unwind.h>",
+        "struct walk_st { void **got; int64_t k, max; };",
+        "static _Unwind_Reason_Code step(struct _Unwind_Context *c, void *p) {",
+        "    struct walk_st *w = p;",
+        "    if (w->k >= w->max) return _URC_END_OF_STACK;",
+        "    w->got[w->k++] = (void *)_Unwind_GetRegionStart(c);",
+        "    return _URC_NO_REASON;",
+        "}",
+        "static int64_t walk(void **got, int64_t max) {",
+        "    struct walk_st w = {got, 0, max};",
+        "    _Unwind_Backtrace(step, &w);",
+        "    return w.k;",
+        "}",
+        "#endif",
+        "/* how many of fns[0..n] (innermost first) are on the stack in a row */",
+        "int64_t brx_walk(void **fns, int64_t n) {",
+        "    void *got[64];",
+        "    int64_t k = walk(got, 64), i = 0, m = 0;",
+        "    while (i < k && got[i] != fns[0]) i++;",
+        "    while (i + m < k && m < n && got[i + m] == fns[m]) m++;",
+        "    return m;",
+        "}",
+        "/* longjmp out of native code (on Windows it unwinds the frames between) */",
+        "static jmp_buf jb;",
+        "void brx_throw(int64_t v) { longjmp(jb, (int)v); }",
+        "int64_t brx_catch(void (*f)(int64_t), int64_t a) {",
+        "    int r = setjmp(jb);",
+        "    if (r == 0) { f(a); return 0; }",
+        "    return r;",
+        "}"
+    ]
+    return "\n".join(lines) + "\n"
+
+# brine frames of every shape between the unwinder and main: an odd and an even
+# number of saved registers, none, over-aligned slots, a large frame
+fn t_unwind(ref t: T):
+    t.begin("uw3", [K.I64], true, K.I64)
+    let acc = hot_loop(ref t, 0)
+    let names = ["uw3", "uw2", "uw1", "t_unwind", "main"]
+    let fns = t.fb.temp_mem(8 * len(names), 8)
+    for i, nm in enumerate(names):
+        let g = t.glob(nm)
+        t.fb.store(fns, 8 * i, g)
+    let n = t.kc(K.I64, len(names))
+    let found = t.fb.call(K.I64, "brx_walk", [fns, n])
+    let r3 = t.fb.bin(Op.Add, K.I64, found, acc)
+    t.fb.ret(r3)
+    t.finish()
+    t.begin("uw2", [K.I64], true, K.I64)
+    let s = t.fb.temp_mem(20000, 64)
+    t.fb.store(s, 19992, 0)
+    let acc2 = hot_loop(ref t, 0)
+    let acc3 = hot_loop(ref t, acc2)
+    let r2 = t.fb.call(K.I64, "uw3", [acc3])
+    let back = t.fb.load(K.I64, s, 19992)
+    let r2b = t.fb.bin(Op.Add, K.I64, r2, back)
+    t.fb.ret(r2b)
+    t.finish()
+    t.begin("uw1", [K.I64], true, K.I64)
+    let r1 = t.fb.call(K.I64, "uw2", [0])
+    t.fb.ret(r1)
+    t.finish()
+    # longjmp from C across brine frames
+    t.begin("uwj2", [K.I64], false, K.I64)
+    let sj = t.fb.temp_mem(64, 128)
+    t.fb.store(sj, 0, 0)
+    let accj = hot_loop(ref t, 0)
+    t.fb.call_void("brx_throw", [accj])
+    t.finish()
+    t.begin("uwj1", [K.I64], false, K.I64)
+    t.fb.call_void("uwj2", [0])
+    t.finish()
+    t.begin("t_unwind", [], false, K.I64)
+    let x = t.val(K.I64, 2, true)
+    let r = t.fb.call(K.I64, "uw1", [x])
+    let fj = t.glob("uwj1")
+    let a = t.val(K.I64, 7, true)
+    let rj = t.fb.call(K.I64, "brx_catch", [fj, a])
+    # uw3 gets 3 * 3 * 2 = 18 and adds 3 * 18 to the 5 frames found; uw2 adds 2
+    t.line([r, rj], f"{5 + 54 + 2} 21")
+    t.finish()
+
 # ================================================================ panics
 
 # One function per panic; returns what each must print.
@@ -1251,7 +1446,9 @@ fn tests() -> [str]:
         "t_calls",
         "t_hot",
         "t_callbacks",
-        "t_big"
+        "t_big",
+        "t_align",
+        "t_unwind"
     ]
 
 fn build() -> (Module, [str], [str]):
@@ -1267,6 +1464,8 @@ fn build() -> (Module, [str], [str]):
     t_hot(ref t)
     t_callbacks(ref t)
     t_big(ref t)
+    t_align(ref t)
+    t_unwind(ref t)
     let panics = panic_tests(ref t)
     # main(argc, argv): no arguments runs the tests; k arguments, panic test k - 1
     t.begin("main", [K.I32, K.Ptr], true, K.I32)
@@ -1349,7 +1548,19 @@ fn main() -> int:
         if c != 0:
             eprint(f"runtime build failed: {o}{e}")
             return 1
-    var link = ["gcc", objp, rt, "-o", exe]
+    let walk_src = f"{DIR}/walk.c"
+    let walk = f"{DIR}/walk_{os.name()}.o"
+    match write_file(walk_src, walk_c()):
+        case Ok(_):
+            pass
+        case Err(e):
+            eprint(f"cannot write {walk_src}: {e}")
+            return 1
+    let (wc, wo, we) = run_cmd(["gcc", "-O2", "-w", "-c", walk_src, "-o", walk])
+    if wc != 0:
+        eprint(f"stack walker build failed: {wo}{we}")
+        return 1
+    var link = ["gcc", objp, walk, rt, "-o", exe]
     if windows:
         link.extend(["-lws2_32", "-lshell32"])
     else:
