@@ -1,0 +1,204 @@
+# Optimizations on the IR for the native backend (x64.br). The C backend
+# doesn't need them: the C compiler does the same and more.
+#
+# The lowering keeps every local variable in a stack slot and reads and writes
+# it through its address. `promote` moves the slots that are only read and
+# written whole (their address goes nowhere else) into vregs, so the register
+# allocator can keep them in registers, and then removes the copies that this
+# leaves behind.
+
+from ir import K, Op, Inst, Func
+
+# The vregs that only ever hold the address of one slot: slot by vreg, -1 for
+# the others.
+fn slot_vregs(f: Func) -> [int]:
+    let nv = len(f.vk)
+    var slot = [-1] * nv
+    var ndef = [0] * nv
+    for x in f.code:
+        if x.d >= 0:
+            ndef[x.d] += 1
+            if x.op == Op.SlotAddr:
+                slot[x.d] = x.a
+    for v in 0..nv:
+        if ndef[v] != 1 or v < f.nparams:
+            slot[v] = -1
+    return slot
+
+# Every vreg an instruction reads.
+fn reads(x: Inst, nv: int) -> [int]:
+    var r: [int] = []
+    if x.op == Op.Const or x.op == Op.FConst or x.op == Op.SlotAddr or x.op == Op.Global:
+        return r
+    if x.op == Op.Label or x.op == Op.Jmp or x.op == Op.Line or x.op == Op.Unreachable:
+        return r
+    if x.a >= 0 and x.a < nv:
+        r.push(x.a)
+    if x.b >= 0 and x.b < nv:
+        r.push(x.b)
+    # c is a vreg only for these (elsewhere it is an immediate or unused)
+    if (x.op == Op.AddO or x.op == Op.SubO or x.op == Op.MulO or x.op == Op.IdxChk) and x.c >= 0:
+        r.push(x.c)
+    if x.op == Op.Call or x.op == Op.CallInd:
+        r.extend(x.args)
+    return r
+
+# Which slots can live in a vreg, and the kind they hold (K.I64 when not).
+fn promotable(f: Func, slot: [int]) -> ([bool], [K]):
+    let ns = len(f.slots)
+    let nv = len(f.vk)
+    var ok = [true] * ns
+    var seen = [false] * ns
+    var kind = [K.I64] * ns
+    for x in f.code:
+        if x.op == Op.SlotAddr:
+            continue
+        # a slot address used as anything but the address of a whole load or store
+        var addr = -1
+        var k = K.I64
+        if x.op == Op.Load and x.n == 0 and slot[x.a] >= 0:
+            addr = x.a
+            k = f.vk[x.d]
+        elif x.op == Op.Store and x.n == 0 and slot[x.a] >= 0 and slot[x.b] < 0:
+            addr = x.a
+            k = f.vk[x.b]
+        for v in reads(x, nv):
+            if v != addr and slot[v] >= 0:
+                ok[slot[v]] = false
+        if addr >= 0:
+            let s = slot[addr]
+            if k.is_wide():
+                ok[s] = false
+            elif not seen[s]:
+                seen[s] = true
+                kind[s] = k
+            elif kind[s] != k:
+                ok[s] = false
+    for s in 0..ns:
+        if not seen[s]:
+            ok[s] = false
+    return (ok, kind)
+
+fn arith(op: Op) -> bool:
+    match op:
+        case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
+            return true
+        case Op.AddO | Op.SubO | Op.MulO:
+            return true
+        case _:
+            return false
+
+fn mov(d: int, a: int) -> Inst:
+    return Inst(op=Op.Mov, d=d, a=a, b=-1, c=-1, n=0, s="", args=[])
+
+fn promote(f: Func) -> Func:
+    let slot = slot_vregs(f)
+    let (ok, kind) = promotable(f, slot)
+    var g = f
+    var home = [-1] * len(f.slots)
+    for s in 0..len(f.slots):
+        if ok[s]:
+            g.vk.push(kind[s])
+            home[s] = len(g.vk) - 1
+    var code: [Inst] = []
+    for x in f.code:
+        if x.op == Op.SlotAddr and slot[x.d] >= 0 and ok[x.a]:
+            continue
+        if x.op == Op.Load and x.n == 0 and slot[x.a] >= 0 and ok[slot[x.a]]:
+            code.push(mov(x.d, home[slot[x.a]]))
+        elif x.op == Op.Store and x.n == 0 and slot[x.a] >= 0 and ok[slot[x.a]]:
+            code.push(mov(home[slot[x.a]], x.b))
+        else:
+            code.push(x)
+    g.code = code
+    return forward(g)
+
+# Removes the copies `d = v` with d read once, later in the same block: the
+# reader reads v itself if v doesn't change in between. And `d = t` where t is
+# made just before and read only there: t's instruction writes d directly.
+fn forward(f: Func) -> Func:
+    let nv = len(f.vk)
+    var ndef = [0] * nv
+    var nuse = [0] * nv
+    for i in 0..f.nparams:
+        ndef[i] = 1
+    for x in f.code:
+        if x.d >= 0:
+            ndef[x.d] += 1
+        for v in reads(x, nv):
+            nuse[v] += 1
+    var code = f.code
+    var dead = [false] * len(code)
+    let n = len(code)
+    for i in 0..n:
+        let x = code[i]
+        if x.op != Op.Mov or ndef[x.d] != 1 or nuse[x.d] != 1:
+            continue
+        # the reader, in the same block, with v unchanged until it
+        let d = x.d
+        let v = x.a
+        var j = i + 1
+        var found = -1
+        while j < n:
+            let y = code[j]
+            if y.op == Op.Label or y.op == Op.Jmp or y.op == Op.Br or y.op == Op.BrNot or y.op == Op.Ret:
+                if y.a == d and (y.op == Op.Br or y.op == Op.BrNot or y.op == Op.Ret):
+                    found = j
+                break
+            if y.op == Op.Unreachable:
+                break
+            if d in reads(y, nv):
+                found = j
+                break
+            if y.d == v:
+                break
+            j += 1
+        if found < 0:
+            continue
+        var y = code[found]
+        if y.d == v and y.op != Op.Mov and not arith(y.op):
+            continue
+        if y.a == d:
+            y.a = v
+        if y.b == d:
+            y.b = v
+        if (
+            y.op == Op.AddO or y.op == Op.SubO or y.op == Op.MulO or y.op == Op.IdxChk
+        ) and y.c == d:
+            y.c = v
+        if y.op == Op.Call or y.op == Op.CallInd:
+            for k in 0..len(y.args):
+                if y.args[k] == d:
+                    y.args[k] = v
+        code[found] = y
+        dead[i] = true
+    # `t = ...; d = t` with t read only by the copy, and d not read or written
+    # in between: the first writes d
+    for i in 0..n:
+        let x = code[i]
+        if dead[i] or x.op != Op.Mov or ndef[x.a] != 1 or nuse[x.a] != 1 or x.a < f.nparams:
+            continue
+        let t = x.a
+        let d = x.d
+        if f.vk[t] != f.vk[d]:
+            continue
+        var j = i - 1
+        while j >= 0 and dead[j]:
+            j -= 1
+        if j < 0 or code[j].d != t:
+            continue
+        let op = code[j].op
+        if op == Op.Call or op == Op.CallInd or op == Op.Label:
+            continue
+        # `d = d op x`: only where x64.br reads the operands before writing d
+        if d in reads(code[j], nv) and not arith(op):
+            continue
+        code[j].d = d
+        dead[i] = true
+    var out: [Inst] = []
+    for i in 0..n:
+        if not dead[i]:
+            out.push(code[i])
+    var g = f
+    g.code = out
+    return g
