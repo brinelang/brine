@@ -372,15 +372,7 @@ void brine_rt_arr(void *p) { brine_arr_retain(*(brine_arr **)p); }
 void brine_rl_arr(void *p) { brine_arr_release(*(brine_arr **)p); }
 
 /* ============================================================ strings */
-/* The bytes allocated for a string of length n, rounded up (by at most a
-   quarter) so `+=` can usually grow it in place. Every heap string is at least
-   this big for its length, which is what brine_str_append relies on. */
-static size_t br_str_size(int64_t n) {
-    size_t t = sizeof(brine_str) + (size_t)n + 1;
-    if (t <= 64) return (t + 15) & ~(size_t)15;
-    size_t g = (size_t)1 << (61 - __builtin_clzll(t));
-    return (t + g - 1) & ~(g - 1);
-}
+#define br_str_size brine_str_size
 static brine_str *br_str_alloc(int64_t n) {
     brine_str *s = (brine_str *)brine_alloc((int64_t)br_str_size(n));
     BR_LIVE(1);
@@ -433,25 +425,18 @@ bool brine_str_contains(brine_str *s, brine_str *sub) {
         if (s->data[i] == sub->data[0] && memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) return true;
     return false;
 }
-/* one-byte strings for `s[i]`, immortal so indexing never allocates */
-typedef struct {
-    int64_t rc, len;
-    char d[2];
-} br_str1;
 #define BR_B1(i) {-1, 1, {(char)(i), 0}}
 #define BR_B4(i) BR_B1(i), BR_B1((i) + 1), BR_B1((i) + 2), BR_B1((i) + 3)
 #define BR_B16(i) BR_B4(i), BR_B4((i) + 4), BR_B4((i) + 8), BR_B4((i) + 12)
 #define BR_B64(i) BR_B16(i), BR_B16((i) + 16), BR_B16((i) + 32), BR_B16((i) + 48)
-static br_str1 br_bytes[256] = {BR_B64(0), BR_B64(64), BR_B64(128), BR_B64(192)};
-
-brine_str *brine_str_byte(brine_str *s, int64_t i) { return (brine_str *)&br_bytes[(unsigned char)s->data[i]]; }
+brine_str1 brine_bytes[256] = {BR_B64(0), BR_B64(64), BR_B64(128), BR_B64(192)};
 
 static brine_str *br_sub(brine_str *s, int64_t lo, int64_t hi) {
     if (lo == 0 && hi == s->len) {
         brine_str_retain(s);
         return s;
     }
-    if (hi - lo == 1) return (brine_str *)&br_bytes[(unsigned char)s->data[lo]];
+    if (hi - lo == 1) return (brine_str *)&brine_bytes[(unsigned char)s->data[lo]];
     return brine_str_new(s->data + lo, hi - lo);
 }
 brine_str *brine_str_slice(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
@@ -480,7 +465,7 @@ brine_str *brine_chr(int64_t c, const char *loc) {
     char b[4];
     int n;
     if (c < 0 || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff)) br_panicf(loc, "chr(%lld) is not a valid character", (long long)c);
-    if (c < 0x80) return (brine_str *)&br_bytes[c];
+    if (c < 0x80) return (brine_str *)&brine_bytes[c];
     if (c < 0x800) {
         b[0] = (char)(0xc0 | (c >> 6));
         b[1] = (char)(0x80 | (c & 0x3f));
@@ -4066,6 +4051,8 @@ bool brine_x_box_dec(void *p) { return brine_box_dec(p); }
 void brine_x_map_retain(brine_map *m) { brine_map_retain(m); }
 void brine_x_map_release(brine_map *m) { brine_map_release(m); }
 brine_str *brine_x_str_at(brine_str *s, int64_t i, const char *loc) { return brine_str_at(s, i, loc); }
+brine_str *brine_x_str_byte(brine_str *s, int64_t i) { return brine_str_byte(s, i); }
+void brine_x_str_add(brine_str **ps, brine_str *b) { brine_str_add(ps, b); }
 bool brine_x_map_has(brine_map *m, const void *k) { return brine_map_has(m, k); }
 uint64_t brine_x_hash_u64(uint64_t x) { return brine_hash_u64(x); }
 uint64_t brine_x_hash_mix(uint64_t h, uint64_t x) { return brine_hash_mix(h, x); }

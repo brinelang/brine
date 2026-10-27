@@ -143,10 +143,37 @@ void brine_rl_map(void *p);
 brine_str *brine_str_new(const char *p, int64_t n);
 brine_str *brine_str_concat(brine_str *a, brine_str *b);
 void brine_str_append(brine_str **ps, brine_str *b);
+/* The bytes allocated for a string of length n, rounded up (by at most a
+   quarter) so `+=` can usually grow it in place. Every heap string is at least
+   this big for its length. */
+static inline size_t brine_str_size(int64_t n) {
+    size_t t = sizeof(brine_str) + (size_t)n + 1;
+    if (t <= 64) return (t + 15) & ~(size_t)15;
+    size_t g = (size_t)1 << (61 - __builtin_clzll(t));
+    return (t + g - 1) & ~(g - 1);
+}
+/* `s += t`: in place when s is unshared and its block has room */
+static inline void brine_str_add(brine_str **ps, brine_str *b) {
+    brine_str *a = *ps;
+    int64_t n = a->len + b->len;
+    if (__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 && brine_str_size(n) == brine_str_size(a->len)) {
+        __builtin_memcpy(a->data + a->len, b->data, (size_t)b->len);
+        a->data[n] = 0;
+        a->len = n;
+        return;
+    }
+    brine_str_append(ps, b);
+}
 bool brine_str_eq(brine_str *a, brine_str *b);
 bool brine_str_contains(brine_str *s, brine_str *sub);
-/* `s[i]`: the byte at i as a one-character string (never allocates) */
-brine_str *brine_str_byte(brine_str *s, int64_t i);
+/* `s[i]`: the byte at i as a one-character string, from a table of immortal
+   ones so indexing never allocates */
+typedef struct {
+    int64_t rc, len;
+    char d[2];
+} brine_str1;
+extern brine_str1 brine_bytes[256];
+static inline brine_str *brine_str_byte(brine_str *s, int64_t i) { return (brine_str *)&brine_bytes[(unsigned char)s->data[i]]; }
 static inline brine_str *brine_str_at(brine_str *s, int64_t i, const char *loc) {
     if (BR_UNLIKELY((uint64_t)i >= (uint64_t)s->len)) brine_panic_idx(i, s->len, loc);
     return brine_str_byte(s, i);
