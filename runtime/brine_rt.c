@@ -1967,6 +1967,9 @@ enum { BR_GS_NONE, BR_GS_INIT, BR_GS_READY, BR_GS_FAILED };
 /* a launch should take about this long (seconds): Windows resets a GPU
  * whose kernel runs for 2 s */
 #define BR_GPU_SLICE 0.03
+/* how much one hardware thread adds to the pool's speed: most CPUs run two
+ * threads per core */
+#define BR_CPU_EFF 0.5
 
 static struct {
     br_mutex mu; /* the fields below */
@@ -1987,6 +1990,7 @@ static struct {
     double init_s; /* how long getting the device ready takes */
     char name[128];
     int sms;
+    double f64_ratio; /* how much faster than one CPU thread at f64 code */
 } br_gpu;
 
 /* what the runtime learned about one construct */
@@ -1995,6 +1999,7 @@ typedef struct {
     double seq_ns; /* one CPU thread, per element */
     double cpu_ns; /* the thread pool, per element */
     double gpu_ns; /* the device, per element (0: not measured) */
+    int cpu_seen;  /* cpu_ns was measured, not estimated */
 } br_kst;
 
 static void br_gpu_setup(void) {
@@ -2009,6 +2014,7 @@ static void br_gpu_setup(void) {
     br_gpu.log = l && *l && strcmp(l, "0") != 0;
     br_gpu.bw = 8e9;
     br_gpu.init_s = 0.3;
+    br_gpu.f64_ratio = 40;
 }
 
 static void br_gpu_logf(const char *fmt, ...) {
@@ -2085,8 +2091,12 @@ static int br_gpu_open(const char *ptx, char *why, size_t nwhy) {
         snprintf(why, nwhy, "no CUDA device");
         return 0;
     }
-    int major = 0;
+    int major = 0, minor = 0;
     c->DeviceGetAttribute(&major, BR_CU_ATTR_CC_MAJOR, dev);
+    c->DeviceGetAttribute(&minor, BR_CU_ATTR_CC_MINOR, dev);
+    /* x.0 data-center parts (P100, V100, A100, H100, B200) run f64 at half
+     * the f32 rate; the others at 1/32 or 1/64 */
+    if (minor == 0 && major >= 6) br_gpu.f64_ratio = 75;
     c->DeviceGetAttribute(&br_gpu.sms, BR_CU_ATTR_SMS, dev);
     c->DeviceGetName(br_gpu.name, (int)sizeof br_gpu.name, dev);
     if (major < 5) {
@@ -2433,7 +2443,7 @@ static const char *br_gpu_kind(const brine_kernel *k) {
 static double br_gpu_guess_ns(const brine_kernel *k, double seq_ns) {
     double f = k->cost > 0 ? (double)k->cost64 / (double)k->cost : 0;
     if (f > 1) f = 1;
-    return seq_ns * ((1 - f) / 300.0 + f / 40.0);
+    return seq_ns * ((1 - f) / 150.0 + f / br_gpu.f64_ratio);
 }
 
 typedef struct {
@@ -2494,8 +2504,11 @@ static void br_gpu_note_cpu(br_kst *st, int64_t count, double secs) {
     if (count <= 0 || !st) return;
     br_lock(&br_gpu.mu);
     double ns = secs * 1e9 / (double)count;
-    st->cpu_ns = st->cpu_ns > 0 ? 0.5 * (st->cpu_ns + ns) : ns;
-    if (st->seq_ns <= 0) st->seq_ns = st->cpu_ns * br_threads();
+    /* a measurement replaces the probe's estimate: the first elements may
+     * not be typical */
+    st->cpu_ns = st->cpu_seen ? 0.5 * (st->cpu_ns + ns) : ns;
+    st->cpu_seen = 1;
+    st->seq_ns = st->cpu_ns * br_threads() * BR_CPU_EFF;
     br_unlock(&br_gpu.mu);
 }
 
@@ -2562,7 +2575,7 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
         done = br_probe_for(fn, ctx, 0, n, 1e-4, &ns);
         br_lock(&br_gpu.mu);
         st->seq_ns = ns;
-        st->cpu_ns = ns / (br_threads() * 0.8);
+        st->cpu_ns = ns / (br_threads() * BR_CPU_EFF);
         br_unlock(&br_gpu.mu);
         if (done >= n) {
             *why = "done while measuring";
@@ -2718,7 +2731,7 @@ static int br_gpu_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx
         double ns = (brine_clock() - t0) * 1e9 / (double)(p * BRINE_LEAF);
         br_lock(&br_gpu.mu);
         st->seq_ns = ns;
-        st->cpu_ns = ns / (br_threads() * 0.8);
+        st->cpu_ns = ns / (br_threads() * BR_CPU_EFF);
         br_unlock(&br_gpu.mu);
     }
     br_gplan pl;
