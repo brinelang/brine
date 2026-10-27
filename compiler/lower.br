@@ -15,12 +15,13 @@
 # tuples and structs are C structs, enums with payload are boxes
 # `{rc, tag, union of variant structs}`, other enums are int32.
 from diag import Span, SourceMap
-from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, int_ty
+from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, LocalKind, int_ty
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import FmtSpec, parse_fmt_spec
 from info import ProgramInfo, ConstVal, TryKind, try_kind, mangle_module, PRELUDE
 from num import u128_bits
 from ir import K, Op, Func, Data, Reloc, Module, FB, new_func, le_bytes, str_bytes, f64_bits, f32_bits
+from ir import DType, DField, DVar, DT_BASE, DT_STRUCT, DT_UNION, DT_ENUM, DT_PTR, DT_TYPEDEF, DT_ARRAY
 
 struct Options:
     # generate a test-runner `main` instead of the program's `main`
@@ -59,6 +60,8 @@ struct FnCx:
     loc: int
     # where an aggregate result is written (an extra first parameter), or -1
     sret: int
+    # debug builds: the number of `Func.dvars` when each scope opened
+    dmark: [int]
 
 fn new_cx(f: Func) -> FnCx:
     return FnCx(
@@ -70,7 +73,8 @@ fn new_cx(f: Func) -> FnCx:
         lslot={},
         lptr={},
         loc=-1,
-        sret=-1
+        sret=-1,
+        dmark=[]
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -144,7 +148,9 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         cx=new_cx(new_func("", [], false, K.I64)),
         fnd=None,
         flocals=[],
-        fsyms={}
+        fsyms={},
+        dtypes=[],
+        dtys={}
     )
     return g.run()
 
@@ -171,6 +177,9 @@ struct Lower:
     flocals: [LocalInfo]
     # IR names of brine functions, by id
     fsyms: {int: str}
+    # debug builds: the types of variables, and their indexes by mangled name
+    dtypes: [DType]
+    dtys: {str: int}
 
     # ============================================================ driver
     fn run(ref self) -> Lowered:
@@ -192,7 +201,10 @@ struct Lower:
                 let ks = [self.kind(p.ty) for p in sig.params]
                 let has = self.ret_has(sig.ret)
                 externs.push(new_func(sig.c_name, ks, has, self.kind(sig.ret) if has else K.I64))
-        return Lowered(m=Module(funcs=self.funcs, data=self.data), externs=externs)
+        return Lowered(
+            m=Module(funcs=self.funcs, data=self.data, dtypes=self.dtypes),
+            externs=externs
+        )
 
     # The IR parameters of brine function `id`: an sret pointer first for an
     # aggregate result, then the parameters, then `__loc` for prelude functions.
@@ -225,6 +237,8 @@ struct Lower:
         self.fnd = Some(f)
         self.flocals = f.locals
         self.cx = new_cx(new_func(name, ks, has, rk))
+        if self.opts.debug:
+            self.dbg_func(f, is_test)
         if not is_test:
             let sig = self.info.fns[f.id]
             var pi = 0
@@ -238,6 +252,7 @@ struct Lower:
                 let id = f.param_locals[i]
                 if p.by_ref or self.agg(p.ty):
                     self.cx.lptr[id] = v
+                    self.dbg_ptr_var(id, v, true)
                 else:
                     let a = self.new_local(id, p.ty)
                     self.cx.fb.store(a, 0, v)
@@ -534,11 +549,16 @@ struct Lower:
 
     fn push_scope(ref self):
         self.cx.scopes.push([])
+        if self.opts.debug:
+            self.cx.dmark.push(len(self.cx.fb.f.dvars))
 
     fn pop_scope(ref self):
         var s: [Owned] = []
         if len(self.cx.scopes) > 0:
             s = self.cx.scopes.pop()
+        if self.opts.debug and len(self.cx.dmark) > 0:
+            let mark = self.cx.dmark.pop()
+            self.dbg_close(mark)
         if self.cx.fb.ends():
             return
         var i = len(s) - 1
@@ -857,6 +877,10 @@ struct Lower:
         let s = self.cx.fb.slot(lay.size, lay.align)
         self.cx.fb.name_slot(s, self.flocals[id].name, not self.agg(t), self.kind(t))
         self.cx.lslot[id] = s
+        if self.opts.debug:
+            let lk = self.flocals[id].kind
+            let param = lk == LocalKind.Param or lk == LocalKind.RefParam
+            self.dbg_var(id, s, -1, param)
         return self.cx.fb.slot_addr(s)
 
     fn local_ptr(ref self, id: int) -> int:
@@ -875,6 +899,187 @@ struct Lower:
     fn read_local(ref self, id: int) -> int:
         let p = self.local_ptr(id)
         return self.ld(p, 0, self.flocals[id].ty)
+
+    # ============================================================ debug info
+    # Debug builds describe each function's variables and their types for
+    # debuggers (see `Func.dvars` and `Module.dtypes`).
+    fn dbg_func(ref self, f: FnDecl, is_test: bool):
+        var name = f.name
+        if is_test:
+            name = "test " + f.test_name.unwrap_or(f.name)
+        else:
+            let sig = self.info.fns[f.id]
+            name = sig.name
+            match sig.method_of:
+                case Some(t):
+                    name = self.info.ty_name(t) + "." + sig.name
+                case None:
+                    pass
+            if self.ret_has(sig.ret) and not self.kind(sig.ret).is_wide():
+                self.cx.fb.f.dret = self.dty(sig.ret)
+        let file = self.sm.file(f.span.file)
+        let (l, _) = file.line_col(f.span.lo)
+        self.cx.fb.f.dname = name
+        self.cx.fb.f.dfile = file.path
+        self.cx.fb.f.dline = l
+
+    # Local `id` lives in stack slot `slot`, or behind the pointer in vreg `ptr`.
+    fn dbg_var(ref self, id: int, slot: int, ptr: int, param: bool):
+        let li = self.flocals[id]
+        if li.name == "_" or li.name.starts_with("__"):
+            return
+        let ty = self.dty(li.ty)
+        let lo = len(self.cx.fb.f.code)
+        self.cx.fb.f.dvars.push(
+            DVar(name=li.name, ty=ty, slot=slot, ptr=ptr, param=param, lo=lo, hi=-1)
+        )
+
+    fn dbg_ptr_var(ref self, id: int, v: int, param: bool):
+        if self.opts.debug:
+            self.dbg_var(id, -1, v, param)
+
+    # The variables declared since `mark` go out of scope here.
+    fn dbg_close(ref self, mark: int):
+        let here = len(self.cx.fb.f.code)
+        for i in mark..len(self.cx.fb.f.dvars):
+            if self.cx.fb.f.dvars[i].hi < 0:
+                self.cx.fb.f.dvars[i].hi = here
+
+    fn dty_add(ref self, d: DType) -> int:
+        self.dtypes.push(d)
+        return len(self.dtypes) - 1
+
+    # The debug type of `t`, by index (described once, even when recursive).
+    fn dty(ref self, t: Ty) -> int:
+        let key = self.mangle(t)
+        match self.dtys.get(key):
+            case Some(i):
+                return i
+            case None:
+                pass
+        let i = self.dty_add(dbase("?", K.I64))
+        self.dtys[key] = i
+        let d = self.make_dty(t)
+        self.dtypes[i] = d
+        return i
+
+    # A pointer to debug type `to` (-1: to anything).
+    fn dty_ptr(ref self, to: int) -> int:
+        let key = f"#ptr{to}"
+        match self.dtys.get(key):
+            case Some(i):
+                return i
+            case None:
+                pass
+        let i = self.dty_add(DType(tag=DT_PTR, name="", size=8, k=K.Ptr, to=to, fields=[]))
+        self.dtys[key] = i
+        return i
+
+    # Strings, arrays, maps and enum boxes are pointers to runtime objects
+    # (brine_rt.h); debuggers see them under their brine names (`str`,
+    # `[int]`), which is what the pretty-printers look for.
+    fn make_dty(ref self, t: Ty) -> DType:
+        let name = self.info.ty_name(t)
+        match t:
+            case Ty.Int(_) | Ty.Float(_) | Ty.Bool:
+                return dbase(name, self.kind(t))
+            case Ty.Str:
+                let int = self.dty(int_ty())
+                let ch = self.dty_add(dbase("char", K.U8))
+                let data = self.dty_add(
+                    DType(tag=DT_ARRAY, name="", size=0, k=K.U8, to=ch, fields=[])
+                )
+                let fs = [dfield("rc", int, 0), dfield("len", int, 8), dfield("data", data, 16)]
+                let s = self.dty_add(dstruct("brine_str", 16, fs))
+                return dtypedef(name, self.dty_ptr(s))
+            case Ty.Array(e):
+                let int = self.dty(int_ty())
+                let any = self.dty_ptr(-1)
+                let et = self.dty(e)
+                let ep = self.dty_ptr(et)
+                let fs = [
+                    dfield("rc", int, 0),
+                    dfield("len", int, 8),
+                    dfield("cap", int, 16),
+                    dfield("esz", int, 24),
+                    dfield("retain", any, 32),
+                    dfield("release", any, 40),
+                    dfield("data", ep, 48)
+                ]
+                let s = self.dty_add(dstruct("brine_arr " + name, 56, fs))
+                return dtypedef(name, self.dty_ptr(s))
+            case Ty.Map(k, v):
+                let int = self.dty(int_ty())
+                let any = self.dty_ptr(-1)
+                let kt = self.dty(k)
+                let kp = self.dty_ptr(kt)
+                let vt = self.dty(v)
+                let vp = self.dty_ptr(vt)
+                let bt = self.dty(Ty.Bool)
+                let bp = self.dty_ptr(bt)
+                let fs = [
+                    dfield("rc", int, 0),
+                    dfield("len", int, 8),
+                    dfield("used", int, 16),
+                    dfield("cap", int, 24),
+                    dfield("nidx", int, 32),
+                    dfield("ty", any, 40),
+                    dfield("keys", kp, 48),
+                    dfield("vals", vp, 56),
+                    dfield("hashes", any, 64),
+                    dfield("live", bp, 72),
+                    dfield("index", any, 80)
+                ]
+                let s = self.dty_add(dstruct("brine_map " + name, 88, fs))
+                return dtypedef(name, self.dty_ptr(s))
+            case Ty.Struct(sid):
+                var fs: [DField] = []
+                for i, fd in enumerate(self.info.structs[sid].fields):
+                    let ft = self.dty(fd.1)
+                    fs.push(dfield(fd.0, ft, self.soffs[sid][i]))
+                return dstruct(name, self.slays[sid].size, fs)
+            case Ty.Tuple(ts):
+                if len(ts) == 0:
+                    return dbase("()", K.U8)
+                let (lay, offs) = self.struct_lay(ts)
+                var fs: [DField] = []
+                for i, x in enumerate(ts):
+                    fs.push(dfield(f"_{i}", self.dty(x), offs[i]))
+                return dstruct(name, lay.size, fs)
+            case Ty.Enum(eid):
+                let en = self.info.enums[eid]
+                var vals: [DField] = []
+                for vi in 0..len(en.variants):
+                    vals.push(dfield(en.variant_label(vi), -1, vi))
+                if not en.has_payload():
+                    return DType(tag=DT_ENUM, name=name, size=4, k=K.I32, to=-1, fields=vals)
+                # a box: {rc, tag, the union of the variants with fields}
+                let int = self.dty(int_ty())
+                let bl = self.blays[eid]
+                let tag = self.dty_add(
+                    DType(tag=DT_ENUM, name=name + ".tag", size=8, k=K.I64, to=-1, fields=vals)
+                )
+                var vs: [DField] = []
+                for vi, v in enumerate(en.variants):
+                    if len(v.fields) == 0:
+                        continue
+                    var fs: [DField] = []
+                    for fi, fd in enumerate(v.fields):
+                        fs.push(dfield(fd.0, self.dty(fd.1), bl.voffs[vi][fi] - bl.uoff))
+                    let vt = self.dty_add(dstruct(en.variant_label(vi), bl.vsize[vi] - bl.uoff, fs))
+                    vs.push(dfield(v.name, vt, 0))
+                let u = self.dty_add(
+                    DType(tag=DT_UNION, name=name + ".variants", size=bl.size - bl.uoff, k=K.I64, to=-1, fields=vs)
+                )
+                let fs = [
+                    dfield("rc", int, 0),
+                    dfield("tag", tag, 8),
+                    dfield("variant", u, bl.uoff)
+                ]
+                let b = self.dty_add(dstruct("brine_box " + name, bl.size, fs))
+                return dtypedef(name, self.dty_ptr(b))
+            case _:
+                return dbase("()", K.U8)
 
     # ============================================================ reference counting
     fn retain(ref self, v: int, t: Ty):
@@ -3601,6 +3806,8 @@ struct Lower:
             self.cx.par_writes[w] = true
         for c in captures:
             self.cx.lptr[c] = self.cx.fb.offset(0, pc.off(f"c{c}"))
+            if self.opts.debug:
+                self.dbg_ptr_var(c, self.cx.lptr[c], false)
         return saved
 
     fn lift_exit(ref self, saved: FnCx):
@@ -3875,3 +4082,15 @@ fn world_desc(t: Ty) -> str:
             return "a" + world_desc(e)
         case _:
             return "?"
+
+fn dbase(name: str, k: K) -> DType:
+    return DType(tag=DT_BASE, name=name, size=k.size(), k=k, to=-1, fields=[])
+
+fn dstruct(name: str, size: int, fields: [DField]) -> DType:
+    return DType(tag=DT_STRUCT, name=name, size=size, k=K.I64, to=-1, fields=fields)
+
+fn dtypedef(name: str, to: int) -> DType:
+    return DType(tag=DT_TYPEDEF, name=name, size=8, k=K.Ptr, to=to, fields=[])
+
+fn dfield(name: str, ty: int, off: int) -> DField:
+    return DField(name=name, ty=ty, off=off)

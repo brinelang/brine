@@ -13,8 +13,14 @@
 # Overflow and index checks jump to cold stubs after the function body.
 # Every function gets unwind tables (.pdata / .xdata on Windows, .eh_frame on
 # Linux) so that debuggers, profilers and Windows' longjmp can walk the stack.
+#
+# Debug builds (`emit_object_debug`) also get DWARF line and variable info
+# (dwarf.br). They keep every vreg in its slot and drop the optimizations that
+# keep values in registers across instructions, so whenever a debugger stops
+# at a line, variables are in memory where the debug info says.
 
 from ir import K, Op, Inst, Func, Module
+from dwarf import Dwarf, DFn, DRow, DLocal, new_dwarf, loc_breg, loc_deref, write_dwarf
 from obj import ObjFile, OSym, ORel, new_obj, write_coff, write_elf, put16, put32, put64, set32, uleb, sleb, log2
 from obj import SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, SEC_UNWIND, R_PC32, R_CALL, R_ABS64, R_GOT, R_RVA32
 
@@ -290,6 +296,15 @@ struct X:
     has_ret: bool
     ret: K
     u: Unw
+    # debug builds: the debug info so far, the start of each instruction of
+    # the function being compiled, and its line rows
+    dbg: bool
+    dw: Dwarf
+    ipos: [int]
+    rows: [DRow]
+    # the C entry point goes with brine's `main`, and where it is
+    entry_main: bool
+    entry: (int, int)
 
     # ------------------------------------------------------------ bytes
     fn b(ref self, v: int):
@@ -939,9 +954,11 @@ struct X:
                 for a in x.args:
                     self.nuse[a] += 1
         self.once = [false] * nv
+        # (not in debug builds: the value would only be in a register)
+        let fold_once = not self.dbg
         for v in f.nparams..nv:
             let k = f.vk[v]
-            self.once[v] = self.nuse[v] == 1 and not k.is_float() and not k.is_wide()
+            self.once[v] = fold_once and self.nuse[v] == 1 and not k.is_float() and not k.is_wide()
         # the panic stubs read these again
         for x in f.code:
             if x.op == Op.IdxChk:
@@ -968,7 +985,11 @@ struct X:
         for x in f.code:
             if x.op == Op.Call or x.op == Op.CallInd:
                 nstack = max(nstack, self.call_stack(x))
-        self.alloc_regs(f, ndef)
+        if self.dbg:
+            self.reg = [-1] * nv
+            self.saved = []
+        else:
+            self.alloc_regs(f, ndef)
         # incoming parameters (the hidden 128-bit result pointer first)
         let hidden = f.has_ret and f.ret.is_wide()
         var fls: [int] = []
@@ -1090,10 +1111,17 @@ struct X:
         self.u.pro_end = self.pos()
         self.store_params(f)
         # body
+        self.ipos = [-1] * (ncode + 1)
+        self.rows = []
+        if self.dbg and f.dline > 0 and not f.dfile.starts_with("<"):
+            let fi = self.dw.file(f.dfile)
+            self.rows.push(DRow(pc=self.u.start, file=fi, line=f.dline))
         var i = 0
         while i < ncode:
             self.cur = i
+            self.ipos[i] = self.pos()
             i = self.inst(i)
+        self.ipos[ncode] = self.pos()
         if ncode == 0 or not (
             f.code[ncode - 1].op == Op.Ret or f.code[ncode - 1].op == Op.Jmp or f.code[ncode - 1].op == Op.Unreachable
         ):
@@ -1119,6 +1147,8 @@ struct X:
             self.unwind_coff()
         else:
             self.unwind_elf()
+        if self.dbg:
+            self.debug_func(f)
 
     # push r (op 80) / pop r (op 88)
     fn push_pop(ref self, op: int, r: int):
@@ -1266,6 +1296,92 @@ struct X:
     fn cfi_saved(ref self, r: int, n: int):
         self.o.unwind.push(u8(128 | dwarf_reg(r)))
         uleb(ref self.o.unwind, n)
+
+    # ------------------------------------------------------------ debug info
+    # A line row where the code of source line x.n starts. A debugger may
+    # change variables here, so no value cached in a register is used past it.
+    fn line_row(ref self, x: Inst):
+        self.cpos = -1
+        if x.s.starts_with("<"):
+            return
+        let fi = self.dw.file(x.s)
+        let row = DRow(pc=self.pos(), file=fi, line=x.n)
+        let n = len(self.rows)
+        if n > 0:
+            let last = self.rows[n - 1]
+            if last.line == x.n and last.file == fi:
+                return
+            if last.pc == row.pc:
+                # the line before has no code of its own
+                self.rows[n - 1] = row
+                return
+        self.rows.push(row)
+
+    # A variable is visible from the line after its declaration (the
+    # first line row after `pc`, at most `hi`): on the declaration's own line
+    # it is not set yet.
+    fn next_row(self, pc: int, hi: int) -> int:
+        for r in self.rows:
+            if r.pc > pc:
+                return min(r.pc, hi)
+        return hi
+
+    fn slot_loc(self, s: int) -> [u8]:
+        return loc_breg(dwarf_reg(self.slot_base[s]), self.slot_off[s])
+
+    # The function's entry in the debug info: its range, lines and variables.
+    fn debug_func(ref self, f: Func):
+        let end = self.pos()
+        for j in 1..len(self.ipos):
+            if self.ipos[j] < 0:
+                # the second instruction of a fused compare-and-branch
+                self.ipos[j] = self.ipos[j - 1]
+        var file = -1
+        var line = 0
+        if f.dline > 0 and not f.dfile.starts_with("<"):
+            file = self.dw.file(f.dfile)
+            line = f.dline
+        var locals: [DLocal] = []
+        for v in f.dvars:
+            var loc: [u8] = []
+            if v.slot >= 0:
+                loc = self.slot_loc(v.slot)
+            elif self.fold[v.ptr] == F_SLOT:
+                loc = self.slot_loc(self.fval[v.ptr])
+            elif self.fold[v.ptr] == F_NONE and self.reg[v.ptr] < 0:
+                loc = loc_deref(loc_breg(dwarf_reg(RBP), self.home[v.ptr]))
+            else:
+                continue
+            var lo = -1
+            var hi = end
+            if not v.param:
+                if v.hi >= 0:
+                    hi = self.ipos[v.hi]
+                lo = self.next_row(self.ipos[v.lo], hi)
+            locals.push(DLocal(name=v.name, ty=v.ty, param=v.param, loc=loc, lo=lo, hi=hi))
+        if f.public and f.dname == "" and self.entry_main:
+            # The C entry point that calls brine's `main` comes right before
+            # it (see `emit_order`) and is described as a second range of it:
+            # then gdb finds one place for `break main`, not two.
+            self.entry = (self.u.start, end)
+            return
+        let name = f.name if f.dname == "" else f.dname
+        var d = DFn(
+            name=name,
+            lo=self.u.start,
+            hi=end,
+            lo2=-1,
+            hi2=-1,
+            ret=f.dret,
+            file=file,
+            line=line,
+            rows=self.rows,
+            locals=locals
+        )
+        if f.name == "main__main" and self.entry.0 >= 0:
+            d.lo2 = self.entry.0
+            d.hi2 = self.entry.1
+        self.dw.fns.push(d)
 
     # Keeps the most used integer vregs (uses in loops count more) in
     # callee-saved registers for the whole function.
@@ -1468,8 +1584,8 @@ struct X:
             case Op.Unreachable:
                 self.call_rt("brine_unreachable", [])
             case Op.Line:
-                # no debug info in native objects yet
-                pass
+                if self.dbg:
+                    self.line_row(x)
         return i + 1
 
     fn op_const(ref self, x: Inst):
@@ -2013,7 +2129,37 @@ struct X:
 
 # ================================================================ module
 
+# Debug builds put the C entry point `main` right before brine's `main` (see
+# `X.debug_func`).
+fn emit_order(fs: [Func], dbg: bool) -> [Func]:
+    if not dbg:
+        return fs
+    var entry = -1
+    var bmain = -1
+    for i, f in enumerate(fs):
+        if f.public and f.dname == "":
+            entry = i
+        elif f.name == "main__main":
+            bmain = i
+    if entry < 0 or bmain < 0:
+        return fs
+    var out: [Func] = []
+    for i, f in enumerate(fs):
+        if i == bmain:
+            out.push(fs[entry])
+        if i != entry:
+            out.push(f)
+    return out
+
 fn emit_object(m: Module, windows: bool) -> [u8]:
+    return emit(m, windows, false, "", "", "")
+
+# The same with DWARF debug info. `src` is the main source file, `comp_dir`
+# the directory relative source paths start from.
+fn emit_object_debug(m: Module, windows: bool, src: str, comp_dir: str, producer: str) -> [u8]:
+    return emit(m, windows, true, src, comp_dir, producer)
+
+fn emit(m: Module, windows: bool, dbg: bool, src: str, comp_dir: str, producer: str) -> [u8]:
     var x = X(
         win=windows,
         o=new_obj(),
@@ -2050,7 +2196,13 @@ fn emit_object(m: Module, windows: bool) -> [u8]:
         scratch=0,
         has_ret=false,
         ret=K.I64,
-        u=Unw(start=0, pushes=[], pad=-1, fp=0, alloc=0, grow=0, pro_end=0, epis=[])
+        u=Unw(start=0, pushes=[], pad=-1, fp=0, alloc=0, grow=0, pro_end=0, epis=[]),
+        dbg=dbg,
+        dw=new_dwarf(),
+        ipos=[],
+        rows=[],
+        entry_main=false,
+        entry=(-1, -1)
     )
     x.text_sym = x.sym_def("__brx_text", SEC_TEXT, 0, false, false)
     if windows:
@@ -2086,7 +2238,8 @@ fn emit_object(m: Module, windows: bool) -> [u8]:
                 x.o.rrel.push(rel)
             else:
                 x.o.drel.push(rel)
-    for f in m.funcs:
+    x.entry_main = dbg and any(f.name == "main__main" for f in m.funcs)
+    for f in emit_order(m.funcs, dbg):
         x.func(f)
     # references inside .text need no relocation
     var keep: [ORel] = []
@@ -2097,6 +2250,8 @@ fn emit_object(m: Module, windows: bool) -> [u8]:
         else:
             keep.push(r)
     x.o.trel = keep
+    if dbg:
+        write_dwarf(ref x.o, x.dw, m.dtypes, x.text_sym, src, comp_dir, producer)
     if windows:
         return write_coff(ref x.o)
     return write_elf(ref x.o)

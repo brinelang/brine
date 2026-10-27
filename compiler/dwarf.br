@@ -1,0 +1,533 @@
+# DWARF 4 debug info for the native backend (debug builds): what x64.br
+# learns about each function (its code range, line rows and where its
+# variables live) and the IR's debug types become .debug_abbrev, .debug_info
+# and .debug_line sections of the object (obj.br), which the system linker
+# keeps and gdb / lldb read.
+#
+# One compile unit holds every function. Variables live in stack slots
+# (rbp- or rsp-relative), or behind a pointer that does (`ref` and aggregate
+# parameters). A variable is visible from the line after its declaration to
+# the end of its block: a DW_TAG_lexical_block per distinct range, nested.
+
+from ir import K, DType, DField, DT_BASE, DT_STRUCT, DT_UNION, DT_ENUM, DT_PTR, DT_TYPEDEF, DT_ARRAY
+from obj import ObjFile, OSec, OSym, ORel, put16, put32, put64, uleb, sleb, set32, R_ABS64, R_SECREL, SEC_DEBUG
+
+# a line row: code at .text offset `pc` comes from line `line` of files[file]
+struct DRow:
+    pc: int
+    file: int
+    line: int
+
+struct DLocal:
+    name: str
+    ty: int
+    param: bool
+    # a DWARF location expression
+    loc: [u8]
+    # the .text range where it is in scope (lo -1: the whole function)
+    lo: int
+    hi: int
+
+struct DFn:
+    name: str
+    lo: int
+    hi: int
+    # a second range of code (lo2 -1: none)
+    lo2: int
+    hi2: int
+    # the debug type of the result (-1: none)
+    ret: int
+    # where it is declared (file -1: generated code, no source)
+    file: int
+    line: int
+    rows: [DRow]
+    locals: [DLocal]
+
+struct Dwarf:
+    files: [str]
+    fidx: {str: int}
+    fns: [DFn]
+
+    fn file(ref self, path: str) -> int:
+        match self.fidx.get(path):
+            case Some(i):
+                return i
+            case None:
+                self.files.push(path)
+                self.fidx[path] = len(self.files) - 1
+                return len(self.files) - 1
+
+fn new_dwarf() -> Dwarf:
+    return Dwarf(files=[], fidx={}, fns=[])
+
+# DWARF location expressions
+fn loc_breg(r: int, off: int) -> [u8]:
+    # DW_OP_breg0 + r
+    var out: [u8] = [u8(112 + r)]
+    sleb(ref out, off)
+    return out
+
+fn loc_deref(e: [u8]) -> [u8]:
+    var out = e
+    # DW_OP_deref
+    out.push(6)
+    return out
+
+# ================================================================ abbreviations
+const AB_CU = 1
+const AB_FN = 2
+const AB_FN_GEN = 3
+const AB_PARAM = 4
+const AB_VAR = 5
+const AB_BLOCK = 6
+const AB_BASE = 7
+const AB_PTR = 8
+const AB_PTR_VOID = 9
+const AB_TYPEDEF = 10
+const AB_STRUCT = 11
+const AB_MEMBER = 12
+const AB_UNION = 13
+const AB_ENUM = 14
+const AB_ENUMERATOR = 15
+const AB_ARRAY = 16
+const AB_SUBRANGE = 17
+const AB_FN_RANGES = 18
+# AB_FN and AB_FN_RANGES with a result type
+const AB_FN_RET = 19
+const AB_FN_RANGES_RET = 20
+
+# DW_AT_*
+const AT_LOCATION = 2
+const AT_NAME = 3
+const AT_BYTE_SIZE = 11
+const AT_STMT_LIST = 16
+const AT_LOW_PC = 17
+const AT_HIGH_PC = 18
+const AT_LANGUAGE = 19
+const AT_COMP_DIR = 27
+const AT_CONST_VALUE = 28
+const AT_PRODUCER = 37
+const AT_DATA_MEMBER_LOCATION = 56
+const AT_ENCODING = 62
+const AT_FRAME_BASE = 64
+const AT_DECL_FILE = 58
+const AT_DECL_LINE = 59
+const AT_TYPE = 73
+const AT_RANGES = 85
+
+# DW_FORM_*
+const FORM_ADDR = 1
+const FORM_DATA2 = 5
+const FORM_DATA8 = 7
+const FORM_STRING = 8
+const FORM_DATA1 = 11
+const FORM_UDATA = 15
+const FORM_REF4 = 19
+const FORM_SEC_OFFSET = 23
+const FORM_EXPRLOC = 24
+
+fn abbrev(ref out: [u8], code: int, tag: int, children: bool, attrs: [int]):
+    uleb(ref out, code)
+    uleb(ref out, tag)
+    out.push(1 if children else 0)
+    var i = 0
+    while i < len(attrs):
+        uleb(ref out, attrs[i])
+        uleb(ref out, attrs[i + 1])
+        i += 2
+    out.push(0)
+    out.push(0)
+
+fn abbrevs() -> [u8]:
+    var o: [u8] = []
+    let lo = [AT_LOW_PC, FORM_ADDR, AT_HIGH_PC, FORM_DATA8]
+    var cu = [
+        AT_PRODUCER,
+        FORM_STRING,
+        AT_LANGUAGE,
+        FORM_DATA2,
+        AT_NAME,
+        FORM_STRING,
+        AT_COMP_DIR,
+        FORM_STRING
+    ]
+    cu.extend(lo)
+    cu.extend([AT_STMT_LIST, FORM_SEC_OFFSET])
+    # DW_TAG_compile_unit
+    abbrev(ref o, AB_CU, 17, true, cu)
+    var f = [AT_NAME, FORM_STRING, AT_DECL_FILE, FORM_UDATA, AT_DECL_LINE, FORM_UDATA]
+    f.extend(lo)
+    f.extend([AT_FRAME_BASE, FORM_EXPRLOC])
+    # DW_TAG_subprogram
+    # frame base: rbp (locations use rbp / rsp directly)
+    abbrev(ref o, AB_FN, 46, true, f)
+    var fret = f
+    fret.extend([AT_TYPE, FORM_REF4])
+    abbrev(ref o, AB_FN_RET, 46, true, fret)
+    var g = [AT_NAME, FORM_STRING]
+    g.extend(lo)
+    g.extend([AT_FRAME_BASE, FORM_EXPRLOC])
+    abbrev(ref o, AB_FN_GEN, 46, true, g)
+    let fr = [
+        AT_NAME,
+        FORM_STRING,
+        AT_DECL_FILE,
+        FORM_UDATA,
+        AT_DECL_LINE,
+        FORM_UDATA,
+        AT_RANGES,
+        FORM_SEC_OFFSET,
+        AT_FRAME_BASE,
+        FORM_EXPRLOC
+    ]
+    abbrev(ref o, AB_FN_RANGES, 46, true, fr)
+    var frr = fr
+    frr.extend([AT_TYPE, FORM_REF4])
+    abbrev(ref o, AB_FN_RANGES_RET, 46, true, frr)
+    let v = [AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_LOCATION, FORM_EXPRLOC]
+    # DW_TAG_formal_parameter, DW_TAG_variable, DW_TAG_lexical_block
+    abbrev(ref o, AB_PARAM, 5, false, v)
+    abbrev(ref o, AB_VAR, 52, false, v)
+    abbrev(ref o, AB_BLOCK, 11, true, lo)
+    # DW_TAG_base_type
+    abbrev(
+        ref o,
+        AB_BASE,
+        36,
+        false,
+        [AT_NAME, FORM_STRING, AT_ENCODING, FORM_DATA1, AT_BYTE_SIZE, FORM_UDATA]
+    )
+    # DW_TAG_pointer_type
+    abbrev(ref o, AB_PTR, 15, false, [AT_BYTE_SIZE, FORM_DATA1, AT_TYPE, FORM_REF4])
+    abbrev(ref o, AB_PTR_VOID, 15, false, [AT_BYTE_SIZE, FORM_DATA1])
+    # DW_TAG_typedef
+    abbrev(ref o, AB_TYPEDEF, 22, false, [AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4])
+    # DW_TAG_structure_type, DW_TAG_member, DW_TAG_union_type
+    let agg = [AT_NAME, FORM_STRING, AT_BYTE_SIZE, FORM_UDATA]
+    abbrev(ref o, AB_STRUCT, 19, true, agg)
+    abbrev(
+        ref o,
+        AB_MEMBER,
+        13,
+        false,
+        [AT_NAME, FORM_STRING, AT_TYPE, FORM_REF4, AT_DATA_MEMBER_LOCATION, FORM_UDATA]
+    )
+    abbrev(ref o, AB_UNION, 23, true, agg)
+    # DW_TAG_enumeration_type, DW_TAG_enumerator
+    abbrev(ref o, AB_ENUM, 4, true, agg)
+    abbrev(ref o, AB_ENUMERATOR, 40, false, [AT_NAME, FORM_STRING, AT_CONST_VALUE, FORM_UDATA])
+    # DW_TAG_array_type, DW_TAG_subrange_type (no bound: a flexible array)
+    abbrev(ref o, AB_ARRAY, 1, true, [AT_TYPE, FORM_REF4])
+    abbrev(ref o, AB_SUBRANGE, 33, false, [])
+    o.push(0)
+    return o
+
+# DW_ATE_* for a base type
+fn encoding(d: DType) -> int:
+    if d.name == "char":
+        # DW_ATE_unsigned_char
+        return 8
+    if d.k == K.Bool:
+        # DW_ATE_boolean
+        return 2
+    if d.k.is_float():
+        return 4
+    if d.k.is_signed():
+        return 5
+    return 7
+
+# ================================================================ .debug_info
+struct Info:
+    b: [u8]
+    rels: [ORel]
+    # type references to patch: (position, type index)
+    fix: [(int, int)]
+    text_sym: int
+    # .debug_ranges: lists of .text offsets (from the unit's base, .text)
+    ranges: [u8]
+    ranges_sym: int
+
+    fn str(ref self, s: str):
+        for c in s.bytes():
+            self.b.push(u8(c))
+        self.b.push(0)
+
+    fn ref_ty(ref self, t: int):
+        self.fix.push((len(self.b), t))
+        put32(ref self.b, 0)
+
+    # a .text address (relocated)
+    fn addr(ref self, off: int):
+        self.rels.push(ORel(off=len(self.b), sym=self.text_sym, kind=R_ABS64, add=off))
+        put64(ref self.b, 0)
+
+    fn range(ref self, lo: int, hi: int):
+        self.addr(lo)
+        put64(ref self.b, hi - lo)
+
+    fn exprloc(ref self, e: [u8]):
+        uleb(ref self.b, len(e))
+        self.b.extend(e)
+
+    fn ty(ref self, d: DType):
+        match d.tag:
+            case 0:
+                uleb(ref self.b, AB_BASE)
+                self.str(d.name)
+                self.b.push(u8(encoding(d)))
+                uleb(ref self.b, d.size)
+            case 1 | 2:
+                uleb(ref self.b, AB_STRUCT if d.tag == DT_STRUCT else AB_UNION)
+                self.str(d.name)
+                uleb(ref self.b, d.size)
+                for f in d.fields:
+                    uleb(ref self.b, AB_MEMBER)
+                    self.str(f.name)
+                    self.ref_ty(f.ty)
+                    uleb(ref self.b, f.off)
+                self.b.push(0)
+            case 3:
+                uleb(ref self.b, AB_ENUM)
+                self.str(d.name)
+                uleb(ref self.b, d.size)
+                for f in d.fields:
+                    uleb(ref self.b, AB_ENUMERATOR)
+                    self.str(f.name)
+                    uleb(ref self.b, f.off)
+                self.b.push(0)
+            case 4:
+                if d.to < 0:
+                    uleb(ref self.b, AB_PTR_VOID)
+                    self.b.push(8)
+                else:
+                    uleb(ref self.b, AB_PTR)
+                    self.b.push(8)
+                    self.ref_ty(d.to)
+            case 5:
+                uleb(ref self.b, AB_TYPEDEF)
+                self.str(d.name)
+                self.ref_ty(d.to)
+            case _:
+                uleb(ref self.b, AB_ARRAY)
+                self.ref_ty(d.to)
+                uleb(ref self.b, AB_SUBRANGE)
+                self.b.push(0)
+
+    fn local(ref self, v: DLocal):
+        uleb(ref self.b, AB_PARAM if v.param else AB_VAR)
+        self.str(v.name)
+        self.ref_ty(v.ty)
+        self.exprloc(v.loc)
+
+    fn func(ref self, f: DFn):
+        if f.lo2 >= 0 and f.file >= 0:
+            # its own code first: debuggers take the first range's start as
+            # the entry point
+            uleb(ref self.b, AB_FN_RANGES if f.ret < 0 else AB_FN_RANGES_RET)
+            self.str(f.name)
+            uleb(ref self.b, f.file + 1)
+            uleb(ref self.b, f.line)
+            self.rels.push(
+                ORel(off=len(self.b), sym=self.ranges_sym, kind=R_SECREL, add=len(self.ranges))
+            )
+            put32(ref self.b, 0)
+            put64(ref self.ranges, f.lo)
+            put64(ref self.ranges, f.hi)
+            put64(ref self.ranges, f.lo2)
+            put64(ref self.ranges, f.hi2)
+            put64(ref self.ranges, 0)
+            put64(ref self.ranges, 0)
+            self.exprloc([86])
+        elif f.file >= 0:
+            uleb(ref self.b, AB_FN if f.ret < 0 else AB_FN_RET)
+            self.str(f.name)
+            uleb(ref self.b, f.file + 1)
+            uleb(ref self.b, f.line)
+            self.range(f.lo, f.hi)
+            self.exprloc([86])
+        else:
+            uleb(ref self.b, AB_FN_GEN)
+            self.str(f.name)
+            self.range(f.lo, f.hi)
+            self.exprloc([86])
+        if f.ret >= 0 and f.file >= 0:
+            self.ref_ty(f.ret)
+        for v in f.locals:
+            if v.lo < 0 and v.param:
+                self.local(v)
+        for v in f.locals:
+            if v.lo < 0 and not v.param:
+                self.local(v)
+        self.blocks(f)
+        self.b.push(0)
+
+    # The scoped variables, in nested lexical blocks: the distinct ranges,
+    # by start and then longest first, each inside the last one still open.
+    fn blocks(ref self, f: DFn):
+        var rs: [(int, int)] = []
+        for v in f.locals:
+            if v.lo >= 0 and v.lo < v.hi and (v.lo, v.hi) not in rs:
+                rs.push((v.lo, v.hi))
+        rs = sort_ranges(rs)
+        var open: [int] = []
+        for r in rs:
+            while len(open) > 0 and r.0 >= open[len(open) - 1]:
+                open.pop()
+                self.b.push(0)
+            var hi = r.1
+            if len(open) > 0:
+                hi = min(hi, open[len(open) - 1])
+            uleb(ref self.b, AB_BLOCK)
+            self.range(r.0, hi)
+            for v in f.locals:
+                if v.lo == r.0 and v.hi == r.1:
+                    self.local(v)
+            open.push(hi)
+        for _ in open:
+            self.b.push(0)
+
+fn range_less(a: (int, int), b: (int, int)) -> bool:
+    if a.0 != b.0:
+        return a.0 < b.0
+    return a.1 > b.1
+
+fn sort_ranges(xs: [(int, int)]) -> [(int, int)]:
+    var out = xs
+    # insertion sort: a function has few distinct scopes
+    for i in 1..len(out):
+        let x = out[i]
+        var j = i - 1
+        while j >= 0 and range_less(x, out[j]):
+            out[j + 1] = out[j]
+            j -= 1
+        out[j + 1] = x
+    return out
+
+# ================================================================ .debug_line
+const LINE_BASE = -5
+const LINE_RANGE = 14
+const OPCODE_BASE = 13
+
+fn line_program(d: Dwarf, text_sym: int, ref rels: [ORel]) -> [u8]:
+    var o: [u8] = []
+    put32(ref o, 0)
+    # version 4
+    put16(ref o, 4)
+    put32(ref o, 0)
+    let hstart = len(o)
+    # minimum instruction length, maximum operations per instruction,
+    # default is_stmt, line base, line range, opcode base
+    o.extend([1, 1, 1, u8(LINE_BASE & 255), u8(LINE_RANGE), u8(OPCODE_BASE)])
+    # the operands of the standard opcodes
+    o.extend([0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1])
+    # no include directories; files relative to the compilation directory
+    o.push(0)
+    for f in d.files:
+        for c in f.bytes():
+            o.push(u8(c))
+        o.extend([0, 0, 0, 0])
+    o.push(0)
+    set32(ref o, 6, len(o) - hstart)
+    for f in d.fns:
+        if len(f.rows) == 0:
+            continue
+        # DW_LNE_set_address
+        o.extend([0, 9, 2])
+        rels.push(ORel(off=len(o), sym=text_sym, kind=R_ABS64, add=f.lo))
+        put64(ref o, 0)
+        var pc = f.lo
+        var line = 1
+        var file = 0
+        for r in f.rows:
+            if r.file != file:
+                # DW_LNS_set_file
+                o.push(4)
+                uleb(ref o, r.file + 1)
+                file = r.file
+            let dl = r.line - line
+            let da = r.pc - pc
+            let op = (dl - LINE_BASE) + LINE_RANGE * da + OPCODE_BASE
+            if dl >= LINE_BASE and dl < LINE_BASE + LINE_RANGE and op <= 255:
+                o.push(u8(op))
+            else:
+                if dl != 0:
+                    # DW_LNS_advance_line
+                    o.push(3)
+                    sleb(ref o, dl)
+                if da != 0:
+                    # DW_LNS_advance_pc
+                    o.push(2)
+                    uleb(ref o, da)
+                # DW_LNS_copy
+                o.push(1)
+            pc = r.pc
+            line = r.line
+        if f.hi > pc:
+            o.push(2)
+            uleb(ref o, f.hi - pc)
+        # DW_LNE_end_sequence
+        o.extend([0, 1, 1])
+    set32(ref o, 0, len(o) - 4)
+    return o
+
+# ================================================================ sections
+# Adds the debug sections to `o`. `text_sym` is a symbol at the start of
+# .text; `name` is the main source file, `comp_dir` the directory the
+# relative paths start from.
+fn write_dwarf(
+    ref o: ObjFile,
+    d: Dwarf,
+    types: [DType],
+    text_sym: int,
+    name: str,
+    comp_dir: str,
+    producer: str
+):
+    let first = len(o.dsecs)
+    let abbrev_sym = len(o.syms)
+    o.syms.push(
+        OSym(name="__brx_debug_abbrev", sec=SEC_DEBUG + first, off=0, global=false, func=false)
+    )
+    let line_sym = len(o.syms)
+    o.syms.push(
+        OSym(name="__brx_debug_line", sec=SEC_DEBUG + first + 2, off=0, global=false, func=false)
+    )
+    let ranges_sym = len(o.syms)
+    o.syms.push(
+        OSym(name="__brx_debug_ranges", sec=SEC_DEBUG + first + 3, off=0, global=false, func=false)
+    )
+    var w = Info(b=[], rels=[], fix=[], text_sym=text_sym, ranges=[], ranges_sym=ranges_sym)
+    # compile unit header: length, version 4, abbreviations, address size
+    put32(ref w.b, 0)
+    put16(ref w.b, 4)
+    w.rels.push(ORel(off=len(w.b), sym=abbrev_sym, kind=R_SECREL, add=0))
+    put32(ref w.b, 0)
+    w.b.push(8)
+    uleb(ref w.b, AB_CU)
+    w.str(producer)
+    # DW_LANG_C99: gdb and lldb evaluate expressions like C
+    put16(ref w.b, 12)
+    w.str(name)
+    w.str(comp_dir)
+    var hi = 0
+    for f in d.fns:
+        hi = max(hi, f.hi)
+    w.range(0, hi)
+    w.rels.push(ORel(off=len(w.b), sym=line_sym, kind=R_SECREL, add=0))
+    put32(ref w.b, 0)
+    var toff = [0] * len(types)
+    for i, t in enumerate(types):
+        toff[i] = len(w.b)
+        w.ty(t)
+    for f in d.fns:
+        w.func(f)
+    w.b.push(0)
+    for fx in w.fix:
+        set32(ref w.b, fx.0, toff[fx.1])
+    set32(ref w.b, 0, len(w.b) - 4)
+    var lrels: [ORel] = []
+    let lines = line_program(d, text_sym, ref lrels)
+    o.dsecs.push(OSec(name=".debug_abbrev", bytes=abbrevs(), rels=[]))
+    o.dsecs.push(OSec(name=".debug_info", bytes=w.b, rels=w.rels))
+    o.dsecs.push(OSec(name=".debug_line", bytes=lines, rels=lrels))
+    o.dsecs.push(OSec(name=".debug_ranges", bytes=w.ranges, rels=[]))
