@@ -3703,51 +3703,34 @@ struct Lower:
         self.lift_exit(saved)
         return res
 
-    # `local` and `captures` are the comprehension's loop variable and captured locals.
+    # `local` and `captures` are the comprehension's loop variable and captured
+    # locals. The runtime splits the elements into leaves and combines the
+    # leaves' results in a fixed tree (`brine_par_reduce`); the lifted function
+    # folds one leaf.
     fn par_reduce(ref self, r: Reducer, c: Comp, e: Expr, local: int, captures: [int]) -> int:
         let ty = e.ty
-        let sz = self.lay(ty).size
+        let lay = self.lay(ty)
         let dom = self.domain(c.iter, false)
         let n = self.dom_count(dom, e.span)
-        let nc = self.cx.fb.rt(K.I64, "brine_par_plan", [n])
-        let szk = self.cx.fb.konst(K.I64, sz)
-        let bytes = self.cx.fb.bin(Op.Mul, K.I64, nc, szk)
-        let parts = self.cx.fb.call(K.Ptr, "brine_alloc", [bytes])
-        let hasv = self.cx.fb.call(K.Ptr, "brine_alloc", [nc])
-        var extra = self.dom_fields(dom)
-        extra.push(("parts", Ty.Str, parts))
-        extra.push(("has", Ty.Str, hasv))
-        let pc = self.par_ctx(captures, extra)
-        self.par_run(pc, n, nc)
         let (acc, has) = self.reduce_init(r, ty)
-        let k = self.cx.fb.konst(K.I64, 0)
-        let one = self.cx.fb.konst(K.I64, 1)
-        let head = self.cx.fb.label()
-        let next = self.cx.fb.label()
-        let out = self.cx.fb.label()
-        self.cx.fb.place(head)
-        let more = self.cx.fb.cmp(Op.Lt, k, nc)
-        self.cx.fb.brnot(more, out)
-        let hptr = self.cx.fb.elem(hasv, k, 1)
-        let hk = self.cx.fb.load(K.Bool, hptr, 0)
-        self.cx.fb.brnot(hk, next)
-        let pptr = self.cx.fb.elem(parts, k, sz)
-        let pv = self.ld(pptr, 0, ty)
-        self.reduce_into(r, ty, acc, has, pv, e.span, -1)
-        let t = self.cx.fb.konst(K.Bool, 1)
-        self.cx.fb.mov(has, t)
-        self.cx.fb.place(next)
-        let k2 = self.cx.fb.bin(Op.Add, K.I64, k, one)
-        self.cx.fb.mov(k, k2)
-        self.cx.fb.jmp(head)
-        self.cx.fb.place(out)
-        self.cx.fb.call_void("brine_free", [parts])
-        self.cx.fb.call_void("brine_free", [hasv])
+        let accp = self.cx.fb.temp_mem(lay.size, lay.align)
+        self.cx.fb.store(accp, 0, acc)
+        let hasp = self.cx.fb.temp_mem(1, 1)
+        self.cx.fb.store(hasp, 0, has)
+        let extra = self.dom_fields(dom)
+        let pc = self.par_ctx(captures, extra)
+        let fp = self.cx.fb.global(f"br_par_{pc.id}")
+        let op = self.cx.fb.konst(K.I64, reducer_code(r))
+        let vk = self.cx.fb.konst(K.I64, kind_code(self.kind(ty)))
+        let loc = self.loc(e.span)
+        self.cx.fb.call_void("brine_par_reduce", [n, fp, pc.ctx, op, vk, accp, hasp, loc])
+        self.cx.fb.load_to(acc, accp, 0)
+        self.cx.fb.load_to(has, hasp, 0)
         self.reduce_finish(r, has, e.span)
 
         let saved = self.lift_enter(
             f"br_par_{pc.id}",
-            [K.Ptr, K.I64, K.I64, K.I64],
+            [K.Ptr, K.I64, K.I64, K.I64, K.Ptr, K.Ptr],
             pc,
             captures,
             []
@@ -3756,12 +3739,8 @@ struct Lower:
         let lc = self.chunk_open(dom, pc, local)
         self.reduce_step(r, c, ty, a2, h2, e.span, lc)
         self.chunk_close(lc)
-        let pp = self.cx.fb.load(K.Ptr, 0, pc.off("parts"))
-        let mine = self.cx.fb.elem(pp, 1, sz)
-        self.st(mine, 0, ty, a2)
-        let hp = self.cx.fb.load(K.Ptr, 0, pc.off("has"))
-        let mine_has = self.cx.fb.elem(hp, 1, 1)
-        self.cx.fb.store(mine_has, 0, h2)
+        self.cx.fb.store(4, 0, a2)
+        self.cx.fb.store(5, 0, h2)
         self.lift_exit(saved)
         return acc
 
@@ -3819,6 +3798,53 @@ struct ParCtx:
                 return self.offs[i]
         panic(f"lowering: no context field {name}")
         return 0
+
+# The runtime's numbers for reducers and value kinds (BRINE_RED_*, BRINE_VK_* in brine_rt.h).
+fn reducer_code(r: Reducer) -> int:
+    match r:
+        case Reducer.Sum:
+            return 0
+        case Reducer.Product:
+            return 1
+        case Reducer.Min:
+            return 2
+        case Reducer.Max:
+            return 3
+        case Reducer.Any:
+            return 4
+        case Reducer.All:
+            return 5
+
+fn kind_code(k: K) -> int:
+    match k:
+        case K.I8:
+            return 0
+        case K.I16:
+            return 1
+        case K.I32:
+            return 2
+        case K.I64:
+            return 3
+        case K.I128:
+            return 4
+        case K.U8:
+            return 5
+        case K.U16:
+            return 6
+        case K.U32:
+            return 7
+        case K.U64:
+            return 8
+        case K.U128:
+            return 9
+        case K.F32:
+            return 10
+        case K.F64:
+            return 11
+        case K.Ptr:
+            return 12
+        case K.Bool:
+            return 13
 
 fn cmp_op(op: CmpOp) -> Op:
     match op:

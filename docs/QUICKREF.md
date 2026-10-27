@@ -376,6 +376,10 @@ let (a, b) = par(work(1), work(2))            # fork-join
 Rules: inside a `par` body, outer variables are read-only, except that
 `par for i` may write `arr[i]` (exactly the loop variable) of an outer array.
 Reductions are deterministic: same result bits on any machine and thread count.
+They fold leaves of 16 consecutive elements left to right, then combine the leaves
+in a balanced pairwise tree (so `par sum` of floats can differ in the last bits from
+a sequential `sum`, usually by being more accurate). Integer overflow of any partial
+result in that order traps.
 `BRINE_THREADS=n` or `brine run --threads n` sets the thread count.
 
 ## Multiple processes and machines: `world`

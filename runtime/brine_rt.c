@@ -1703,6 +1703,212 @@ void brine_par_tasks(int64_t k, brine_task_fn fn, void *ctx) {
     free(spawned);
 }
 
+/* ============================================================ reductions */
+/* `par sum(...)` and the other reductions combine in one fixed order that
+ * depends only on the element count (see brine_rt.h). A fold holds the nodes
+ * of complete aligned subtrees, highest first, like the digits of a binary
+ * counter: a new node merges with the top while their heights match. Pushing
+ * aligned subtrees in order and then combining what's left from the top down
+ * gives exactly the level-by-level pairing tree. */
+typedef void (*br_comb_fn)(void *a, const void *b, const char *loc);
+
+#define BR_COMB_INT(T, S)                                                         \
+    static void br_sum_##S(void *a, const void *b, const char *loc) {             \
+        *(T *)a = brine_add_##S(*(T *)a, *(const T *)b, loc);                     \
+    }                                                                             \
+    static void br_prod_##S(void *a, const void *b, const char *loc) {            \
+        *(T *)a = brine_mul_##S(*(T *)a, *(const T *)b, loc);                     \
+    }
+#define BR_COMB_FLOAT(T, S)                                                       \
+    static void br_sum_##S(void *a, const void *b, const char *loc) {             \
+        (void)loc;                                                                \
+        *(T *)a = *(T *)a + *(const T *)b;                                        \
+    }                                                                             \
+    static void br_prod_##S(void *a, const void *b, const char *loc) {            \
+        (void)loc;                                                                \
+        *(T *)a = *(T *)a * *(const T *)b;                                        \
+    }
+/* like the sequential `min`/`max`: the right value replaces the left one only
+ * if it's strictly smaller (larger), so NaNs and ties keep the left one */
+#define BR_COMB_ORD(T, S)                                                         \
+    static void br_min_##S(void *a, const void *b, const char *loc) {             \
+        (void)loc;                                                                \
+        if (*(const T *)b < *(T *)a) *(T *)a = *(const T *)b;                     \
+    }                                                                             \
+    static void br_max_##S(void *a, const void *b, const char *loc) {             \
+        (void)loc;                                                                \
+        if (*(const T *)b > *(T *)a) *(T *)a = *(const T *)b;                     \
+    }
+#define BR_COMB_ALL(T, S) BR_COMB_INT(T, S) BR_COMB_ORD(T, S)
+BR_COMB_ALL(int8_t, i8)
+BR_COMB_ALL(int16_t, i16)
+BR_COMB_ALL(int32_t, i32)
+BR_COMB_ALL(int64_t, i64)
+BR_COMB_ALL(brine_i128, i128)
+BR_COMB_ALL(uint8_t, u8)
+BR_COMB_ALL(uint16_t, u16)
+BR_COMB_ALL(uint32_t, u32)
+BR_COMB_ALL(uint64_t, u64)
+BR_COMB_ALL(brine_u128, u128)
+BR_COMB_FLOAT(float, f32)
+BR_COMB_FLOAT(double, f64)
+BR_COMB_ORD(float, f32)
+BR_COMB_ORD(double, f64)
+static void br_any(void *a, const void *b, const char *loc) {
+    (void)loc;
+    *(bool *)a = *(bool *)a || *(const bool *)b;
+}
+static void br_all(void *a, const void *b, const char *loc) {
+    (void)loc;
+    *(bool *)a = *(bool *)a && *(const bool *)b;
+}
+
+static const int br_vk_size[] = {1, 2, 4, 8, 16, 1, 2, 4, 8, 16, 4, 8, 8, 1};
+
+static br_comb_fn br_comb_pick(int64_t op, int64_t vk) {
+#define BR_PICK(S)                                                                \
+    switch (op) {                                                                 \
+    case BRINE_RED_SUM: return br_sum_##S;                                        \
+    case BRINE_RED_PRODUCT: return br_prod_##S;                                   \
+    case BRINE_RED_MIN: return br_min_##S;                                        \
+    default: return br_max_##S;                                                   \
+    }
+    if (op == BRINE_RED_ANY) return br_any;
+    if (op == BRINE_RED_ALL) return br_all;
+    switch (vk) {
+    case BRINE_VK_I8: BR_PICK(i8)
+    case BRINE_VK_I16: BR_PICK(i16)
+    case BRINE_VK_I32: BR_PICK(i32)
+    case BRINE_VK_I64: BR_PICK(i64)
+    case BRINE_VK_I128: BR_PICK(i128)
+    case BRINE_VK_U8: BR_PICK(u8)
+    case BRINE_VK_U16: BR_PICK(u16)
+    case BRINE_VK_U32: BR_PICK(u32)
+    case BRINE_VK_U64: BR_PICK(u64)
+    case BRINE_VK_U128: BR_PICK(u128)
+    case BRINE_VK_F32: BR_PICK(f32)
+    default: BR_PICK(f64)
+    }
+#undef BR_PICK
+}
+
+typedef struct {
+    br_comb_fn comb;
+    size_t size;
+    const char *loc;
+    int top;
+    int height[72];
+    bool has[72];
+    _Alignas(16) char val[72][16];
+} br_fold;
+
+static void br_fold_init(br_fold *f, br_comb_fn comb, int64_t size, const char *loc) {
+    f->comb = comb;
+    f->size = (size_t)size;
+    f->loc = loc;
+    f->top = 0;
+}
+
+/* a <- a (+) b, where a node without a value (all filtered out) is the identity */
+static void br_node_comb(br_fold *f, void *a, bool *ha, const void *b, bool hb) {
+    if (!hb) return;
+    if (!*ha) {
+        memcpy(a, b, f->size);
+        *ha = true;
+        return;
+    }
+    f->comb(a, b, f->loc);
+}
+
+/* Push the node of an aligned subtree of 2^h leaves that starts where the
+ * nodes pushed so far end. */
+static void br_fold_push(br_fold *f, int h, const void *v, bool has) {
+    while (f->top > 0 && f->height[f->top - 1] == h) {
+        int t = f->top - 1;
+        br_node_comb(f, f->val[t], &f->has[t], v, has);
+        f->top = t;
+        v = f->val[t];
+        has = f->has[t];
+        h++;
+    }
+    int t = f->top++;
+    f->height[t] = h;
+    f->has[t] = has;
+    if (v != f->val[t]) memcpy(f->val[t], v, f->size);
+}
+
+/* The root: the nodes left, combined from the top down. False if no element
+ * had a value. */
+static bool br_fold_finish(br_fold *f, void *out) {
+    if (f->top == 0) return false;
+    int t = f->top - 1;
+    while (t > 0) {
+        br_node_comb(f, f->val[t - 1], &f->has[t - 1], f->val[t], f->has[t]);
+        t--;
+    }
+    if (f->has[0]) memcpy(out, f->val[0], f->size);
+    return f->has[0];
+}
+
+typedef struct {
+    brine_leaf_fn fn;
+    void *ctx;
+    int64_t n, nleaves, task_leaves;
+    br_comb_fn comb;
+    int64_t size;
+    const char *loc;
+    char *vals; /* per task: the node of its subtree */
+    bool *has;
+} br_reduce_job;
+
+static void br_reduce_task(void *ctx, int64_t chunk, int64_t lo, int64_t hi) {
+    (void)chunk;
+    br_reduce_job *j = (br_reduce_job *)ctx;
+    _Alignas(16) char v[16];
+    for (int64_t t = lo; t < hi; t++) {
+        br_fold f;
+        br_fold_init(&f, j->comb, j->size, j->loc);
+        int64_t l0 = t * j->task_leaves;
+        int64_t l1 = l0 + j->task_leaves < j->nleaves ? l0 + j->task_leaves : j->nleaves;
+        for (int64_t l = l0; l < l1; l++) {
+            int64_t a = l * BRINE_LEAF;
+            int64_t b = a + BRINE_LEAF < j->n ? a + BRINE_LEAF : j->n;
+            bool h = false;
+            j->fn(j->ctx, l, a, b, v, &h);
+            br_fold_push(&f, 0, v, h);
+        }
+        j->has[t] = br_fold_finish(&f, j->vals + t * 16);
+    }
+}
+
+void brine_par_reduce(int64_t n, brine_leaf_fn fn, void *ctx, int64_t op, int64_t vk, void *val, bool *has, const char *loc) {
+    if (n <= 0) return;
+    br_reduce_job j;
+    j.fn = fn;
+    j.ctx = ctx;
+    j.n = n;
+    j.nleaves = (n + BRINE_LEAF - 1) / BRINE_LEAF;
+    j.comb = br_comb_pick(op, vk);
+    j.size = br_vk_size[vk];
+    j.loc = loc;
+    /* tasks of 2^h leaves, several per thread for balance; the result doesn't
+     * depend on the split, since every task is a whole subtree */
+    int64_t want = (int64_t)br_threads() * 8;
+    int h = 0;
+    while (h < 62 && (((int64_t)1 << h) * want) < j.nleaves) h++;
+    j.task_leaves = (int64_t)1 << h;
+    int64_t ntasks = (j.nleaves + j.task_leaves - 1) / j.task_leaves;
+    j.vals = (char *)brine_alloc(ntasks * 16);
+    j.has = (bool *)brine_alloc(ntasks);
+    brine_par_run(0, ntasks, ntasks, br_reduce_task, &j);
+    br_fold f;
+    br_fold_init(&f, j.comb, j.size, loc);
+    for (int64_t t = 0; t < ntasks; t++) br_fold_push(&f, h, j.vals + t * 16, j.has[t]);
+    if (br_fold_finish(&f, val)) *has = true;
+    free(j.vals);
+    free(j.has);
+}
+
 /* ============================================================ world: transport */
 enum { BR_CH_USER = 0, BR_CH_COLL = 1 };
 enum { BR_K_EMPTY = 0, BR_K_I64 = 1, BR_K_F64 = 2, BR_K_BOOL = 3, BR_K_STR = 4, BR_K_AI64 = 5, BR_K_AF64 = 6, BR_K_MSG = 7 };

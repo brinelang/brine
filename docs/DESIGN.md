@@ -125,9 +125,16 @@ written *only at the loop index* (`out[i] = ...`), and then it may not be access
 any other index in the body. Function calls cannot receive outer variables as `ref`.
 Since values have no observable aliasing, this is sufficient for data-race freedom.
 
-Reductions are **deterministic**: the chunking depends only on the iteration count,
-never on the number of threads, so `par sum` over floats gives the same bits on a
-laptop and on a 128-core server.
+Reductions are **deterministic**: they combine in one fixed order that depends only
+on the number of elements, never on the number of threads, so `par sum` over floats
+gives the same bits on a laptop and on a 128-core server. The elements are split into
+*leaves* of 16 consecutive elements; each leaf is folded left to right, starting from
+the reducer's start value (`0`, `1`, ...); then the leaves are combined by a balanced
+binary tree, level by level: leaves 0 and 1, 2 and 3, ..., then those results in pairs,
+and so on (a node without a partner moves up a level unchanged; a leaf whose elements
+were all filtered out doesn't take part). Integer `sum` and `product` trap on overflow
+of any partial result in this order. Besides being parallel, the tree loses less
+precision than a left-to-right sum.
 
 Threads: `BRINE_THREADS=n` or `brine run --threads n` (default: all cores).
 

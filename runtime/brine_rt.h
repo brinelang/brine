@@ -437,6 +437,26 @@ static inline int64_t brine_par_plan(int64_t n) { return n <= 0 ? 0 : (n < 256 ?
 void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, void *ctx);
 void brine_par_tasks(int64_t k, brine_task_fn fn, void *ctx);
 
+/* Parallel reductions (`par sum(...)` etc.) have one combination order, which
+ * depends only on the element count n: elements are split into leaves of
+ * BRINE_LEAF consecutive elements, each folded left to right by the leaf
+ * function, and the leaves are combined by a balanced binary tree, level by
+ * level, adjacent pairs (a node without a partner moves up a level as it is).
+ * So float results have the same bits on any machine, thread count or device,
+ * and integer overflow traps at the same partial result. */
+#define BRINE_LEAF 16
+enum { BRINE_RED_SUM, BRINE_RED_PRODUCT, BRINE_RED_MIN, BRINE_RED_MAX, BRINE_RED_ANY, BRINE_RED_ALL };
+/* value kinds, in the order of `K` in compiler/ir.br */
+enum {
+    BRINE_VK_I8, BRINE_VK_I16, BRINE_VK_I32, BRINE_VK_I64, BRINE_VK_I128,
+    BRINE_VK_U8, BRINE_VK_U16, BRINE_VK_U32, BRINE_VK_U64, BRINE_VK_U128,
+    BRINE_VK_F32, BRINE_VK_F64, BRINE_VK_PTR, BRINE_VK_BOOL
+};
+/* folds elements [lo, hi) of leaf `leaf` into *val; sets *has unless all were filtered out */
+typedef void (*brine_leaf_fn)(void *ctx, int64_t leaf, int64_t lo, int64_t hi, void *val, bool *has);
+/* *val and *has: the accumulator (the reducer's start value, false); set when an element had a value */
+void brine_par_reduce(int64_t n, brine_leaf_fn fn, void *ctx, int64_t op, int64_t vk, void *val, bool *has, const char *loc);
+
 /* ------------------------------------------------------------ world (multi-process) */
 int64_t brine_world_rank(void);
 int64_t brine_world_size(void);
