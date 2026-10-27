@@ -65,6 +65,22 @@ fn dir_of(p: str) -> str:
 
 # Parses the entry file and every module it (transitively) imports.
 # `import a.b` loads `<root>/a/b.br`, where root is the entry file's directory.
+# An imported module: its source, or None when the file is missing.
+struct Found:
+    name: str
+    src: Option[str]
+    file: int
+
+fn parse_found(f: Found) -> (Module, [Diag]):
+    match f.src:
+        case Some(src):
+            return parse_module(src, f.file, f.name)
+        case None:
+            return (
+                Module(name=f.name, file=f.file, imports=[], fns=[], structs=[], enums=[], consts=[], tests=[]),
+                []
+            )
+
 fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
     var root = dir_of(entry)
     if root == "":
@@ -83,44 +99,48 @@ fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
     diags.extend(d)
     by_name["main"] = 0
     prog.modules.push(m)
+    # Breadth first, a wave at a time: scanning the modules found so far
+    # numbers the new imports in the order they're seen, then the new files
+    # are parsed in parallel and appended in that order, so the numbering
+    # doesn't depend on the parallelism.
     var i = 0
     while i < len(prog.modules):
-        let imports = prog.modules[i].imports
-        var targets: [int] = []
-        for imp in imports:
-            let name = ".".join(imp.path)
-            match by_name.get(name):
-                case Some(t):
-                    targets.push(t)
-                    continue
-                case None:
-                    pass
-            var p = root
-            for seg in imp.path:
-                p = project.join(p, seg)
-            p += ".br"
-            match read_source(p):
-                case Ok(src):
-                    let f = sm.add(display_path(p), src)
-                    let (mm, dd) = parse_module(src, f, name)
-                    diags.extend(dd)
-                    let idx = len(prog.modules)
-                    by_name[name] = idx
-                    prog.modules.push(mm)
-                    targets.push(idx)
-                case Err(_):
-                    diags.push(
-                        diag.error("E0701", f"module `{name}` not found").label(imp.span, "expected a file at `" + display_path(p) + "`").with_help("modules are `.br` files next to the main file; `import a.b` loads `a/b.br`")
-                    )
-                    # keep indices aligned: point at an empty module
-                    let idx = len(prog.modules)
-                    by_name[name] = idx
-                    prog.modules.push(
-                        Module(name=name, file=prog.modules[i].file, imports=[], fns=[], structs=[], enums=[], consts=[], tests=[])
-                    )
-                    targets.push(idx)
-        prog.import_targets.push(targets)
-        i += 1
+        let first_new = len(prog.modules)
+        var found: [Found] = []
+        while i < first_new:
+            var targets: [int] = []
+            for imp in prog.modules[i].imports:
+                let name = ".".join(imp.path)
+                match by_name.get(name):
+                    case Some(t):
+                        targets.push(t)
+                        continue
+                    case None:
+                        pass
+                var p = root
+                for seg in imp.path:
+                    p = project.join(p, seg)
+                p += ".br"
+                let idx = first_new + len(found)
+                by_name[name] = idx
+                targets.push(idx)
+                match read_source(p):
+                    case Ok(src):
+                        found.push(
+                            Found(name=name, src=Some(src), file=sm.add(display_path(p), src))
+                        )
+                    case Err(_):
+                        diags.push(
+                            diag.error("E0701", f"module `{name}` not found").label(imp.span, "expected a file at `" + display_path(p) + "`").with_help("modules are `.br` files next to the main file; `import a.b` loads `a/b.br`")
+                        )
+                        # keeps the numbering: an empty module
+                        found.push(Found(name=name, src=None, file=prog.modules[i].file))
+            prog.import_targets.push(targets)
+            i += 1
+        let parsed = par [parse_found(f) for f in found]
+        for pm in parsed:
+            diags.extend(pm.1)
+            prog.modules.push(pm.0)
     # the prelude (`Option`, `Result`) is part of every program
     if PRELUDE not in by_name:
         let f = sm.add("<prelude>", PRELUDE_SRC)
