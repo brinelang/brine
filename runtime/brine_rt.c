@@ -2323,7 +2323,7 @@ static struct {
     char err[256];
 } br_mtl;
 
-enum { BR_MTL_FAIL = 1, BR_MTL_STATUS_ERROR = 5, BR_MTL_KERNEL = 3, BR_MTL_MATH_SAFE = 0, BR_MTL_FUNCTIONS_PRECISE = 1 };
+enum { BR_MTL_FAIL = 1, BR_MTL_STATUS_ERROR = 5, BR_MTL_KERNEL = 3, BR_MTL_MATH_SAFE = 0, BR_MTL_FUNCTIONS_PRECISE = 1, BR_MTL_FAMILY_APPLE7 = 1007 };
 
 #define BR_OBJC(ret, ...) ((ret(*)(br_id, br_sel, ##__VA_ARGS__))br_mtl.msg)
 static br_id br_oc(br_id o, const char *s) { return BR_OBJC(br_id)(o, br_mtl.sel(s)); }
@@ -2385,6 +2385,14 @@ static int br_dev_open(const char *code, char *why, size_t nwhy) {
     }
     br_mtl.dev = dev;
     snprintf(br_gpu.name, sizeof br_gpu.name, "%s", br_oc_cstr(br_oc(dev, "name")));
+    /* Only Apple GPUs (M1 and later) are tested. The AMD and Intel GPUs of Intel
+       Macs wait for hardware to test on (see docs/DESIGN.md); the virtual GPU of
+       an Intel Mac VM gave wrong results. */
+    if (!br_oc_has(dev, "supportsFamily:") ||
+        !BR_OBJC(unsigned char, long)(dev, br_mtl.sel("supportsFamily:"), BR_MTL_FAMILY_APPLE7)) {
+        snprintf(why, nwhy, "%s isn't an Apple GPU (AMD and Intel GPUs aren't supported yet)", br_gpu.name);
+        goto out;
+    }
     br_mtl.flag = br_mtl_buffer(256, &br_mtl.flag_at);
     if (!br_mtl.flag || !br_oc_has(br_mtl.flag, "gpuAddress")) {
         snprintf(why, nwhy, "%s has no Metal 3 (GPU addresses need macOS 13)", br_gpu.name);

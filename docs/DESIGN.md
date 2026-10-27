@@ -386,7 +386,8 @@ with SPIR-V kernels (the driver loaded at run time, as CUDA is), exactly rounded
 `/` and `sqrt` in the kernels, a capability check for denormals and f64, and a
 self-test kernel at startup that turns the GPU off if its results differ from the
 CPU's. NVIDIA and lavapipe (Mesa's CPU Vulkan) can test most of it, but not each
-vendor's own shader compiler, so it waits for real devices.
+vendor's own shader compiler, so it waits for real devices. Intel Macs' AMD and Intel
+GPUs are part of it: Metal is used only on Apple GPUs for now.
 
 **Proofs:** generic bodies checked once against constraints (rather than per
 instance), quantifiers in specs (`forall i in 0..n: a[i] >= 0`), array-content
