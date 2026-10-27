@@ -383,9 +383,11 @@ a sequential `sum`, usually by being more accurate). Integer overflow of any par
 result in that order traps.
 `BRINE_THREADS=n` or `brine run --threads n` sets the thread count.
 
-**GPUs.** `par for`, `par [...]` and `par` reductions also run on an NVIDIA GPU
-when the runtime expects that to be faster (big constructs with much work per byte
-copied); the results are the same bits, and a failing check panics as on the CPU.
+**GPUs.** `par for`, `par [...]` and `par` reductions also run on a GPU (NVIDIA
+through CUDA, Apple silicon through Metal) when the runtime expects that to be
+faster (big constructs with much work per byte copied); the results are the same
+bits, and a failing check panics as on the CPU. On Apple GPUs, f64 code stays on
+the CPU (they have no f64).
 Nothing to write or install beyond the driver: the compiler makes a kernel of every
 body that only uses int/float arithmetic, comparisons, branches, loops, structs,
 tuples, reads of outer arrays and scalars, `out[i]` writes, `sqrt`, `abs`, `floor`,

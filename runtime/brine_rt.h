@@ -493,7 +493,7 @@ typedef void (*brine_leaf_fn)(void *ctx, int64_t leaf, int64_t lo, int64_t hi, v
 /* A parallel construct, as the compiler describes it for the GPU (lower.br,
  * `gpu_emit`). `ptx` is NULL when the body can't run on a GPU. */
 typedef struct brine_kernel {
-    const char *ptx;   /* the program's PTX module */
+    const char *ptx;   /* the program's GPU module: PTX, or MSL on macOS */
     const char *entry; /* the kernel */
     const char *where; /* file:line:col, for BRINE_GPU_LOG */
     int64_t kind;      /* 0 `par for`, 1 map, 2 reduction */

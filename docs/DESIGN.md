@@ -138,9 +138,10 @@ precision than a left-to-right sum.
 
 Threads: `BRINE_THREADS=n` or `brine run --threads n` (default: all cores).
 
-**GPUs.** A `par for`, `par [...]` or `par` reduction can also run on an NVIDIA GPU,
-with no annotation and no change in meaning: the results are the same bits as on the
-CPU, and a check that fails on the device panics exactly as it would on the CPU.
+**GPUs.** A `par for`, `par [...]` or `par` reduction can also run on a GPU (NVIDIA's
+through CUDA, Apple's through Metal), with no annotation and no change in meaning:
+the results are the same bits as on the CPU, and a check that fails on the device
+panics exactly as it would on the CPU.
 * *Which constructs:* the compiler decides. A body can run on a GPU when it (and
   every function it calls) uses only int and float arithmetic up to 64 bits,
   comparisons, branches, loops, structs and tuples, reads of captured scalars and of
@@ -148,7 +149,9 @@ CPU, and a check that fails on the device panics exactly as it would on the CPU.
   `floor`, `ceil`, `round`, `min` and `max`. It can't allocate (no strings, maps,
   enums with payloads or new arrays), print, use `world`, call function values, or
   call `sin`, `cos`, `exp`, `log`, `pow` and the like, whose last bit depends on
-  the C library. `BRINE_GPU_LOG=1` says why a construct stayed on the CPU.
+  the C library. Apple GPUs have no f64 and Metal has no recursion, so on macOS
+  those stay on the CPU too. `BRINE_GPU_LOG=1` says why a construct stayed on the
+  CPU.
 * *When:* the runtime decides, per launch. It skips constructs under 4096 elements
   and nested ones, and otherwise compares the CPU's time (estimated by running the
   first elements for about 100 µs, then measured) with the device's (guessed from
@@ -157,11 +160,14 @@ CPU, and a check that fails on the device panics exactly as it would on the CPU.
   would gain only later starts it in the background and stays on the CPU until it
   is ready. `BRINE_GPU=off` never uses a GPU, `BRINE_GPU=on` uses one whenever it
   can.
-* *How:* the compiler turns the lifted body of each eligible construct into a PTX
-  kernel (`compiler/ptx.br`), and the program carries the PTX. The runtime loads the
-  CUDA driver (`nvcuda.dll`, `libcuda.so.1`) when it first needs it and lets the
-  driver compile the PTX for the device. Without a driver or a device, programs run
-  on the CPU as before; there is no build-time dependency on CUDA.
+* *How:* the compiler turns the lifted body of each eligible construct into a
+  kernel, and the program carries the module: PTX (`compiler/ptx.br`), or Metal
+  Shading Language source on macOS (`compiler/msl.br`). The runtime loads the CUDA
+  driver (`nvcuda.dll`, `libcuda.so.1`) or the Metal framework when it first needs
+  it, and the driver compiles the module for the device. Without a driver or a
+  device, programs run on the CPU as before; there is no build-time dependency on
+  CUDA or Metal (Metal is reached through the Objective-C runtime, loaded with
+  `dlopen`).
 * *Same results:* the kernels use the CPU's semantics, not the device's defaults:
   every float operation rounds to nearest even with no fused multiply-add, `/` and
   `sqrt` are exactly rounded, and integer division, conversions and shifts follow
@@ -169,7 +175,9 @@ CPU, and a check that fails on the device panics exactly as it would on the CPU.
   launch reduces an aligned subtree of up to 2^24 leaves; the CPU folds the
   subtrees' results). Checks (overflow, bounds, division by zero, contracts) set a
   flag instead of panicking; when it is set, the device's results are dropped and
-  the construct reruns on the CPU, which panics with the usual message. Results are
+  the construct reruns on the CPU, which panics with the usual message. Apple GPUs
+  flush subnormal f32 values to zero, so on Metal a subnormal operand or result
+  sets the flag too, and the construct reruns on the CPU. Results are
   only copied back after a launch succeeded, and a body may only write `out[i]`, so
   rerunning is safe.
 * *Copies:* every launch copies the arrays the body reads to the device and the ones
@@ -280,11 +288,14 @@ reads it:
   compiled once and cached, and the system C compiler links.
 * **AArch64** (`a64.br`): the same design for 64-bit ARM, writing ELF objects
   (Linux) through `obj.br`, with .eh_frame unwind info and the same DWARF.
-* **PTX** (`ptx.br`): GPU kernels for the `par` constructs that can run on a GPU
-  (§2.3), next to the x86-64 or C code for the CPU. Lowering marks each construct
-  with a descriptor (`brine_kernel`: kernel name, the layout of its captured
-  context, a cost estimate) and the runtime picks a side per launch.
-  `BRINE_DUMP_PTX=file` writes the module when building.
+* **PTX** (`ptx.br`) and **Metal** (`msl.br`): GPU kernels for the `par`
+  constructs that can run on a GPU (§2.3), next to the machine or C code for the
+  CPU. `ptx.br` also decides which constructs are eligible, for both. Metal has no
+  `goto`, so `msl.br` runs a function with labels as a `switch` in a loop.
+  Lowering marks each construct with a descriptor (`brine_kernel`: kernel name, the
+  layout of its captured context, a cost estimate) and the runtime picks a side per
+  launch.
+  `BRINE_DUMP_PTX=file` writes the module (PTX or MSL) when building.
 * **C** (`ir_c.br`): one statement per IR instruction. gcc/clang at `-O2`/`-O3`
   make it as fast as hand-written C, so it serves `--release` and every
   platform without a native backend (with `#line` for `--debug` there). It's also the bootstrap

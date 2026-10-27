@@ -2174,12 +2174,12 @@ static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, void *ctx, int64_t op, in
 
 /* ============================================================ GPU */
 /* `par` constructs whose bodies only compute (ptx.br decides, at compile
- * time) can run on an NVIDIA GPU. The CUDA driver is loaded when first
- * needed (nvcuda.dll, libcuda.so.1): there's no toolkit or link-time
- * dependency, and without a driver everything runs on the thread pool.
+ * time) can run on a GPU: NVIDIA's through CUDA, Apple's through Metal. The
+ * driver or framework is loaded when first needed: there's no toolkit or
+ * link-time dependency, and without a GPU everything runs on the thread pool.
  *
  * Results are the same either way: kernels compute exactly what the CPU code
- * does (ptx.br), reductions combine in the same tree, and a failing check on
+ * does (ptx.br, msl.br), reductions combine in the same tree, and a failing check on
  * the device (overflow, an index, ...) discards the device's work and runs
  * the construct on the CPU, which reports the error as usual.
  *
@@ -2189,35 +2189,10 @@ static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, void *ctx, int64_t op, in
  * it for every construct it can run. BRINE_GPU_LOG=1 prints where each
  * construct ran, and how long it took, to stderr. */
 
-typedef int br_cu_res;
-typedef unsigned long long br_cu_ptr;
+typedef int br_gpu_res;
+typedef unsigned long long br_gpu_ptr;
 
-typedef struct {
-    br_cu_res (*Init)(unsigned);
-    br_cu_res (*DeviceGetCount)(int *);
-    br_cu_res (*DeviceGet)(int *, int);
-    br_cu_res (*DeviceGetAttribute)(int *, int, int);
-    br_cu_res (*DeviceGetName)(char *, int, int);
-    br_cu_res (*DevicePrimaryCtxRetain)(void **, int);
-    br_cu_res (*CtxSetCurrent)(void *);
-    br_cu_res (*CtxSynchronize)(void);
-    br_cu_res (*ModuleLoadDataEx)(void **, const void *, unsigned, int *, void **);
-    br_cu_res (*ModuleGetFunction)(void **, void *, const char *);
-    br_cu_res (*ModuleGetGlobal)(br_cu_ptr *, size_t *, void *, const char *);
-    br_cu_res (*MemAlloc)(br_cu_ptr *, size_t);
-    br_cu_res (*MemFree)(br_cu_ptr);
-    br_cu_res (*MemAllocHost)(void **, size_t);
-    br_cu_res (*MemFreeHost)(void *);
-    br_cu_res (*MemcpyHtoD)(br_cu_ptr, const void *, size_t);
-    br_cu_res (*MemcpyDtoH)(void *, br_cu_ptr, size_t);
-    br_cu_res (*MemsetD8)(br_cu_ptr, unsigned char, size_t);
-    br_cu_res (*LaunchKernel)(void *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void *, void **, void **);
-    br_cu_res (*GetErrorString)(br_cu_res, const char **);
-} br_cu_api;
-
-enum { BR_CU_OOM = 2 };
-enum { BR_CU_ATTR_SMS = 16, BR_CU_ATTR_CC_MAJOR = 75, BR_CU_ATTR_CC_MINOR = 76 };
-enum { BR_CU_JIT_ERROR_LOG = 5, BR_CU_JIT_ERROR_LOG_SIZE = 6 };
+enum { BR_GPU_OOM = 2 };
 enum { BR_GPU_OFF, BR_GPU_AUTO, BR_GPU_ON };
 enum { BR_GS_NONE, BR_GS_INIT, BR_GS_READY, BR_GS_FAILED };
 
@@ -2238,11 +2213,9 @@ static struct {
     br_mutex run; /* held while the device is in use */
     int mode, log, state;
     char why[256];
-    br_cu_api cu;
-    void *ctx, *mod;
     const char *ptx;
-    br_cu_ptr err;
-    br_cu_ptr buf;
+    br_gpu_ptr err; /* the error flag kernels set */
+    br_gpu_ptr buf;
     size_t cap;
     char *stage;
     size_t stage_cap;
@@ -2251,7 +2224,8 @@ static struct {
     double init_s; /* how long getting the device ready takes */
     char name[128];
     int sms;
-    double f64_ratio; /* how much faster than one CPU thread at f64 code */
+    double speed;     /* how much faster than one CPU thread at f32 and integer code */
+    double f64_ratio; /* the same at f64 code */
 } br_gpu;
 
 /* what the runtime learned about one construct */
@@ -2275,6 +2249,7 @@ static void br_gpu_setup(void) {
     br_gpu.log = l && *l && strcmp(l, "0") != 0;
     br_gpu.bw = 8e9;
     br_gpu.init_s = 0.3;
+    br_gpu.speed = 150;
     br_gpu.f64_ratio = 40;
 }
 
@@ -2290,9 +2265,375 @@ static void br_gpu_logf(const char *fmt, ...) {
     va_end(ap);
 }
 
-static const char *br_cu_err(br_cu_res r) {
+/* ------------------------------------------------------------ devices */
+/* What the rest needs from a GPU; CUDA and Metal below. Calls return 0 or an
+ * error br_dev_err describes. Device pointers are addresses the kernels use
+ * as they are. */
+static int br_dev_open(const char *code, char *why, size_t nwhy);
+static const char *br_dev_err(br_gpu_res r);
+/* makes the device current on this thread */
+static br_gpu_res br_dev_bind(void);
+static br_gpu_res br_dev_alloc(br_gpu_ptr *p, size_t n);
+static void br_dev_free(br_gpu_ptr p);
+/* host memory the device copies from quickly, or NULL */
+static void *br_dev_host_alloc(size_t n);
+static void br_dev_host_free(void *p);
+static br_gpu_res br_dev_htod(br_gpu_ptr d, const void *h, size_t n);
+static br_gpu_res br_dev_dtoh(void *h, br_gpu_ptr d, size_t n);
+static br_gpu_res br_dev_zero(br_gpu_ptr d, size_t n);
+static br_gpu_res br_dev_func(void **fn, const char *name);
+/* `count` threads of a construct's kernel, and waits for them. args: the
+ * context, n, the first index, count, and for reductions where the leaves'
+ * values and flags go. */
+static br_gpu_res br_dev_run(void *fn, int64_t count, const uint64_t *args, int nargs);
+/* `blocks` blocks of BR_GPU_BLOCK threads of a combine kernel. args: values
+ * and flags in, their count, values and flags out. */
+static br_gpu_res br_dev_comb(void *fn, int64_t blocks, const uint64_t *args, int nargs);
+
+#if defined(__APPLE__)
+/* Metal, through the Objective-C runtime: the frameworks are loaded when
+ * first needed, so there's nothing to link. The program's module is MSL
+ * source (msl.br); "// stack N" on its second line is the device stack each
+ * thread needs. Memory is shared with the CPU, so copies are memcpy. */
+typedef void *br_id;
+typedef void *br_sel;
+typedef struct {
+    unsigned long w, h, d;
+} br_mtl_size;
+
+typedef struct {
+    char *name;
+    br_id ps;
+} br_mtl_fn;
+
+static struct {
+    br_id (*cls)(const char *);
+    br_sel (*sel)(const char *);
+    void (*msg)(void); /* objc_msgSend: cast to each call's type */
+    void *(*push)(void);
+    void (*pop)(void *);
+    br_id dev, queue, lib;
+    br_id buf, flag, stk; /* the main buffer, the error flag's, the stack's */
+    br_gpu_ptr buf_at, flag_at, stk_at;
+    char *buf_mem, *flag_mem;
+    size_t buf_len, stk_len;
+    uint64_t stack;
+    br_mtl_fn *fns;
+    int nfns;
+    char err[256];
+} br_mtl;
+
+enum { BR_MTL_FAIL = 1, BR_MTL_STATUS_ERROR = 5, BR_MTL_KERNEL = 3 };
+
+#define BR_OBJC(ret, ...) ((ret(*)(br_id, br_sel, ##__VA_ARGS__))br_mtl.msg)
+static br_id br_oc(br_id o, const char *s) { return BR_OBJC(br_id)(o, br_mtl.sel(s)); }
+static br_id br_oc_o(br_id o, const char *s, br_id a) { return BR_OBJC(br_id, br_id)(o, br_mtl.sel(s), a); }
+static unsigned long br_oc_u(br_id o, const char *s) { return BR_OBJC(unsigned long)(o, br_mtl.sel(s)); }
+static int br_oc_has(br_id o, const char *s) { return BR_OBJC(unsigned char, br_sel)(o, br_mtl.sel("respondsToSelector:"), br_mtl.sel(s)) != 0; }
+static br_id br_oc_str(const char *s) {
+    return BR_OBJC(br_id, const char *)(br_mtl.cls("NSString"), br_mtl.sel("stringWithUTF8String:"), s);
+}
+static const char *br_oc_cstr(br_id nsstr) {
+    const char *s = nsstr ? BR_OBJC(const char *)(nsstr, br_mtl.sel("UTF8String")) : NULL;
+    return s ? s : "unknown error";
+}
+
+static br_gpu_res br_mtl_fail(const char *what, br_id nserr) {
+    snprintf(br_mtl.err, sizeof br_mtl.err, "%s%s%s", what, nserr ? ": " : "", nserr ? br_oc_cstr(br_oc(nserr, "localizedDescription")) : "");
+    return BR_MTL_FAIL;
+}
+
+static const char *br_dev_err(br_gpu_res r) { return r == BR_GPU_OOM ? "out of memory" : br_mtl.err; }
+
+/* a shared buffer of n bytes, and its GPU address */
+static br_id br_mtl_buffer(size_t n, br_gpu_ptr *at) {
+    br_id b = BR_OBJC(br_id, unsigned long, unsigned long)(br_mtl.dev, br_mtl.sel("newBufferWithLength:options:"), (unsigned long)n, 0);
+    if (b) *at = (br_gpu_ptr)br_oc_u(b, "gpuAddress");
+    return b;
+}
+
+static int br_dev_open(const char *code, char *why, size_t nwhy) {
+    if (strncmp(code, "// brine metal\n// stack ", 24) != 0) {
+        snprintf(why, nwhy, "the program wasn't built for Metal");
+        return 0;
+    }
+    br_mtl.stack = strtoull(code + 24, NULL, 10);
+    void *objc = dlopen("/usr/lib/libobjc.A.dylib", RTLD_NOW | RTLD_LOCAL);
+    void *fnd = dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_NOW | RTLD_LOCAL);
+    void *mtl = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_NOW | RTLD_LOCAL);
+    if (!objc || !fnd || !mtl) {
+        snprintf(why, nwhy, "no Metal framework");
+        return 0;
+    }
+    *(void **)&br_mtl.cls = dlsym(objc, "objc_getClass");
+    *(void **)&br_mtl.sel = dlsym(objc, "sel_registerName");
+    *(void **)&br_mtl.msg = dlsym(objc, "objc_msgSend");
+    *(void **)&br_mtl.push = dlsym(objc, "objc_autoreleasePoolPush");
+    *(void **)&br_mtl.pop = dlsym(objc, "objc_autoreleasePoolPop");
+    br_id (*create)(void) = NULL;
+    *(void **)&create = dlsym(mtl, "MTLCreateSystemDefaultDevice");
+    if (!br_mtl.cls || !br_mtl.sel || !br_mtl.msg || !br_mtl.push || !br_mtl.pop || !create) {
+        snprintf(why, nwhy, "the Objective-C runtime or Metal is missing a function");
+        return 0;
+    }
+    void *pool = br_mtl.push();
+    int ok = 0;
+    br_id dev = create();
+    if (!dev) {
+        snprintf(why, nwhy, "no Metal device");
+        goto out;
+    }
+    br_mtl.dev = dev;
+    snprintf(br_gpu.name, sizeof br_gpu.name, "%s", br_oc_cstr(br_oc(dev, "name")));
+    br_mtl.flag = br_mtl_buffer(256, &br_mtl.flag_at);
+    if (!br_mtl.flag || !br_oc_has(br_mtl.flag, "gpuAddress")) {
+        snprintf(why, nwhy, "%s has no Metal 3 (GPU addresses need macOS 13)", br_gpu.name);
+        goto out;
+    }
+    br_mtl.flag_mem = (char *)br_oc(br_mtl.flag, "contents");
+    /* exact arithmetic, as on the CPU */
+    br_id opts = br_oc(br_oc(br_mtl.cls("MTLCompileOptions"), "alloc"), "init");
+    if (br_oc_has(opts, "setMathMode:"))
+        BR_OBJC(void, long)(opts, br_mtl.sel("setMathMode:"), 0);
+    else
+        BR_OBJC(void, _Bool)(opts, br_mtl.sel("setFastMathEnabled:"), 0);
+    br_id err = NULL;
+    br_mtl.lib = BR_OBJC(br_id, br_id, br_id, br_id *)(dev, br_mtl.sel("newLibraryWithSource:options:error:"), br_oc_str(code), opts, &err);
+    BR_OBJC(void)(opts, br_mtl.sel("release"));
+    if (!br_mtl.lib) {
+        snprintf(why, nwhy, "the Metal source doesn't compile: %.180s", err ? br_oc_cstr(br_oc(err, "localizedDescription")) : "");
+        goto out;
+    }
+    /* every kernel's pipeline now, while the program runs on the CPU */
+    br_id names = br_oc(br_mtl.lib, "functionNames");
+    unsigned long nn = br_oc_u(names, "count");
+    br_mtl.fns = (br_mtl_fn *)calloc(nn ? nn : 1, sizeof(br_mtl_fn));
+    if (!br_mtl.fns) {
+        snprintf(why, nwhy, "out of memory");
+        goto out;
+    }
+    for (unsigned long i = 0; i < nn; i++) {
+        br_id nm = BR_OBJC(br_id, unsigned long)(names, br_mtl.sel("objectAtIndex:"), i);
+        const char *cn = br_oc_cstr(nm);
+        br_id f = br_oc_o(br_mtl.lib, "newFunctionWithName:", nm);
+        /* kernels only */
+        if (f && br_oc_u(f, "functionType") != BR_MTL_KERNEL) {
+            BR_OBJC(void)(f, br_mtl.sel("release"));
+            continue;
+        }
+        err = NULL;
+        br_id ps = f ? BR_OBJC(br_id, br_id, br_id *)(dev, br_mtl.sel("newComputePipelineStateWithFunction:error:"), f, &err) : NULL;
+        if (f) BR_OBJC(void)(f, br_mtl.sel("release"));
+        if (!ps) {
+            snprintf(why, nwhy, "no pipeline for %s: %.160s", cn, err ? br_oc_cstr(br_oc(err, "localizedDescription")) : "");
+            goto out;
+        }
+        br_mtl.fns[br_mtl.nfns].name = strdup(cn);
+        br_mtl.fns[br_mtl.nfns++].ps = ps;
+    }
+    br_mtl.queue = br_oc(dev, "newCommandQueue");
+    if (!br_mtl.queue) {
+        snprintf(why, nwhy, "no Metal command queue");
+        goto out;
+    }
+    br_gpu.err = br_mtl.flag_at;
+    /* memory is shared: copies run at memcpy speed */
+    br_gpu.bw = 30e9;
+    br_gpu.speed = 60;
+    ok = 1;
+out:
+    br_mtl.pop(pool);
+    return ok;
+}
+
+static br_gpu_res br_dev_bind(void) { return 0; }
+
+/* one main buffer at a time: br_gpu_reserve frees the old one first */
+static br_gpu_res br_dev_alloc(br_gpu_ptr *p, size_t n) {
+    br_id b = br_mtl_buffer(n, p);
+    if (!b) return BR_GPU_OOM;
+    br_mtl.buf = b;
+    br_mtl.buf_at = *p;
+    br_mtl.buf_mem = (char *)br_oc(b, "contents");
+    br_mtl.buf_len = n;
+    return 0;
+}
+
+static void br_dev_free(br_gpu_ptr p) {
+    if (!br_mtl.buf || p != br_mtl.buf_at) return;
+    BR_OBJC(void)(br_mtl.buf, br_mtl.sel("release"));
+    br_mtl.buf = NULL;
+    br_mtl.buf_len = 0;
+}
+
+static void *br_dev_host_alloc(size_t n) {
+    (void)n;
+    return NULL;
+}
+static void br_dev_host_free(void *p) { (void)p; }
+
+/* where device memory is in the CPU's view of it */
+static char *br_mtl_host(br_gpu_ptr d, size_t n) {
+    if (br_mtl.buf && d >= br_mtl.buf_at && d + n <= br_mtl.buf_at + br_mtl.buf_len) return br_mtl.buf_mem + (d - br_mtl.buf_at);
+    if (d >= br_mtl.flag_at && d + n <= br_mtl.flag_at + 256) return br_mtl.flag_mem + (d - br_mtl.flag_at);
+    snprintf(br_mtl.err, sizeof br_mtl.err, "an address outside the GPU's buffers");
+    return NULL;
+}
+
+static br_gpu_res br_dev_htod(br_gpu_ptr d, const void *h, size_t n) {
+    char *m = br_mtl_host(d, n);
+    if (!m) return BR_MTL_FAIL;
+    memcpy(m, h, n);
+    return 0;
+}
+
+static br_gpu_res br_dev_dtoh(void *h, br_gpu_ptr d, size_t n) {
+    char *m = br_mtl_host(d, n);
+    if (!m) return BR_MTL_FAIL;
+    memcpy(h, m, n);
+    return 0;
+}
+
+static br_gpu_res br_dev_zero(br_gpu_ptr d, size_t n) {
+    char *m = br_mtl_host(d, n);
+    if (!m) return BR_MTL_FAIL;
+    memset(m, 0, n);
+    return 0;
+}
+
+static br_gpu_res br_dev_func(void **fn, const char *name) {
+    for (int i = 0; i < br_mtl.nfns; i++)
+        if (!strcmp(br_mtl.fns[i].name, name)) {
+            *fn = br_mtl.fns[i].ps;
+            return 0;
+        }
+    snprintf(br_mtl.err, sizeof br_mtl.err, "no kernel %s", name);
+    return BR_MTL_FAIL;
+}
+
+/* Runs one dispatch and waits for it: `groups` threadgroups of `per`
+ * threads, or (groups 0) `threads` threads. */
+static br_gpu_res br_mtl_dispatch(br_id ps, const uint64_t *a, size_t na, unsigned long threads, unsigned long groups, unsigned long per) {
+    void *pool = br_mtl.push();
+    br_gpu_res r = 0;
+    br_id cb = br_oc(br_mtl.queue, "commandBuffer");
+    br_id enc = cb ? br_oc(cb, "computeCommandEncoder") : NULL;
+    if (!enc) {
+        r = br_mtl_fail("no Metal command buffer", NULL);
+        goto out;
+    }
+    BR_OBJC(void, br_id)(enc, br_mtl.sel("setComputePipelineState:"), ps);
+    br_sel set = br_mtl.sel("setBuffer:offset:atIndex:");
+    BR_OBJC(void, br_id, unsigned long, unsigned long)(enc, set, br_mtl.buf, 0, 0);
+    BR_OBJC(void, const void *, unsigned long, unsigned long)(enc, br_mtl.sel("setBytes:length:atIndex:"), a, (unsigned long)(na * 8), 1);
+    BR_OBJC(void, br_id, unsigned long, unsigned long)(enc, set, br_mtl.flag, 0, 2);
+    /* the kernels reach memory by address, not through their arguments (which
+     * the Metal compiler drops when unused): every buffer has to be made
+     * resident (read and write) */
+    br_sel use = br_mtl.sel("useResource:usage:");
+    BR_OBJC(void, br_id, unsigned long)(enc, use, br_mtl.buf, 3);
+    BR_OBJC(void, br_id, unsigned long)(enc, use, br_mtl.flag, 3);
+    if (br_mtl.stk) BR_OBJC(void, br_id, unsigned long)(enc, use, br_mtl.stk, 3);
+    br_mtl_size tg = {per, 1, 1};
+    if (groups) {
+        br_mtl_size g = {groups, 1, 1};
+        BR_OBJC(void, br_mtl_size, br_mtl_size)(enc, br_mtl.sel("dispatchThreadgroups:threadsPerThreadgroup:"), g, tg);
+    } else {
+        br_mtl_size g = {threads, 1, 1};
+        BR_OBJC(void, br_mtl_size, br_mtl_size)(enc, br_mtl.sel("dispatchThreads:threadsPerThreadgroup:"), g, tg);
+    }
+    BR_OBJC(void)(enc, br_mtl.sel("endEncoding"));
+    BR_OBJC(void)(cb, br_mtl.sel("commit"));
+    BR_OBJC(void)(cb, br_mtl.sel("waitUntilCompleted"));
+    if (br_oc_u(cb, "status") == BR_MTL_STATUS_ERROR) r = br_mtl_fail("a Metal command failed", br_oc(cb, "error"));
+out:
+    br_mtl.pop(pool);
+    return r;
+}
+
+/* the device stack for `threads` threads at a time (bytes) */
+static br_gpu_res br_mtl_stack(uint64_t bytes) {
+    if (br_mtl.stk_len >= bytes) return 0;
+    if (br_mtl.stk) BR_OBJC(void)(br_mtl.stk, br_mtl.sel("release"));
+    br_mtl.stk = br_mtl_buffer((size_t)bytes, &br_mtl.stk_at);
+    br_mtl.stk_len = br_mtl.stk ? (size_t)bytes : 0;
+    return br_mtl.stk ? 0 : BR_GPU_OOM;
+}
+
+static br_gpu_res br_dev_run(void *fn, int64_t count, const uint64_t *args, int nargs) {
+    /* msl.br's kernel arguments: context, n, first index, count, error flag,
+     * stack, stack per thread, first thread, values, flags */
+    uint64_t a[10] = {0};
+    for (int i = 0; i < nargs && i < 6; i++) a[i < 4 ? i : i + 4] = args[i];
+    a[4] = br_mtl.flag_at;
+    a[6] = br_mtl.stack;
+    unsigned long max = br_oc_u((br_id)fn, "maxTotalThreadsPerThreadgroup");
+    unsigned long per = max < BR_GPU_BLOCK ? max : BR_GPU_BLOCK;
+    /* threads at a time: as many as 256 MB of stack holds */
+    int64_t step = count;
+    if (br_mtl.stack > 0) {
+        int64_t most = (int64_t)(((uint64_t)256 << 20) / br_mtl.stack);
+        if (most < 1) most = 1;
+        if (step > most) step = most;
+        br_gpu_res r = br_mtl_stack((uint64_t)step * br_mtl.stack);
+        if (r) return r;
+        a[5] = br_mtl.stk_at;
+    }
+    for (int64_t t0 = 0; t0 < count; t0 += step) {
+        int64_t m = count - t0 < step ? count - t0 : step;
+        a[7] = (uint64_t)t0;
+        br_gpu_res r = br_mtl_dispatch((br_id)fn, a, 10, (unsigned long)m, 0, per);
+        if (r) return r;
+    }
+    return 0;
+}
+
+static br_gpu_res br_dev_comb(void *fn, int64_t blocks, const uint64_t *args, int nargs) {
+    uint64_t a[6] = {0};
+    for (int i = 0; i < nargs && i < 5; i++) a[i] = args[i];
+    a[5] = br_mtl.flag_at;
+    if (br_oc_u((br_id)fn, "maxTotalThreadsPerThreadgroup") < BR_GPU_BLOCK) {
+        snprintf(br_mtl.err, sizeof br_mtl.err, "a combine kernel can't run %d threads per threadgroup", BR_GPU_BLOCK);
+        return BR_MTL_FAIL;
+    }
+    return br_mtl_dispatch((br_id)fn, a, 6, 0, (unsigned long)blocks, BR_GPU_BLOCK);
+}
+
+#else
+/* CUDA: the driver is loaded when first needed (nvcuda.dll, libcuda.so.1),
+ * and JIT-compiles the program's PTX (ptx.br). */
+typedef struct {
+    br_gpu_res (*Init)(unsigned);
+    br_gpu_res (*DeviceGetCount)(int *);
+    br_gpu_res (*DeviceGet)(int *, int);
+    br_gpu_res (*DeviceGetAttribute)(int *, int, int);
+    br_gpu_res (*DeviceGetName)(char *, int, int);
+    br_gpu_res (*DevicePrimaryCtxRetain)(void **, int);
+    br_gpu_res (*CtxSetCurrent)(void *);
+    br_gpu_res (*CtxSynchronize)(void);
+    br_gpu_res (*ModuleLoadDataEx)(void **, const void *, unsigned, int *, void **);
+    br_gpu_res (*ModuleGetFunction)(void **, void *, const char *);
+    br_gpu_res (*ModuleGetGlobal)(br_gpu_ptr *, size_t *, void *, const char *);
+    br_gpu_res (*MemAlloc)(br_gpu_ptr *, size_t);
+    br_gpu_res (*MemFree)(br_gpu_ptr);
+    br_gpu_res (*MemAllocHost)(void **, size_t);
+    br_gpu_res (*MemFreeHost)(void *);
+    br_gpu_res (*MemcpyHtoD)(br_gpu_ptr, const void *, size_t);
+    br_gpu_res (*MemcpyDtoH)(void *, br_gpu_ptr, size_t);
+    br_gpu_res (*MemsetD8)(br_gpu_ptr, unsigned char, size_t);
+    br_gpu_res (*LaunchKernel)(void *, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void *, void **, void **);
+    br_gpu_res (*GetErrorString)(br_gpu_res, const char **);
+} br_cu_api;
+
+enum { BR_CU_ATTR_SMS = 16, BR_CU_ATTR_CC_MAJOR = 75, BR_CU_ATTR_CC_MINOR = 76 };
+enum { BR_CU_JIT_ERROR_LOG = 5, BR_CU_JIT_ERROR_LOG_SIZE = 6 };
+
+static br_cu_api br_cu;
+static void *br_cu_ctx, *br_cu_mod;
+
+static const char *br_dev_err(br_gpu_res r) {
     const char *s = NULL;
-    if (br_gpu.cu.GetErrorString) br_gpu.cu.GetErrorString(r, &s);
+    if (br_cu.GetErrorString) br_cu.GetErrorString(r, &s);
     return s ? s : "unknown CUDA error";
 }
 
@@ -2309,13 +2650,13 @@ static void *br_cu_sym(void *lib, const char *name) { return dlsym(lib, name); }
 
 /* Loads the driver, picks device 0 and JIT-compiles the program's PTX. On
  * failure, `why` says what's missing. Called without br_gpu.mu held. */
-static int br_gpu_open(const char *ptx, char *why, size_t nwhy) {
+static int br_dev_open(const char *ptx, char *why, size_t nwhy) {
     void *lib = br_cu_open();
     if (!lib) {
         snprintf(why, nwhy, "no CUDA driver");
         return 0;
     }
-    br_cu_api *c = &br_gpu.cu;
+    br_cu_api *c = &br_cu;
 #define BR_CU(field, name)                                         \
     if (!(*(void **)&c->field = br_cu_sym(lib, name))) {           \
         snprintf(why, nwhy, "the CUDA driver has no %s", name);    \
@@ -2342,10 +2683,14 @@ static int br_gpu_open(const char *ptx, char *why, size_t nwhy) {
     BR_CU(LaunchKernel, "cuLaunchKernel")
     BR_CU(GetErrorString, "cuGetErrorString")
 #undef BR_CU
-    br_cu_res r;
+    if (!strncmp(ptx, "// brine metal", 14)) {
+        snprintf(why, nwhy, "the program was built for Metal");
+        return 0;
+    }
+    br_gpu_res r;
     int n = 0, dev = 0;
     if ((r = c->Init(0)) != 0 || (r = c->DeviceGetCount(&n)) != 0) {
-        snprintf(why, nwhy, "cuInit: %s", br_cu_err(r));
+        snprintf(why, nwhy, "cuInit: %s", br_dev_err(r));
         return 0;
     }
     if (n <= 0 || c->DeviceGet(&dev, 0) != 0) {
@@ -2364,29 +2709,56 @@ static int br_gpu_open(const char *ptx, char *why, size_t nwhy) {
         snprintf(why, nwhy, "%s is older than compute capability 5.0", br_gpu.name);
         return 0;
     }
-    if ((r = c->DevicePrimaryCtxRetain(&br_gpu.ctx, dev)) != 0 || (r = c->CtxSetCurrent(br_gpu.ctx)) != 0) {
-        snprintf(why, nwhy, "no CUDA context: %s", br_cu_err(r));
+    if ((r = c->DevicePrimaryCtxRetain(&br_cu_ctx, dev)) != 0 || (r = c->CtxSetCurrent(br_cu_ctx)) != 0) {
+        snprintf(why, nwhy, "no CUDA context: %s", br_dev_err(r));
         return 0;
     }
     static char log[4096];
     int opts[2] = {BR_CU_JIT_ERROR_LOG, BR_CU_JIT_ERROR_LOG_SIZE};
     void *vals[2] = {log, (void *)(uintptr_t)sizeof log};
-    if ((r = c->ModuleLoadDataEx(&br_gpu.mod, ptx, 2, opts, vals)) != 0) {
-        snprintf(why, nwhy, "the PTX doesn't compile (%s): %.180s", br_cu_err(r), log);
+    if ((r = c->ModuleLoadDataEx(&br_cu_mod, ptx, 2, opts, vals)) != 0) {
+        snprintf(why, nwhy, "the PTX doesn't compile (%s): %.180s", br_dev_err(r), log);
         return 0;
     }
     size_t sz = 0;
-    if ((r = c->ModuleGetGlobal(&br_gpu.err, &sz, br_gpu.mod, "brine_gpu_err")) != 0) {
-        snprintf(why, nwhy, "cuModuleGetGlobal: %s", br_cu_err(r));
+    if ((r = c->ModuleGetGlobal(&br_gpu.err, &sz, br_cu_mod, "brine_gpu_err")) != 0) {
+        snprintf(why, nwhy, "cuModuleGetGlobal: %s", br_dev_err(r));
         return 0;
     }
     return 1;
 }
 
+static br_gpu_res br_dev_bind(void) { return br_cu.CtxSetCurrent(br_cu_ctx); }
+static br_gpu_res br_dev_alloc(br_gpu_ptr *p, size_t n) { return br_cu.MemAlloc(p, n); }
+static void br_dev_free(br_gpu_ptr p) { br_cu.MemFree(p); }
+static void *br_dev_host_alloc(size_t n) {
+    void *p = NULL;
+    return br_cu.MemAllocHost(&p, n) == 0 ? p : NULL;
+}
+static void br_dev_host_free(void *p) { br_cu.MemFreeHost(p); }
+static br_gpu_res br_dev_htod(br_gpu_ptr d, const void *h, size_t n) { return br_cu.MemcpyHtoD(d, h, n); }
+static br_gpu_res br_dev_dtoh(void *h, br_gpu_ptr d, size_t n) { return br_cu.MemcpyDtoH(h, d, n); }
+static br_gpu_res br_dev_zero(br_gpu_ptr d, size_t n) { return br_cu.MemsetD8(d, 0, n); }
+static br_gpu_res br_dev_func(void **fn, const char *name) { return br_cu.ModuleGetFunction(fn, br_cu_mod, name); }
+
+static br_gpu_res br_cu_launch(void *fn, int64_t blocks, const uint64_t *args, int nargs) {
+    void *p[8];
+    for (int i = 0; i < nargs && i < 8; i++) p[i] = (void *)&args[i];
+    br_gpu_res r = br_cu.LaunchKernel(fn, (unsigned)blocks, 1, 1, BR_GPU_BLOCK, 1, 1, 0, NULL, p, NULL);
+    return r ? r : br_cu.CtxSynchronize();
+}
+
+static br_gpu_res br_dev_run(void *fn, int64_t count, const uint64_t *args, int nargs) {
+    return br_cu_launch(fn, (count + BR_GPU_BLOCK - 1) / BR_GPU_BLOCK, args, nargs);
+}
+
+static br_gpu_res br_dev_comb(void *fn, int64_t blocks, const uint64_t *args, int nargs) { return br_cu_launch(fn, blocks, args, nargs); }
+#endif
+
 static void br_gpu_init_main(void *arg) {
     char why[256] = "";
     double t0 = brine_clock();
-    int ok = br_gpu_open((const char *)arg, why, sizeof why);
+    int ok = br_dev_open((const char *)arg, why, sizeof why);
     double dt = brine_clock() - t0;
     br_lock(&br_gpu.mu);
     br_gpu.state = ok ? BR_GS_READY : BR_GS_FAILED;
@@ -2410,7 +2782,7 @@ static void br_gpu_start(const char *ptx) {
     br_thread th;
     if (!br_thread_start(&th, br_gpu_init_main, (void *)ptx)) {
         br_gpu.state = BR_GS_FAILED;
-        snprintf(br_gpu.why, sizeof br_gpu.why, "no thread to start CUDA");
+        snprintf(br_gpu.why, sizeof br_gpu.why, "no thread to start the GPU");
     }
 }
 
@@ -2430,13 +2802,13 @@ static int br_gpu_wait(const char *ptx) {
     return br_gpu.state == BR_GS_READY;
 }
 
-/* A CUDA call failed: no more GPU for this run. */
-static void br_gpu_fail(const char *what, br_cu_res r) {
+/* A device call failed: no more GPU for this run. */
+static void br_gpu_fail(const char *what, br_gpu_res r) {
     br_lock(&br_gpu.mu);
     br_gpu.state = BR_GS_FAILED;
-    snprintf(br_gpu.why, sizeof br_gpu.why, "%s: %s", what, br_cu_err(r));
+    snprintf(br_gpu.why, sizeof br_gpu.why, "%s: %s", what, br_dev_err(r));
     br_unlock(&br_gpu.mu);
-    if (br_gpu.log) br_gpu_logf("disabled: %s: %s", what, br_cu_err(r));
+    if (br_gpu.log) br_gpu_logf("disabled: %s: %s", what, br_dev_err(r));
 }
 
 static br_kst *br_kstate(brine_kernel *k) {
@@ -2598,14 +2970,14 @@ static int64_t br_gplan_index(br_gplan *p, const void *h) {
 }
 
 /* Device memory for `n` bytes (one buffer, kept between launches). */
-static int br_gpu_reserve(uint64_t n, br_cu_res *r) {
+static int br_gpu_reserve(uint64_t n, br_gpu_res *r) {
     *r = 0;
     if (br_gpu.cap >= n) return 1;
-    if (br_gpu.buf) br_gpu.cu.MemFree(br_gpu.buf);
+    if (br_gpu.buf) br_dev_free(br_gpu.buf);
     br_gpu.buf = 0;
     br_gpu.cap = 0;
     uint64_t c = n + n / 4;
-    if ((*r = br_gpu.cu.MemAlloc(&br_gpu.buf, (size_t)c)) != 0) {
+    if ((*r = br_dev_alloc(&br_gpu.buf, (size_t)c)) != 0) {
         br_gpu.buf = 0;
         return 0;
     }
@@ -2617,13 +2989,13 @@ static char *br_gpu_stage(uint64_t n) {
     if (br_gpu.stage_cap >= n) return br_gpu.stage;
     if (br_gpu.stage) {
         if (br_gpu.stage_pinned)
-            br_gpu.cu.MemFreeHost(br_gpu.stage);
+            br_dev_host_free(br_gpu.stage);
         else
             free(br_gpu.stage);
     }
     uint64_t c = n + n / 4 + 4096;
-    void *p = NULL;
-    br_gpu.stage_pinned = br_gpu.cu.MemAllocHost(&p, (size_t)c) == 0;
+    void *p = br_dev_host_alloc((size_t)c);
+    br_gpu.stage_pinned = p != NULL;
     if (!br_gpu.stage_pinned) p = malloc((size_t)c);
     br_gpu.stage = (char *)p;
     br_gpu.stage_cap = p ? (size_t)c : 0;
@@ -2632,11 +3004,10 @@ static char *br_gpu_stage(uint64_t n) {
 
 /* Copies the context and the arrays to the device: the device context is at
  * br_gpu.buf. Holds br_gpu.run. */
-static br_cu_res br_gpu_copy_in(br_gplan *p, const void *ctx) {
-    br_cu_api *c = &br_gpu.cu;
+static br_gpu_res br_gpu_copy_in(br_gplan *p, const void *ctx) {
     char *st = br_gpu_stage(p->stage);
-    if (!st) return BR_CU_OOM;
-    br_cu_ptr base = br_gpu.buf;
+    if (!st) return BR_GPU_OOM;
+    br_gpu_ptr base = br_gpu.buf;
     const brine_kernel *k = p->k;
     memcpy(st, ctx, (size_t)k->ctx_size);
     int64_t nf = k->ptrs[0];
@@ -2666,40 +3037,30 @@ static br_cu_res br_gpu_copy_in(br_gplan *p, const void *ctx) {
                 memcpy(at, &cd, 8);
             }
     }
-    br_cu_res r = c->MemcpyHtoD(base, st, (size_t)p->stage);
+    br_gpu_res r = br_dev_htod(base, st, (size_t)p->stage);
     for (int64_t i = 0; i < p->na && r == 0; i++) {
         br_garr *g = &p->a[i];
-        if (!g->staged && g->read && g->bytes > 0) r = c->MemcpyHtoD(base + g->doff, g->host->data, (size_t)g->bytes);
+        if (!g->staged && g->read && g->bytes > 0) r = br_dev_htod(base + g->doff, g->host->data, (size_t)g->bytes);
     }
-    if (r == 0) r = c->MemsetD8(br_gpu.err, 0, 4);
+    if (r == 0) r = br_dev_zero(br_gpu.err, 4);
     return r;
 }
 
 /* Copies the arrays the body wrote back. */
-static br_cu_res br_gpu_copy_out(br_gplan *p) {
-    br_cu_res r = 0;
+static br_gpu_res br_gpu_copy_out(br_gplan *p) {
+    br_gpu_res r = 0;
     for (int64_t i = 0; i < p->na && r == 0; i++) {
         br_garr *g = &p->a[i];
-        if (g->written && g->bytes > 0) r = br_gpu.cu.MemcpyDtoH(g->host->data, br_gpu.buf + g->doff, (size_t)g->bytes);
+        if (g->written && g->bytes > 0) r = br_dev_dtoh(g->host->data, br_gpu.buf + g->doff, (size_t)g->bytes);
     }
     return r;
 }
 
-static br_cu_res br_gpu_errflag(int *flag) {
+static br_gpu_res br_gpu_errflag(int *flag) {
     uint32_t v = 0;
-    br_cu_res r = br_gpu.cu.MemcpyDtoH(&v, br_gpu.err, 4);
+    br_gpu_res r = br_dev_dtoh(&v, br_gpu.err, 4);
     *flag = v != 0;
     return r;
-}
-
-static br_cu_res br_gpu_launch_blocks(void *fn, int64_t blocks, void **args) {
-    br_cu_res r = br_gpu.cu.LaunchKernel(fn, (unsigned)blocks, 1, 1, BR_GPU_BLOCK, 1, 1, 0, NULL, args, NULL);
-    return r ? r : br_gpu.cu.CtxSynchronize();
-}
-
-/* `count` threads */
-static br_cu_res br_gpu_launch(void *fn, int64_t count, void **args) {
-    return br_gpu_launch_blocks(fn, (count + BR_GPU_BLOCK - 1) / BR_GPU_BLOCK, args);
 }
 
 /* ------------------------------------------------------------ policy */
@@ -2713,7 +3074,7 @@ static const char *br_gpu_kind(const brine_kernel *k) {
 static double br_gpu_guess_ns(const brine_kernel *k, double seq_ns) {
     double f = k->cost > 0 ? (double)k->cost64 / (double)k->cost : 0;
     if (f > 1) f = 1;
-    return seq_ns * ((1 - f) / 150.0 + f / br_gpu.f64_ratio);
+    return seq_ns * ((1 - f) / br_gpu.speed + f / br_gpu.f64_ratio);
 }
 
 typedef struct {
@@ -2783,8 +3144,7 @@ static void br_gpu_note_cpu(br_kst *st, int64_t count, double secs) {
 }
 
 /* Launches `entry` for elements [lo, n) in slices of about BR_GPU_SLICE. */
-static br_cu_res br_gpu_run_for(br_kst *st, int64_t lo, int64_t n, int *flag, double *kern) {
-    br_cu_ptr dctx = br_gpu.buf;
+static br_gpu_res br_gpu_run_for(br_kst *st, int64_t lo, int64_t n, int *flag, double *kern) {
     double ns = st->gpu_ns;
     int64_t i = lo;
     *flag = 0;
@@ -2794,10 +3154,9 @@ static br_cu_res br_gpu_run_for(br_kst *st, int64_t lo, int64_t n, int *flag, do
         if (cnt < 65536) cnt = 65536;
         if (cnt > ((int64_t)1 << 30)) cnt = (int64_t)1 << 30;
         if (cnt > n - i) cnt = n - i;
-        int64_t base = i, total = n;
-        void *args[4] = {&dctx, &total, &base, &cnt};
+        uint64_t args[4] = {br_gpu.buf, (uint64_t)n, (uint64_t)i, (uint64_t)cnt};
         double t0 = brine_clock();
-        br_cu_res r = br_gpu_launch(st->fn, cnt, args);
+        br_gpu_res r = br_dev_run(st->fn, cnt, args, 4);
         if (r) return r;
         double dt = brine_clock() - t0;
         *kern += dt;
@@ -2809,10 +3168,10 @@ static br_cu_res br_gpu_run_for(br_kst *st, int64_t lo, int64_t n, int *flag, do
     return 0;
 }
 
-static br_cu_res br_gpu_func(br_kst *st, const brine_kernel *k) {
-    br_cu_res r = 0;
-    if (!st->fn && (r = br_gpu.cu.ModuleGetFunction(&st->fn, br_gpu.mod, k->entry)) != 0) return r;
-    if (k->kind == 2 && !st->comb) r = br_gpu.cu.ModuleGetFunction(&st->comb, br_gpu.mod, k->comb);
+static br_gpu_res br_gpu_func(br_kst *st, const brine_kernel *k) {
+    br_gpu_res r = 0;
+    if (!st->fn && (r = br_dev_func(&st->fn, k->entry)) != 0) return r;
+    if (k->kind == 2 && !st->comb) r = br_dev_func(&st->comb, k->comb);
     return r;
 }
 
@@ -2877,11 +3236,11 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
         return done;
     }
     double t0 = brine_clock();
-    br_cu_res r = br_gpu.cu.CtxSetCurrent(br_gpu.ctx);
+    br_gpu_res r = br_dev_bind();
     int flag = 0, oom = 0;
     double kern = 0, t1 = t0, t2 = t0;
     if (r == 0) r = br_gpu_func(st, k);
-    if (r == 0 && !br_gpu_reserve(br_gplan_size(&p), &r)) oom = r == BR_CU_OOM;
+    if (r == 0 && !br_gpu_reserve(br_gplan_size(&p), &r)) oom = r == BR_GPU_OOM;
     if (r == 0) r = br_gpu_copy_in(&p, ctx);
     t1 = brine_clock();
     if (r == 0) r = br_gpu_run_for(st, done, n, &flag, &kern);
@@ -2948,20 +3307,19 @@ static void br_fold_leaves(br_fold *f, brine_leaf_fn fn, void *ctx, int64_t n, i
 /* One aligned subtree of 2^h leaves starting at leaf l0 (fewer at the end) on
  * the device; its root goes to *v, *has. vals and the buffer after it: room
  * for 2^h values and flags, twice. */
-static br_cu_res br_gpu_subtree(brine_kernel *k, br_kst *st, int64_t n, int64_t l0, int64_t cnt, br_cu_ptr bufa, br_cu_ptr bufb,
-                                int64_t room, void *v, bool *has) {
-    br_cu_ptr dctx = br_gpu.buf;
+static br_gpu_res br_gpu_subtree(brine_kernel *k, br_kst *st, int64_t n, int64_t l0, int64_t cnt, br_gpu_ptr bufa, br_gpu_ptr bufb,
+                                 int64_t room, void *v, bool *has) {
     int64_t sz = br_vk_size[k->vk];
-    br_cu_ptr va = bufa, ha = bufa + (br_cu_ptr)(room * sz);
-    br_cu_ptr vb = bufb, hb = bufb + (br_cu_ptr)(room * sz);
-    int64_t total = n, base = l0, count = cnt;
-    void *args[6] = {&dctx, &total, &base, &count, &va, &ha};
-    br_cu_res r = br_gpu_launch(st->fn, cnt, args);
+    br_gpu_ptr va = bufa, ha = bufa + (br_gpu_ptr)(room * sz);
+    br_gpu_ptr vb = bufb, hb = bufb + (br_gpu_ptr)(room * sz);
+    int64_t count = cnt;
+    uint64_t args[6] = {br_gpu.buf, (uint64_t)n, (uint64_t)l0, (uint64_t)cnt, va, ha};
+    br_gpu_res r = br_dev_run(st->fn, cnt, args, 6);
     while (r == 0 && count > 1) {
         int64_t blocks = (count + BR_GPU_BLOCK - 1) / BR_GPU_BLOCK;
-        void *cargs[5] = {&va, &ha, &count, &vb, &hb};
-        r = br_gpu_launch_blocks(st->comb, blocks, cargs);
-        br_cu_ptr t = va;
+        uint64_t cargs[5] = {va, ha, (uint64_t)count, vb, hb};
+        r = br_dev_comb(st->comb, blocks, cargs, 5);
+        br_gpu_ptr t = va;
         va = vb;
         vb = t;
         t = ha;
@@ -2969,8 +3327,8 @@ static br_cu_res br_gpu_subtree(brine_kernel *k, br_kst *st, int64_t n, int64_t 
         hb = t;
         count = blocks;
     }
-    if (r == 0) r = br_gpu.cu.MemcpyDtoH(v, va, (size_t)sz);
-    if (r == 0) r = br_gpu.cu.MemcpyDtoH(has, ha, 1);
+    if (r == 0) r = br_dev_dtoh(v, va, (size_t)sz);
+    if (r == 0) r = br_dev_dtoh(has, ha, 1);
     return r;
 }
 
@@ -3039,10 +3397,10 @@ static int br_gpu_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx
     uint64_t half = BR_ALIGN((uint64_t)(room * (sz + 1)), 256);
     uint64_t at = BR_ALIGN(br_gplan_size(&pl), 256);
     double t0 = brine_clock();
-    br_cu_res r = br_gpu.cu.CtxSetCurrent(br_gpu.ctx);
+    br_gpu_res r = br_dev_bind();
     int flag = 0, oom = 0;
     if (r == 0) r = br_gpu_func(st, k);
-    if (r == 0 && !br_gpu_reserve(at + 2 * half, &r)) oom = r == BR_CU_OOM;
+    if (r == 0 && !br_gpu_reserve(at + 2 * half, &r)) oom = r == BR_GPU_OOM;
     if (r == 0) r = br_gpu_copy_in(&pl, ctx);
     double t1 = brine_clock();
     int64_t l = p;

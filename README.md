@@ -31,7 +31,8 @@ fn main():
   In that case the check is removed.
 * **Natively parallel.** `par for`, `par [...]`, `par sum(...)` and `par(a, b)` are
   data-race free by construction, and reductions are deterministic. Big ones run
-  on an NVIDIA GPU when that is faster, with the same results.
+  on an NVIDIA GPU (CUDA) or an Apple one (Metal) when that is faster, with the
+  same results.
 * **Multi-process built in.** The `world` module gives every program MPI-style
   ranks, messages and collectives. `brine run --ranks 4`.
 * **Fast.** Compiles to native code through C. There is no garbage collector, and

@@ -1,0 +1,875 @@
+# Metal Shading Language for Apple GPUs: the `par` bodies that can run on a
+# GPU (ptx.br's `plan`, which also rules out f64, which Apple GPUs lack, and
+# recursion, which Metal lacks) as MSL source. The runtime compiles it with the
+# Metal framework, loaded when first needed (brine_rt.c, "GPU").
+#
+# Every vreg is a local variable and every instruction a statement, as in the
+# C backend (ir_c.br). Metal has no `goto`, so a function with labels runs as
+# a loop around a `switch` on the next label; the Metal compiler turns the
+# constant jumps back into branches.
+#
+# Pointers are 64-bit GPU addresses (`ulong`): everything a kernel reaches is
+# in one buffer the runtime fills. A stack slot whose address escapes (passed
+# to a call, stored, indexed) lives in device memory, in the thread's part of
+# a stack area (`sp`); the others are thread-local arrays or variables.
+#
+# Results are bit-identical to the CPU's, as with PTX: the runtime compiles
+# without fast math (exact `+ - * /` and `sqrt`, no fused multiply-adds), and
+# since Apple GPUs flush subnormal f32 values to zero, a subnormal operand or
+# result is treated like a failed check: the runtime drops the GPU's results
+# and runs the construct on the CPU. A failed check ends the thread: functions
+# return with `bad` set, and the kernel sets the error flag.
+from ir import K, Op, Inst, Func
+from ptx import KReq, GpuCode, LocalAddr, plan, slot_info, comb_name, is_panic, is_refcount, suffix_kind, kmin, kmax, LEAF, BLOCK
+
+fn build(funcs: [Func], ks: [KReq]) -> GpuCode:
+    let p = plan(funcs, ks, true)
+    if not p.any_ok:
+        return GpuCode(ptx="", ok=p.ok, why=p.why, cost=p.cost, cost64=p.cost64)
+    let index = p.index
+    # device stack each function needs, with what its callees need
+    var frames: {int: int} = {}
+    for i in p.used:
+        frames[i] = frame_size(funcs[i])
+    var roots: [int] = []
+    for i, k in enumerate(ks):
+        if p.ok[i]:
+            let j = index[k.fname]
+            roots.push(j)
+            frames[j] = frame_size(funcs[j])
+    var memo: {int: int} = {}
+    var stack = 0
+    for j in roots:
+        stack = max(stack, stack_need(j, p.calls, frames, ref memo))
+    var o: [str] = []
+    o.push("// brine metal")
+    o.push(f"// stack {align16(stack)}")
+    o.push("#include <metal_stdlib>")
+    o.push("using namespace metal;")
+    o.push("#pragma clang diagnostic ignored \"-Wunused-variable\"")
+    o.push("#pragma clang diagnostic ignored \"-Wunused-but-set-variable\"")
+    o.push("")
+    for i in p.used:
+        o.push(head(funcs[i], index) + ";")
+    o.push("")
+    var combs: {str: bool} = {}
+    for i, k in enumerate(ks):
+        if not p.ok[i]:
+            continue
+        o.extend(emit_entry(funcs[index[k.fname]], k, index))
+        if k.kind == 2:
+            let cn = comb_name(k.op, k.vk)
+            if cn not in combs:
+                combs[cn] = true
+                o.extend(emit_comb(k.op, k.vk))
+    for i in p.used:
+        o.extend(emit_func(funcs[i], index))
+    return GpuCode(ptx="\n".join(o) + "\n", ok=p.ok, why=p.why, cost=p.cost, cost64=p.cost64)
+
+fn align16(n: int) -> int:
+    return (n + 15) / 16 * 16
+
+fn stack_need(i: int, calls: {int: [int]}, frames: {int: int}, ref memo: {int: int}) -> int:
+    match memo.get(i):
+        case Some(n):
+            return n
+        case None:
+            pass
+    var deepest = 0
+    for j in calls.get(i).unwrap_or([]):
+        deepest = max(deepest, stack_need(j, calls, frames, ref memo))
+    let n = frames.get(i).unwrap_or(0) + deepest
+    memo[i] = n
+    return n
+
+fn frame_size(f: Func) -> int:
+    let (_, size) = frame_layout(f)
+    return size
+
+# Offsets of the device-memory slots (those whose address escapes), and the
+# frame's size (a multiple of 16).
+fn frame_layout(f: Func) -> ({int: int}, int):
+    let si = slot_info(f)
+    var esc: {int: bool} = {}
+    for v in si.gen:
+        esc[si.base[v].slot] = true
+    # a slot address the analysis doesn't follow
+    for x in f.code:
+        if x.op == Op.SlotAddr and x.d not in si.base:
+            esc[x.a] = true
+    var offs: {int: int} = {}
+    var off = 0
+    for i, s in enumerate(f.slots):
+        if i in esc:
+            let a = max(min(s.align, 16), 8)
+            off = (off + a - 1) / a * a
+            offs[i] = off
+            off += s.size
+    return (offs, align16(off))
+
+# ---------------------------------------------------------------- types
+
+fn mt(k: K) -> str:
+    match k:
+        case K.I8:
+            return "char"
+        case K.I16:
+            return "short"
+        case K.I32:
+            return "int"
+        case K.I64:
+            return "long"
+        case K.U8:
+            return "uchar"
+        case K.U16:
+            return "ushort"
+        case K.U32:
+            return "uint"
+        case K.Bool:
+            return "bool"
+        case K.F32:
+            return "float"
+        case _:
+            return "ulong"
+
+# the unsigned type integer arithmetic wraps in
+fn ut(k: K) -> str:
+    match k:
+        case K.I8 | K.U8:
+            return "uchar"
+        case K.I16 | K.U16:
+            return "ushort"
+        case K.I32 | K.U32:
+            return "uint"
+        case _:
+            return "ulong"
+
+# the type a value has in memory
+fn memt(k: K) -> str:
+    if k == K.Bool:
+        return "uchar"
+    return mt(k)
+
+fn bits(k: K) -> int:
+    return k.size() * 8
+
+fn hex(n: int, digits: int) -> str:
+    var u = i128(n)
+    if u < 0:
+        u += 18446744073709551616
+    if digits == 8:
+        u = u & 4294967295
+        return f"0x{u64(u):08x}u"
+    return f"0x{u64(u):016x}ul"
+
+# integer constant n of kind k
+fn lit(k: K, n: int) -> str:
+    match k:
+        case K.Bool:
+            return "true" if n != 0 else "false"
+        case K.I64:
+            return f"as_type<long>({hex(n, 16)})"
+        case K.U64 | K.Ptr:
+            return hex(n, 16)
+        case _:
+            return f"({mt(k)})({hex(n, 8)})"
+
+fn v(n: int) -> str:
+    return f"v{n}"
+
+fn fname(f: str, index: {str: int}) -> str:
+    return f"bf{index[f]}"
+
+fn head(f: Func, index: {str: int}) -> str:
+    var ps = ["ulong sp", "thread int &bad"]
+    for i in 0..f.nparams:
+        ps.push(f"{mt(f.vk[i])} v{i}")
+    let r = mt(f.ret) if f.has_ret else "void"
+    return f"static {r} {fname(f.name, index)}(" + ", ".join(ps) + ")"
+
+# ---------------------------------------------------------------- functions
+
+struct Ms:
+    f: Func
+    index: {str: int}
+    o: [str]
+    base: {int: LocalAddr}
+    gen: {int: bool}
+    promo: {int: bool}
+    # device-memory slots: offset from sp
+    esc: {int: int}
+    frame: int
+    entry: bool
+    ntmp: int
+
+    fn e(ref self, s: str):
+        self.o.push("    " + s)
+
+    fn k(self, n: int) -> K:
+        return self.f.vk[n]
+
+    fn tmp(ref self) -> str:
+        self.ntmp += 1
+        return f"t{self.ntmp}"
+
+    # what a failed check does
+    fn fail(self) -> str:
+        if self.entry:
+            return "{ *reinterpret_cast<device uint *>(E) = 1u; return; }"
+        if self.f.has_ret:
+            return "{ bad = 1; return 0; }"
+        return "{ bad = 1; return; }"
+
+    fn fail_if(ref self, c: str):
+        self.e(f"if ({c}) {self.fail()}")
+
+    # The memory of kind k at pointer vreg a plus `off` (an expression).
+    fn mem(self, k: K, a: int, off: str) -> str:
+        let t = memt(k)
+        match self.base.get(a):
+            case Some(la):
+                match self.esc.get(la.slot):
+                    case Some(so):
+                        return f"*reinterpret_cast<device {t} *>(sp + {so + la.off} + {off})"
+                    case None:
+                        return f"*(thread {t} *)((thread uchar *)s{la.slot} + {la.off} + {off})"
+            case None:
+                return f"*reinterpret_cast<device {t} *>({v(a)} + {off})"
+
+    # the value of slot-address vreg n
+    fn gen_addr(ref self, n: int):
+        let la = self.base[n]
+        self.e(f"{v(n)} = sp + {self.esc[la.slot] + la.off};")
+
+fn new_ms(f: Func, index: {str: int}, entry: bool) -> Ms:
+    let si = slot_info(f)
+    let (esc, frame) = frame_layout(f)
+    return Ms(
+        f=f,
+        index=index,
+        o=[],
+        base=si.base,
+        gen=si.gen,
+        promo=si.promo,
+        esc=esc,
+        frame=frame,
+        entry=entry,
+        ntmp=0
+    )
+
+fn decls(ms: Ms, first: int) -> [str]:
+    let f = ms.f
+    var o: [str] = []
+    for i in first..len(f.vk):
+        o.push(f"    {mt(f.vk[i])} v{i} = 0;")
+    for i, s in enumerate(f.slots):
+        if i in ms.esc:
+            continue
+        if i in ms.promo:
+            o.push(f"    {mt(s.k)} s{i} = 0;")
+        else:
+            o.push(f"    ulong s{i}[{(s.size + 7) / 8}];")
+    return o
+
+fn has_labels(f: Func) -> bool:
+    for x in f.code:
+        if x.op == Op.Label:
+            return true
+    return false
+
+# The body: straight code, or a dispatch loop when there are labels.
+fn body(ref ms: Ms) -> [str]:
+    for x in ms.f.code:
+        # temporaries get a scope: `case` labels can't skip declarations
+        let at = len(ms.o)
+        let nt = ms.ntmp
+        inst(ref ms, x)
+        if ms.ntmp != nt:
+            var o = ms.o[:at]
+            o.push("    {")
+            for line in ms.o[at:]:
+                o.push("    " + line)
+            o.push("    }")
+            ms.o = o
+    let end = "    return;" if ms.entry or not ms.f.has_ret else "    return 0;"
+    if not has_labels(ms.f):
+        var o = ms.o
+        o.push(end)
+        return o
+    var o = ["    int L = -1;", "    for (;;) {", "    switch (L) {", "    case -1:"]
+    o.extend(ms.o)
+    o.push("    }")
+    o.push(end)
+    o.push("    }")
+    return o
+
+fn emit_func(f: Func, index: {str: int}) -> [str]:
+    var ms = new_ms(f, index, false)
+    var o = [head(f, index) + " {"]
+    o.extend(decls(ms, f.nparams))
+    o.extend(body(ref ms))
+    o.push("}")
+    o.push("")
+    return o
+
+# The kernel of a lifted body: thread t of a launch runs element (or leaf)
+# base + t0 + t. Arguments (8 bytes each): the context, n, base, count, the
+# error flag, the stack area, bytes of stack per thread, t0, and for
+# reductions where leaf values and their flags go.
+fn emit_entry(f: Func, k: KReq, index: {str: int}) -> [str]:
+    var ms = new_ms(f, index, true)
+    var o = [
+        f"kernel void {k.entry}(device uchar *M [[buffer(0)]], constant ulong *A [[buffer(1)]], device uchar *X [[buffer(2)]], uint t [[thread_position_in_grid]]) {{",
+        "    long g = (long)A[7] + (long)t;",
+        "    if (g >= (long)A[3]) return;",
+        "    ulong E = A[4];",
+        "    ulong sp = A[5] + (ulong)t * A[6];",
+        "    int bad = 0;"
+    ]
+    o.extend(decls(ms, 0))
+    o.push(f"    v0 = ({mt(f.vk[0])})A[0];")
+    o.push(f"    v1 = ({mt(f.vk[1])})((long)A[2] + g);")
+    if k.kind == 2:
+        o.push(f"    v2 = ({mt(f.vk[2])})(((long)A[2] + g) * {LEAF});")
+        o.push(f"    v3 = ({mt(f.vk[3])})min(((long)A[2] + g) * {LEAF} + {LEAF}, (long)A[1]);")
+        o.push(f"    v4 = ({mt(f.vk[4])})(A[8] + (ulong)g * {k.vk.size()});")
+        o.push(f"    v5 = ({mt(f.vk[5])})(A[9] + (ulong)g);")
+    else:
+        o.push(f"    v2 = ({mt(f.vk[2])})((long)A[2] + g);")
+        o.push(f"    v3 = ({mt(f.vk[3])})((long)A[2] + g + 1);")
+    o.extend(body(ref ms))
+    o.push("}")
+    o.push("")
+    return o
+
+# ---------------------------------------------------------------- instructions
+
+fn inst(ref ms: Ms, x: Inst):
+    let f = ms.f
+    match x.op:
+        case Op.Const:
+            let k = ms.k(x.d)
+            if k.is_float():
+                ms.e(f"{v(x.d)} = (float)({lit(K.I64, x.n)});")
+            else:
+                ms.e(f"{v(x.d)} = {lit(k, x.n)};")
+        case Op.FConst:
+            ms.e(f"{v(x.d)} = as_type<float>({hex(x.n, 8)});")
+        case Op.Mov:
+            if x.d in ms.base:
+                if x.d in ms.gen:
+                    ms.gen_addr(x.d)
+            else:
+                ms.e(f"{v(x.d)} = {v(x.a)};")
+        case Op.Add | Op.Sub | Op.Mul | Op.Div | Op.Rem:
+            arith(ref ms, x)
+        case Op.And | Op.Or | Op.Xor:
+            let k = ms.k(x.d)
+            let s = "&" if x.op == Op.And else ("|" if x.op == Op.Or else "^")
+            ms.e(f"{v(x.d)} = ({mt(k)})({v(x.a)} {s} {v(x.b)});")
+        case Op.Shl:
+            let k = ms.k(x.d)
+            ms.e(f"{v(x.d)} = ({mt(k)})(({ut(k)}){v(x.a)} << (uint)({v(x.b)} & {shift_mask(k)}));")
+        case Op.Shr:
+            let k = ms.k(x.d)
+            ms.e(f"{v(x.d)} = ({mt(k)})({v(x.a)} >> (uint)({v(x.b)} & {shift_mask(k)}));")
+        case Op.Neg:
+            let k = ms.k(x.d)
+            if k.is_float():
+                ms.e(f"{v(x.d)} = -{v(x.a)};")
+            else:
+                ms.e(f"{v(x.d)} = ({mt(k)})(0 - ({ut(k)}){v(x.a)});")
+        case Op.Not:
+            let k = ms.k(x.d)
+            if k == K.Bool:
+                ms.e(f"{v(x.d)} = !{v(x.a)};")
+            else:
+                ms.e(f"{v(x.d)} = ({mt(k)})~{v(x.a)};")
+        case Op.Eq | Op.Ne | Op.Lt | Op.Le | Op.Gt | Op.Ge:
+            ms.e(f"{v(x.d)} = {v(x.a)} {cmp_sym(x.op)} {v(x.b)};")
+        case Op.Conv:
+            let k = ms.k(x.d)
+            let src = ms.k(x.a)
+            if k == K.Bool and src != K.Bool:
+                ms.e(f"{v(x.d)} = {v(x.a)} != 0;")
+            else:
+                ms.e(f"{v(x.d)} = ({mt(k)}){v(x.a)};")
+        case Op.AddO | Op.SubO | Op.MulO:
+            let nm = "add" if x.op == Op.AddO else ("sub" if x.op == Op.SubO else "mul")
+            checked(ref ms, nm, ms.k(x.d), v(x.d), v(x.a), v(x.b))
+        case Op.IdxChk:
+            ms.fail_if(f"(ulong){v(x.a)} >= (ulong){v(x.b)}")
+            ms.e(f"{v(x.d)} = {v(x.a)};")
+        case Op.SlotAddr:
+            if x.d in ms.base:
+                if x.d in ms.gen:
+                    ms.gen_addr(x.d)
+            else:
+                ms.e(f"{v(x.d)} = sp + {ms.esc[x.a]};")
+        case Op.Global:
+            ms.e(f"{v(x.d)} = 0;")
+        case Op.Load:
+            load(ref ms, x)
+        case Op.Store:
+            store(ref ms, x)
+        case Op.Elem:
+            if x.d in ms.base:
+                if x.d in ms.gen:
+                    ms.gen_addr(x.d)
+            else:
+                ms.e(f"{v(x.d)} = {v(x.a)} + (ulong){v(x.b)} * {x.n};")
+        case Op.Copy:
+            copy(ref ms, x.a, x.b, x.n)
+        case Op.Zero:
+            copy(ref ms, x.a, -1, x.n)
+        case Op.Call:
+            call(ref ms, x)
+        case Op.Label:
+            ms.o.push(f"    case {x.n}:")
+        case Op.Jmp:
+            ms.e(f"L = {x.n}; continue;")
+        case Op.Br:
+            ms.e(f"if ({v(x.a)}) {{ L = {x.n}; continue; }}")
+        case Op.BrNot:
+            ms.e(f"if (!{v(x.a)}) {{ L = {x.n}; continue; }}")
+        case Op.Ret:
+            if ms.entry or not f.has_ret:
+                ms.e("return;")
+            elif x.a >= 0:
+                ms.e(f"return {v(x.a)};")
+            else:
+                ms.e("return 0;")
+        case Op.Unreachable:
+            ms.e(ms.fail())
+        case _:
+            pass
+
+fn shift_mask(k: K) -> int:
+    # narrow values are promoted to 32 bits
+    if k.size() == 8:
+        return 63
+    return 31
+
+fn cmp_sym(op: Op) -> str:
+    match op:
+        case Op.Eq:
+            return "=="
+        case Op.Ne:
+            return "!="
+        case Op.Lt:
+            return "<"
+        case Op.Le:
+            return "<="
+        case Op.Gt:
+            return ">"
+        case _:
+            return ">="
+
+fn arith(ref ms: Ms, x: Inst):
+    let k = ms.k(x.d)
+    let d = v(x.d)
+    let a = v(x.a)
+    let b = v(x.b)
+    if k.is_float():
+        # a result flushed to zero
+        match x.op:
+            case Op.Add:
+                ms.e(f"{d} = {a} + {b};")
+                ms.fail_if(f"{d} == 0.0f && {a} != -{b}")
+            case Op.Sub:
+                ms.e(f"{d} = {a} - {b};")
+                ms.fail_if(f"{d} == 0.0f && {a} != {b}")
+            case Op.Mul:
+                ms.e(f"{d} = {a} * {b};")
+                ms.fail_if(f"{d} == 0.0f && {a} != 0.0f && {b} != 0.0f")
+            case _:
+                ms.e(f"{d} = {a} / {b};")
+                ms.fail_if(f"{d} == 0.0f && {a} != 0.0f && !isinf({b})")
+        return
+    match x.op:
+        case Op.Add:
+            ms.e(f"{d} = ({mt(k)})(({ut(k)}){a} + ({ut(k)}){b});")
+        case Op.Sub:
+            ms.e(f"{d} = ({mt(k)})(({ut(k)}){a} - ({ut(k)}){b});")
+        case Op.Mul:
+            ms.e(f"{d} = ({mt(k)})(({ut(k)}){a} * ({ut(k)}){b});")
+        case Op.Div:
+            ms.e(f"{d} = ({mt(k)})({a} / {b});")
+        case _:
+            ms.e(f"{d} = ({mt(k)})({a} % {b});")
+
+# d = a op b of kind k, failing on overflow.
+fn checked(ref ms: Ms, op: str, k: K, d: str, a: str, b: str):
+    let s = k.is_signed()
+    if k.size() == 8:
+        let t = ms.tmp()
+        let u = ut(k)
+        let sym = "+" if op == "add" else ("-" if op == "sub" else "*")
+        ms.e(f"{mt(k)} {t} = ({mt(k)})(({u}){a} {sym} ({u}){b});")
+        if op == "add":
+            ms.fail_if(f"(({a} ^ {t}) & ({b} ^ {t})) < 0" if s else f"{t} < {a}")
+        elif op == "sub":
+            ms.fail_if(f"(({a} ^ {b}) & ({a} ^ {t})) < 0" if s else f"{a} < {b}")
+        elif s:
+            ms.fail_if(f"mulhi({a}, {b}) != ({t} >> 63)")
+        else:
+            ms.fail_if(f"mulhi({a}, {b}) != 0")
+        ms.e(f"{d} = {t};")
+        return
+    # exact in 64 bits, then in range?
+    let t = ms.tmp()
+    let w = "long" if s else "ulong"
+    let sym = "+" if op == "add" else ("-" if op == "sub" else "*")
+    if not s and op == "sub":
+        ms.fail_if(f"{a} < {b}")
+    ms.e(f"{w} {t} = ({w}){a} {sym} ({w}){b};")
+    if s:
+        ms.fail_if(f"{t} < {kmin(k)} || {t} > {kmax(k)}")
+    else:
+        ms.fail_if(f"{t} > {kmax(k)}ul")
+    ms.e(f"{d} = ({mt(k)}){t};")
+
+fn load(ref ms: Ms, x: Inst):
+    let k = ms.k(x.d)
+    match ms.base.get(x.a):
+        case Some(la):
+            if la.slot in ms.promo:
+                ms.e(f"{v(x.d)} = s{la.slot};")
+                return
+        case None:
+            pass
+    let off = f"{x.n}"
+    if k == K.Bool:
+        ms.e(f"{v(x.d)} = {ms.mem(K.U8, x.a, off)} != 0;")
+    elif k == K.F32:
+        # as bits: a subnormal can't be loaded as a float here
+        let t = ms.tmp()
+        ms.e(f"uint {t} = {ms.mem(K.U32, x.a, off)};")
+        ms.fail_if(f"({t} & 0x7f800000u) == 0u && ({t} & 0x7fffffu) != 0u")
+        ms.e(f"{v(x.d)} = as_type<float>({t});")
+    else:
+        ms.e(f"{v(x.d)} = {ms.mem(k, x.a, off)};")
+
+fn store(ref ms: Ms, x: Inst):
+    let k = ms.k(x.b)
+    match ms.base.get(x.a):
+        case Some(la):
+            if la.slot in ms.promo:
+                ms.e(f"s{la.slot} = {v(x.b)};")
+                return
+        case None:
+            pass
+    let off = f"{x.n}"
+    if k == K.Bool:
+        ms.e(f"{ms.mem(K.U8, x.a, off)} = (uchar)({v(x.b)} ? 1 : 0);")
+    else:
+        ms.e(f"{ms.mem(k, x.a, off)} = {v(x.b)};")
+
+# Alignment a slot address is known to have (up to 8).
+fn known_align(ms: Ms, la: LocalAddr) -> int:
+    var al = min(ms.f.slots[la.slot].align, 8)
+    if la.slot in ms.esc:
+        al = 8
+    while al > 1 and la.off % al != 0:
+        al = al / 2
+    return al
+
+fn chunk_kind(w: int) -> K:
+    match w:
+        case 8:
+            return K.U64
+        case 4:
+            return K.U32
+        case 2:
+            return K.U16
+        case _:
+            return K.U8
+
+# memcpy(dst, src, n), or memset(dst, 0, n) when src is -1, in chunks as wide
+# as both addresses allow (tested at run time for pointers).
+fn copy(ref ms: Ms, dst: int, src: int, n: int):
+    if n <= 0:
+        return
+    var al = 8
+    var dyn: [int] = []
+    for p in [dst, src]:
+        if p < 0:
+            continue
+        match ms.base.get(p):
+            case Some(la):
+                al = min(al, known_align(ms, la))
+            case None:
+                dyn.push(p)
+    if len(dyn) == 0 or al == 1:
+        copy_chunks(ref ms, dst, src, n, al)
+        return
+    var w = al
+    var first = true
+    while w > 1:
+        var c = f"({v(dyn[0])} & {w - 1}) == 0"
+        if len(dyn) == 2:
+            c = f"(({v(dyn[0])} | {v(dyn[1])}) & {w - 1}) == 0"
+        let lead = "" if first else "} else "
+        ms.e(f"{lead}if ({c}) {{")
+        copy_chunks(ref ms, dst, src, n, w)
+        first = false
+        w = w / 2
+    ms.e("} else {")
+    copy_chunks(ref ms, dst, src, n, 1)
+    ms.e("}")
+
+fn copy_chunks(ref ms: Ms, dst: int, src: int, n: int, al: int):
+    if n > 256:
+        let ck = chunk_kind(al)
+        let i = ms.tmp()
+        let val = ms.mem(ck, src, f"{i}") if src >= 0 else "0"
+        ms.e(
+            f"for (ulong {i} = 0; {i} < {n / al * al}; {i} += {al}) {ms.mem(ck, dst, f'{i}')} = {val};"
+        )
+        var off = n / al * al
+        while off < n:
+            let f = ms.mem(K.U8, src, f"{off}") if src >= 0 else "0"
+            ms.e(f"{ms.mem(K.U8, dst, f'{off}')} = {f};")
+            off += 1
+        return
+    var off = 0
+    while off < n:
+        var w = al
+        while w > n - off:
+            w = w / 2
+        let ck = chunk_kind(w)
+        let f = ms.mem(ck, src, f"{off}") if src >= 0 else "0"
+        ms.e(f"{ms.mem(ck, dst, f'{off}')} = {f};")
+        off += w
+
+fn call(ref ms: Ms, x: Inst):
+    if is_panic(x.s):
+        ms.e(ms.fail())
+        return
+    if is_refcount(x.s):
+        return
+    if x.b == 1:
+        if x.s.starts_with("brine_f_"):
+            rt_float(ref ms, x)
+        else:
+            rt_int(ref ms, x)
+        return
+    var args = [f"sp + {ms.frame}", "bad"]
+    for a in x.args:
+        args.push(v(a))
+    let c = f"{fname(x.s, ms.index)}(" + ", ".join(args) + ")"
+    if x.d >= 0:
+        ms.e(f"{v(x.d)} = {c};")
+    else:
+        ms.e(f"{c};")
+    ms.fail_if("bad")
+
+# The integer helpers of brine_rt.h, with the same checks.
+fn rt_int(ref ms: Ms, x: Inst):
+    let s = x.s[6:]
+    var name = ""
+    var suf = ""
+    var src = ""
+    if s.starts_with("conv_"):
+        let rest = s[5:]
+        let at = len(rest) - 9
+        suf = rest[:at]
+        src = rest[at + 6:]
+        name = "conv"
+    else:
+        var i = 0
+        while s[i] != "_":
+            i += 1
+        name = s[:i]
+        suf = s[i + 1:]
+    let k = suffix_kind(suf).unwrap_or(K.I64)
+    let d = v(x.d)
+    let a = v(x.args[0])
+    let t = mt(k)
+    let signed = k.is_signed()
+    match name:
+        case "add" | "sub" | "mul":
+            checked(ref ms, name, k, d, a, v(x.args[1]))
+        case "div" | "mod" | "fdiv" | "fmod":
+            let b = v(x.args[1])
+            if name == "div" or name == "mod":
+                ms.fail_if(f"{b} == 0")
+            if name == "div" and signed:
+                ms.fail_if(f"{b} == -1 && {a} == {lit(k, kmin(k))}")
+            if not signed:
+                let o = "/" if name == "div" or name == "fdiv" else "%"
+                ms.e(f"{d} = ({t})({a} {o} {b});")
+            elif name == "div" or name == "fdiv":
+                # floor: one less when the remainder isn't 0 and the signs differ
+                let q = ms.tmp()
+                ms.e(f"{t} {q} = ({t})({a} / {b});")
+                ms.e(f"if (({a} ^ {b}) < 0 && ({t})({a} % {b}) != 0) {q} = ({t})({q} - 1);")
+                ms.e(f"{d} = {q};")
+            else:
+                # the remainder takes the divisor's sign; `x % -1` is 0
+                let m = ms.tmp()
+                let r = ms.tmp()
+                ms.e(f"{t} {m} = {b} == -1 ? ({t})1 : {b};")
+                ms.e(f"{t} {r} = ({t})({a} % {m});")
+                ms.e(f"if (({r} ^ {m}) < 0 && {r} != 0) {r} = ({t})({r} + {m});")
+                ms.e(f"{d} = {r};")
+        case "neg":
+            ms.fail_if(f"{a} == {lit(k, kmin(k))}")
+            ms.e(f"{d} = ({t})(0 - ({ut(k)}){a});")
+        case "abs":
+            if signed:
+                ms.fail_if(f"{a} == {lit(k, kmin(k))}")
+                ms.e(f"{d} = {a} < 0 ? ({t})(0 - ({ut(k)}){a}) : {a};")
+            else:
+                ms.e(f"{d} = {a};")
+        case "shl" | "shr":
+            let b = v(x.args[1])
+            ms.fail_if(f"(ulong){b} >= {bits(k)}")
+            if name == "shl":
+                ms.e(f"{d} = ({t})(({ut(k)}){a} << (uint){b});")
+            else:
+                ms.e(f"{d} = ({t})({a} >> (uint){b});")
+        case _:
+            conv_checked(ref ms, k, d, src, a)
+
+# `brine_conv_<k>_from_<src>`: a narrowing conversion that must fit (f64
+# sources never get here: they keep a body off Metal).
+fn conv_checked(ref ms: Ms, k: K, d: str, src: str, a: str):
+    if src == "i64":
+        if k != K.I64:
+            if k == K.U64:
+                ms.fail_if(f"{a} < 0")
+            else:
+                ms.fail_if(f"{a} < {kmin(k)} || {a} > {kmax(k)}")
+    elif k != K.U64:
+        ms.fail_if(f"{a} > {kmax(k)}ul")
+    ms.e(f"{d} = ({mt(k)}){a};")
+
+# `brine_f_*` float helpers: the same results as the C library's, exactly.
+fn rt_float(ref ms: Ms, x: Inst):
+    let d = v(x.d)
+    let a = v(x.args[0])
+    var n = x.s[8:]
+    if n.ends_with("f"):
+        n = n[:len(n) - 1]
+    match n:
+        case "sqrt":
+            ms.e(f"{d} = sqrt({a});")
+        case "fabs":
+            ms.e(f"{d} = fabs({a});")
+        case "floor":
+            ms.e(f"{d} = floor({a});")
+        case "ceil":
+            ms.e(f"{d} = ceil({a});")
+        case "round":
+            # half away from zero: truncate, then step if the dropped part is >= 0.5
+            let t = ms.tmp()
+            ms.e(f"float {t} = trunc({a});")
+            ms.e(f"if (fabs({a} - {t}) >= 0.5f) {t} = {t} + copysign(1.0f, {a});")
+            ms.e(f"{d} = {t};")
+        case _:
+            # brine_f_fmin/fmax (brine_rt.h): NaN loses; -0.0 < +0.0
+            let b = v(x.args[1])
+            let t = ms.tmp()
+            let neg = f"as_type<int>({a}) < 0"
+            if n == "fmin":
+                ms.e(f"float {t} = {neg} ? {a} : {b};")
+                ms.e(f"if ({b} < {a} || isnan({a})) {t} = {b};")
+                ms.e(f"{d} = ({a} < {b} || isnan({b})) ? {a} : {t};")
+            else:
+                ms.e(f"float {t} = {neg} ? {b} : {a};")
+                ms.e(f"if ({b} > {a} || isnan({a})) {t} = {b};")
+                ms.e(f"{d} = ({a} > {b} || isnan({b})) ? {a} : {t};")
+
+# ---------------------------------------------------------------- combine kernels
+
+# One pass of a reduction tree, as in ptx.br: threadgroup g combines nodes
+# [256 g, 256 g + 256) level by level into node g of the output. Arguments:
+# values and flags in, their count, values and flags out, the error flag.
+fn emit_comb(op: int, vk: K) -> [str]:
+    let e = comb_name(op, vk)
+    let sz = vk.size()
+    let t = memt(vk)
+    var o = [
+        f"kernel void {e}(device uchar *M [[buffer(0)]], constant ulong *A [[buffer(1)]], device uchar *X [[buffer(2)]], uint tid [[thread_index_in_threadgroup]], uint gid [[threadgroup_position_in_grid]]) {{",
+        f"    threadgroup {t} sv[{BLOCK}];",
+        f"    threadgroup uchar sh[{BLOCK}];",
+        f"    ulong i = (ulong)gid * {BLOCK} + tid;",
+        f"    {t} l = 0;",
+        "    uchar h = 0;",
+        "    if (i < A[2]) {",
+        "        h = *reinterpret_cast<device uchar *>(A[1] + i);",
+        f"        l = *reinterpret_cast<device {t} *>(A[0] + i * {sz});",
+        "    }",
+        "    sv[tid] = l;",
+        "    sh[tid] = h;",
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);"
+    ]
+    var s = 1
+    while s < BLOCK:
+        o.push(f"    if ((tid & {2 * s - 1}) == 0 && sh[tid + {s}] != 0) {{")
+        o.push(f"        {t} r = sv[tid + {s}];")
+        o.push("        if (sh[tid] == 0) {")
+        o.push("            l = r;")
+        o.push("        } else {")
+        o.push("            l = sv[tid];")
+        for line in comb_op(op, vk):
+            o.push("            " + line)
+        o.push("        }")
+        o.push("        sv[tid] = l;")
+        o.push("        sh[tid] = 1;")
+        o.push("    }")
+        o.push("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        s *= 2
+    o.push("    if (tid == 0) {")
+    o.push(f"        *reinterpret_cast<device {t} *>(A[3] + (ulong)gid * {sz}) = sv[0];")
+    o.push("        *reinterpret_cast<device uchar *>(A[4] + gid) = sh[0];")
+    o.push("    }")
+    o.push("}")
+    o.push("")
+    return o
+
+# l = l (op) r, as brine_rt.c's combine functions do it; an overflow or a
+# flushed float sets the error flag but the thread goes on (the barriers need
+# every thread).
+fn comb_op(op: int, vk: K) -> [str]:
+    let err = "*reinterpret_cast<device uint *>(A[5]) = 1u;"
+    let t = mt(vk)
+    match op:
+        case 0 | 1:
+            let sym = "+" if op == 0 else "*"
+            if vk.is_float():
+                if op == 0:
+                    return [f"float c = l + r;", f"if (c == 0.0f && l != -r) {err}", "l = c;"]
+                return [
+                    f"float c = l * r;",
+                    f"if (c == 0.0f && l != 0.0f && r != 0.0f) {err}",
+                    "l = c;"
+                ]
+            if vk.size() == 8:
+                let u = ut(vk)
+                var o = [f"{t} c = ({t})(({u})l {sym} ({u})r);"]
+                if op == 0:
+                    o.push(f"if ({'((l ^ c) & (r ^ c)) < 0' if vk.is_signed() else 'c < l'}) {err}")
+                elif vk.is_signed():
+                    o.push(f"if (mulhi(l, r) != (c >> 63)) {err}")
+                else:
+                    o.push(f"if (mulhi(l, r) != 0) {err}")
+                o.push("l = c;")
+                return o
+            let w = "long" if vk.is_signed() else "ulong"
+            var o = [f"{w} c = ({w})l {sym} ({w})r;"]
+            if vk.is_signed():
+                o.push(f"if (c < {kmin(vk)} || c > {kmax(vk)}) {err}")
+            else:
+                o.push(f"if (c > {kmax(vk)}ul) {err}")
+            o.push(f"l = ({t})c;")
+            return o
+        case 2:
+            return ["if (r < l) l = r;"]
+        case 3:
+            return ["if (r > l) l = r;"]
+        case 4:
+            return ["l = l | r;"]
+        case _:
+            return ["l = l & r;"]
