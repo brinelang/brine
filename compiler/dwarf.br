@@ -47,6 +47,8 @@ struct Dwarf:
     files: [str]
     fidx: {str: int}
     fns: [DFn]
+    # DW_OP_reg* of the frame pointer, every function's frame base
+    fbase: int
 
     fn file(ref self, path: str) -> int:
         match self.fidx.get(path):
@@ -58,7 +60,8 @@ struct Dwarf:
                 return len(self.files) - 1
 
 fn new_dwarf() -> Dwarf:
-    return Dwarf(files=[], fidx={}, fns=[])
+    # rbp (DW_OP_reg6)
+    return Dwarf(files=[], fidx={}, fns=[], fbase=86)
 
 # DWARF location expressions
 fn loc_breg(r: int, off: int) -> [u8]:
@@ -159,7 +162,7 @@ fn abbrevs() -> [u8]:
     f.extend(lo)
     f.extend([AT_FRAME_BASE, FORM_EXPRLOC])
     # DW_TAG_subprogram
-    # frame base: rbp (locations use rbp / rsp directly)
+    # frame base: the frame pointer (locations use it or the stack pointer directly)
     abbrev(ref o, AB_FN, 46, true, f)
     var fret = f
     fret.extend([AT_TYPE, FORM_REF4])
@@ -246,6 +249,7 @@ struct Info:
     # .debug_ranges: lists of .text offsets (from the unit's base, .text)
     ranges: [u8]
     ranges_sym: int
+    fbase: int
 
     fn str(ref self, s: str):
         for c in s.bytes():
@@ -337,19 +341,19 @@ struct Info:
             put64(ref self.ranges, f.hi2)
             put64(ref self.ranges, 0)
             put64(ref self.ranges, 0)
-            self.exprloc([86])
+            self.exprloc([u8(self.fbase)])
         elif f.file >= 0:
             uleb(ref self.b, AB_FN if f.ret < 0 else AB_FN_RET)
             self.str(f.name)
             uleb(ref self.b, f.file + 1)
             uleb(ref self.b, f.line)
             self.range(f.lo, f.hi)
-            self.exprloc([86])
+            self.exprloc([u8(self.fbase)])
         else:
             uleb(ref self.b, AB_FN_GEN)
             self.str(f.name)
             self.range(f.lo, f.hi)
-            self.exprloc([86])
+            self.exprloc([u8(self.fbase)])
         if f.ret >= 0 and f.file >= 0:
             self.ref_ty(f.ret)
         for v in f.locals:
@@ -496,7 +500,15 @@ fn write_dwarf(
     o.syms.push(
         OSym(name="__brx_debug_ranges", sec=SEC_DEBUG + first + 3, off=0, global=false, func=false)
     )
-    var w = Info(b=[], rels=[], fix=[], text_sym=text_sym, ranges=[], ranges_sym=ranges_sym)
+    var w = Info(
+        b=[],
+        rels=[],
+        fix=[],
+        text_sym=text_sym,
+        ranges=[],
+        ranges_sym=ranges_sym,
+        fbase=d.fbase
+    )
     # compile unit header: length, version 4, abbreviations, address size
     put32(ref w.b, 0)
     put16(ref w.b, 4)

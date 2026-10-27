@@ -1,6 +1,6 @@
-# Relocatable object files for the native backend: an in-memory object
-# (sections, symbols, relocations) and writers for COFF (Windows) and ELF64
-# (Linux), both x86-64.
+# Relocatable object files for the native backends: an in-memory object
+# (sections, symbols, relocations) and writers for COFF (Windows, x86-64) and
+# ELF64 (Linux, x86-64 or AArch64).
 
 from ir import str_bytes
 
@@ -30,6 +30,18 @@ const R_GOT = 3
 const R_RVA32 = 4
 # a 4-byte offset into a debug section (S + A, S counted from the section start)
 const R_SECREL = 5
+# AArch64: `bl` / `b` (imm26, S + A - P)
+const R_A64_CALL26 = 6
+# AArch64: `adrp` to the 4 KB page of S + A, and the `add` of its low 12 bits
+const R_A64_PAGE = 7
+const R_A64_LO12 = 8
+# AArch64: `adrp` to the page of S's GOT entry, and the `ldr` from it
+const R_A64_GOT_PAGE = 9
+const R_A64_GOT_LO12 = 10
+
+# ObjFile.arch
+const ARCH_X64 = 0
+const ARCH_A64 = 1
 
 struct OSym:
     name: str
@@ -52,6 +64,7 @@ struct OSec:
     rels: [ORel]
 
 struct ObjFile:
+    arch: int
     text: [u8]
     data: [u8]
     rodata: [u8]
@@ -71,6 +84,7 @@ struct ObjFile:
 
 fn new_obj() -> ObjFile:
     return ObjFile(
+        arch=ARCH_X64,
         text=[],
         data=[],
         rodata=[],
@@ -299,7 +313,33 @@ fn write_coff(ref o: ObjFile) -> [u8]:
 
 # ================================================================ ELF64
 
-fn elf_reloc_type(kind: int) -> int:
+fn elf_reloc_type(kind: int, arch: int) -> int:
+    if arch == ARCH_A64:
+        match kind:
+            case 0:
+                # R_AARCH64_PREL32
+                return 261
+            case 2:
+                # R_AARCH64_ABS64
+                return 257
+            case 5:
+                # R_AARCH64_ABS32
+                return 258
+            case 6:
+                # R_AARCH64_CALL26
+                return 283
+            case 7:
+                # R_AARCH64_ADR_PREL_PG_HI21
+                return 275
+            case 8:
+                # R_AARCH64_ADD_ABS_LO12_NC
+                return 277
+            case 9:
+                # R_AARCH64_ADR_GOT_PAGE
+                return 311
+            case _:
+                # R_AARCH64_LD64_GOT_LO12_NC
+                return 312
     match kind:
         case 0:
             # R_X86_64_PC32
@@ -317,11 +357,11 @@ fn elf_reloc_type(kind: int) -> int:
             # R_X86_64_GOTPCREL
             return 9
 
-fn elf_relocs(rels: [ORel], map: [int]) -> [u8]:
+fn elf_relocs(rels: [ORel], map: [int], arch: int) -> [u8]:
     var out: [u8] = []
     for r in rels:
         put64(ref out, r.off)
-        put32(ref out, elf_reloc_type(r.kind))
+        put32(ref out, elf_reloc_type(r.kind, arch))
         put32(ref out, map[r.sym])
         put64(ref out, r.add)
     return out
@@ -394,7 +434,7 @@ fn write_elf(ref o: ObjFile) -> [u8]:
     var rels = [o.trel, o.drel, o.rrel, o.urel]
     var pnames = [".text", ".data", ".rodata", ".eh_frame"]
     # SHT_PROGBITS, SHT_X86_64_UNWIND
-    var ptype = [1, 1, 1, 1879048193]
+    var ptype = [1, 1, 1, 1879048193 if o.arch == ARCH_X64 else 1]
     # SHF_ALLOC 2, SHF_WRITE 1, SHF_EXECINSTR 4
     var pflags = [6, 3, 2, 2]
     var palign = [o.text_align, o.data_align, o.rodata_align, 8]
@@ -435,7 +475,7 @@ fn write_elf(ref o: ObjFile) -> [u8]:
         out.extend(progs[i])
     pad_to(ref out, 8)
     for i in 0..np:
-        let r = elf_relocs(rels[i], map)
+        let r = elf_relocs(rels[i], map, o.arch)
         offs[np + 1 + i] = len(out)
         sizes[np + 1 + i] = len(r)
         out.extend(r)
@@ -495,9 +535,9 @@ fn write_elf(ref o: ObjFile) -> [u8]:
     out[5] = 1
     out[6] = 1
     var h: [u8] = []
-    # ET_REL, EM_X86_64, version
+    # ET_REL, EM_X86_64 or EM_AARCH64, version
     put16(ref h, 1)
-    put16(ref h, 62)
+    put16(ref h, 62 if o.arch == ARCH_X64 else 183)
     put32(ref h, 1)
     put64(ref h, 0)
     put64(ref h, 0)
