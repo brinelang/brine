@@ -2,6 +2,10 @@
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
+/* glibc keeps MAP_ANONYMOUS and MAP_NORESERVE behind this */
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
 #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
 #define _DARWIN_C_SOURCE
 #endif
@@ -26,6 +30,7 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -34,6 +39,7 @@
 #endif
 
 /* ============================================================ platform layer */
+static void br_heap_exit(void);
 #ifdef _WIN32
 typedef CRITICAL_SECTION br_mutex;
 typedef CONDITION_VARIABLE br_cond;
@@ -50,6 +56,7 @@ static DWORD WINAPI br_thread_main(LPVOID p) {
     br_tramp t = *(br_tramp *)p;
     free(p);
     t.fn(t.arg);
+    br_heap_exit();
     return 0;
 }
 static int br_thread_start(br_thread *th, void (*fn)(void *), void *arg) {
@@ -88,6 +95,7 @@ static void *br_thread_main(void *p) {
     br_tramp t = *(br_tramp *)p;
     free(p);
     t.fn(t.arg);
+    br_heap_exit();
     return NULL;
 }
 static int br_thread_start(br_thread *th, void (*fn)(void *), void *arg) {
@@ -164,15 +172,175 @@ void brine_unreachable(void) {
 }
 
 /* ============================================================ memory */
-void *brine_alloc(int64_t n) {
-    void *p = malloc(n > 0 ? (size_t)n : 1);
+/* Small blocks (strings, boxes, array headers) come from a heap of our own:
+   one big reserved address range cut into 64 KiB chunks, each holding blocks
+   of one size class, with a free list per class and thread. A range check
+   tells its blocks from malloc's, so br_free and br_realloc take either, and
+   every free/realloc in this file goes through them (see the macros below).
+   A thread that frees far more than it allocates (one consuming what others
+   made), or that exits, hands its free blocks over in batches of about
+   BR_SPARE bytes, and a thread that runs out takes one batch, so memory
+   doesn't pile up on any one thread. */
+#define BR_SMALL 256
+#define BR_NCLASS 12
+#define BR_CHUNK ((uintptr_t)1 << 16)
+#define BR_RESERVE ((uintptr_t)1 << 36)
+#define BR_SPARE ((int64_t)1 << 16) /* bytes a thread may keep free per class */
+static uintptr_t br_heap_base, br_heap_end, br_heap_next;
+static uint8_t br_chunk_class[BR_RESERVE / BR_CHUNK];
+static br_mutex br_heap_mu;
+/* a stack of batches per class: a batch is a free list, and its first block's
+   second word links the next batch */
+static void *br_batches[BR_NCLASS];
+
+typedef struct {
+    void *head[BR_NCLASS];
+    int64_t count[BR_NCLASS];
+    char *bump[BR_NCLASS], *end[BR_NCLASS];
+} br_heap_th;
+static _Thread_local br_heap_th br_th;
+
+static int br_class_of(size_t n) { return n <= 128 ? (int)((n + 15) / 16) - 1 : 8 + (int)((n - 129) / 32); }
+static size_t br_class_size(int c) { return c < 8 ? (size_t)(c + 1) * 16 : 128 + (size_t)(c - 7) * 32; }
+static int br_in_heap(const void *p) { return (uintptr_t)p - br_heap_base < br_heap_end - br_heap_base; }
+
+/* once, before any thread starts; without the reservation everything is malloc */
+static void br_heap_init(void) {
+    if (br_heap_base) return;
+    br_mutex_init(&br_heap_mu);
+#ifdef _WIN32
+    /* reservations are 64 KiB aligned */
+    uintptr_t b = (uintptr_t)VirtualAlloc(NULL, BR_RESERVE, MEM_RESERVE, PAGE_NOACCESS);
+#else
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    void *m = mmap(NULL, BR_RESERVE + BR_CHUNK, PROT_NONE, flags, -1, 0);
+    uintptr_t b = m == MAP_FAILED ? 0 : ((uintptr_t)m + BR_CHUNK - 1) & ~(BR_CHUNK - 1);
+#endif
+    if (!b) return;
+    br_heap_next = b;
+    br_heap_end = b + BR_RESERVE;
+    br_heap_base = b;
+}
+
+static char *br_chunk_new(int c) {
+    uintptr_t ch = __atomic_fetch_add(&br_heap_next, BR_CHUNK, __ATOMIC_RELAXED);
+    if (ch + BR_CHUNK > br_heap_end) return NULL;
+#ifdef _WIN32
+    if (!VirtualAlloc((void *)ch, BR_CHUNK, MEM_COMMIT, PAGE_READWRITE)) return NULL;
+#else
+    if (mprotect((void *)ch, BR_CHUNK, PROT_READ | PROT_WRITE) != 0) return NULL;
+#endif
+    br_chunk_class[(ch - br_heap_base) / BR_CHUNK] = (uint8_t)c;
+    return (char *)ch;
+}
+
+static void *br_big(size_t n) {
+    void *p = malloc(n ? n : 1);
     if (!p) {
         fprintf(stderr, "out of memory\n");
         abort();
     }
     return p;
 }
-void brine_free(void *p) { free(p); }
+
+/* hands a thread's free list for class c over as one batch */
+static void br_give(br_heap_th *h, int c) {
+    void *p = h->head[c];
+    if (!p) return;
+    br_lock(&br_heap_mu);
+    ((void **)p)[1] = br_batches[c];
+    br_batches[c] = p;
+    br_unlock(&br_heap_mu);
+    h->head[c] = NULL;
+    h->count[c] = 0;
+}
+
+static void *br_alloc_slow(br_heap_th *h, int c, size_t n) {
+    size_t sz = br_class_size(c);
+    if (h->bump[c] && (size_t)(h->end[c] - h->bump[c]) >= sz) {
+        void *p = h->bump[c];
+        h->bump[c] += sz;
+        return p;
+    }
+    if (__atomic_load_n(&br_batches[c], __ATOMIC_RELAXED)) {
+        br_lock(&br_heap_mu);
+        void *b = br_batches[c];
+        if (b) br_batches[c] = ((void **)b)[1];
+        br_unlock(&br_heap_mu);
+        if (b) {
+            h->head[c] = *(void **)b;
+            h->count[c] = 0;
+            return b;
+        }
+    }
+    char *ch = br_chunk_new(c);
+    if (!ch) return br_big(n);
+    h->bump[c] = ch + sz;
+    h->end[c] = ch + BR_CHUNK;
+    return ch;
+}
+
+static void *br_alloc(size_t n) {
+    if (n > BR_SMALL || !br_heap_base) return br_big(n);
+    int c = br_class_of(n ? n : 1);
+    br_heap_th *h = &br_th;
+    void *p = h->head[c];
+    if (p) {
+        h->head[c] = *(void **)p;
+        if (h->count[c] > 0) h->count[c]--;
+        return p;
+    }
+    return br_alloc_slow(h, c, n);
+}
+
+static void br_free(void *p) {
+    if (!br_in_heap(p)) {
+        free(p);
+        return;
+    }
+    int c = br_chunk_class[((uintptr_t)p - br_heap_base) / BR_CHUNK];
+    br_heap_th *h = &br_th;
+    *(void **)p = h->head[c];
+    h->head[c] = p;
+    if (++h->count[c] * (int64_t)br_class_size(c) > BR_SPARE) br_give(h, c);
+}
+
+static void *br_realloc(void *p, size_t n) {
+    if (!p) return br_alloc(n);
+    if (!br_in_heap(p)) return realloc(p, n ? n : 1);
+    size_t have = br_class_size(br_chunk_class[((uintptr_t)p - br_heap_base) / BR_CHUNK]);
+    if (n <= have) return p;
+    void *q = br_alloc(n);
+    memcpy(q, p, have);
+    br_free(p);
+    return q;
+}
+
+/* a thread's last act: its free blocks, and what is left of its chunks, go
+   to the shared lists */
+static void br_heap_exit(void) {
+    if (!br_heap_base) return;
+    br_heap_th *h = &br_th;
+    for (int c = 0; c < BR_NCLASS; c++) {
+        size_t sz = br_class_size(c);
+        while (h->bump[c] && (size_t)(h->end[c] - h->bump[c]) >= sz) {
+            void *p = h->bump[c];
+            h->bump[c] += sz;
+            *(void **)p = h->head[c];
+            h->head[c] = p;
+        }
+        br_give(h, c);
+    }
+}
+
+#define free(p) br_free(p)
+#define realloc(p, n) br_realloc(p, n)
+
+void *brine_alloc(int64_t n) { return br_alloc(n > 0 ? (size_t)n : 1); }
+void brine_free(void *p) { br_free(p); }
 /* live string/array count, reported at exit when BRINE_LEAKCHECK is set */
 static int64_t br_live;
 #define BR_LIVE(d) __atomic_fetch_add(&br_live, (d), __ATOMIC_RELAXED)
@@ -2297,6 +2465,7 @@ static void br_utf8_args(void) {
 #endif
 
 void brine_rt_init(int argc, char **argv) {
+    br_heap_init();
     br_argc = argc;
     br_argv = argv;
 #ifdef _WIN32
