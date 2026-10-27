@@ -249,6 +249,7 @@ xs.sort()               # numbers and strings; stable
 xs.reverse()
 xs.clear()
 print(len(xs), xs == [3, 1, 2], 3 in xs, xs.index(3))  # index: Option[int]
+print(xs.contains(3))   # the same as `3 in xs`
 print(xs[1:3], xs[:2], xs[2:])   # slices are copies; out of range panics
 ```
 There are no negative indexes: write `xs[len(xs) - 1]`. A statement can't both
@@ -263,7 +264,7 @@ Strings are immutable UTF-8. `len(s)`, `s[i]` and slices count **bytes**;
 
 ```python
 let s = "hello, brine"
-print(s[0], s[7:], s + "!", "ri" in s, f"{s} has {len(s)} bytes")
+print(s[0], s[7:], s + "!", "ri" in s, s.contains("ri"), f"{s} has {len(s)} bytes")
 print(s.find("brine"))                    # Some(7); None if absent
 print(s.split(", "), "a b  c".split())    # ["hello", "brine"], ["a", "b", "c"]
 print("-".join(["a", "b"]), "ab".repeat(3), s.replace("l", "L"))
