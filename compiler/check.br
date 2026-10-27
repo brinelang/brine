@@ -6,10 +6,10 @@ from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, Worl
 from types import int_ty, float_ty, builtins, world_ops, os_ops
 from ast import TypeExpr, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Expr, ExprKind, mk
 from ast import LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, stmt, pattern
-from ast import children, stmt_exprs, stmt_blocks
+from ast import children, stmt_exprs, stmt_blocks, local_of, lvalue_root, parse_fmt_spec
 from ast import Param, FnDecl, FieldDecl, StructDecl, EnumDecl, Module, Program
 from info import StructInfo, VariantInfo, EnumInfo, ParamSig, FnSig, ConstVal, ConstInfo, ProgramInfo
-from info import TryKind, try_kind, new_info, PRELUDE
+from info import TryKind, try_kind, new_info, mangle_module, PRELUDE
 import num
 
 # Upper bound on instances. Stops runaway recursion like `f[T]` calling `f[[T]]`.
@@ -139,9 +139,6 @@ fn builtin_by_name(n: str) -> Option[Builtin]:
         if name == n:
             return Some(b)
     return None
-
-fn mangle_module(name: str) -> str:
-    return name.replace(".", "_")
 
 fn is_messageable(t: Ty) -> bool:
     match t:
@@ -5795,29 +5792,6 @@ fn equatable(t: Ty) -> bool:
         case _:
             return true
 
-fn local_of(e: Expr) -> Option[int]:
-    match e.kind:
-        case ExprKind.Ident(_):
-            match e.res:
-                case Res.Local(id):
-                    return Some(id)
-                case _:
-                    return None
-        case _:
-            return None
-
-# The local variable at the root of a place expression (`a`, `a.x`, `a[i].y`).
-fn lvalue_root(e: Expr) -> Option[int]:
-    match e.kind:
-        case ExprKind.Ident(_):
-            return local_of(e)
-        case ExprKind.Field(x, _, _):
-            return lvalue_root(x)
-        case ExprKind.Index(x, _):
-            return lvalue_root(x)
-        case _:
-            return None
-
 # The path step applied directly to the root variable.
 fn root_step(e: Expr) -> Option[Expr]:
     var inner = e
@@ -6076,66 +6050,6 @@ fn block_has_break(b: Block) -> bool:
                 pass
     return false
 
-# ================================================================ format specs
-
-struct FmtSpec:
-    left: bool
-    zero: bool
-    width: int
-    prec: Option[int]
-    kind: Option[str]
-
-fn is_ascii_digit(c: str) -> bool:
-    return len(c) == 1 and "0" <= c <= "9"
-
-fn parse_fmt_spec(s: str) -> Option[FmtSpec]:
-    let cs = s.chars()
-    var i = 0
-    var f = FmtSpec(left=false, zero=false, width=0, prec=None, kind=None)
-    if i < len(cs) and cs[i] == "<":
-        f.left = true
-        i += 1
-    elif i < len(cs) and cs[i] == ">":
-        i += 1
-    if i < len(cs) and cs[i] == "0":
-        f.zero = true
-        i += 1
-    var w = ""
-    while i < len(cs) and is_ascii_digit(cs[i]):
-        w += cs[i]
-        i += 1
-    if w != "":
-        # more digits than an int holds
-        if len(w) > 18:
-            return None
-        f.width = int(w)
-    if i < len(cs) and cs[i] == ".":
-        i += 1
-        var p = ""
-        while i < len(cs) and is_ascii_digit(cs[i]):
-            p += cs[i]
-            i += 1
-        if p == "" or len(p) > 18:
-            return None
-        f.prec = Some(int(p))
-    if i < len(cs):
-        let k = cs[i]
-        i += 1
-        if k != "f" and k != "e" and k != "x" and k != "b":
-            return None
-        f.kind = Some(k)
-    if i < len(cs) or f.width > 1000:
-        return None
-    match f.prec:
-        case Some(p):
-            if p > 100:
-                return None
-            if f.kind.is_none():
-                f.kind = Some("f")
-        case None:
-            pass
-    return Some(f)
-
 # Python spellings we don't use, and what to write instead.
 fn str_renames() -> [(str, str)]:
     return [
@@ -6170,9 +6084,8 @@ fn path_join(dir: str, rel: str) -> str:
 fn parse_index(s: str) -> Option[int]:
     if s == "" or len(s) > 18:
         return None
-    for c in s:
-        if not is_ascii_digit(c):
-            return None
+    if not s.is_digit():
+        return None
     return Some(int(s))
 
 # ================================================================ generics helpers
