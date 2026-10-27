@@ -19,18 +19,21 @@
 86 87 punct +
 88 127 int 170141183460469231731687303715884105727
 128 129 punct +
-130 169 int 0
+130 169 int 170141183460469231731687303715884105728
 170 171 punct +
 172 206 int 170141183460469231731687303715884105727
 207 208 punct +
-209 243 int 0
-243 243 newline
-244 244 eof
+209 243 int 170141183460469231731687303715884105728
+244 245 punct +
+246 285 int 340282366920938463463374607431768211455
+286 287 punct +
+288 327 int 0
+327 327 newline
+328 328 eof
 error E0101 53 57 invalid integer literal
   label 53 57 not a valid number
 error E0101 60 62 invalid integer literal
   label 60 62 not a valid number
-error E0101 130 169 integer literal is too large
-  label 130 169 too large
-error E0101 209 243 invalid integer literal
-  label 209 243 not a valid number
+error E0101 288 327 integer literal is too large
+  label 288 327 larger than any integer type
+  help the largest is `u128`'s 340282366920938463463374607431768211455

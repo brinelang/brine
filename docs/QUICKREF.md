@@ -34,7 +34,7 @@ Add `--json` to any command for one JSON object per line.
   `i32(n)` (checked), `str(v)`, `int("42")` (parses), `float("2.5")`.
 * Literals adapt to context: `let b: u8 = 200`, `let f: f32 = 1`,
   `let big: i128 = 10_000_000_000_000_000_000_000`. Integer literals go up to
-  `i128`'s maximum (2^127 - 1).
+  `u128`'s maximum (2^128 - 1); above `i128`'s maximum only a `u128` holds them.
 * `i128` and `u128` need a 64-bit target (they're a GCC/Clang feature). The prover
   can't remove their overflow checks; those always run.
 * Integer overflow, out-of-range conversions, division by zero and
