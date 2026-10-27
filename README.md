@@ -1,10 +1,30 @@
-# brine
+<img alt="brine" src="docs/assets/banner.png" width="100%">
+
+**A compiled systems language with Python-like syntax, compile-time proofs, and
+parallelism built into the language: every core, the GPU, and many machines.**
 
 [![CI](https://github.com/brinelang/brine/actions/workflows/ci.yml/badge.svg)](https://github.com/brinelang/brine/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/brinelang/brine?include_prereleases&sort=semver)](https://github.com/brinelang/brine/releases)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
 
-A compiled systems language with Python-like syntax, compile-time proofs, and
-parallelism built into the language.
+[Install](#installation) · [Tour](#a-quick-tour) · [Language reference](docs/QUICKREF.md) · [Design](docs/DESIGN.md) · [Examples](examples/)
+
+---
+
+brine is for programs that need to be fast, parallel and correct at the same
+time. You write code that reads like Python. The compiler turns it into native
+code, proves what it can about it (array bounds, overflow, your own contracts),
+and spreads it across every core you have, or onto a GPU, with results that are
+the same bits on any machine.
+
+Parallelism is syntax, not a library. `par for`, `par [...]`, `par sum(...)` and
+`par(a, b)` can't race: a data race is a compile error. Reductions are
+deterministic, so a float sum gives the same answer on a laptop and on a
+128-core server. Big constructs move to an NVIDIA or Apple GPU on their own when
+that is faster, with no annotations and no change in results. And every program
+can run as many cooperating processes (`brine run --ranks 4`), with deadlocks
+ruled out at compile time.
 
 ```python
 fn index_of(xs: [int], target: int) -> int:
@@ -28,90 +48,397 @@ fn main():
     print(index_of(squares, 144), total)
 ```
 
-* **Rules can't be broken.** `requires`, `ensures`, `invariant` and `prove` are
-  checked at compile time. Overflow, bad indexes and division by zero always stop
-  the program with a clear message, unless the compiler proved they can't happen.
-  In that case the check is removed.
-* **Natively parallel.** `par for`, `par [...]`, `par sum(...)` and `par(a, b)` are
-  data-race free by construction, and reductions are deterministic. Big ones run
-  on an NVIDIA GPU (CUDA) or an Apple one (Metal) when that is faster, with the
-  same results.
-* **Multi-process built in.** The `world` module gives every program MPI-style
-  ranks, messages and collectives. `brine run --ranks 4`.
-* **Fast.** Compiles to native code through C. There is no garbage collector, and
-  values are copy-on-write.
-* **Easy for people and agents.** One CLI and readable errors. `--json` gives
-  machine-readable output, `brine explain` explains every error code, and
-  `brine guide` prints the whole language on one page.
+## Highlights
 
-## Install
+| | |
+|---|---|
+| ⚡ **Natively parallel** | `par` loops, maps, reductions and fork-join, data-race free by construction. Deterministic reductions. Automatic GPU offload (CUDA, Metal). MPI-style multi-process with the `world` module. |
+| 🔒 **Rules can't be broken** | `requires`, `ensures`, `invariant` and `prove` are checked at compile time. Overflow, bad indexes and division by zero always stop the program with a clear message, unless the compiler proved they can't happen; then the check is removed. There is no `unsafe` and no flag to turn checks off. |
+| 🚀 **Fast** | Native code, no garbage collector, no VM. Values are copy-on-write and memory is freed deterministically. Dev builds on Linux and Windows go straight to machine code; `--release` builds go through an optimizing C compiler. |
+| 🐍 **Easy to read** | Python-like syntax, static types with local inference, structs, enums with `match`, generics, `Option`/`Result` with `?`. One obvious way to write things. |
+| 🤖 **Made for humans and agents** | One CLI. Every error has a code, a precise span, the reason and a fix. `--json` output for tools, `brine explain <code>`, and `brine guide` prints the whole language on one page. |
+| 🛠️ **Self-hosted** | The compiler is written in brine and builds itself. All it needs is a C compiler. |
 
-Linux and macOS:
+## Installation
+
+### Quick install
+
+**Linux and macOS**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/brinelang/brine/main/install.sh | sh
 ```
 
-Windows (PowerShell):
+**Windows** (PowerShell)
 
 ```powershell
 irm https://raw.githubusercontent.com/brinelang/brine/main/install.ps1 | iex
 ```
 
-The installers put `brine` in `~/.brine/bin` and add it to your `PATH`; run them
-again to upgrade. Set `BRINE_VERSION=0.4.0` first to install a given version. There
-are builds for Linux (x64, ARM64), macOS (Apple silicon, Intel) and Windows (x64),
-also on the [releases page](https://github.com/brinelang/brine/releases).
+The installer puts `brine` in `~/.brine/bin` and adds it to your `PATH`. Run it
+again to upgrade.
 
-brine needs a C compiler (`gcc` or `clang`, or MinGW on Windows): it builds the
-runtime, links, and compiles `--release` builds. `brine doctor` checks it.
+| Variable | Effect |
+|---|---|
+| `BRINE_VERSION=0.4.0` | install a given version (default: the latest release) |
+| `BRINE_INSTALL=~/.brine` | where to install (the binary goes in `$BRINE_INSTALL/bin`) |
+| `BRINE_NO_MODIFY_PATH=1` | don't add brine to your `PATH` |
+
+Prebuilt archives are also on the [releases page](https://github.com/brinelang/brine/releases).
+To uninstall, delete `~/.brine` and the `PATH` line the installer added.
+
+### Requirements
+
+brine needs a C compiler on your machine: `gcc` or `clang`, or MinGW on Windows.
+It uses it to build the runtime, to link, and for `--release` builds. Check
+your setup with:
 
 ```sh
-brine new hello && cd hello
+brine doctor
+```
+
+GPU offload needs nothing extra at build time. If an NVIDIA driver or Apple
+silicon is present when the program runs, brine uses it; otherwise everything
+runs on the CPU.
+
+### Supported platforms
+
+| Platform | Prebuilt | Native dev builds | GPU |
+|---|:---:|:---:|---|
+| Linux x86-64 | ✅ | ✅ | NVIDIA (CUDA) |
+| Linux ARM64 | ✅ | ✅ | NVIDIA (CUDA) |
+| Windows x86-64 | ✅ | ✅ | NVIDIA (CUDA) |
+| macOS Apple silicon | ✅ | via C | Apple GPU (Metal) |
+| macOS Intel | ✅ | via C | – |
+
+"Native dev builds" means the compiler writes machine code itself (the whole
+compiler builds in under a second). Everywhere else, and for every `--release`
+build, it goes through C.
+
+### Your first project
+
+```sh
+brine new hello
+cd hello
 brine run
 ```
 
-### From source
+```text
+     Built hello v0.1.0 [dev] in 2.03s
+   Running target/dev/hello
+Hello, brine!
+[0, 1, 4, 9, 16, 25, 36, 49, 64, 81]
+```
 
-The compiler is written in brine; build it once from the bootstrap seed (see
-[bootstrap/README.md](bootstrap/README.md)):
+### Build from source
+
+The compiler is written in brine, so the first build starts from its own
+generated C, the bootstrap seed (see [bootstrap/README.md](bootstrap/README.md)):
 
 ```sh
-# from the repository root (Windows: add .exe and use -lws2_32 -lshell32)
+git clone https://github.com/brinelang/brine && cd brine
+# Windows: brine.exe and -lws2_32 -lshell32 instead of -lm -lpthread -ldl
 cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread -ldl
+./brine build compiler/main.br -o brine2   # brine rebuilding itself
 ```
+
+## A quick tour
+
+### Parallel loops, maps and reductions
+
+```python
+fn collatz_len(n: int) -> int:
+    var x = n
+    var steps = 0
+    while x != 1:
+        x = x / 2 if x % 2 == 0 else 3 * x + 1
+        steps += 1
+    return steps
+
+fn main():
+    let n = 1_000_000
+    let lens = par [collatz_len(i) for i in 1..=n]       # parallel map
+    let total = par sum(float(l) for l in lens)          # parallel reduction
+    let longest = par max(l for l in lens)
+    print(f"average steps: {total / float(n):.2f}, longest: {longest}")
+
+    var out = [0.0] * 8
+    par for i in 0..8:                                   # parallel loop
+        out[i] = sqrt(float(i))
+
+    let (a, b) = par(collatz_len(27), collatz_len(97))   # fork-join
+```
+
+| Construct | Meaning |
+|---|---|
+| `par for i in lo..hi:` | data-parallel loop over a thread pool |
+| `par [e for i in lo..hi]` | parallel map |
+| `par sum(e for ...)` | parallel reduction: `sum`, `product`, `min`, `max`, `any`, `all` |
+| `par(f(a), g(b))` | fork-join of independent expressions, returns a tuple |
+
+Threads default to all cores; `--threads n` or `BRINE_THREADS=n` changes that.
+
+### Data races are compile errors
+
+Inside a `par` body, outer variables are read-only, except that a `par for` may
+write its own element of an outer array (`out[i]`). Break that rule and the
+program doesn't compile:
+
+```python
+fn main():
+    let xs = [1, 2, 3, 4]
+    var total = 0
+    par for i in 0..len(xs):
+        total += xs[i]
+    print(total)
+```
+
+```text
+error[E0501]: cannot assign to `total` inside a `par` body
+ --> race.br:5:9
+  |
+5 |         total += xs[i]
+  |         ^^^^^ would be a data race
+  |
+  = note: `total` is shared by all parallel iterations
+  = help: a `par for` may only write `total[i]` (its own element); to combine values use `par sum(...)`, `par [...]`, or a sequential loop
+```
+
+### Same bits on every machine
+
+Reductions combine elements in one fixed order that depends only on how many
+there are, never on how many threads run. `par sum` over floats gives the same
+result on 1 thread, 32 threads or a GPU, and it is usually more accurate than a
+left-to-right sum. Integer reductions still trap on overflow.
+
+### GPUs, with no code changes
+
+A `par for`, `par [...]` or `par` reduction can run on an NVIDIA GPU (CUDA) or an
+Apple GPU (Metal). There is nothing to annotate and nothing to install beyond the
+driver:
+
+* **The compiler decides what can run there.** Bodies that use numeric code,
+  loops, structs and array reads and writes become GPU kernels.
+* **The runtime decides when.** It measures each construct on the CPU, estimates
+  the GPU's time including copies, and only uses the GPU when that's faster.
+* **The results don't change.** Kernels follow the CPU's floating-point rules
+  exactly (no fused multiply-adds, exactly rounded `/` and `sqrt`). If a check
+  fails on the GPU (overflow, bounds, a contract), the construct reruns on the CPU
+  and panics with the usual message.
+
+```sh
+brine run examples/find_signal.br --release              # GPU when it pays off
+BRINE_GPU=off brine run examples/find_signal.br --release   # CPU only
+BRINE_GPU_LOG=1 brine run examples/find_signal.br --release # where each `par` ran, and why
+```
+
+On an RTX 4090, an f32 n-body step runs about 8x faster than on all 32 threads
+of a Ryzen 9 9950X3D. See [bench/gpu](bench/gpu/README.md) for the numbers,
+including the cases where the CPU wins and `auto` keeps the work there.
+
+### Many processes, no deadlocks
+
+The `world` module gives every program MPI-style ranks and collectives:
+
+```python
+fn main():
+    let rank = world.rank()
+    let size = world.size()
+
+    var local = 0
+    for i in 0..1_000_000:
+        if i % size == rank:
+            local += i
+    let total = world.sum(local)                 # every rank gets the total
+
+    let all = world.gather_all(rank * rank)      # everyone gets everyone's value
+    if rank == 0:
+        print(f"{size} ranks, total = {total}, squares = {all}")
+```
+
+```text
+$ brine run world.br --ranks 4
+4 ranks, total = 499999500000, squares = [0, 1, 4, 9]
+```
+
+Every communication is collective, and the compiler checks that all ranks make
+the same calls in the same order, so a brine program can't hang waiting for a
+message that never comes:
+
+```python
+fn main():
+    if world.rank() == 0:
+        let total = world.sum(1)
+        print(total)
+```
+
+```text
+error[E0510]: some ranks might not reach this communication
+ --> dead.br:3:21
+  |
+3 |         let total = world.sum(1)
+  |                     ^^^^^^^^^^^^ calls `world.sum`
+2 |     if world.rank() == 0:
+  |        ----------------- this may differ between ranks
+  |
+  = note: every rank must make the same `world` calls in the same order, otherwise the program could hang
+  = help: move the call out of the rank-dependent branch or loop; compute rank-specific values first, then communicate on every rank
+```
+
+### Contracts the compiler proves
+
+```python
+fn clamp(x: int, lo: int, hi: int) -> int:
+    requires lo <= hi                 # every caller must prove this
+    ensures lo <= result <= hi        # the compiler proves this
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+fn last(xs: [int]) -> int:
+    requires len(xs) >= 1
+    return xs[len(xs) - 1]            # in bounds: no runtime check
+
+fn main():
+    let xs: [int] = []
+    print(last(xs))
+```
+
+```text
+error[E0601]: cannot prove the precondition of `last`
+  --> proof.br:16:11
+   |
+16 |     print(last(xs))
+   |           ^^^^^^^^ this call might violate `requires len(xs) >= 1`
+11 |     requires len(xs) >= 1
+   |              ------------ precondition declared here
+   |
+   = note: with the values used here, this is always false
+   = help: add an `assert` before the call to check it at runtime, or a `requires` to this function so its callers must prove it
+```
+
+`brine check --report` lists every runtime check the prover couldn't remove, so
+you can add the facts that remove them:
+
+```text
+$ brine check examples/contracts.br --report
+   Checked contracts in 0.00s — 9 runtime checks proven unnecessary, 0 remain
+```
+
+### Structs, enums and errors as values
+
+```python
+struct Point:
+    x: float
+    y: float
+
+    fn dist(self, other: Point) -> float:
+        let dx = self.x - other.x
+        let dy = self.y - other.y
+        return sqrt(dx * dx + dy * dy)
+
+enum Shape:
+    Circle(radius: float)
+    Square(side: float)
+    Dot
+
+    fn area(self) -> float:
+        match self:                    # must cover every case
+            case Shape.Circle(r):
+                return 3.14159 * r * r
+            case Shape.Square(s):
+                return s * s
+            case Shape.Dot:
+                return 0.0
+
+fn parse_bit(s: str) -> Result[int, str]:
+    if s == "0":
+        return Ok(0)
+    if s == "1":
+        return Ok(1)
+    return Err(f"not a bit: {s}")
+
+fn load(path: str) -> Result[int, str]:
+    let text = read_file(path)?        # an Err goes back to the caller
+    return parse_bit(text.strip())
+```
+
+### Tests are part of the language
+
+```python
+test "clamp stays in range":
+    assert clamp(15, 0, 10) == 10
+    assert clamp(-5, 0, 10) == 0
+```
+
+```text
+$ brine test examples/contracts.br
+test clamp stays in range ... ok
+test binary search finds every element ... ok
+
+test result: ok. 2 passed; 0 failed; finished in 0.03s
+```
+
+## The `brine` command
 
 | Command | What it does |
 |---|---|
 | `brine new <name>` / `brine init` | create a project |
 | `brine run [file] [-- args]` | build and run (`--release`, `--threads N`, `--ranks N`) |
 | `brine build` | build a binary (`--release`, `--debug`, `-o`, `--emit-c`) |
-| `brine check` | type-check and prove, without building (`--report` lists remaining runtime checks) |
+| `brine check` | type-check and prove without building (`--report` lists remaining runtime checks) |
 | `brine test [filter]` | run `test "...":` blocks in parallel |
 | `brine fmt` | format sources (`--check`) |
-| `brine debug` | debug build and launch gdb/lldb |
+| `brine debug` | debug build, then launch gdb or lldb |
 | `brine explain E0601` | explain an error code |
-| `brine guide` | the language quick reference |
-| `brine doctor` | diagnose the toolchain |
+| `brine guide` | the whole language on one page |
+| `brine doctor` | check your toolchain |
 
-## Learn more
+Building, checking and testing take `--json` for machine-readable output, one
+JSON object per line. New projects come with an `AGENTS.md`, so coding agents know how to work in
+them from the start.
 
-* [docs/QUICKREF.md](docs/QUICKREF.md): the whole language on one page (`brine guide`)
-* [docs/DESIGN.md](docs/DESIGN.md): philosophy, architecture, roadmap, open decisions
-* [examples/](examples/): hello, contracts, parallel, world (multi-process), shapes (structs, enums, modules),
-  find_signal (proofs and the GPU together)
+## Examples
+
+| Example | What it shows |
+|---|---|
+| [hello.br](examples/hello.br) | the smallest program |
+| [parallel.br](examples/parallel.br) | `par` maps, reductions, loops and fork-join |
+| [contracts.br](examples/contracts.br) | `requires`, `ensures`, `invariant`, and a binary with no runtime checks left |
+| [world.br](examples/world.br) | multi-process: collectives, ring messages, all-to-all |
+| [shapes/](examples/shapes/) | structs, enums, methods, `match` and modules |
+| [find_signal.br](examples/find_signal.br) | finding GPS satellites in noise: proofs and the GPU together |
+
+## Documentation
+
+* [docs/QUICKREF.md](docs/QUICKREF.md): the whole language on one page (also `brine guide`)
+* [docs/DESIGN.md](docs/DESIGN.md): philosophy, architecture, roadmap and open decisions
+* [CHANGELOG.md](CHANGELOG.md): what changed in each release
 
 ## Status
 
-brine is young (v0.x): the language and tools still change. The compiler is
-written in brine (`compiler/`) and builds itself; `bootstrap/brinec.c` is its own
-generated C, used to build it from scratch. Dev builds on x86-64 Windows and Linux and on ARM64 Linux
-go straight to machine code (the whole compiler builds in under a second);
-`--release` builds and other platforms go through C. The runtime is written in C
-(`runtime/`). It runs on Windows, Linux and macOS.
+brine is young (v0.x): the language and tools still change between minor
+releases. It runs on Linux, macOS and Windows, and its compiler, written in
+brine, builds itself to a fixed point on every CI run.
 
-`brine test tests/integration.br` (from the repository root) runs the end-to-end
-suite: the examples and `tests/programs/`, expected errors, the formatter, the
-lexer and parser on edge cases, and the compiler rebuilding itself to a fixed point.
-See [AGENTS.md](AGENTS.md) for how to work on brine itself, and
-[docs/RELEASING.md](docs/RELEASING.md) for how changes and releases are made.
+Next on the [roadmap](docs/DESIGN.md#5-roadmap): Mach-O output for native dev
+builds on Apple silicon, a built-in linker so builds don't need a C toolchain,
+keeping arrays on the GPU between constructs, AMD and Intel GPUs through Vulkan,
+quantifiers in contracts, an LSP server and a package manager.
+
+## Contributing
+
+Contributions are welcome. [AGENTS.md](AGENTS.md) explains how the repository is
+laid out, how to build and test the compiler, and the commit conventions;
+[docs/RELEASING.md](docs/RELEASING.md) covers pull requests and releases. The
+full test suite runs with:
+
+```sh
+./brine2 test tests/integration.br
+```
+
+## License
+
+brine is licensed under the [Apache License 2.0](LICENSE).
