@@ -155,7 +155,7 @@ to any depth.
 **Deadlock freedom (decided: enforced at compile time).** Every `world` operation is
 collective, and there is no unmatched `send`/`recv`. Point-to-point patterns are written
 with `shift` and `exchange`. A program can then only hang if ranks disagree about which
-calls to make, so the compiler checks that they can't (`src/uniform.rs`):
+calls to make, so the compiler checks that they can't (`compiler/uniform.br`):
 
 * Every value is classified as *uniform* (the same on every rank) or *varying*. Varying
   sources are `world.rank()`, `clock()`, results of `shift`/`exchange`, and C functions.
