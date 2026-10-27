@@ -274,7 +274,9 @@ print("a\nb".lines(), s.chars(), s.bytes())  # [str], [str], [int]
 print("42".is_digit(), "ab".is_alpha(), " ".is_space(), "a1".is_alnum())
 print(ord("a"), chr(97))                   # 97 "a"
 ```
-Character classes and case conversion are ASCII-only. `str(x)` converts any
+Case conversion and `is_alpha`/`is_space` follow Unicode, as in Python
+(`"straße".upper()` is `"STRASSE"`); `is_digit` is `0`-`9`, the digits `int()`
+reads. `str(x)` converts any
 printable value; `int("42")` and `float("2.5")` parse (and panic on bad input, so
 check with `is_digit` first when the text comes from outside).
 
