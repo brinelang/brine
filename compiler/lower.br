@@ -15,9 +15,9 @@
 # tuples and structs are C structs, enums with payload are boxes
 # `{rc, tag, union of variant structs}`, other enums are int32.
 from diag import Span, SourceMap
-from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, int_ty
+from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, LocalKind, int_ty
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
-from ast import FmtSpec, parse_fmt_spec
+from ast import FmtSpec, parse_fmt_spec, children, stmt_exprs, stmt_blocks, local_of
 from info import ProgramInfo, ConstVal, TryKind, try_kind, mangle_module, PRELUDE
 from num import u128_bits
 from ir import K, Op, Func, Data, Reloc, Module, FB, new_func, le_bytes, str_bytes, f64_bits, f32_bits
@@ -40,6 +40,11 @@ struct Owned:
     ty: Ty
     home: bool
 
+struct ArrCache:
+    arr: int
+    data: int
+    len: int
+
 struct Loop:
     depth: int
     brk: int
@@ -52,6 +57,9 @@ struct FnCx:
     scopes: [[Owned]]
     loops: [Loop]
     par_writes: {int: bool}
+    # arrays no enclosing loop can share, grow or replace: their pointers
+    # are loaded once before the loop (and made unique if the loop writes them)
+    arrc: {int: ArrCache}
     # homes of locals: a stack slot, or a pointer vreg
     lslot: {int: int}
     lptr: {int: int}
@@ -67,6 +75,7 @@ fn new_cx(f: Func) -> FnCx:
         scopes=[],
         loops=[],
         par_writes={},
+        arrc={},
         lslot={},
         lptr={},
         loc=-1,
@@ -1634,6 +1643,7 @@ struct Lower:
             case StmtKind.While(cond, _, body):
                 let head = self.cx.fb.label()
                 let brk = self.cx.fb.label()
+                let saved = self.loop_arrays([cond], body)
                 self.cx.fb.place(head)
                 self.push_frame()
                 let c = self.expr(cond)
@@ -1645,6 +1655,7 @@ struct Lower:
                 if not self.cx.fb.ends():
                     self.cx.fb.jmp(head)
                 self.cx.fb.place(brk)
+                self.cx.arrc = saved
             case StmtKind.For(_, _, _, iter, _, body, is_par):
                 if is_par:
                     self.par_for(iter, s.local, s.caps, s.writes, body, s.span)
@@ -1653,11 +1664,13 @@ struct Lower:
                     self.push_frame()
                     let dom = self.domain(iter, true)
                     self.pop_frame()
+                    let saved = self.loop_arrays([iter], body)
                     let lc = self.loop_open(dom, s.local)
                     self.cx.loops.push(Loop(depth=len(self.cx.scopes), brk=lc.brk, cont=lc.cont))
                     self.block(body)
                     self.cx.loops.pop()
                     self.loop_close(dom, lc)
+                    self.cx.arrc = saved
                     self.pop_scope()
             case StmtKind.Return(value):
                 match value:
@@ -1707,6 +1720,57 @@ struct Lower:
                 self.pop_frame()
             case _:
                 pass
+
+    # Before a loop: the local arrays it only indexes (and measures) can't be
+    # shared, grown or replaced inside it, so their pointer, data and length are
+    # loaded once, and those it writes are made unique once. Returns the old set.
+    fn loop_arrays(ref self, head: [Expr], body: Block) -> {int: ArrCache}:
+        let saved = self.cx.arrc
+        var u = IndexUse(info=self.info, seen={}, written={}, bad={}, decl={})
+        for e in head:
+            u.expr(e)
+        u.block(body)
+        for l in u.seen:
+            if l in u.bad or l in u.decl or l in self.cx.par_writes or l in self.cx.arrc:
+                continue
+            if not (l in self.cx.lslot or l in self.cx.lptr):
+                continue
+            let info = self.flocals[l]
+            if l in u.written:
+                # only a variable the function may change can be made unique
+                match info.kind:
+                    case LocalKind.Var | LocalKind.RefParam:
+                        pass
+                    case _:
+                        continue
+            match info.ty:
+                case Ty.Array(_):
+                    let p = self.local_ptr(l)
+                    if l in u.written:
+                        self.cx.fb.call_void("brine_arr_unique", [p])
+                    let a = self.cx.fb.load(K.Ptr, p, 0)
+                    let n = self.cx.fb.load(K.I64, a, 8)
+                    let d = self.cx.fb.load(K.Ptr, a, 48)
+                    self.cx.arrc[l] = ArrCache(arr=a, data=d, len=n)
+                case _:
+                    pass
+        return saved
+
+    # The local array `e` names, when an enclosing loop cached it.
+    fn cached_arr(self, e: Expr) -> Option[ArrCache]:
+        match local_of(e):
+            case Some(l):
+                return self.cx.arrc.get(l)
+            case None:
+                return None
+
+    # The address of element `i` of a cached array.
+    fn cached_elem_ptr(ref self, c: ArrCache, i: int, et: Ty, checked: bool, span: Span) -> int:
+        var ix = self.cx.fb.conv(K.I64, i)
+        if checked:
+            let loc = self.loc(span)
+            ix = self.cx.fb.chk(Op.IdxChk, K.I64, ix, c.len, loc)
+        return self.cx.fb.elem(c.data, ix, self.lay(et).size)
 
     fn assign(ref self, target: Expr, op: Option[BinOp], value: Expr, span: Span):
         let ty = target.ty
@@ -1915,6 +1979,11 @@ struct Lower:
                     case _:
                         pass
                 let i = self.expr(idx)
+                match self.cached_arr(base):
+                    case Some(c):
+                        return self.cached_elem_ptr(c, i, e.ty, e.checked, e.span)
+                    case None:
+                        pass
                 let b = self.lvalue(base)
                 var skip = false
                 match base.kind:
@@ -2164,6 +2233,13 @@ struct Lower:
                         let p = self.cx.fb.call(K.Ptr, "brine_map_at", [b, kp, loc])
                         return self.ld(p, 0, e.ty)
                     case _:
+                        pass
+                match self.cached_arr(base):
+                    case Some(c):
+                        let i = self.expr(idx)
+                        let p = self.cached_elem_ptr(c, i, e.ty, e.checked, e.span)
+                        return self.ld(p, 0, e.ty)
+                    case None:
                         pass
                 let b = self.expr(base)
                 let i = self.expr(idx)
@@ -2587,6 +2663,11 @@ struct Lower:
                 self.cx.fb.call_void(f, [sb])
                 return self.unit()
             case Builtin.Len:
+                match self.cached_arr(args[0].expr):
+                    case Some(c):
+                        return c.len
+                    case None:
+                        pass
                 let v = self.expr(args[0].expr)
                 return self.cx.fb.load(K.I64, v, 8)
             case Builtin.Get:
@@ -3875,3 +3956,116 @@ fn world_desc(t: Ty) -> str:
             return "a" + world_desc(e)
         case _:
             return "?"
+
+# How a loop uses its local arrays: `seen` indexed, `written` changed through
+# an index (assigned, a receiver, a `ref` argument), `bad` used any other way (copied, passed, reassigned, iterated).
+struct IndexUse:
+    info: ProgramInfo
+    seen: {int: bool}
+    written: {int: bool}
+    bad: {int: bool}
+    # declared inside the loop: not there yet when it starts
+    decl: {int: bool}
+
+    fn expr(ref self, e: Expr):
+        match e.kind:
+            case ExprKind.Index(base, idx):
+                match local_of(base):
+                    case Some(l):
+                        self.seen[l] = true
+                        self.expr(idx)
+                        return
+                    case None:
+                        pass
+            case ExprKind.MethodCall(recv, _, _, args):
+                # a receiver or `ref` argument may be changed in place
+                var recv_mut = true
+                match e.cres:
+                    case CallRes.Builtin(b):
+                        recv_mut = b.mutates_recv()
+                    case CallRes.Method(id):
+                        let ps = self.info.fns[id].params
+                        recv_mut = len(ps) == 0 or ps[0].by_ref
+                    case _:
+                        pass
+                if recv_mut:
+                    self.target(recv)
+                for a in args:
+                    if a.by_ref:
+                        self.target(a.expr)
+            case ExprKind.Call(_, args):
+                for a in args:
+                    if a.by_ref:
+                        self.target(a.expr)
+                match e.cres:
+                    case CallRes.Builtin(b):
+                        match b:
+                            case Builtin.Len:
+                                if len(args) == 1 and local_of(args[0].expr).is_some():
+                                    return
+                            case _:
+                                pass
+                    case _:
+                        pass
+            case ExprKind.Ident(_):
+                match local_of(e):
+                    case Some(l):
+                        self.bad[l] = true
+                    case None:
+                        pass
+                return
+            case _:
+                pass
+        for c in children(e):
+            self.expr(c)
+
+    fn block(ref self, b: Block):
+        for s in b.stmts:
+            match s.kind:
+                case StmtKind.Assign(t, _, _):
+                    self.target(t)
+                case StmtKind.Let(_, _, _, init, is_ref):
+                    for l in s.locals:
+                        self.decl[l] = true
+                    if is_ref:
+                        self.target(init)
+                case StmtKind.For(_, _, _, _, _, _, _):
+                    self.decl[s.local] = true
+                case StmtKind.Match(_, cases):
+                    for c in cases:
+                        self.pat(c.pat)
+                case _:
+                    pass
+            for e in stmt_exprs(s):
+                self.expr(e)
+            for blk in stmt_blocks(s):
+                self.block(blk)
+
+    fn pat(ref self, p: Pattern):
+        match p.kind:
+            case PatKind.Bind(_):
+                self.decl[p.local] = true
+            case PatKind.Tuple(ps):
+                for q in ps:
+                    self.pat(q)
+            case PatKind.Or(ps):
+                for q in ps:
+                    self.pat(q)
+            case _:
+                pass
+        for q in p.fields:
+            self.pat(q)
+
+    # `a[i] = v`, `a[i].f = v`, `a[i][j] = v`: the array at the root is written
+    fn target(ref self, t: Expr):
+        match t.kind:
+            case ExprKind.Index(base, _):
+                match local_of(base):
+                    case Some(l):
+                        self.written[l] = true
+                    case None:
+                        self.target(base)
+            case ExprKind.Field(base, _, _):
+                self.target(base)
+            case _:
+                pass
