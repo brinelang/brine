@@ -1054,22 +1054,29 @@ brine_str *brine_sb_finish(brine_sb *sb) {
     sb->p = NULL;
     return s;
 }
-void brine_print_sb(brine_sb *sb) {
-    brine_sb_cat(sb, "\n", 1);
+/* write a finished builder (and free it); `print` adds its own `end` */
+void brine_out_sb(brine_sb *sb) {
     br_lock(&br_io_mu);
     fwrite(sb->p, 1, (size_t)sb->len, stdout);
     br_unlock(&br_io_mu);
     free(sb->p);
     sb->p = NULL;
 }
-void brine_eprint_sb(brine_sb *sb) {
-    brine_sb_cat(sb, "\n", 1);
+void brine_err_sb(brine_sb *sb) {
     br_lock(&br_io_mu);
     fflush(stdout);
     fwrite(sb->p, 1, (size_t)sb->len, stderr);
     br_unlock(&br_io_mu);
     free(sb->p);
     sb->p = NULL;
+}
+void brine_print_sb(brine_sb *sb) {
+    brine_sb_cat(sb, "\n", 1);
+    brine_out_sb(sb);
+}
+void brine_eprint_sb(brine_sb *sb) {
+    brine_sb_cat(sb, "\n", 1);
+    brine_err_sb(sb);
 }
 
 /* ============================================================ misc */

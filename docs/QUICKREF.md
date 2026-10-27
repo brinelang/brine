@@ -299,7 +299,8 @@ Keys can be integers, `bool`, `str`, enums, or arrays/tuples/structs of those
 
 ## Built-ins
 
-`print(a, b, ...)`, `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`, `cos`,
+`print(a, b, ...)` (`sep=" "` goes between the values and `end="\n"` after
+them: `print(x, end="")`), `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`, `cos`,
 `tan`, `exp`, `log`, `pow(x, y)`, `floor`, `ceil`, `round`, `clock()` (seconds),
 `args()` (command-line arguments), `exit(code)`, `panic(msg)`, `eprint(...)`
 (print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`.

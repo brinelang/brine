@@ -245,6 +245,8 @@ void brine_sb_fmt_u128(brine_sb *sb, brine_u128 v, int kind);
 void brine_sb_fmt_f64(brine_sb *sb, double v, int prec, int kind);
 void brine_sb_pad(brine_sb *sb, int64_t start, int64_t width, bool left, bool zero);
 brine_str *brine_sb_finish(brine_sb *sb);
+void brine_out_sb(brine_sb *sb);
+void brine_err_sb(brine_sb *sb);
 void brine_print_sb(brine_sb *sb);
 void brine_eprint_sb(brine_sb *sb);
 
