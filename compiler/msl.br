@@ -19,6 +19,11 @@
 # result is treated like a failed check: the runtime drops the GPU's results
 # and runs the construct on the CPU. A failed check ends the thread: functions
 # return with `bad` set, and the kernel sets the error flag.
+#
+# Branching after every float operation makes kernels 1.5x slower, so a
+# flushed value only sets `fz`, which is checked before a jump back, a call
+# and a return: a flushed value can change what a loop iteration computes,
+# but not make it loop or call on with it, and the results are dropped anyway.
 from ir import K, Op, Inst, Func
 from ptx import KReq, GpuCode, LocalAddr, plan, slot_info, comb_name, is_panic, is_refcount, suffix_kind, kmin, kmax, LEAF, BLOCK
 
@@ -201,6 +206,8 @@ struct Ms:
     frame: int
     entry: bool
     ntmp: int
+    # labels already emitted: a jump to one goes back
+    seen: {int: bool}
 
     fn e(ref self, s: str):
         self.o.push("    " + s)
@@ -222,6 +229,13 @@ struct Ms:
 
     fn fail_if(ref self, c: str):
         self.e(f"if ({c}) {self.fail()}")
+
+    # a value was flushed to zero if c
+    fn flushed_if(ref self, c: str):
+        self.e(f"fz |= {c};")
+
+    fn check_fz(ref self):
+        self.fail_if("fz")
 
     # The memory of kind k at pointer vreg a plus `off` (an expression).
     fn mem(self, k: K, a: int, off: str) -> str:
@@ -254,12 +268,13 @@ fn new_ms(f: Func, index: {str: int}, entry: bool) -> Ms:
         esc=esc,
         frame=frame,
         entry=entry,
-        ntmp=0
+        ntmp=0,
+        seen={}
     )
 
 fn decls(ms: Ms, first: int) -> [str]:
     let f = ms.f
-    var o: [str] = []
+    var o = ["    bool fz = false;"]
     for i in first..len(f.vk):
         o.push(f"    {mt(f.vk[i])} v{i} = 0;")
     for i, s in enumerate(f.slots):
@@ -292,13 +307,16 @@ fn body(ref ms: Ms) -> [str]:
             o.push("    }")
             ms.o = o
     let end = "    return;" if ms.entry or not ms.f.has_ret else "    return 0;"
+    let check = f"    if (fz) {ms.fail()}"
     if not has_labels(ms.f):
         var o = ms.o
+        o.push(check)
         o.push(end)
         return o
     var o = ["    int L = -1;", "    for (;;) {", "    switch (L) {", "    case -1:"]
     o.extend(ms.o)
     o.push("    }")
+    o.push(check)
     o.push(end)
     o.push("    }")
     return o
@@ -426,13 +444,15 @@ fn inst(ref ms: Ms, x: Inst):
             call(ref ms, x)
         case Op.Label:
             ms.o.push(f"    case {x.n}:")
+            ms.seen[x.n] = true
         case Op.Jmp:
-            ms.e(f"L = {x.n}; continue;")
+            ms.e(f"{back(ms, x.n)}L = {x.n}; continue;")
         case Op.Br:
-            ms.e(f"if ({v(x.a)}) {{ L = {x.n}; continue; }}")
+            ms.e(f"if ({v(x.a)}) {{ {back(ms, x.n)}L = {x.n}; continue; }}")
         case Op.BrNot:
-            ms.e(f"if (!{v(x.a)}) {{ L = {x.n}; continue; }}")
+            ms.e(f"if (!{v(x.a)}) {{ {back(ms, x.n)}L = {x.n}; continue; }}")
         case Op.Ret:
+            ms.check_fz()
             if ms.entry or not f.has_ret:
                 ms.e("return;")
             elif x.a >= 0:
@@ -443,6 +463,12 @@ fn inst(ref ms: Ms, x: Inst):
             ms.e(ms.fail())
         case _:
             pass
+
+# before a jump back: no flushed value goes around a loop
+fn back(ms: Ms, label: int) -> str:
+    if label in ms.seen:
+        return f"if (fz) {ms.fail()} "
+    return ""
 
 fn shift_mask(k: K) -> int:
     # narrow values are promoted to 32 bits
@@ -475,16 +501,16 @@ fn arith(ref ms: Ms, x: Inst):
         match x.op:
             case Op.Add:
                 ms.e(f"{d} = {a} + {b};")
-                ms.fail_if(f"{d} == 0.0f && {a} != -{b}")
+                ms.flushed_if(f"{d} == 0.0f && {a} != -{b}")
             case Op.Sub:
                 ms.e(f"{d} = {a} - {b};")
-                ms.fail_if(f"{d} == 0.0f && {a} != {b}")
+                ms.flushed_if(f"{d} == 0.0f && {a} != {b}")
             case Op.Mul:
                 ms.e(f"{d} = {a} * {b};")
-                ms.fail_if(f"{d} == 0.0f && {a} != 0.0f && {b} != 0.0f")
+                ms.flushed_if(f"{d} == 0.0f && {a} != 0.0f && {b} != 0.0f")
             case _:
                 ms.e(f"{d} = {a} / {b};")
-                ms.fail_if(f"{d} == 0.0f && {a} != 0.0f && !isinf({b})")
+                ms.flushed_if(f"{d} == 0.0f && {a} != 0.0f && !isinf({b})")
         return
     match x.op:
         case Op.Add:
@@ -545,7 +571,8 @@ fn load(ref ms: Ms, x: Inst):
         # as bits: a subnormal can't be loaded as a float here
         let t = ms.tmp()
         ms.e(f"uint {t} = {ms.mem(K.U32, x.a, off)};")
-        ms.fail_if(f"({t} & 0x7f800000u) == 0u && ({t} & 0x7fffffu) != 0u")
+        # (exponent 0, mantissa not)
+        ms.flushed_if(f"({t} & 0x7fffffffu) - 1u < 0x7fffffu")
         ms.e(f"{v(x.d)} = as_type<float>({t});")
     else:
         ms.e(f"{v(x.d)} = {ms.mem(k, x.a, off)};")
@@ -654,6 +681,7 @@ fn call(ref ms: Ms, x: Inst):
         else:
             rt_int(ref ms, x)
         return
+    ms.check_fz()
     var args = [f"sp + {ms.frame}", "bad"]
     for a in x.args:
         args.push(v(a))
