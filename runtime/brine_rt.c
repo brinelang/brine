@@ -24,6 +24,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <winternl.h>
 #else
 #include <pthread.h>
 #include <unistd.h>
@@ -198,7 +199,37 @@ typedef struct {
     int64_t count[BR_NCLASS];
     char *bump[BR_NCLASS], *end[BR_NCLASS];
 } br_heap_th;
+#if defined(_WIN32) && !defined(__clang__)
+/* MinGW gcc emulates thread-locals with a library call per access, which
+   would cost more than the allocation; a TLS slot in the thread block is one
+   load */
+static DWORD br_th_key = TLS_OUT_OF_INDEXES;
+static br_heap_th *br_th_peek(void) {
+    return br_th_key < 64 ? (br_heap_th *)((TEB *)NtCurrentTeb())->TlsSlots[br_th_key] : (br_heap_th *)TlsGetValue(br_th_key);
+}
+static br_heap_th *br_th_new(void) {
+    br_heap_th *h = (br_heap_th *)calloc(1, sizeof *h);
+    if (!h) {
+        fprintf(stderr, "out of memory\n");
+        abort();
+    }
+    TlsSetValue(br_th_key, h);
+    return h;
+}
+static inline br_heap_th *br_th_get(void) {
+    br_heap_th *h = br_th_peek();
+    return h ? h : br_th_new();
+}
+static void br_th_done(br_heap_th *h) {
+    TlsSetValue(br_th_key, NULL);
+    free(h);
+}
+#else
 static _Thread_local br_heap_th br_th;
+static br_heap_th *br_th_peek(void) { return &br_th; }
+static inline br_heap_th *br_th_get(void) { return &br_th; }
+static void br_th_done(br_heap_th *h) { (void)h; }
+#endif
 
 static int br_class_of(size_t n) { return n <= 128 ? (int)((n + 15) / 16) - 1 : 8 + (int)((n - 129) / 32); }
 static size_t br_class_size(int c) { return c < 8 ? (size_t)(c + 1) * 16 : 128 + (size_t)(c - 7) * 32; }
@@ -209,6 +240,10 @@ static void br_heap_init(void) {
     if (br_heap_base) return;
     br_mutex_init(&br_heap_mu);
 #ifdef _WIN32
+#ifndef __clang__
+    br_th_key = TlsAlloc();
+    if (br_th_key == TLS_OUT_OF_INDEXES) return;
+#endif
     /* reservations are 64 KiB aligned */
     uintptr_t b = (uintptr_t)VirtualAlloc(NULL, BR_RESERVE, MEM_RESERVE, PAGE_NOACCESS);
 #else
@@ -286,7 +321,7 @@ static void *br_alloc_slow(br_heap_th *h, int c, size_t n) {
 static void *br_alloc(size_t n) {
     if (n > BR_SMALL || !br_heap_base) return br_big(n);
     int c = br_class_of(n ? n : 1);
-    br_heap_th *h = &br_th;
+    br_heap_th *h = br_th_get();
     void *p = h->head[c];
     if (p) {
         h->head[c] = *(void **)p;
@@ -302,7 +337,7 @@ static void br_free(void *p) {
         return;
     }
     int c = br_chunk_class[((uintptr_t)p - br_heap_base) / BR_CHUNK];
-    br_heap_th *h = &br_th;
+    br_heap_th *h = br_th_get();
     *(void **)p = h->head[c];
     h->head[c] = p;
     if (++h->count[c] * (int64_t)br_class_size(c) > BR_SPARE) br_give(h, c);
@@ -323,7 +358,8 @@ static void *br_realloc(void *p, size_t n) {
    to the shared lists */
 static void br_heap_exit(void) {
     if (!br_heap_base) return;
-    br_heap_th *h = &br_th;
+    br_heap_th *h = br_th_peek();
+    if (!h) return;
     for (int c = 0; c < BR_NCLASS; c++) {
         size_t sz = br_class_size(c);
         while (h->bump[c] && (size_t)(h->end[c] - h->bump[c]) >= sz) {
@@ -334,6 +370,7 @@ static void br_heap_exit(void) {
         }
         br_give(h, c);
     }
+    br_th_done(h);
 }
 
 #define free(p) br_free(p)
