@@ -22,6 +22,7 @@ from info import ProgramInfo, ConstVal, TryKind, try_kind, mangle_module, PRELUD
 from num import u128_bits
 from ir import K, Op, Func, Data, Reloc, Module, FB, new_func, le_bytes, str_bytes, f64_bits, f32_bits
 from ir import DType, DField, DVar, DT_BASE, DT_STRUCT, DT_UNION, DT_ENUM, DT_PTR, DT_TYPEDEF, DT_ARRAY
+import ptx
 
 struct Options:
     # generate a test-runner `main` instead of the program's `main`
@@ -182,7 +183,8 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         flocals=[],
         fsyms={},
         dtypes=[],
-        dtys={}
+        dtys={},
+        gsites=[]
     )
     return g.run()
 
@@ -212,6 +214,8 @@ struct Lower:
     # debug builds: the types of variables, and their indexes by mangled name
     dtypes: [DType]
     dtys: {str: int}
+    # `par` constructs that may run on a GPU (see `gpu_emit`)
+    gsites: [GpuSite]
 
     # ============================================================ driver
     fn run(ref self) -> Lowered:
@@ -233,6 +237,7 @@ struct Lower:
                 let ks = [self.kind(p.ty) for p in sig.params]
                 let has = self.ret_has(sig.ret)
                 externs.push(new_func(sig.c_name, ks, has, self.kind(sig.ret) if has else K.I64))
+        self.gpu_emit()
         return Lowered(
             m=Module(funcs=self.funcs, data=self.data, dtypes=self.dtypes),
             externs=externs
@@ -514,6 +519,11 @@ struct Lower:
 
     # The address of a NUL-terminated C string.
     fn cstr(ref self, s: str) -> int:
+        let sym = self.cstr_sym(s)
+        return self.cx.fb.global(sym)
+
+    # The symbol of a NUL-terminated C string.
+    fn cstr_sym(ref self, s: str) -> str:
         var sym = ""
         match self.cstrs.get(s):
             case Some(x):
@@ -525,7 +535,7 @@ struct Lower:
                 str_bytes(ref b, s)
                 b.push(u8(0))
                 self.data.push(Data(name=sym, align=1, bytes=b, relocs=[], readonly=true))
-        return self.cx.fb.global(sym)
+        return sym
 
     # A string literal: an immortal `brine_str`.
     fn str_lit(ref self, s: str) -> int:
@@ -3917,7 +3927,7 @@ struct Lower:
         for j, x in enumerate(extra):
             if x.2 >= 0:
                 self.st(ctx, offs[nc + j], x.1, x.2)
-        return ParCtx(id=id, ctx=ctx, names=names, offs=offs)
+        return ParCtx(id=id, ctx=ctx, names=names, offs=offs, tys=tys, size=lay.size)
 
     # Start lifted function `name` (its parameter 0 is the context); captured
     # locals are read from the context.
@@ -3945,11 +3955,179 @@ struct Lower:
         self.funcs.push(self.cx.fb.f)
         self.cx = saved
 
-    # Run chunk function `br_par_<id>` over n iterations.
-    fn par_run(ref self, pc: ParCtx, n: int, nchunks: int):
-        let zero = self.cx.fb.konst(K.I64, 0)
+    # Run `br_par_<id>` over n iterations: on a GPU when it can and that pays,
+    # otherwise on the thread pool.
+    fn par_launch(ref self, pc: ParCtx, kind: int, n: int, real: [(str, Ty, int)], span: Span):
+        let kd = self.gpu_site(pc, kind, 0, K.I64, real, span)
         let fp = self.cx.fb.global(f"br_par_{pc.id}")
-        self.cx.fb.call_void("brine_par_run", [zero, n, nchunks, fp, pc.ctx])
+        self.cx.fb.call_void("brine_par_for", [kd, pc.ctx, n, fp])
+
+    # The real types of the context fields `dom_fields` adds (an array is
+    # stored there as a plain pointer).
+    fn dom_tys(self, dom: Dom) -> [(str, Ty, int)]:
+        match dom:
+            case Dom.Arr(_, elem):
+                return [("darr", Ty.Array(elem), 0)]
+            case _:
+                return []
+
+    # The descriptor `br_gk_<id>` of a parallel construct, for the runtime to
+    # run it on a GPU (`gpu_emit` fills it in). `real` overrides context field
+    # types, with flags: 1 written by the body, 2 only written (not read).
+    fn gpu_site(
+        ref self,
+        pc: ParCtx,
+        kind: int,
+        op: int,
+        vk: K,
+        real: [(str, Ty, int)],
+        span: Span
+    ) -> int:
+        let ptrs = self.gpu_ptrs(pc, real)
+        let wh = self.cstr_sym(self.sm.loc(span))
+        self.gsites.push(
+            GpuSite(id=pc.id, kind=kind, op=op, vk=vk, where_sym=wh, ctx_size=pc.size, ptrs=ptrs)
+        )
+        return self.cx.fb.global(f"br_gk_{pc.id}")
+
+    # Where the arrays in a context are, for the runtime to copy them to the
+    # device: [nfields, (offset, flags, node)*, nodes...]. A node describes an
+    # array: [element size, n, (offset in the element, node)*] for the arrays
+    # inside each element; nodes are numbered from the first node's position.
+    # Empty: something in the context can't be copied (strings, maps, boxes).
+    fn gpu_ptrs(self, pc: ParCtx, real: [(str, Ty, int)]) -> [int]:
+        var fields: [int] = []
+        var nodes: [int] = []
+        var nf = 0
+        for i, name in enumerate(pc.names):
+            var ty = pc.tys[i]
+            var flags = 0
+            for x in real:
+                if x.0 == name:
+                    ty = x.1
+                    flags = x.2
+            var subs: [(int, Ty)] = []
+            if not self.gpu_plain(ty, pc.offs[i], ref subs):
+                return []
+            for sub in subs:
+                let node = self.gpu_node(sub.1, ref nodes, 0)
+                if node < 0:
+                    return []
+                let top = sub.0 == pc.offs[i]
+                # arrays written on the device are copied back: no pointers in them
+                if flags != 0 and (not top or nodes[node + 1] != 0):
+                    return []
+                fields.push(sub.0)
+                fields.push(flags if top else 0)
+                fields.push(node)
+                nf += 1
+        var out = [nf]
+        out.extend(fields)
+        out.extend(nodes)
+        return out
+
+    fn gpu_node(self, elem: Ty, ref nodes: [int], depth: int) -> int:
+        var subs: [(int, Ty)] = []
+        if depth > 8 or not self.gpu_plain(elem, 0, ref subs):
+            return -1
+        let at = len(nodes)
+        nodes.push(self.lay(elem).size)
+        nodes.push(len(subs))
+        for _ in subs:
+            nodes.push(0)
+            nodes.push(0)
+        for j, sub in enumerate(subs):
+            let child = self.gpu_node(sub.1, ref nodes, depth + 1)
+            if child < 0:
+                return -1
+            nodes[at + 2 + 2 * j] = sub.0
+            nodes[at + 3 + 2 * j] = child
+        return at
+
+    # Is a value of type t plain data and arrays of it? `subs` gets the
+    # offsets (from `base`) and element types of the arrays in it.
+    fn gpu_plain(self, t: Ty, base: int, ref subs: [(int, Ty)]) -> bool:
+        match t:
+            case Ty.Int(_) | Ty.Float(_) | Ty.Bool | Ty.Unit:
+                return true
+            case Ty.Enum(eid):
+                return not self.info.enums[eid].has_payload()
+            case Ty.Array(e):
+                subs.push((base, e))
+                return true
+            case Ty.Tuple(_) | Ty.Struct(_):
+                for i, x in enumerate(self.field_tys(t)):
+                    if not self.gpu_plain(x, base + self.field_off(t, i), ref subs):
+                        return false
+                return true
+            case _:
+                return false
+
+    # The GPU code of the program's parallel constructs, and their descriptors
+    # (`brine_kernel` in brine_rt.h).
+    fn gpu_emit(ref self):
+        if len(self.gsites) == 0:
+            return
+        var ks: [ptx.KReq] = []
+        for g in self.gsites:
+            ks.push(
+                ptx.KReq(fname=f"br_par_{g.id}", entry=f"brk_{g.id}", kind=g.kind, op=g.op, vk=g.vk)
+            )
+        let code = ptx.build(self.funcs, ks)
+        if code.ptx != "":
+            var b: [u8] = []
+            str_bytes(ref b, code.ptx)
+            b.push(u8(0))
+            self.data.push(Data(name="br_gpu_ptx", align=8, bytes=b, relocs=[], readonly=true))
+            match getenv("BRINE_DUMP_PTX"):
+                case Some(path):
+                    match write_file(path, code.ptx):
+                        case Ok(_):
+                            pass
+                        case Err(_):
+                            pass
+                case None:
+                    pass
+        for i, g in enumerate(self.gsites):
+            let ok = code.ok[i] and len(g.ptrs) > 0
+            var rel: [Reloc] = []
+            if ok:
+                rel.push(Reloc(off=0, sym="br_gpu_ptx", add=0))
+                rel.push(Reloc(off=8, sym=self.cstr_sym(f"brk_{g.id}"), add=0))
+                if g.kind == 2:
+                    rel.push(Reloc(off=80, sym=self.cstr_sym(ptx.comb_name(g.op, g.vk)), add=0))
+            rel.push(Reloc(off=16, sym=g.where_sym, add=0))
+            if not ok:
+                var w = code.why[i]
+                if len(g.ptrs) == 0:
+                    w = "its context holds strings, maps or enums with payloads"
+                rel.push(Reloc(off=96, sym=self.cstr_sym(w), add=0))
+            if len(g.ptrs) > 0:
+                var pb: [u8] = []
+                for x in g.ptrs:
+                    le_bytes(ref pb, x, 8)
+                let pn = f"br_gp_{g.id}"
+                self.data.push(Data(name=pn, align=8, bytes=pb, relocs=[], readonly=true))
+                rel.push(Reloc(off=56, sym=pn, add=0))
+            var b: [u8] = []
+            let vals = [
+                0,
+                0,
+                0,
+                g.kind,
+                g.op,
+                kind_code(g.vk),
+                g.ctx_size,
+                0,
+                code.cost[i],
+                code.cost64[i],
+                0,
+                0,
+                0
+            ]
+            for v in vals:
+                le_bytes(ref b, v, 8)
+            self.data.push(Data(name=f"br_gk_{g.id}", align=8, bytes=b, relocs=rel, readonly=false))
 
     # In a chunk function: `for k in lo..hi`, with the loop variable `local` set.
     fn chunk_open(ref self, dom: Dom, pc: ParCtx, local: int) -> LoopCtl:
@@ -3995,8 +4173,10 @@ struct Lower:
             self.cx.fb.call_void("brine_arr_unique", [lp])
         let extra = self.dom_fields(dom)
         let pc = self.par_ctx(captures, extra)
-        let plan = self.cx.fb.rt(K.I64, "brine_par_plan", [n])
-        self.par_run(pc, n, plan)
+        var real = self.dom_tys(dom)
+        for w in par_writes:
+            real.push((f"c{w}", self.flocals[w].ty, 1))
+        self.par_launch(pc, 0, n, real, span)
         self.pop_scope()
 
         let saved = self.lift_enter(
@@ -4023,8 +4203,9 @@ struct Lower:
         var extra = self.dom_fields(dom)
         extra.push(("res", Ty.Str, res))
         let pc = self.par_ctx(e.caps, extra)
-        let plan = self.cx.fb.rt(K.I64, "brine_par_plan", [n])
-        self.par_run(pc, n, plan)
+        var real = self.dom_tys(dom)
+        real.push(("res", e.ty, 3))
+        self.par_launch(pc, 1, n, real, e.span)
 
         let saved = self.lift_enter(f"br_par_{pc.id}", [K.Ptr, K.I64, K.I64, K.I64], pc, e.caps, [])
         let lc = self.chunk_open(dom, pc, e.local)
@@ -4039,51 +4220,33 @@ struct Lower:
         self.lift_exit(saved)
         return res
 
-    # `local` and `captures` are the comprehension's loop variable and captured locals.
+    # `local` and `captures` are the comprehension's loop variable and captured
+    # locals. The runtime splits the elements into leaves and combines the
+    # leaves' results in a fixed tree (`brine_par_reduce`); the lifted function
+    # folds one leaf.
     fn par_reduce(ref self, r: Reducer, c: Comp, e: Expr, local: int, captures: [int]) -> int:
         let ty = e.ty
-        let sz = self.lay(ty).size
+        let lay = self.lay(ty)
         let dom = self.domain(c.iter, false)
         let n = self.dom_count(dom, e.span)
-        let nc = self.cx.fb.rt(K.I64, "brine_par_plan", [n])
-        let szk = self.cx.fb.konst(K.I64, sz)
-        let bytes = self.cx.fb.bin(Op.Mul, K.I64, nc, szk)
-        let parts = self.cx.fb.call(K.Ptr, "brine_alloc", [bytes])
-        let hasv = self.cx.fb.call(K.Ptr, "brine_alloc", [nc])
-        var extra = self.dom_fields(dom)
-        extra.push(("parts", Ty.Str, parts))
-        extra.push(("has", Ty.Str, hasv))
-        let pc = self.par_ctx(captures, extra)
-        self.par_run(pc, n, nc)
         let (acc, has) = self.reduce_init(r, ty)
-        let k = self.cx.fb.konst(K.I64, 0)
-        let one = self.cx.fb.konst(K.I64, 1)
-        let head = self.cx.fb.label()
-        let next = self.cx.fb.label()
-        let out = self.cx.fb.label()
-        self.cx.fb.place(head)
-        let more = self.cx.fb.cmp(Op.Lt, k, nc)
-        self.cx.fb.brnot(more, out)
-        let hptr = self.cx.fb.elem(hasv, k, 1)
-        let hk = self.cx.fb.load(K.Bool, hptr, 0)
-        self.cx.fb.brnot(hk, next)
-        let pptr = self.cx.fb.elem(parts, k, sz)
-        let pv = self.ld(pptr, 0, ty)
-        self.reduce_into(r, ty, acc, has, pv, e.span, -1)
-        let t = self.cx.fb.konst(K.Bool, 1)
-        self.cx.fb.mov(has, t)
-        self.cx.fb.place(next)
-        let k2 = self.cx.fb.bin(Op.Add, K.I64, k, one)
-        self.cx.fb.mov(k, k2)
-        self.cx.fb.jmp(head)
-        self.cx.fb.place(out)
-        self.cx.fb.call_void("brine_free", [parts])
-        self.cx.fb.call_void("brine_free", [hasv])
+        let accp = self.cx.fb.temp_mem(lay.size, lay.align)
+        self.cx.fb.store(accp, 0, acc)
+        let hasp = self.cx.fb.temp_mem(1, 1)
+        self.cx.fb.store(hasp, 0, has)
+        let extra = self.dom_fields(dom)
+        let pc = self.par_ctx(captures, extra)
+        let fp = self.cx.fb.global(f"br_par_{pc.id}")
+        let kd = self.gpu_site(pc, 2, reducer_code(r), self.kind(ty), self.dom_tys(dom), e.span)
+        let loc = self.loc(e.span)
+        self.cx.fb.call_void("brine_par_reduce", [kd, n, fp, pc.ctx, accp, hasp, loc])
+        self.cx.fb.load_to(acc, accp, 0)
+        self.cx.fb.load_to(has, hasp, 0)
         self.reduce_finish(r, has, e.span)
 
         let saved = self.lift_enter(
             f"br_par_{pc.id}",
-            [K.Ptr, K.I64, K.I64, K.I64],
+            [K.Ptr, K.I64, K.I64, K.I64, K.Ptr, K.Ptr],
             pc,
             captures,
             []
@@ -4092,12 +4255,8 @@ struct Lower:
         let lc = self.chunk_open(dom, pc, local)
         self.reduce_step(r, c, ty, a2, h2, e.span, lc)
         self.chunk_close(lc)
-        let pp = self.cx.fb.load(K.Ptr, 0, pc.off("parts"))
-        let mine = self.cx.fb.elem(pp, 1, sz)
-        self.st(mine, 0, ty, a2)
-        let hp = self.cx.fb.load(K.Ptr, 0, pc.off("has"))
-        let mine_has = self.cx.fb.elem(hp, 1, 1)
-        self.cx.fb.store(mine_has, 0, h2)
+        self.cx.fb.store(4, 0, a2)
+        self.cx.fb.store(5, 0, h2)
         self.lift_exit(saved)
         return acc
 
@@ -4142,12 +4301,25 @@ struct LoopCtl:
     # for stepped ranges: is the step positive
     pos: int
 
+# A parallel construct that may run on a GPU. kind 0: `par for`, 1: a map,
+# 2: a reduction with reducer `op` over values of kind `vk`.
+struct GpuSite:
+    id: str
+    kind: int
+    op: int
+    vk: K
+    where_sym: str
+    ctx_size: int
+    ptrs: [int]
+
 # A lifted parallel body's context: its fields' names and offsets.
 struct ParCtx:
     id: str
     ctx: int
     names: [str]
     offs: [int]
+    tys: [Ty]
+    size: int
 
     fn off(self, name: str) -> int:
         for i, n in enumerate(self.names):
@@ -4155,6 +4327,53 @@ struct ParCtx:
                 return self.offs[i]
         panic(f"lowering: no context field {name}")
         return 0
+
+# The runtime's numbers for reducers and value kinds (BRINE_RED_*, BRINE_VK_* in brine_rt.h).
+fn reducer_code(r: Reducer) -> int:
+    match r:
+        case Reducer.Sum:
+            return 0
+        case Reducer.Product:
+            return 1
+        case Reducer.Min:
+            return 2
+        case Reducer.Max:
+            return 3
+        case Reducer.Any:
+            return 4
+        case Reducer.All:
+            return 5
+
+fn kind_code(k: K) -> int:
+    match k:
+        case K.I8:
+            return 0
+        case K.I16:
+            return 1
+        case K.I32:
+            return 2
+        case K.I64:
+            return 3
+        case K.I128:
+            return 4
+        case K.U8:
+            return 5
+        case K.U16:
+            return 6
+        case K.U32:
+            return 7
+        case K.U64:
+            return 8
+        case K.U128:
+            return 9
+        case K.F32:
+            return 10
+        case K.F64:
+            return 11
+        case K.Ptr:
+            return 12
+        case K.Bool:
+            return 13
 
 fn cmp_op(op: CmpOp) -> Op:
     match op:

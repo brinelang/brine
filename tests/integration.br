@@ -167,7 +167,9 @@ fn features() -> [str]:
         "tests/programs/os.br",
         "tests/programs/embed.br",
         "tests/programs/unpacking.br",
-        "tests/programs/loop_arrays.br"
+        "tests/programs/loop_arrays.br",
+        "tests/programs/reductions.br",
+        "tests/programs/gpu.br"
     ]
 
 test "language features":
@@ -259,7 +261,65 @@ test "parallel results don't depend on the thread count":
         let o = brine(["run", "tests/programs/parallel_det.br", "-q", "--threads", t])
         assert o.code == 0, o.err
         runs.push(o.out)
+        let r = brine(["run", "tests/programs/reductions.br", "-q", "--threads", t])
+        assert r.out == expected("tests/programs/reductions.br"), r.all()
     assert runs[0] == runs[1] and runs[0] == runs[2]
+
+# GPU offload (brine_rt.c, "GPU"). BRINE_GPU=on runs every construct that can
+# run on a GPU there; without a usable GPU everything runs on the CPU, so the
+# output checks still apply and only the GPU-only ones are skipped.
+fn gpu_ready(err: str) -> bool:
+    return "brine gpu: " in err and " ready in " in err
+
+fn without_gpu_log(err: str) -> str:
+    var out = ""
+    for l in err.lines():
+        if not l.starts_with("brine gpu: "):
+            out += l + "\n"
+    return out
+
+test "par constructs give the same results on a GPU":
+    let f = "tests/programs/gpu.br"
+    for backend in ["native", "c"]:
+        let o = brine_env(
+            ["run", f, "-q"],
+            {"BRINE_GPU": "on", "BRINE_GPU_LOG": "1", "BRINE_BACKEND": backend}
+        )
+        assert o.code == 0, o.all()
+        assert o.out == expected(f), f"{backend}: unexpected output on the GPU:\n{o.out}"
+        # what can run on a GPU is decided when compiling: the same with or without one
+        var cpu: [str] = []
+        var gpu = 0
+        let mine = "brine gpu: tests/programs/gpu.br:"
+        for l in o.err.lines():
+            # (the compiler's own constructs are logged too)
+            if not l.starts_with(mine):
+                continue
+            if "not GPU-eligible" in l:
+                cpu.push(l[len(mine):].split(":")[0])
+            elif " -> gpu " in l:
+                gpu += 1
+        assert cpu == ["109", "111", "113"], o.err
+        if gpu_ready(o.err):
+            assert gpu == 47, o.err
+
+test "a check that fails on a GPU panics as on the CPU":
+    let f = "tests/programs/gpu_panic.br"
+    for which, msg in [
+        ("index", "index 100000 is out of bounds for an array of length 100000"),
+        ("assert", "assertion failed: x != 77_777"),
+        ("div", "division by zero"),
+        ("overflow", "integer overflow in multiplication"),
+        ("combine", "integer overflow in addition"),
+        ("convert", "float to integer conversion out of range (or NaN) for i32"),
+        ("shift", "shift amount out of range")
+    ]:
+        let off = brine_env(["run", f, "-q", "--", which], {"BRINE_GPU": "off"})
+        let on = brine_env(["run", f, "-q", "--", which], {"BRINE_GPU": "on", "BRINE_GPU_LOG": "1"})
+        assert off.code == 101 and msg in off.err, f"{which}: {off.all()}"
+        assert on.code == 101 and without_gpu_log(on.err) == off.err, f"{which}: {on.all()}"
+        if gpu_ready(on.err):
+            assert "a check failed on the GPU, running it on the CPU" in on.err, on.err
 
 test "panics are clear":
     for f, msg in [

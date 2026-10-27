@@ -341,10 +341,12 @@ static inline double brine_f_pow(double a, double b) { return pow(a, b); }
 /* float `%` also takes the sign of the divisor, like Python */
 static inline double brine_f_fmod(double a, double b) { double r = fmod(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
 static inline float brine_f_fmodf(float a, float b) { float r = fmodf(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
-static inline double brine_f_fmin(double a, double b) { return fmin(a, b); }
-static inline double brine_f_fmax(double a, double b) { return fmax(a, b); }
-static inline float brine_f_fminf(float a, float b) { return fminf(a, b); }
-static inline float brine_f_fmaxf(float a, float b) { return fmaxf(a, b); }
+/* float min and max: a NaN loses to a number, and -0.0 is less than 0.0 (C's
+ * fmin may return either zero), so the result is the same on every platform
+ * and on a GPU (ptx.br) */
+#define BR_MINMAX(T, S)                                                             static inline T brine_f_fmin##S(T a, T b) {                                       if (a < b || b != b) return a;                                                 if (b < a || a != a) return b;                                                 return signbit(a) ? a : b;                                                 }                                                                              static inline T brine_f_fmax##S(T a, T b) {                                       if (a > b || b != b) return a;                                                 if (b > a || a != a) return b;                                                 return signbit(a) ? b : a;                                                 }
+BR_MINMAX(double, )
+BR_MINMAX(float, f)
 
 /* ------------------------------------------------------------ checked integer arithmetic */
 /* UT is the unsigned type shifts are done in */
@@ -469,6 +471,48 @@ typedef void (*brine_task_fn)(void *ctx, int64_t idx);
 static inline int64_t brine_par_plan(int64_t n) { return n <= 0 ? 0 : (n < 256 ? n : 256); }
 void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, void *ctx);
 void brine_par_tasks(int64_t k, brine_task_fn fn, void *ctx);
+
+/* Parallel reductions (`par sum(...)` etc.) have one combination order, which
+ * depends only on the element count n: elements are split into leaves of
+ * BRINE_LEAF consecutive elements, each folded left to right by the leaf
+ * function, and the leaves are combined by a balanced binary tree, level by
+ * level, adjacent pairs (a node without a partner moves up a level as it is).
+ * So float results have the same bits on any machine, thread count or device,
+ * and integer overflow traps at the same partial result. */
+#define BRINE_LEAF 16
+enum { BRINE_RED_SUM, BRINE_RED_PRODUCT, BRINE_RED_MIN, BRINE_RED_MAX, BRINE_RED_ANY, BRINE_RED_ALL };
+/* value kinds, in the order of `K` in compiler/ir.br */
+enum {
+    BRINE_VK_I8, BRINE_VK_I16, BRINE_VK_I32, BRINE_VK_I64, BRINE_VK_I128,
+    BRINE_VK_U8, BRINE_VK_U16, BRINE_VK_U32, BRINE_VK_U64, BRINE_VK_U128,
+    BRINE_VK_F32, BRINE_VK_F64, BRINE_VK_PTR, BRINE_VK_BOOL
+};
+/* folds elements [lo, hi) of leaf `leaf` into *val; sets *has unless all were filtered out */
+typedef void (*brine_leaf_fn)(void *ctx, int64_t leaf, int64_t lo, int64_t hi, void *val, bool *has);
+
+/* A parallel construct, as the compiler describes it for the GPU (lower.br,
+ * `gpu_emit`). `ptx` is NULL when the body can't run on a GPU. */
+typedef struct brine_kernel {
+    const char *ptx;   /* the program's PTX module */
+    const char *entry; /* the kernel */
+    const char *where; /* file:line:col, for BRINE_GPU_LOG */
+    int64_t kind;      /* 0 `par for`, 1 map, 2 reduction */
+    int64_t op, vk;    /* reductions: BRINE_RED_*, BRINE_VK_* */
+    int64_t ctx_size;
+    /* the arrays in the context: [nfields, (offset, flags, node)*, nodes...],
+     * a node [element size, n, (offset in an element, node)*], nodes numbered
+     * from the first; flags 1: written by the body, 2: not read */
+    const int64_t *ptrs;
+    int64_t cost, cost64; /* estimated instructions per element (f64 ones) */
+    const char *comb;     /* reductions: the combine kernel */
+    void *state;          /* the runtime's */
+    const char *why;      /* why it can't run on a GPU */
+} brine_kernel;
+
+/* Runs fn over [0, n) on the thread pool, or on a GPU when that pays. */
+void brine_par_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn fn);
+/* *val and *has: the accumulator (the reducer's start value, false); set when an element had a value */
+void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, void *val, bool *has, const char *loc);
 
 /* ------------------------------------------------------------ world (multi-process) */
 int64_t brine_world_rank(void);

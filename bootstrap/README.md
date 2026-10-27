@@ -5,7 +5,7 @@ generates for itself. It lets you build the compiler with only a C11 compiler:
 
 ```sh
 # Linux / macOS
-cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread
+cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread -ldl
 
 # Windows (MinGW gcc or clang)
 gcc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine.exe -lws2_32 -lshell32
