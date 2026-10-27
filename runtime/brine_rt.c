@@ -137,12 +137,16 @@ static void br_flush(void) { fflush(stdout); }
 static void br_gpu_settle(void);
 
 void brine_panic_at(const char *loc, const char *msg) {
+    /* under the output lock, so other threads' output (the GPU log) can't
+     * land in the middle */
+    br_lock(&br_io_mu);
     br_flush();
     if (br_size > 1)
         fprintf(stderr, "\npanic (rank %lld): %s\n  --> %s\n", (long long)br_rank, msg, loc);
     else
         fprintf(stderr, "\npanic: %s\n  --> %s\n", msg, loc);
     fflush(stderr);
+    br_unlock(&br_io_mu);
     br_gpu_settle();
     exit(101);
 }
