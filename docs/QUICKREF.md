@@ -52,6 +52,7 @@ let x = 10              # immutable
 var total = 0           # mutable
 total += x
 let (q, r) = (17 / 5, 17 % 5)   # tuple unpacking
+let (a, (b, c)) = (1, (2, 3))   # nests
 var names: [str] = []   # annotate when the type can't be inferred
 let n: i32 = 7          # ...or whenever you like
 for i: int in 0..3:     # loop variables too: `for k: str, v: int in m.items():`
@@ -81,6 +82,8 @@ for i in 0..n:          # 0, 1, ..., n-1        (also: 0..=n, range(a, b, step))
 for x in xs:            # iterates over a snapshot of xs
     pass
 for i, x in enumerate(xs):  # unpack tuples: (0, xs[0]), (1, xs[1]), ...
+    pass
+for i, (k, v) in enumerate(pairs):  # nested tuples too (also in comprehensions)
     pass
 for c in "héllo":       # each UTF-8 character, as a one-character str
     pass

@@ -1176,15 +1176,22 @@ struct Checker:
                         # `let () = ...` has no names to annotate
                         case LetPat.Tuple(ns) if len(ns) == 0:
                             pass
+                        # a nested tuple (`tup'..`) is part of a pattern reported as a whole
+                        case LetPat.Tuple(_) if init_name.starts_with("tup'"):
+                            pass
                         case LetPat.Tuple(ns):
                             let sp = ns[0].1.to(ns[len(ns) - 1].1)
-                            let names = ", ".join([x.0 for x in ns])
+                            let shown = [x.0 for x in ns if "'" not in x.0]
+                            let nested = len(shown) < len(ns)
+                            let names = ", ".join(shown) + (", ..." if nested else "")
                             # `for k, v in ...` is unpacked by a `let` the compiler adds
                             let in_for = init_name.starts_with("for'")
                             var label = f"add `: {tn}` after the `)`"
+                            if in_for and nested:
+                                label = "give every loop variable a type, e.g. `i: int, (a: int, b: str)`"
                             match t:
                                 case Ty.Tuple(ts):
-                                    if in_for and len(ts) == len(ns):
+                                    if in_for and not nested and len(ts) == len(ns):
                                         var each: [str] = []
                                         for i, x in enumerate(ns):
                                             each.push(x.0 + ": " + self.info.ty_name(ts[i]))
@@ -3111,6 +3118,53 @@ struct Checker:
                 self.err(d)
                 return Ty.Error
 
+    # The names a comprehension unpacks its element into. Each is a field of its
+    # parent (the hidden loop variable, or a hidden name for a nested tuple),
+    # which is how uses of it are checked and compiled.
+    fn comp_unpack(ref self, c: Comp, vname: str, elem: Ty, kind: LocalKind):
+        var held: {str: Ty} = {}
+        held[vname] = elem
+        var reported: [str] = []
+        for u in c.unpack:
+            let pt = held[u.parent]
+            let count = len([x for x in c.unpack if x.parent == u.parent])
+            var t = Ty.Error
+            var ok = pt.is_error()
+            match pt:
+                case Ty.Tuple(ts):
+                    if len(ts) == count:
+                        t = ts[u.index]
+                        ok = true
+                case _:
+                    pass
+            if not ok and u.parent not in reported:
+                reported.push(u.parent)
+                let tn = self.tn(pt)
+                var sp = c.name_span
+                for x in c.unpack:
+                    if x.name == u.parent:
+                        sp = x.span
+                self.err(
+                    diag.error("E0301", f"cannot unpack {tn} into {count} variables").label(sp, f"this has type {tn}")
+                )
+            held[u.name] = t
+            if u.name == "_":
+                continue
+            if "'" not in u.name:
+                match self.lookup_local(u.name):
+                    case Some(prev):
+                        let pspan = self.locals[prev].span
+                        self.err(
+                            diag.error("E0207", f"`{u.name}` is already defined in this function").label(u.span, "defined again here").label(pspan, "first defined here").with_help("brine doesn't allow shadowing; pick a new name")
+                        )
+                    case None:
+                        pass
+            if ok:
+                self.unpacks.push((u.name, u.parent, u.index))
+            else:
+                # already reported; don't report every use too
+                self.declare(u.name, u.span, Ty.Error, kind)
+
     fn check_comp(ref self, ref e: Expr, c0: Comp, exp: Option[Ty], allow_gen: bool) -> Ty:
         let span = e.span
         if self.in_spec:
@@ -3131,40 +3185,7 @@ struct Checker:
         let vname = c.name
         let unpacked = len(self.unpacks)
         if len(c.unpack) > 0:
-            var bad = false
-            var ok = false
-            match elem:
-                case Ty.Tuple(ts):
-                    ok = len(ts) == len(c.unpack)
-                case Ty.Error:
-                    ok = true
-                case _:
-                    pass
-            if not ok:
-                bad = true
-                let tn = self.tn(elem)
-                let n = len(c.unpack)
-                self.err(
-                    diag.error("E0301", f"cannot unpack {tn} into {n} variables").label(c.name_span, f"each element has type {tn}")
-                )
-            for i, u in enumerate(c.unpack):
-                let n = u.0
-                let sp = u.1
-                if n == "_":
-                    continue
-                match self.lookup_local(n):
-                    case Some(prev):
-                        let pspan = self.locals[prev].span
-                        self.err(
-                            diag.error("E0207", f"`{n}` is already defined in this function").label(sp, "defined again here").label(pspan, "first defined here").with_help("brine doesn't allow shadowing; pick a new name")
-                        )
-                    case None:
-                        pass
-                if bad:
-                    # already reported; don't report every use too
-                    self.declare(n, sp, Ty.Error, kind)
-                else:
-                    self.unpacks.push((n, vname, i))
+            self.comp_unpack(c, vname, elem, kind)
         let id = self.declare(vname, c.name_span, elem, kind)
         e.local = id
         self.no_try += 1

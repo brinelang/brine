@@ -4,7 +4,7 @@
 from diag import Span, Diag
 import diag
 from lexer import Tok, Kw, Token, FPart, lex, describe, kw_name
-from ast import TypeExpr, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Expr, ExprKind, mk
+from ast import TypeExpr, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Unpack, Expr, ExprKind, mk
 from ast import LetPat, Pattern, PatKind, Case, ContractKind, Stmt, StmtKind, Block, stmt, pattern
 from types import I128_MAX
 from ast import Param, FnDecl, FieldDecl, StructDecl, VariantDecl, EnumDecl, ConstDecl, Import, Module
@@ -19,11 +19,25 @@ fn is_int(t: Tok) -> bool:
 fn empty_block() -> Block:
     return Block(stmts=[], span=Span(file=0, lo=0, hi=0))
 
+# What a loop or `let` unpacks into: a name, or a parenthesized tuple of targets.
+enum Target:
+    Name(name: str, span: Span, ty: Option[TypeExpr])
+    Tuple(items: [Target], span: Span)
+
+    fn span(self) -> Span:
+        match self:
+            case Target.Name(_, s, _):
+                return s
+            case Target.Tuple(_, s):
+                return s
+
 struct Parser:
     toks: [Token]
     pos: int
     file: int
     diags: [Diag]
+    # statements to add after the one just parsed (the unpacking of nested tuples)
+    pending: [Stmt]
 
     # ------------------------------------------------------------ helpers
     fn peek(self) -> Tok:
@@ -563,6 +577,7 @@ struct Parser:
         if not self.at(Tok.Newline):
             # single-line block: `if x: return 1`
             stmts.push(self.simple_stmt()?)
+            self.take_pending(ref stmts)
         else:
             self.bump()
             if not self.eat(Tok.Indent):
@@ -579,7 +594,9 @@ struct Parser:
                 match self.stmt():
                     case Ok(s):
                         stmts.push(s)
+                        self.take_pending(ref stmts)
                     case Err(_):
+                        self.pending = []
                         self.sync_line()
                 self.skip_newlines()
             self.eat(Tok.Dedent)
@@ -636,49 +653,85 @@ struct Parser:
 
     fn for_stmt(ref self, is_par: bool) -> Result[Stmt, ()]:
         let start = self.bump()
-        var (name, name_span) = self.expect_ident("loop variable")?
-        var t = self.loop_var_type()?
+        let items = self.targets("loop variable", true)?
+        let name_span = items[0].span().to(items[len(items) - 1].span())
+        var name = ""
+        var t: Option[TypeExpr] = None
         # `for k, v in m.items():` loops over a hidden variable and unpacks it first thing
-        var names: [(str, Span)] = []
-        var unpack_ty: Option[TypeExpr] = None
-        if self.at(Tok.Comma):
-            names.push((name, name_span))
-            var tys: [Option[TypeExpr]] = [t]
-            t = None
-            while self.eat(Tok.Comma):
-                names.push(self.expect_ident("loop variable")?)
-                tys.push(self.loop_var_type()?)
-            let (_, first) = names[0]
-            let (_, last) = names[len(names) - 1]
-            name_span = first.to(last)
-            name = f"for'{name_span.lo}"
-            # `for k: str, v: int in ...`: all typed or none
-            let typed = len([x for x in tys if x.is_some()])
-            if typed == len(tys):
-                let elems = [x.unwrap() for x in tys]
-                let tspan = elems[0].span().to(elems[len(elems) - 1].span())
-                unpack_ty = Some(TypeExpr.Tuple(elems, tspan))
-            elif typed > 0:
-                self.diags.push(
-                    diag.error("E0110", "give every loop variable a type, or none").label(name_span, "some of these have types and some don't")
-                )
-                return Err(())
+        var lets: [Stmt] = []
+        match items[0]:
+            case Target.Name(n, _, nt) if len(items) == 1:
+                name = n
+                t = nt
+            case _:
+                name = f"for'{name_span.lo}"
+                let tuple = self.tuple_items(items, name_span)?
+                self.all_typed_or_none(tuple, name_span)?
+                lets = unpack_lets(unpack_items(tuple, name, None), false)
         if not self.eat_kw(Kw.In):
             self.report("E0110", "expected `in` after the loop variable", "expected `in`")
             return Err(())
         let iter = self.or_expr()?
         self.expect(Tok.Colon, "`:`")?
         var (body, invs) = self.block([ContractKind.Invariant])?
-        if len(names) > 0:
-            let init = mk(ExprKind.Ident(name), name_span)
-            let unpack = stmt(
-                StmtKind.Let(false, LetPat.Tuple(names), unpack_ty, init, false),
-                name_span
-            )
-            body.stmts.insert(0, unpack)
+        lets.extend(body.stmts)
+        body.stmts = lets
         return Ok(
             stmt(StmtKind.For(name, name_span, t, iter, [e for _, e in invs], body, is_par), start.to(name_span))
         )
+
+    # `a`, `a, b`, `(a, b)` or `i, (a, b)`: what a loop or `let` assigns. Loop
+    # variables can have types (`k: str, v: int`); a `let` has one for the whole.
+    fn targets(ref self, what: str, typed: bool) -> Result[[Target], ()]:
+        var items = [self.target(what, typed)?]
+        while self.eat(Tok.Comma):
+            items.push(self.target(what, typed)?)
+        return Ok(items)
+
+    fn target(ref self, what: str, typed: bool) -> Result[Target, ()]:
+        if self.at(Tok.LParen):
+            let lo = self.bump()
+            var items: [Target] = []
+            while not self.at(Tok.RParen):
+                items.push(self.target(what, typed)?)
+                if not self.eat(Tok.Comma):
+                    break
+            self.expect(Tok.RParen, "`)`")?
+            return Ok(Target.Tuple(items, lo.to(self.prev_span())))
+        let (n, sp) = self.expect_ident(what)?
+        var t: Option[TypeExpr] = None
+        if typed:
+            t = self.loop_var_type()?
+        return Ok(Target.Name(n, sp, t))
+
+    # The names a loop unpacks each element into: `(a, b)` on its own is `a, b`.
+    fn tuple_items(ref self, items: [Target], span: Span) -> Result[[Target], ()]:
+        match items[0]:
+            case Target.Tuple(inner, _) if len(items) == 1:
+                if len(inner) == 0:
+                    self.diags.push(
+                        diag.error("E0110", "expected loop variables in the `()`").label(span, "nothing to unpack into")
+                    )
+                    return Err(())
+                return Ok(inner)
+            case _:
+                return Ok(items)
+
+    # `for k: str, v: int in ...`: all typed or none
+    fn all_typed_or_none(ref self, items: [Target], span: Span) -> Result[(), ()]:
+        var typed = 0
+        var names = 0
+        count_typed(items, ref typed, ref names)
+        if typed > 0 and typed < names:
+            self.diags.push(
+                diag.error("E0110", "give every loop variable a type, or none").label(span, "some of these have types and some don't")
+            )
+            return Err(())
+        return Ok(())
+
+    fn take_pending(ref self, ref stmts: [Stmt]):
+        stmts.extend(self.pending)
+        self.pending = []
 
     fn case_clause(ref self) -> Result[Case, ()]:
         if not self.at_kw(Kw.Case):
@@ -870,33 +923,33 @@ struct Parser:
         if t == Tok.Keyword(Kw.Elif) or t == Tok.Keyword(Kw.Else):
             self.pos = i
 
-    fn let_pat(ref self) -> Result[LetPat, ()]:
-        if self.at(Tok.LParen):
-            self.bump()
-            var names: [(str, Span)] = []
-            while not self.at(Tok.RParen):
-                names.push(self.expect_ident("variable name")?)
-                if not self.eat(Tok.Comma):
-                    break
-            self.expect(Tok.RParen, "`)`")?
-            return Ok(LetPat.Tuple(names))
-        let (first, first_span) = self.expect_ident("variable name")?
-        if not self.at(Tok.Comma):
-            return Ok(LetPat.Name(first, first_span))
-        var names = [(first, first_span)]
-        while self.eat(Tok.Comma):
-            names.push(self.expect_ident("variable name")?)
-        return Ok(LetPat.Tuple(names))
-
     fn simple_kind(ref self) -> Result[StmtKind, ()]:
         match self.peek():
             case Tok.Keyword(Kw.Let) | Tok.Keyword(Kw.Var):
                 let mutable = self.at_kw(Kw.Var)
                 self.bump()
-                let pat = self.let_pat()?
+                let lo = self.span()
+                let items = self.targets("variable name", false)?
                 var ty: Option[TypeExpr] = None
                 if self.eat(Tok.Colon):
                     ty = Some(self.type_expr()?)
+                var pat = LetPat.Tuple([])
+                var tuple = items
+                match items[0]:
+                    case Target.Name(n, sp, _) if len(items) == 1:
+                        pat = LetPat.Name(n, sp)
+                    case Target.Tuple(inner, _) if len(items) == 1:
+                        tuple = inner
+                    case _:
+                        pass
+                match pat:
+                    case LetPat.Tuple(_):
+                        # nested tuples are unpacked by `let`s that follow
+                        let us = unpack_items(tuple, "", ty)
+                        pat = LetPat.Tuple([(u.name, u.span) for u in us if u.parent == ""])
+                        self.pending.extend(unpack_lets([u for u in us if u.parent != ""], mutable))
+                    case _:
+                        pass
                 if not self.at(Tok.Assign):
                     let d = self.error_here(
                         "E0110",
@@ -1177,15 +1230,17 @@ struct Parser:
 
     fn comp_tail(ref self, body: Expr, kind: CompKind) -> Result[Expr, ()]:
         self.bump()
-        var (name, name_span) = self.expect_ident("loop variable")?
+        let items = self.targets("loop variable", false)?
+        var name = ""
+        let name_span = items[0].span().to(items[len(items) - 1].span())
         # `[v for k, v in pairs]`: unpack each element
-        var unpack: [(str, Span)] = []
-        if self.at(Tok.Comma):
-            unpack.push((name, name_span))
-            while self.eat(Tok.Comma):
-                unpack.push(self.expect_ident("loop variable")?)
-            name_span = unpack[0].1.to(unpack[len(unpack) - 1].1)
-            name = f"for'{name_span.lo}"
+        var unpack: [Unpack] = []
+        match items[0]:
+            case Target.Name(n, _, _) if len(items) == 1:
+                name = n
+            case _:
+                name = f"for'{name_span.lo}"
+                unpack = unpack_items(self.tuple_items(items, name_span)?, name, None)
         if not self.eat_kw(Kw.In):
             self.report("E0110", "expected `in`", "expected `in`")
             return Err(())
@@ -1473,7 +1528,7 @@ struct Parser:
                 case FPart.Expr(src, offset, spec):
                     let (toks, lex_diags) = lex(src, self.file, offset, false, false)
                     self.diags.extend(lex_diags)
-                    var sub = Parser(toks=toks, pos=0, file=self.file, diags=[])
+                    var sub = Parser(toks=toks, pos=0, file=self.file, diags=[], pending=[])
                     let r = sub.expr()
                     if r.is_ok() and not sub.at(Tok.Eof):
                         sub.diags.push(
@@ -1493,8 +1548,78 @@ struct Parser:
 # Parse a whole file: the module and every error, the lexer's first.
 fn parse_module(text: str, file: int, name: str) -> (Module, [Diag]):
     let (toks, lex_diags) = lex(text, file, 0, false, true)
-    var p = Parser(toks=toks, pos=0, file=file, diags=[])
+    var p = Parser(toks=toks, pos=0, file=file, diags=[], pending=[])
     let m = p.module(name)
     var diags = lex_diags
     diags.extend(p.diags)
     return (m, diags)
+
+# The names `items` unpack `parent` into, nested tuples flattened: each gets a
+# hidden name (`tup'<offset>`) unpacked in turn. `ty` is the written type of
+# the whole tuple, if any.
+fn unpack_items(items: [Target], parent: str, ty: Option[TypeExpr]) -> [Unpack]:
+    var out: [Unpack] = []
+    flatten(items, parent, ty, ref out)
+    return out
+
+fn flatten(items: [Target], parent: str, ty: Option[TypeExpr], ref out: [Unpack]):
+    var elems: [Option[TypeExpr]] = [None for _ in items]
+    match ty:
+        case Some(TypeExpr.Tuple(es, _)):
+            if len(es) == len(items):
+                elems = [Some(e) for e in es]
+        case _:
+            pass
+    for i, t in enumerate(items):
+        match t:
+            case Target.Name(n, sp, nt):
+                let written = nt if nt.is_some() else elems[i]
+                out.push(Unpack(name=n, span=sp, parent=parent, index=i, ty=written))
+            case Target.Tuple(sub, sp):
+                let hidden = f"tup'{sp.lo}"
+                let written = elems[i] if elems[i].is_some() else target_type(t)
+                out.push(Unpack(name=hidden, span=sp, parent=parent, index=i, ty=written))
+                flatten(sub, hidden, written, ref out)
+
+# the type written on every name of a target, as one type (None if any is missing)
+fn target_type(t: Target) -> Option[TypeExpr]:
+    match t:
+        case Target.Name(_, _, ty):
+            return ty
+        case Target.Tuple(items, sp):
+            var tys: [TypeExpr] = []
+            for x in items:
+                match target_type(x):
+                    case Some(xt):
+                        tys.push(xt)
+                    case None:
+                        return None
+            return Some(TypeExpr.Tuple(tys, sp))
+
+fn count_typed(items: [Target], ref typed: int, ref names: int):
+    for t in items:
+        match t:
+            case Target.Name(_, _, ty):
+                names += 1
+                if ty.is_some():
+                    typed += 1
+            case Target.Tuple(sub, _):
+                count_typed(sub, ref typed, ref names)
+
+# One `let (a, b) = parent` per variable that is unpacked, outer ones first.
+fn unpack_lets(us: [Unpack], mutable: bool) -> [Stmt]:
+    var parents: [str] = []
+    for u in us:
+        if u.parent not in parents:
+            parents.push(u.parent)
+    var out: [Stmt] = []
+    for p in parents:
+        let group = [u for u in us if u.parent == p]
+        let span = group[0].span.to(group[len(group) - 1].span)
+        var ty: Option[TypeExpr] = None
+        if all(u.ty.is_some() for u in group):
+            ty = Some(TypeExpr.Tuple([u.ty.unwrap() for u in group], span))
+        let names = [(u.name, u.span) for u in group]
+        let init = mk(ExprKind.Ident(p), span)
+        out.push(stmt(StmtKind.Let(mutable, LetPat.Tuple(names), ty, init, false), span))
+    return out
