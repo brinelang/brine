@@ -1765,10 +1765,14 @@ typedef struct br_job {
     void *ctx;
     int64_t lo, n, k;
     int64_t next;
-    int refs;
     uint64_t id;
 } br_job;
 
+/* The running job is published in `cur` (and its number in `ids`); a worker
+   counts itself in `active` before it reads `cur`, and the thread that posted
+   the job clears `cur` and waits for `active` to drain before the job (on its
+   stack) goes away. Joining and leaving take no lock; `mu` is only for
+   sleeping. */
 static struct {
     br_mutex mu;
     br_cond cv_work, cv_done;
@@ -1777,6 +1781,8 @@ static struct {
     int started;
     br_job *cur;
     uint64_t ids;
+    int active;
+    int main_waits;
 } br_pool;
 
 static _Thread_local int br_in_par = 0;
@@ -1794,6 +1800,20 @@ static int br_threads(void) {
     return br_pool.nthreads;
 }
 
+/* Waking a sleeping thread takes tens of microseconds, longer than many
+   parallel regions run, so threads busy-wait a little before they sleep. */
+#if defined(__x86_64__) || defined(__i386__)
+#define BR_RELAX() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+#define BR_RELAX() __asm__ __volatile__("yield")
+#else
+#define BR_RELAX() ((void)0)
+#endif
+#define BR_SPINS 20000
+static void br_spin_while_eq(uint64_t *p, uint64_t v) {
+    for (int i = 0; i < BR_SPINS && __atomic_load_n(p, __ATOMIC_ACQUIRE) == v; i++) BR_RELAX();
+}
+
 static void br_run_chunks(br_job *j) {
     int64_t base = j->n / j->k, rem = j->n % j->k;
     for (;;) {
@@ -1808,18 +1828,24 @@ static void br_run_chunks(br_job *j) {
 static void br_worker(void *arg) {
     (void)arg;
     br_in_par = 1;
-    uint64_t last = 0;
-    br_lock(&br_pool.mu);
+    uint64_t seen = 0;
     for (;;) {
-        while (!(br_pool.cur && br_pool.cur->id != last)) br_cond_wait(&br_pool.cv_work, &br_pool.mu);
-        br_job *j = br_pool.cur;
-        last = j->id;
-        j->refs++;
-        br_unlock(&br_pool.mu);
-        br_run_chunks(j);
-        br_lock(&br_pool.mu);
-        j->refs--;
-        br_cond_broadcast(&br_pool.cv_done);
+        br_spin_while_eq(&br_pool.ids, seen);
+        if (__atomic_load_n(&br_pool.ids, __ATOMIC_SEQ_CST) == seen) {
+            br_lock(&br_pool.mu);
+            while (__atomic_load_n(&br_pool.ids, __ATOMIC_SEQ_CST) == seen) br_cond_wait(&br_pool.cv_work, &br_pool.mu);
+            br_unlock(&br_pool.mu);
+        }
+        seen = __atomic_load_n(&br_pool.ids, __ATOMIC_SEQ_CST);
+        __atomic_add_fetch(&br_pool.active, 1, __ATOMIC_SEQ_CST);
+        br_job *j = __atomic_load_n(&br_pool.cur, __ATOMIC_SEQ_CST);
+        if (j) br_run_chunks(j);
+        if (__atomic_sub_fetch(&br_pool.active, 1, __ATOMIC_SEQ_CST) == 0 &&
+            __atomic_load_n(&br_pool.main_waits, __ATOMIC_SEQ_CST)) {
+            br_lock(&br_pool.mu);
+            br_cond_broadcast(&br_pool.cv_done);
+            br_unlock(&br_pool.mu);
+        }
     }
 }
 
@@ -1832,7 +1858,6 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
     job.n = hi - lo;
     job.k = nchunks;
     job.next = 0;
-    job.refs = 0;
     if (nchunks == 1 || br_in_par || br_threads() <= 1 || !br_trylock(&br_pool.job_lock)) {
         br_run_chunks(&job);
         return;
@@ -1845,17 +1870,23 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
         }
     }
     br_lock(&br_pool.mu);
-    job.id = ++br_pool.ids;
-    br_pool.cur = &job;
+    job.id = br_pool.ids + 1;
+    __atomic_store_n(&br_pool.cur, &job, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&br_pool.ids, job.id, __ATOMIC_SEQ_CST);
     br_cond_broadcast(&br_pool.cv_work);
     br_unlock(&br_pool.mu);
     br_in_par = 1;
     br_run_chunks(&job);
     br_in_par = 0;
-    br_lock(&br_pool.mu);
-    br_pool.cur = NULL;
-    while (job.refs > 0) br_cond_wait(&br_pool.cv_done, &br_pool.mu);
-    br_unlock(&br_pool.mu);
+    __atomic_store_n(&br_pool.cur, (br_job *)NULL, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < BR_SPINS && __atomic_load_n(&br_pool.active, __ATOMIC_SEQ_CST) > 0; i++) BR_RELAX();
+    if (__atomic_load_n(&br_pool.active, __ATOMIC_SEQ_CST) > 0) {
+        br_lock(&br_pool.mu);
+        __atomic_store_n(&br_pool.main_waits, 1, __ATOMIC_SEQ_CST);
+        while (__atomic_load_n(&br_pool.active, __ATOMIC_SEQ_CST) > 0) br_cond_wait(&br_pool.cv_done, &br_pool.mu);
+        __atomic_store_n(&br_pool.main_waits, 0, __ATOMIC_SEQ_CST);
+        br_unlock(&br_pool.mu);
+    }
     br_unlock(&br_pool.job_lock);
 }
 
