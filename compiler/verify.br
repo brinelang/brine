@@ -62,6 +62,9 @@ struct FnSpec:
     result: Option[int]
 
 const TAG_ARITH = 0
+# Largest disjunction (in formula nodes) a merge of two branches keeps. Past
+# that the solver spends its time re-reading it; dropping it only loses facts.
+const MERGE_MAX = 256
 const TAG_INDEX = 1
 const TAG_ASSERT = 2
 
@@ -77,6 +80,8 @@ fn verify_program(ref prog: Program, info: ProgramInfo, sm: SourceMap) -> Report
                     f.id
                 ] = Some(FnSpec(name=f.name, params=f.param_locals, requires=f.requires, ensures=f.ensures, result=f.result_local))
     var report = Report(diags=[], remaining=[], proven=0)
+    # `BRINE_TIMES=2`: the functions that take the prover long
+    let slow_fns = getenv("BRINE_TIMES") == Some("2")
     for mi in 0..len(prog.modules):
         let nf = len(prog.modules[mi].fns)
         let nt = len(prog.modules[mi].tests)
@@ -84,8 +89,13 @@ fn verify_program(ref prog: Program, info: ProgramInfo, sm: SourceMap) -> Report
             let f = prog.modules[mi].fns[k] if k < nf else prog.modules[mi].tests[k - nf]
             if f.is_extern:
                 continue
+            let t0 = clock()
             var v = new_vf(info, specs, sm, f)
             v.run(f)
+            if slow_fns:
+                let dt = clock() - t0
+                if dt > 0.02:
+                    eprint(f"  verify {f.name}: {dt:.3f}s")
             report.diags.extend(v.diags)
             report.remaining.extend(v.remaining)
             var proven: {(int, int, int, int): bool} = {}
@@ -1197,7 +1207,14 @@ struct Vf:
         fa.extend(ea)
         var fb = b.facts[k:]
         fb.extend(eb)
-        facts.push(F.or_([F.and_(fa), F.and_(fb)]))
+        let both = F.or_([F.and_(fa), F.and_(fb)])
+        if both.size() <= MERGE_MAX:
+            facts.push(both)
+        else:
+            # too big: keep what both branches agree on
+            for f in fa:
+                if f in fb:
+                    facts.push(f)
         return Some(St(env=env, facts=facts))
 
     fn if_chain(ref self, branches: [(Expr, Block)], els: Option[Block]):
