@@ -308,10 +308,12 @@ static inline double brine_f_pow(double a, double b) { return pow(a, b); }
 /* float `%` also takes the sign of the divisor, like Python */
 static inline double brine_f_fmod(double a, double b) { double r = fmod(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
 static inline float brine_f_fmodf(float a, float b) { float r = fmodf(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
-static inline double brine_f_fmin(double a, double b) { return fmin(a, b); }
-static inline double brine_f_fmax(double a, double b) { return fmax(a, b); }
-static inline float brine_f_fminf(float a, float b) { return fminf(a, b); }
-static inline float brine_f_fmaxf(float a, float b) { return fmaxf(a, b); }
+/* float min and max: a NaN loses to a number, and -0.0 is less than 0.0 (C's
+ * fmin may return either zero), so the result is the same on every platform
+ * and on a GPU (ptx.br) */
+#define BR_MINMAX(T, S)                                                             static inline T brine_f_fmin##S(T a, T b) {                                       if (a < b || b != b) return a;                                                 if (b < a || a != a) return b;                                                 return signbit(a) ? a : b;                                                 }                                                                              static inline T brine_f_fmax##S(T a, T b) {                                       if (a > b || b != b) return a;                                                 if (b > a || a != a) return b;                                                 return signbit(a) ? b : a;                                                 }
+BR_MINMAX(double, )
+BR_MINMAX(float, f)
 
 /* ------------------------------------------------------------ checked integer arithmetic */
 /* UT is the unsigned type shifts are done in */
