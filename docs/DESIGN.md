@@ -206,9 +206,12 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
   split into one translation unit per core (by a hash of each function's name, each
   unit declaring only what it uses), compiled in parallel; an edit recompiles only
   the units it touches. An unchanged program skips the link (`.brine-hash` stamp).
+* **Parallel:** the compiler uses `par` itself: imported modules are parsed a wave
+  of imports at a time, and the prover takes every function on its own. Results
+  are combined in a fixed order, so the output doesn't depend on the thread count.
 * **Timing:** `BRINE_TIMES=1` prints the time of each phase; `BRINE_TIMES=2` also
   names the functions the prover is slow on. `BRINE_BACKEND=c` or `=native` picks
-  the backend.
+  the backend (a build with an overridden backend gets its own output folder).
 
 ### Backends
 The **brine IR** (`compiler/ir.br`) sits between the verifier and code generation:
