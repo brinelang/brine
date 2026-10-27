@@ -368,7 +368,14 @@ parallel translation units with per-unit caching.
 register allocation and optimization passes on the IR; a built-in linker and a
 prebuilt runtime, so builds don't need a C toolchain at all; SIMD, MSVC support for
 the C backend. GPUs (§2.3): arrays kept on the device between constructs, `par(...)`
-forks and nested constructs, other vendors (SPIR-V, Metal).
+forks and nested constructs.
+
+**TODO: AMD and Intel GPUs**, once there is hardware to test on: Vulkan compute
+with SPIR-V kernels (the driver loaded at run time, as CUDA is), exactly rounded
+`/` and `sqrt` in the kernels, a capability check for denormals and f64, and a
+self-test kernel at startup that turns the GPU off if its results differ from the
+CPU's. NVIDIA and lavapipe (Mesa's CPU Vulkan) can test most of it, but not each
+vendor's own shader compiler, so it waits for real devices.
 
 **Proofs:** generic bodies checked once against constraints (rather than per
 instance), quantifiers in specs (`forall i in 0..n: a[i] >= 0`), array-content
