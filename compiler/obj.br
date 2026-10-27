@@ -1,0 +1,416 @@
+# Relocatable object files for the native backend: an in-memory object
+# (sections, symbols, relocations) and writers for COFF (Windows) and ELF64
+# (Linux), both x86-64.
+
+from ir import str_bytes
+
+# sections
+const SEC_UNDEF = 0
+const SEC_TEXT = 1
+const SEC_DATA = 2
+const SEC_RODATA = 3
+
+# Relocation kinds. Addends follow ELF: the value stored is S + A (absolute) or
+# S + A - P (pc-relative, P = the address of the 4-byte field).
+# a rip-relative data reference (lea / mov / ... [rip + disp32])
+const R_PC32 = 0
+# call rel32
+const R_CALL = 1
+# an 8-byte absolute address in data
+const R_ABS64 = 2
+# ELF only: `mov r64, [rip + disp32]` loading the address from the GOT
+const R_GOT = 3
+
+struct OSym:
+    name: str
+    # SEC_*; SEC_UNDEF for external symbols
+    sec: int
+    off: int
+    global: bool
+    func: bool
+
+struct ORel:
+    off: int
+    sym: int
+    kind: int
+    add: int
+
+struct ObjFile:
+    text: [u8]
+    data: [u8]
+    rodata: [u8]
+    # alignment of each section (a power of two)
+    text_align: int
+    data_align: int
+    rodata_align: int
+    syms: [OSym]
+    trel: [ORel]
+    drel: [ORel]
+    rrel: [ORel]
+
+fn new_obj() -> ObjFile:
+    return ObjFile(
+        text=[],
+        data=[],
+        rodata=[],
+        text_align=16,
+        data_align=16,
+        rodata_align=16,
+        syms=[],
+        trel=[],
+        drel=[],
+        rrel=[]
+    )
+
+# ================================================================ bytes
+
+fn put8(ref out: [u8], v: int):
+    out.push(u8(v & 255))
+
+fn put16(ref out: [u8], v: int):
+    out.push(u8(v & 255))
+    out.push(u8((v >> 8) & 255))
+
+fn put32(ref out: [u8], v: int):
+    out.push(u8(v & 255))
+    out.push(u8((v >> 8) & 255))
+    out.push(u8((v >> 16) & 255))
+    out.push(u8((v >> 24) & 255))
+
+fn put64(ref out: [u8], v: int):
+    put32(ref out, v & 4294967295)
+    put32(ref out, (v >> 32) & 4294967295)
+
+fn set32(ref out: [u8], at: int, v: int):
+    out[at] = u8(v & 255)
+    out[at + 1] = u8((v >> 8) & 255)
+    out[at + 2] = u8((v >> 16) & 255)
+    out[at + 3] = u8((v >> 24) & 255)
+
+fn set64(ref out: [u8], at: int, v: int):
+    set32(ref out, at, v & 4294967295)
+    set32(ref out, at + 4, (v >> 32) & 4294967295)
+
+fn pad_to(ref out: [u8], align: int):
+    while len(out) % align != 0:
+        out.push(0)
+
+fn append(ref out: [u8], ref b: [u8]):
+    out.extend(b)
+
+# a fixed-size name field (COFF section names)
+fn put_name8(ref out: [u8], s: str):
+    let bs = s.bytes()
+    for i in 0..8:
+        if i < len(bs):
+            out.push(u8(bs[i]))
+        else:
+            out.push(0)
+
+fn log2(n: int) -> int:
+    var k = 0
+    while (1 << k) < n:
+        k += 1
+    return k
+
+# ================================================================ COFF
+
+fn coff_reloc_type(kind: int) -> int:
+    if kind == R_ABS64:
+        # IMAGE_REL_AMD64_ADDR64
+        return 1
+    # IMAGE_REL_AMD64_REL32
+    return 4
+
+# COFF keeps addends in the section bytes: REL32 adds the stored value to
+# S - (P + 4), ADDR64 to S.
+fn coff_addends(ref sec: [u8], rels: [ORel]):
+    for r in rels:
+        if r.kind == R_ABS64:
+            set64(ref sec, r.off, r.add)
+        else:
+            set32(ref sec, r.off, r.add + 4)
+
+fn coff_relocs(ref out: [u8], ref rels: [ORel], ref map: [int]):
+    if len(rels) >= 65535:
+        # IMAGE_SCN_LNK_NRELOC_OVFL: the first entry holds the count
+        put32(ref out, len(rels) + 1)
+        put32(ref out, 0)
+        put16(ref out, 0)
+    for r in rels:
+        put32(ref out, r.off)
+        put32(ref out, map[r.sym])
+        put16(ref out, coff_reloc_type(r.kind))
+
+fn coff_align_flag(a: int) -> int:
+    # IMAGE_SCN_ALIGN_<a>BYTES
+    return (log2(a) + 1) << 20
+
+fn write_coff(ref o: ObjFile) -> [u8]:
+    coff_addends(ref o.text, o.trel)
+    coff_addends(ref o.data, o.drel)
+    coff_addends(ref o.rodata, o.rrel)
+    var map = [0] * len(o.syms)
+    for i in 0..len(o.syms):
+        map[i] = i
+    let nsec = 3
+    let hdr = 20 + 40 * nsec
+    var pos = hdr
+    var secs: [[int]] = []
+    # [raw ptr, raw size, reloc ptr, nrel]
+    let sizes = [len(o.text), len(o.data), len(o.rodata)]
+    let nrels = [len(o.trel), len(o.drel), len(o.rrel)]
+    for i in 0..nsec:
+        pos = (pos + 15) / 16 * 16
+        let raw = pos
+        pos += sizes[i]
+        pos = (pos + 3) / 4 * 4
+        let rel = pos
+        var nr = nrels[i]
+        if nr >= 65535:
+            nr += 1
+        pos += 10 * nr
+        secs.push([raw, sizes[i], rel, nrels[i]])
+    pos = (pos + 3) / 4 * 4
+    let symtab = pos
+    var out: [u8] = []
+    # file header
+    put16(ref out, 34404)
+    put16(ref out, nsec)
+    put32(ref out, 0)
+    put32(ref out, symtab)
+    put32(ref out, len(o.syms))
+    put16(ref out, 0)
+    put16(ref out, 0)
+    let names = [".text", ".data", ".rdata"]
+    let flags = [
+        1610612768 | coff_align_flag(o.text_align),
+        3221225536 | coff_align_flag(o.data_align),
+        1073741888 | coff_align_flag(o.rodata_align)
+    ]
+    for i in 0..nsec:
+        let s = secs[i]
+        put_name8(ref out, names[i])
+        put32(ref out, 0)
+        put32(ref out, 0)
+        put32(ref out, s[1])
+        put32(ref out, s[0] if s[1] > 0 else 0)
+        put32(ref out, s[2] if s[3] > 0 else 0)
+        put32(ref out, 0)
+        var fl = flags[i]
+        if s[3] >= 65535:
+            put16(ref out, 65535)
+            fl = fl | 16777216
+        else:
+            put16(ref out, s[3])
+        put16(ref out, 0)
+        put32(ref out, fl)
+    for i in 0..nsec:
+        pad_to(ref out, 16)
+        if i == 0:
+            append(ref out, ref o.text)
+        elif i == 1:
+            append(ref out, ref o.data)
+        else:
+            append(ref out, ref o.rodata)
+        pad_to(ref out, 4)
+        if i == 0:
+            coff_relocs(ref out, ref o.trel, ref map)
+        elif i == 1:
+            coff_relocs(ref out, ref o.drel, ref map)
+        else:
+            coff_relocs(ref out, ref o.rrel, ref map)
+    pad_to(ref out, 4)
+    # symbols
+    var strs: [u8] = []
+    put32(ref strs, 0)
+    for s in o.syms:
+        let bs = s.name.bytes()
+        if len(bs) <= 8:
+            put_name8(ref out, s.name)
+        else:
+            put32(ref out, 0)
+            put32(ref out, len(strs))
+            str_bytes(ref strs, s.name)
+            strs.push(0)
+        put32(ref out, s.off if s.sec != SEC_UNDEF else 0)
+        put16(ref out, s.sec)
+        put16(ref out, 32 if s.func else 0)
+        out.push(u8(2 if s.global or s.sec == SEC_UNDEF else 3))
+        out.push(0)
+    set32(ref strs, 0, len(strs))
+    append(ref out, ref strs)
+    return out
+
+# ================================================================ ELF64
+
+fn elf_reloc_type(kind: int) -> int:
+    match kind:
+        case 0:
+            # R_X86_64_PC32
+            return 2
+        case 1:
+            # R_X86_64_PLT32
+            return 4
+        case 2:
+            # R_X86_64_64
+            return 1
+        case _:
+            # R_X86_64_GOTPCREL
+            return 9
+
+fn elf_relocs(ref rels: [ORel], ref map: [int]) -> [u8]:
+    var out: [u8] = []
+    for r in rels:
+        put64(ref out, r.off)
+        put32(ref out, elf_reloc_type(r.kind))
+        put32(ref out, map[r.sym])
+        put64(ref out, r.add)
+    return out
+
+fn elf_shdr(
+    ref out: [u8],
+    name: int,
+    typ: int,
+    flags: int,
+    off: int,
+    size: int,
+    link: int,
+    info: int,
+    align: int,
+    entsize: int
+):
+    put32(ref out, name)
+    put32(ref out, typ)
+    put64(ref out, flags)
+    put64(ref out, 0)
+    put64(ref out, off)
+    put64(ref out, size)
+    put32(ref out, link)
+    put32(ref out, info)
+    put64(ref out, align)
+    put64(ref out, entsize)
+
+fn write_elf(ref o: ObjFile) -> [u8]:
+    # symbol order: null, locals, then globals (ELF requires it)
+    let n = len(o.syms)
+    var map = [0] * n
+    var order: [int] = []
+    for i in 0..n:
+        if not (o.syms[i].global or o.syms[i].sec == SEC_UNDEF):
+            map[i] = len(order) + 1
+            order.push(i)
+    let first_global = len(order) + 1
+    for i in 0..n:
+        if o.syms[i].global or o.syms[i].sec == SEC_UNDEF:
+            map[i] = len(order) + 1
+            order.push(i)
+    var strtab: [u8] = [0]
+    var symtab: [u8] = []
+    for _ in 0..24:
+        symtab.push(0)
+    for i in order:
+        let s = o.syms[i]
+        put32(ref symtab, len(strtab))
+        str_bytes(ref strtab, s.name)
+        strtab.push(0)
+        let bind = 1 if s.global or s.sec == SEC_UNDEF else 0
+        var typ = 0
+        if s.sec != SEC_UNDEF:
+            typ = 2 if s.func else 1
+        symtab.push(u8(bind * 16 + typ))
+        symtab.push(0)
+        put16(ref symtab, s.sec)
+        put64(ref symtab, s.off if s.sec != SEC_UNDEF else 0)
+        put64(ref symtab, 0)
+    var rt = elf_relocs(ref o.trel, ref map)
+    var rd = elf_relocs(ref o.drel, ref map)
+    var rr = elf_relocs(ref o.rrel, ref map)
+    var shstr: [u8] = [0]
+    let names = [
+        ".text",
+        ".data",
+        ".rodata",
+        ".rela.text",
+        ".rela.data",
+        ".rela.rodata",
+        ".symtab",
+        ".strtab",
+        ".shstrtab",
+        ".note.GNU-stack"
+    ]
+    var name_off: [int] = [0]
+    for nm in names:
+        name_off.push(len(shstr))
+        str_bytes(ref shstr, nm)
+        shstr.push(0)
+    var out: [u8] = []
+    for _ in 0..64:
+        out.push(0)
+    # section contents, remembering offsets
+    var offs = [0] * 11
+    pad_to(ref out, 16)
+    offs[1] = len(out)
+    append(ref out, ref o.text)
+    pad_to(ref out, 16)
+    offs[2] = len(out)
+    append(ref out, ref o.data)
+    pad_to(ref out, 16)
+    offs[3] = len(out)
+    append(ref out, ref o.rodata)
+    pad_to(ref out, 8)
+    offs[4] = len(out)
+    append(ref out, ref rt)
+    offs[5] = len(out)
+    append(ref out, ref rd)
+    offs[6] = len(out)
+    append(ref out, ref rr)
+    offs[7] = len(out)
+    append(ref out, ref symtab)
+    offs[8] = len(out)
+    append(ref out, ref strtab)
+    offs[9] = len(out)
+    append(ref out, ref shstr)
+    offs[10] = len(out)
+    pad_to(ref out, 8)
+    let shoff = len(out)
+    for _ in 0..64:
+        out.push(0)
+    # SHF_ALLOC 2, SHF_WRITE 1, SHF_EXECINSTR 4, SHF_INFO_LINK 64
+    elf_shdr(ref out, name_off[1], 1, 6, offs[1], len(o.text), 0, 0, o.text_align, 0)
+    elf_shdr(ref out, name_off[2], 1, 3, offs[2], len(o.data), 0, 0, o.data_align, 0)
+    elf_shdr(ref out, name_off[3], 1, 2, offs[3], len(o.rodata), 0, 0, o.rodata_align, 0)
+    elf_shdr(ref out, name_off[4], 4, 64, offs[4], len(rt), 7, 1, 8, 24)
+    elf_shdr(ref out, name_off[5], 4, 64, offs[5], len(rd), 7, 2, 8, 24)
+    elf_shdr(ref out, name_off[6], 4, 64, offs[6], len(rr), 7, 3, 8, 24)
+    elf_shdr(ref out, name_off[7], 2, 0, offs[7], len(symtab), 8, first_global, 8, 24)
+    elf_shdr(ref out, name_off[8], 3, 0, offs[8], len(strtab), 0, 0, 1, 0)
+    elf_shdr(ref out, name_off[9], 3, 0, offs[9], len(shstr), 0, 0, 1, 0)
+    elf_shdr(ref out, name_off[10], 1, 0, offs[10], 0, 0, 0, 1, 0)
+    # ELF header
+    out[0] = 127
+    out[1] = 69
+    out[2] = 76
+    out[3] = 70
+    # 64-bit, little endian, version 1
+    out[4] = 2
+    out[5] = 1
+    out[6] = 1
+    var h: [u8] = []
+    # ET_REL, EM_X86_64, version
+    put16(ref h, 1)
+    put16(ref h, 62)
+    put32(ref h, 1)
+    put64(ref h, 0)
+    put64(ref h, 0)
+    put64(ref h, shoff)
+    put32(ref h, 0)
+    put16(ref h, 64)
+    put16(ref h, 0)
+    put16(ref h, 0)
+    put16(ref h, 64)
+    put16(ref h, 11)
+    put16(ref h, 9)
+    for i in 0..len(h):
+        out[16 + i] = h[i]
+    return out

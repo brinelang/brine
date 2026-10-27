@@ -3358,3 +3358,125 @@ static void br_procs_free(void) {
     br_procs = NULL;
     br_nprocs = br_cap_procs = 0;
 }
+
+/* ------------------------------------------------------------ entry points for native code
+ * Natively compiled brine (the x86-64 backend) can't call the `static inline`
+ * helpers of brine_rt.h, so each has an ordinary twin here: `brine_<name>` is
+ * `brine_x_<name>`. 128-bit integers go by pointer: an i128/u128 argument is a
+ * pointer to it, and an i128/u128 result is written through an extra first
+ * argument. The `brine_x_i128_*` / `brine_x_u128_*` functions are the plain
+ * (wrapping) 128-bit operations the native backend doesn't do inline. */
+void brine_x_str_retain(brine_str *s) { brine_str_retain(s); }
+void brine_x_str_release(brine_str *s) { brine_str_release(s); }
+void brine_x_arr_retain(brine_arr *a) { brine_arr_retain(a); }
+void brine_x_arr_release(brine_arr *a) { brine_arr_release(a); }
+void brine_x_box_retain(void *p) { brine_box_retain(p); }
+bool brine_x_box_dec(void *p) { return brine_box_dec(p); }
+void brine_x_map_retain(brine_map *m) { brine_map_retain(m); }
+void brine_x_map_release(brine_map *m) { brine_map_release(m); }
+brine_str *brine_x_str_at(brine_str *s, int64_t i, const char *loc) { return brine_str_at(s, i, loc); }
+bool brine_x_map_has(brine_map *m, const void *k) { return brine_map_has(m, k); }
+uint64_t brine_x_hash_u64(uint64_t x) { return brine_hash_u64(x); }
+uint64_t brine_x_hash_mix(uint64_t h, uint64_t x) { return brine_hash_mix(h, x); }
+uint64_t brine_x_hash_u128(const brine_u128 *x) { return brine_hash_u128(*x); }
+int64_t brine_x_idx(int64_t i, int64_t len, const char *loc) { return brine_idx(i, len, loc); }
+int64_t brine_x_par_plan(int64_t n) { return brine_par_plan(n); }
+
+#define BR_X_MATH1(name) \
+    double brine_x_f_##name(double x) { return brine_f_##name(x); } \
+    float brine_x_f_##name##f(float x) { return brine_f_##name##f(x); }
+BR_X_MATH1(sqrt)
+BR_X_MATH1(sin)
+BR_X_MATH1(cos)
+BR_X_MATH1(tan)
+BR_X_MATH1(exp)
+BR_X_MATH1(log)
+BR_X_MATH1(floor)
+BR_X_MATH1(ceil)
+BR_X_MATH1(round)
+BR_X_MATH1(fabs)
+double brine_x_f_pow(double a, double b) { return brine_f_pow(a, b); }
+double brine_x_f_fmod(double a, double b) { return brine_f_fmod(a, b); }
+float brine_x_f_fmodf(float a, float b) { return brine_f_fmodf(a, b); }
+double brine_x_f_fmin(double a, double b) { return brine_f_fmin(a, b); }
+double brine_x_f_fmax(double a, double b) { return brine_f_fmax(a, b); }
+float brine_x_f_fminf(float a, float b) { return brine_f_fminf(a, b); }
+float brine_x_f_fmaxf(float a, float b) { return brine_f_fmaxf(a, b); }
+
+/* integer helpers for types up to 64 bits */
+#define BR_X_COMMON(T, S)                                                                         \
+    T brine_x_add_##S(T a, T b, const char *loc) { return brine_add_##S(a, b, loc); }            \
+    T brine_x_sub_##S(T a, T b, const char *loc) { return brine_sub_##S(a, b, loc); }            \
+    T brine_x_mul_##S(T a, T b, const char *loc) { return brine_mul_##S(a, b, loc); }            \
+    T brine_x_shl_##S(T a, int64_t b, const char *loc) { return brine_shl_##S(a, b, loc); }      \
+    T brine_x_shr_##S(T a, int64_t b, const char *loc) { return brine_shr_##S(a, b, loc); }      \
+    T brine_x_conv_##S##_from_i64(int64_t x, const char *loc) { return brine_conv_##S##_from_i64(x, loc); } \
+    T brine_x_conv_##S##_from_u64(uint64_t x, const char *loc) { return brine_conv_##S##_from_u64(x, loc); } \
+    T brine_x_conv_##S##_from_i128(const brine_i128 *x, const char *loc) { return brine_conv_##S##_from_i128(*x, loc); } \
+    T brine_x_conv_##S##_from_u128(const brine_u128 *x, const char *loc) { return brine_conv_##S##_from_u128(*x, loc); } \
+    T brine_x_fdiv_##S(T a, T b) { return brine_fdiv_##S(a, b); }                                \
+    T brine_x_fmod_##S(T a, T b) { return brine_fmod_##S(a, b); }                                \
+    T brine_x_div_##S(T a, T b, const char *loc) { return brine_div_##S(a, b, loc); }            \
+    T brine_x_mod_##S(T a, T b, const char *loc) { return brine_mod_##S(a, b, loc); }            \
+    T brine_x_abs_##S(T a, const char *loc) { return brine_abs_##S(a, loc); }                    \
+    T brine_x_conv_##S##_from_f64(double x, const char *loc) { return brine_conv_##S##_from_f64(x, loc); }
+#define BR_X_SIGNED(T, S) \
+    BR_X_COMMON(T, S)     \
+    T brine_x_neg_##S(T a, const char *loc) { return brine_neg_##S(a, loc); }
+BR_X_SIGNED(int8_t, i8)
+BR_X_SIGNED(int16_t, i16)
+BR_X_SIGNED(int32_t, i32)
+BR_X_SIGNED(int64_t, i64)
+BR_X_COMMON(uint8_t, u8)
+BR_X_COMMON(uint16_t, u16)
+BR_X_COMMON(uint32_t, u32)
+BR_X_COMMON(uint64_t, u64)
+
+/* the same for 128-bit integers, by pointer */
+#define BR_X_COMMON128(T, S)                                                                        \
+    void brine_x_add_##S(T *r, const T *a, const T *b, const char *loc) { *r = brine_add_##S(*a, *b, loc); } \
+    void brine_x_sub_##S(T *r, const T *a, const T *b, const char *loc) { *r = brine_sub_##S(*a, *b, loc); } \
+    void brine_x_mul_##S(T *r, const T *a, const T *b, const char *loc) { *r = brine_mul_##S(*a, *b, loc); } \
+    void brine_x_shl_##S(T *r, const T *a, int64_t b, const char *loc) { *r = brine_shl_##S(*a, b, loc); } \
+    void brine_x_shr_##S(T *r, const T *a, int64_t b, const char *loc) { *r = brine_shr_##S(*a, b, loc); } \
+    void brine_x_conv_##S##_from_i64(T *r, int64_t x, const char *loc) { *r = brine_conv_##S##_from_i64(x, loc); } \
+    void brine_x_conv_##S##_from_u64(T *r, uint64_t x, const char *loc) { *r = brine_conv_##S##_from_u64(x, loc); } \
+    void brine_x_conv_##S##_from_i128(T *r, const brine_i128 *x, const char *loc) { *r = brine_conv_##S##_from_i128(*x, loc); } \
+    void brine_x_conv_##S##_from_u128(T *r, const brine_u128 *x, const char *loc) { *r = brine_conv_##S##_from_u128(*x, loc); } \
+    void brine_x_fdiv_##S(T *r, const T *a, const T *b) { *r = brine_fdiv_##S(*a, *b); }        \
+    void brine_x_fmod_##S(T *r, const T *a, const T *b) { *r = brine_fmod_##S(*a, *b); }        \
+    void brine_x_div_##S(T *r, const T *a, const T *b, const char *loc) { *r = brine_div_##S(*a, *b, loc); } \
+    void brine_x_mod_##S(T *r, const T *a, const T *b, const char *loc) { *r = brine_mod_##S(*a, *b, loc); } \
+    void brine_x_abs_##S(T *r, const T *a, const char *loc) { *r = brine_abs_##S(*a, loc); }    \
+    void brine_x_conv_##S##_from_f64(T *r, double x, const char *loc) { *r = brine_conv_##S##_from_f64(x, loc); }
+BR_X_COMMON128(brine_i128, i128)
+BR_X_COMMON128(brine_u128, u128)
+void brine_x_neg_i128(brine_i128 *r, const brine_i128 *a, const char *loc) { *r = brine_neg_i128(*a, loc); }
+
+/* runtime functions that take or return 128-bit integers */
+void brine_x_parse_i128(brine_i128 *r, brine_str *s, const char *loc) { *r = brine_parse_i128(s, loc); }
+void brine_x_parse_u128(brine_u128 *r, brine_str *s, const char *loc) { *r = brine_parse_u128(s, loc); }
+void brine_x_sb_i128(brine_sb *sb, const brine_i128 *v) { brine_sb_i128(sb, *v); }
+void brine_x_sb_u128(brine_sb *sb, const brine_u128 *v) { brine_sb_u128(sb, *v); }
+void brine_x_sb_fmt_i128(brine_sb *sb, const brine_i128 *v, int kind) { brine_sb_fmt_i128(sb, *v, kind); }
+void brine_x_sb_fmt_u128(brine_sb *sb, const brine_u128 *v, int kind) { brine_sb_fmt_u128(sb, *v, kind); }
+
+/* plain 128-bit operations (wrapping; division by zero is excluded by the caller) */
+#define BR_X_W128(T, S)                                                                             \
+    void brine_x_##S##_add(T *r, const T *a, const T *b) { *r = (T)((brine_u128)*a + (brine_u128)*b); } \
+    void brine_x_##S##_sub(T *r, const T *a, const T *b) { *r = (T)((brine_u128)*a - (brine_u128)*b); } \
+    void brine_x_##S##_mul(T *r, const T *a, const T *b) { *r = (T)((brine_u128)*a * (brine_u128)*b); } \
+    void brine_x_##S##_div(T *r, const T *a, const T *b) { *r = *a / *b; }                         \
+    void brine_x_##S##_rem(T *r, const T *a, const T *b) { *r = *a % *b; }                         \
+    void brine_x_##S##_shl(T *r, const T *a, int64_t b) { *r = (T)((brine_u128)*a << b); }         \
+    void brine_x_##S##_shr(T *r, const T *a, int64_t b) { *r = *a >> b; }                          \
+    void brine_x_##S##_neg(T *r, const T *a) { *r = (T)(0 - (brine_u128)*a); }                    \
+    int brine_x_##S##_cmp(const T *a, const T *b) { return (*a > *b) - (*a < *b); }                \
+    void brine_x_##S##_from_i64(T *r, int64_t x) { *r = (T)x; }                                    \
+    void brine_x_##S##_from_u64(T *r, uint64_t x) { *r = (T)x; }                                   \
+    void brine_x_##S##_from_f64(T *r, double x) { *r = (T)x; }                                     \
+    void brine_x_##S##_from_f32(T *r, float x) { *r = (T)x; }                                      \
+    double brine_x_##S##_to_f64(const T *a) { return (double)*a; }                                 \
+    float brine_x_##S##_to_f32(const T *a) { return (float)*a; }
+BR_X_W128(brine_i128, i128)
+BR_X_W128(brine_u128, u128)

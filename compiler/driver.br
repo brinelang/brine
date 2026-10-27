@@ -12,6 +12,7 @@ import uniform
 import verify
 import lower
 import ir_c
+import x64
 from verify import Report
 
 const PRELUDE_SRC = embed("../runtime/prelude.br")
@@ -326,6 +327,12 @@ fn fnv(data: str) -> u64:
         h = (h * prime) & mask
     return u64(h)
 
+fn fnv_bytes(data: [u8]) -> u64:
+    var h: u128 = 14695981039346656037
+    for b in data:
+        h = ((h ^ u128(b)) * 1099511628211) & 18446744073709551615
+    return u64(h)
+
 fn hex16(h: u64) -> str:
     return f"{h:016x}"
 
@@ -375,6 +382,8 @@ fn io_diag(e: str) -> Diag:
 enum Code:
     # C translation units, compiled in parallel and cached one by one
     C(units: [str])
+    # a native object file (x64.br)
+    Obj(bytes: [u8])
 
 fn make_dirs(d: str) -> Result[(), Diag]:
     match os.make_dir(d):
@@ -451,12 +460,16 @@ fn compile(code: Code, out_exe: str, dir: str, profile: Profile) -> Result[bool,
 
     # objects are named by a hash of what they're made from
     var units: [str] = []
+    var native: [u8] = []
     var hashes: [str] = []
     match code:
         case Code.C(us):
             units = us
             for u in units:
                 hashes.push(hex16(fnv(u + key)))
+        case Code.Obj(b):
+            native = b
+            hashes.push(hex16(fnv_bytes(b)))
     let prog_hash = fnv(" ".join(hashes) + rt_obj)
     let stamp = with_extension(out_exe, "brine-hash")
     if file_exists(out_exe):
@@ -491,6 +504,19 @@ fn compile(code: Code, out_exe: str, dir: str, profile: Profile) -> Result[bool,
             case Err(e):
                 return Err(diag.error("E0705", f"could not run the C compiler: {e}"))
     var t = clock()
+    if len(native) > 0:
+        let obj = project.join(obj_dir, hashes[0] + ".o")
+        objs.push(obj)
+        if not file_exists(obj):
+            let tmp = project.join(obj_dir, f"{hashes[0]}.{os.pid()}.o")
+            match os.write_bytes(tmp, native):
+                case Ok(_):
+                    pass
+                case Err(e):
+                    return Err(io_diag(e))
+            match os.rename(tmp, obj):
+                case _:
+                    pass
     var failure = ""
     for h, c_path, tmp, obj in jobs:
         let rc = os.wait(h)
@@ -506,7 +532,8 @@ fn compile(code: Code, out_exe: str, dir: str, profile: Profile) -> Result[bool,
                 case _:
                     pass
     prune(obj_dir, objs)
-    t = phase_time(t, f"cc ({len(jobs)}/{len(units)})")
+    if len(units) > 0:
+        t = phase_time(t, f"cc ({len(jobs)}/{len(units)})")
     if failure != "":
         return Err(cc_failed("the C compiler rejected the generated code", failure))
     match project.parent(out_exe):
@@ -558,10 +585,29 @@ fn lowered(fe: Frontend, tests: bool, debug: bool) -> lower.Lowered:
         lower.Options(tests=tests, debug=debug)
     )
 
+# Native code for quick dev builds where x64.br knows the platform; C for
+# optimized and debug builds and everywhere else. `BRINE_BACKEND=c` or
+# `=native` overrides.
+fn use_native(profile: Profile) -> bool:
+    let host = os.arch() == "x86_64" and (os.name() == "windows" or os.name() == "linux")
+    match getenv("BRINE_BACKEND"):
+        case Some(b):
+            if b == "c":
+                return false
+            if b == "native":
+                return host
+        case None:
+            pass
+    return host and profile == Profile.Dev
+
 fn gen_code(fe: Frontend, profile: Profile, tests: bool) -> Code:
     var t = clock()
     let l = lowered(fe, tests, profile == Profile.Debug)
     t = phase_time(t, "lower")
+    if use_native(profile):
+        let b = x64.emit_object(l.m, os.name() == "windows")
+        phase_time(t, "x86-64")
+        return Code.Obj(b)
     let n = unit_count(profile)
     var units = [ir_c.emit_c(l)] if n == 1 else ir_c.emit_units(l, n)
     phase_time(t, "emit C")
