@@ -37,7 +37,9 @@ bootstrap() {
     echo "building the seed with $cc"
     # shellcheck disable=SC2086
     "$cc" $cflags bootstrap/brinec.c runtime/brine_rt.c -o "target/boot/brine0$exe" $libs
-    "target/boot/brine0$exe" build compiler/main.br -o "brine$exe"
+    # brine0 carries the seed's copy of the runtime, which may predate fixes in
+    # runtime/; build with the C compiler that just built it, which handles it.
+    BRINE_CC="$cc" "target/boot/brine0$exe" build compiler/main.br -o "brine$exe"
     "./brine$exe" --version
 }
 
