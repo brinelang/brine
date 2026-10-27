@@ -2842,6 +2842,11 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
         *why = "out of memory";
         return done;
     }
+    /* the arrays go back whole, so the elements the probe wrote must be on
+     * the device too */
+    if (done > 0)
+        for (int64_t i = 0; i < p.na; i++)
+            if (p.a[i].written) p.a[i].read = 1;
     br_lock(&br_gpu.mu);
     br_gpu_choice c = br_gpu_choose(k, st, n - done, br_gplan_bytes(&p), 1 + (int64_t)((n - done) / ((int64_t)1 << 22)));
     br_unlock(&br_gpu.mu);
