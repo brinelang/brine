@@ -54,7 +54,7 @@ fn main():
 |---|---|
 | ⚡ **Natively parallel** | `par` loops, maps, reductions and fork-join, data-race free by construction. Deterministic reductions. Automatic GPU offload (CUDA, Metal). MPI-style multi-process with the `world` module. |
 | 🔒 **Rules can't be broken** | `requires`, `ensures`, `invariant` and `prove` are checked at compile time. Overflow, bad indexes and division by zero always stop the program with a clear message, unless the compiler proved they can't happen; then the check is removed. There is no `unsafe` and no flag to turn checks off. |
-| 🚀 **Fast** | Native code, no garbage collector, no VM. Values are copy-on-write and memory is freed deterministically. Dev builds go straight to machine code; `--release` builds go through an optimizing C compiler. |
+| 🚀 **Fast** | Native code, no garbage collector, no VM. Values are copy-on-write and memory is freed deterministically. Dev builds on Linux and Windows go straight to machine code; `--release` builds go through an optimizing C compiler. |
 | 🐍 **Easy to read** | Python-like syntax, static types with local inference, structs, enums with `match`, generics, `Option`/`Result` with `?`. One obvious way to write things. |
 | 🤖 **Made for humans and agents** | One CLI. Every error has a code, a precise span, the reason and a fix. `--json` on every command, `brine explain <code>`, and `brine guide` prints the whole language on one page. |
 | 🛠️ **Self-hosted** | The compiler is written in brine and builds itself. All it needs is a C compiler. |
@@ -185,9 +185,12 @@ write its own element of an outer array (`out[i]`). Break that rule and the
 program doesn't compile:
 
 ```python
-var total = 0
-par for i in 0..len(xs):
-    total += xs[i]
+fn main():
+    let xs = [1, 2, 3, 4]
+    var total = 0
+    par for i in 0..len(xs):
+        total += xs[i]
+    print(total)
 ```
 
 ```text
@@ -254,7 +257,7 @@ fn main():
 ```
 
 ```text
-$ brine run examples/world.br --ranks 4
+$ brine run world.br --ranks 4
 4 ranks, total = 499999500000, squares = [0, 1, 4, 9]
 ```
 
@@ -263,8 +266,10 @@ the same calls in the same order, so a brine program can't hang waiting for a
 message that never comes:
 
 ```python
-if world.rank() == 0:
-    let total = world.sum(1)
+fn main():
+    if world.rank() == 0:
+        let total = world.sum(1)
+        print(total)
 ```
 
 ```text
@@ -303,15 +308,15 @@ fn main():
 
 ```text
 error[E0601]: cannot prove the precondition of `last`
- --> proof.br:7:11
-  |
-7 |     print(last(xs))
-  |           ^^^^^^^^ this call might violate `requires len(xs) >= 1`
-2 |     requires len(xs) >= 1
-  |              ------------ precondition declared here
-  |
-  = note: with the values used here, this is always false
-  = help: add an `assert` before the call to check it at runtime, or a `requires` to this function so its callers must prove it
+  --> proof.br:16:11
+   |
+16 |     print(last(xs))
+   |           ^^^^^^^^ this call might violate `requires len(xs) >= 1`
+11 |     requires len(xs) >= 1
+   |              ------------ precondition declared here
+   |
+   = note: with the values used here, this is always false
+   = help: add an `assert` before the call to check it at runtime, or a `requires` to this function so its callers must prove it
 ```
 
 `brine check --report` lists every runtime check the prover couldn't remove, so
