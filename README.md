@@ -113,4 +113,5 @@ go straight to machine code (the whole compiler builds in under a second);
 `brine test tests/integration.br` (from the repository root) runs the end-to-end
 suite: the examples and `tests/programs/`, expected errors, the formatter, the
 lexer and parser on edge cases, and the compiler rebuilding itself to a fixed point.
-See [AGENTS.md](AGENTS.md) for how to work on brine itself.
+See [AGENTS.md](AGENTS.md) for how to work on brine itself, and
+[docs/RELEASING.md](docs/RELEASING.md) for how changes and releases are made.

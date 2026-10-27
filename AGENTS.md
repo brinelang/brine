@@ -46,7 +46,8 @@ parser on purpose, regenerate `tests/syntax/` with
 `type(scope): summary` in the imperative, lower case, no final period, under ~72
 characters. A body explains why, when that isn't obvious.
 - types: `feat` (new behavior), `fix` (bug fix), `perf` (faster, same behavior),
-  `refactor`, `docs`, `test`, `build` (bootstrap, toolchain), `chore` (releases, tidying).
+  `refactor`, `docs`, `test`, `build` (bootstrap, toolchain, install scripts), `ci`
+  (GitHub workflows, `scripts/`), `chore` (releases, tidying).
 - scopes (optional): `lexer`, `parser`, `check`, `verify`, `solver`, `ir` (the IR
   and lowering), `native` (x86-64, AArch64 and objects), `c` (the C backend), `driver`,
   `runtime`, `cli`, `fmt`, `tests`, `docs`, `bootstrap`.
@@ -64,7 +65,15 @@ The version is set in one place: `VERSION` in `compiler/driver.br`.
   only the maintainer decides when 1.0 happens.
 - Releases are their own commit, `chore(release): X.Y.Z`: bump `VERSION`, add the
   release notes to `CHANGELOG.md` (from the commit messages since the last release),
-  refresh the bootstrap seed, then tag it `vX.Y.Z`.
+  refresh the bootstrap seed. Once it is merged, tag the merge commit `vX.Y.Z` and
+  push the tag: the release workflow builds, tests and publishes it.
+  [docs/RELEASING.md](docs/RELEASING.md) has the steps.
+
+## Pull requests and CI
+Changes reach `main` through pull requests, merged with a merge commit once CI
+(`.github/workflows/ci.yml`: seed build, `fmt --check`, the integration tests and
+packaging on Linux, macOS and Windows) is green. See
+[docs/RELEASING.md](docs/RELEASING.md).
 
 ## Generated files
 Don't commit anything that can be regenerated from the sources (build output,
