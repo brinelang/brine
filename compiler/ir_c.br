@@ -98,6 +98,11 @@ fn extern_proto(f: Func) -> str:
 fn data_words(d: Data) -> bool:
     return len(d.relocs) > 0
 
+fn data_decl(d: Data) -> str:
+    if data_words(d):
+        return f"extern void *{d.name}[];\n"
+    return f"extern uint8_t {d.name}[];\n"
+
 fn data_def(d: Data, split: bool) -> str:
     let st = "" if split else "static "
     if not data_words(d):
@@ -146,6 +151,58 @@ fn emit_c(l: Lowered) -> str:
     for f in m.funcs:
         o += func_def(f, false)
     return o
+
+fn name_hash(s: str) -> int:
+    var h: u128 = 2166136261
+    for b in s.bytes():
+        h = ((h ^ u128(b)) * 16777619) & 4294967295
+    return int(h)
+
+# The program as `n` translation units that the C compiler can work on in
+# parallel. A function's unit depends only on its name, and a unit declares
+# only what it uses, so a change to one function leaves the other units'
+# text (and their cached objects) alone.
+fn emit_units(l: Lowered, n: int) -> [str]:
+    let m = l.m
+    var decl: {str: str} = {}
+    for f in l.externs:
+        decl[f.name] = extern_proto(f)
+    for f in m.funcs:
+        decl[f.name] = proto(f, true) + ";\n"
+    for d in m.data:
+        decl[d.name] = data_decl(d)
+    var fs: [[int]] = [[] for _ in 0..n]
+    var ds: [[int]] = [[] for _ in 0..n]
+    for i, f in enumerate(m.funcs):
+        fs[name_hash(f.name) % n].push(i)
+    for i, d in enumerate(m.data):
+        ds[name_hash(d.name) % n].push(i)
+    var out: [str] = []
+    for u in 0..n:
+        var used: {str: bool} = {}
+        for i in fs[u]:
+            used[m.funcs[i].name] = true
+            for x in m.funcs[i].code:
+                if (x.op == Op.Call or x.op == Op.Global) and x.s in decl:
+                    used[x.s] = true
+        for i in ds[u]:
+            used[m.data[i].name] = true
+            for r in m.data[i].relocs:
+                if r.sym in decl:
+                    used[r.sym] = true
+        var names = used.keys()
+        names.sort()
+        var o = prelude()
+        for nm in names:
+            o += decl[nm]
+        o += "\n"
+        for i in ds[u]:
+            o += data_def(m.data[i], true)
+        o += "\n"
+        for i in fs[u]:
+            o += func_def(m.funcs[i], true)
+        out.push(o)
+    return out
 
 fn func_def(f: Func, split: bool) -> str:
     var o = proto(f, split) + " {\n"

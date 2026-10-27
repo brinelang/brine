@@ -371,69 +371,93 @@ fn with_extension(p: str, ext: str) -> str:
 fn io_diag(e: str) -> Diag:
     return diag.error("E0704", f"cannot write build files: {e}")
 
-# Compile generated C to an executable. `dir` is a cache directory for
+# Generated code, ready for the system toolchain.
+enum Code:
+    # C translation units, compiled in parallel and cached one by one
+    C(units: [str])
+
+fn make_dirs(d: str) -> Result[(), Diag]:
+    match os.make_dir(d):
+        case Ok(_):
+            return Ok(())
+        case Err(e):
+            return Err(diag.error("E0704", f"cannot create `{d}`: {e}"))
+
+fn cc_failed(what: str, e: str) -> Diag:
+    let ls = e.strip().lines()
+    let first = ls[:min(30, len(ls))]
+    return diag.error(
+        "E0705",
+        what
+    ).note("this is a bug in the brine compiler, not in your program — please report it").note("\n".join(first))
+
+fn write_or_diag(path: str, text: str) -> Result[(), Diag]:
+    match write_file(path, text):
+        case Ok(_):
+            return Ok(())
+        case Err(e):
+            return Err(io_diag(e))
+
+# The runtime as an object file, cached by runtime source + C compiler + flags.
+# Returns its directory (it has brine_rt.h) and the object's path.
+fn runtime_object(cc: str, flags: [str], key: str, dir: str) -> Result[(str, str), Diag]:
+    let rt_dir = project.join(dir, "rt-" + hex16(fnv(RT_H + RT_C + key)))
+    let rt_obj = project.join(rt_dir, "brine_rt.o")
+    if file_exists(rt_obj):
+        return Ok((rt_dir, rt_obj))
+    make_dirs(rt_dir)?
+    # the directory name is a hash of the contents, so existing files are already right
+    # (and rewriting them could collide with a concurrent build reading them)
+    for name, text in [("brine_rt.h", RT_H), ("brine_rt.c", RT_C)]:
+        let f = project.join(rt_dir, name)
+        var same = false
+        match read_file(f):
+            case Ok(t):
+                same = len(t) == len(text)
+            case Err(_):
+                pass
+        if not same:
+            write_or_diag(f, text)?
+    let tmp = project.join(rt_dir, f"brine_rt.{os.pid()}.o")
+    var cmd = [cc]
+    cmd.extend(flags)
+    cmd.extend(["-c", project.join(rt_dir, "brine_rt.c"), "-o", tmp])
+    match run_cc(cmd):
+        case Ok(_):
+            pass
+        case Err(e):
+            return Err(
+                diag.error("E0705", "the C compiler failed on the brine runtime").note(e.strip())
+            )
+    match os.rename(tmp, rt_obj):
+        case _:
+            pass
+    return Ok((rt_dir, rt_obj))
+
+# Compile generated code to an executable. `dir` is a cache directory for
 # intermediate files. Returns Ok(true) if the C compiler actually ran.
-fn compile_c(c_src: str, out_exe: str, dir: str, profile: Profile) -> Result[bool, Diag]:
+fn compile(code: Code, out_exe: str, dir: str, profile: Profile) -> Result[bool, Diag]:
     var cc = ""
     match find_cc():
         case Some(x):
             cc = x
         case None:
             return Err(no_cc_diag())
-    match os.make_dir(dir):
-        case Ok(_):
-            pass
-        case Err(e):
-            return Err(diag.error("E0704", f"cannot create `{dir}`: {e}"))
+    make_dirs(dir)?
     var flags = ["-std=c11", "-fno-strict-aliasing", "-w"]
     flags.extend(profile.cflags())
     let key = cc + "|" + " ".join(flags) + "|" + VERSION
+    let (rt_dir, rt_obj) = runtime_object(cc, flags, key, dir)?
 
-    # runtime object, cached by runtime source + compiler + flags
-    let rt_hash = fnv(RT_H + RT_C + key)
-    let rt_dir = project.join(dir, "rt-" + hex16(rt_hash))
-    let rt_obj = project.join(rt_dir, "brine_rt.o")
-    if not file_exists(rt_obj):
-        match os.make_dir(rt_dir):
-            case Ok(_):
-                pass
-            case Err(e):
-                return Err(io_diag(e))
-        # the directory name is a hash of the contents, so existing files are already right
-        # (and rewriting them could collide with a concurrent build reading them)
-        for name, text in [("brine_rt.h", RT_H), ("brine_rt.c", RT_C)]:
-            let f = project.join(rt_dir, name)
-            var same = false
-            match read_file(f):
-                case Ok(t):
-                    same = len(t) == len(text)
-                case Err(_):
-                    pass
-            if not same:
-                match write_file(f, text):
-                    case Ok(_):
-                        pass
-                    case Err(e):
-                        return Err(io_diag(e))
-        let tmp = project.join(rt_dir, f"brine_rt.{os.pid()}.o")
-        var cmd = [cc]
-        cmd.extend(flags)
-        cmd.extend(["-c", project.join(rt_dir, "brine_rt.c"), "-o", tmp])
-        match run_cc(cmd):
-            case Ok(_):
-                pass
-            case Err(e):
-                return Err(
-                    diag.error("E0705", "the C compiler failed on the brine runtime").note(e.strip())
-                )
-        match os.rename(tmp, rt_obj):
-            case Ok(_):
-                pass
-            case Err(_):
-                pass
-
-    # program
-    let prog_hash = fnv(c_src + key + f"{rt_hash}")
+    # objects are named by a hash of what they're made from
+    var units: [str] = []
+    var hashes: [str] = []
+    match code:
+        case Code.C(us):
+            units = us
+            for u in units:
+                hashes.push(hex16(fnv(u + key)))
+    let prog_hash = fnv(" ".join(hashes) + rt_obj)
     let stamp = with_extension(out_exe, "brine-hash")
     if file_exists(out_exe):
         match read_file(stamp):
@@ -442,51 +466,107 @@ fn compile_c(c_src: str, out_exe: str, dir: str, profile: Profile) -> Result[boo
                     return Ok(false)
             case Err(_):
                 pass
-    let c_path = project.join(dir, file_stem(out_exe) + ".c")
-    match write_file(c_path, c_src):
-        case Ok(_):
-            pass
-        case Err(e):
-            return Err(io_diag(e))
+    # one directory per output, so pruning never touches another build's objects
+    let obj_dir = project.join(dir, "obj-" + hex16(fnv(out_exe)))
+    make_dirs(obj_dir)?
+    var objs: [str] = []
+    var jobs: [(int, str, str, str)] = []
+    for i, u in enumerate(units):
+        let obj = project.join(obj_dir, hashes[i] + ".o")
+        # identical units (empty ones) are one object
+        if obj in objs:
+            continue
+        objs.push(obj)
+        if file_exists(obj):
+            continue
+        let c_path = project.join(obj_dir, f"{hashes[i]}.{os.pid()}.c")
+        write_or_diag(c_path, u)?
+        let tmp = project.join(obj_dir, f"{hashes[i]}.{os.pid()}.o")
+        var cmd = [cc]
+        cmd.extend(flags)
+        cmd.extend(["-I", rt_dir, "-c", c_path, "-o", tmp])
+        match os.spawn(cmd, {}, true, false):
+            case Ok(h):
+                jobs.push((h, c_path, tmp, obj))
+            case Err(e):
+                return Err(diag.error("E0705", f"could not run the C compiler: {e}"))
+    var t = clock()
+    var failure = ""
+    for h, c_path, tmp, obj in jobs:
+        let rc = os.wait(h)
+        let (out, err) = os.output(h)
+        if rc != 0:
+            if failure == "":
+                failure = err + out
+        else:
+            match os.rename(tmp, obj):
+                case _:
+                    pass
+            match os.remove_file(c_path):
+                case _:
+                    pass
+    prune(obj_dir, objs)
+    t = phase_time(t, f"cc ({len(jobs)}/{len(units)})")
+    if failure != "":
+        return Err(cc_failed("the C compiler rejected the generated code", failure))
     match project.parent(out_exe):
         case Some(d):
             if d != "":
-                match os.make_dir(d):
-                    case Ok(_):
-                        pass
-                    case Err(e):
-                        return Err(io_diag(e))
+                make_dirs(d)?
         case None:
             pass
-    var cmd2 = [cc]
-    cmd2.extend(flags)
-    cmd2.extend(["-I", rt_dir, c_path, rt_obj, "-o", out_exe])
-    cmd2.extend(link_libs())
-    match run_cc(cmd2):
+    var link = [cc]
+    link.extend(objs)
+    link.extend([rt_obj, "-o", out_exe])
+    link.extend(link_libs())
+    match run_cc(link):
         case Ok(_):
             pass
         case Err(e):
-            let ls = e.lines()
-            let first = ls[:min(30, len(ls))]
-            return Err(
-                diag.error("E0705", "the C compiler rejected the generated code").note("this is a bug in the brine compiler, not in your program — please report it").note("\n".join(first))
-            )
+            return Err(cc_failed("linking the program failed", e))
+    phase_time(t, "link")
     match write_file(stamp, hex16(prog_hash)):
-        case Ok(_):
-            pass
-        case Err(_):
+        case _:
             pass
     return Ok(true)
 
-fn gen_c(fe: Frontend, profile: Profile, tests: bool) -> str:
-    var t = clock()
-    let l = lower.lower(
+# Every edit leaves an object behind: past a limit, keep only this build's.
+fn prune(obj_dir: str, keep: [str]):
+    let fs = os.list_dir(obj_dir).unwrap_or([])
+    if len(fs) < 4 * len(keep) + 64:
+        return
+    for f in fs:
+        let p = project.join(obj_dir, f)
+        # finished objects only (`<hash>.o`), not another build's work in progress
+        if len(f) == 18 and f.ends_with(".o") and p not in keep:
+            match os.remove_file(p):
+                case _:
+                    pass
+
+# How many C translation units for a build: several for quick parallel dev
+# builds, one when the optimizer should see the whole program.
+fn unit_count(profile: Profile) -> int:
+    if profile == Profile.Release:
+        return 1
+    return min(max(os.cpu_count(), 1), 16)
+
+fn lowered(fe: Frontend, tests: bool, debug: bool) -> lower.Lowered:
+    return lower.lower(
         fe.prog.unwrap(),
         fe.info.unwrap(),
         fe.sm,
-        lower.Options(tests=tests, debug=profile == Profile.Debug)
+        lower.Options(tests=tests, debug=debug)
     )
+
+fn gen_code(fe: Frontend, profile: Profile, tests: bool) -> Code:
+    var t = clock()
+    let l = lowered(fe, tests, profile == Profile.Debug)
     t = phase_time(t, "lower")
-    let c = ir_c.emit_c(l)
+    let n = unit_count(profile)
+    var units = [ir_c.emit_c(l)] if n == 1 else ir_c.emit_units(l, n)
     phase_time(t, "emit C")
-    return c
+    return Code.C(units)
+
+# The program as one C file (`brine emit-c`).
+fn gen_c(fe: Frontend, profile: Profile, tests: bool) -> str:
+    return ir_c.emit_c(lowered(fe, tests, profile == Profile.Debug))
