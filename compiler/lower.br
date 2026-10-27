@@ -40,6 +40,29 @@ struct Owned:
     ty: Ty
     home: bool
 
+# For `x / 2^k` and `x % 2^k` on a signed integer, k (else -1): floor division
+# by a power of two is an arithmetic shift and the floored remainder a mask.
+# C compilers don't see through brine_fdiv/brine_fmod and divide for real.
+fn pow2_shift(op: BinOp, r: Expr, ty: Ty) -> int:
+    if op != BinOp.Div and op != BinOp.Mod:
+        return -1
+    match ty:
+        case Ty.Int(k):
+            if not k.signed() or k.bits() > 64:
+                return -1
+            match r.kind:
+                case ExprKind.Int(v):
+                    var p: i128 = 2
+                    var s = 1
+                    while p < v and s < 62:
+                        p *= 2
+                        s += 1
+                    return s if p == v else -1
+                case _:
+                    return -1
+        case _:
+            return -1
+
 struct ArrCache:
     arr: int
     data: int
@@ -2117,6 +2140,14 @@ struct Lower:
                     let c = self.cx.fb.call(K.Ptr, "brine_str_concat", [a, b])
                     return self.temp(c, Ty.Str)
                 let a = self.expr(l)
+                let sh = -1 if e.checked else pow2_shift(op, r, e.ty)
+                if sh > 0:
+                    let kk = self.kind(e.ty)
+                    if op == BinOp.Div:
+                        let n = self.cx.fb.konst(kk, sh)
+                        return self.cx.fb.bin(Op.Shr, kk, a, n)
+                    let m = self.cx.fb.konst(kk, (1 << sh) - 1)
+                    return self.cx.fb.bin(Op.And, kk, a, m)
                 let b = self.expr(r)
                 return self.arith(op, a, b, e.ty, e.checked, e.span)
             case ExprKind.Compare(first, rest):
