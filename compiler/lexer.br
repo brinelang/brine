@@ -1,0 +1,856 @@
+# The brine lexer, written in brine: a port of src/lexer.rs.
+# It turns source text into tokens, with NEWLINE/INDENT/DEDENT tokens for
+# indentation, and collects errors instead of stopping at the first one.
+from diag import Span, Diag, quote
+import diag
+
+enum Kw:
+    Fn
+    Let
+    Var
+    Const
+    Struct
+    Enum
+    Match
+    Case
+    If
+    Elif
+    Else
+    While
+    For
+    In
+    Return
+    Break
+    Continue
+    And
+    Or
+    Not
+    True
+    False
+    Requires
+    Ensures
+    Invariant
+    Assert
+    Prove
+    Par
+    Test
+    Import
+    As
+    Extern
+    Mut
+    Ref
+    Pass
+
+fn keyword_list() -> [(str, Kw)]:
+    return [
+        ("fn", Kw.Fn),
+        ("let", Kw.Let),
+        ("var", Kw.Var),
+        ("const", Kw.Const),
+        ("struct", Kw.Struct),
+        ("enum", Kw.Enum),
+        ("match", Kw.Match),
+        ("case", Kw.Case),
+        ("if", Kw.If),
+        ("elif", Kw.Elif),
+        ("else", Kw.Else),
+        ("while", Kw.While),
+        ("for", Kw.For),
+        ("in", Kw.In),
+        ("return", Kw.Return),
+        ("break", Kw.Break),
+        ("continue", Kw.Continue),
+        ("and", Kw.And),
+        ("or", Kw.Or),
+        ("not", Kw.Not),
+        ("true", Kw.True),
+        ("false", Kw.False),
+        ("requires", Kw.Requires),
+        ("ensures", Kw.Ensures),
+        ("invariant", Kw.Invariant),
+        ("assert", Kw.Assert),
+        ("prove", Kw.Prove),
+        ("par", Kw.Par),
+        ("test", Kw.Test),
+        ("import", Kw.Import),
+        ("as", Kw.As),
+        ("extern", Kw.Extern),
+        ("mut", Kw.Mut),
+        ("ref", Kw.Ref),
+        ("pass", Kw.Pass)
+    ]
+
+fn kw_name(k: Kw) -> str:
+    for name, kk in keyword_list():
+        if kk == k:
+            return name
+    return "?"
+
+# One piece of an f-string: literal text, or an expression to format.
+enum FPart:
+    Lit(text: str)
+    # `src` is the expression's text, `offset` where it starts in the file,
+    # `spec` the format after `:` (as in `{x:>8}`)
+    Expr(src: str, offset: int, spec: Option[str])
+
+enum Tok:
+    Ident(name: str)
+    Int(value: u128)
+    Float(value: float)
+    Str(value: str)
+    FStr(parts: [FPart])
+    Keyword(kw: Kw)
+    LParen
+    RParen
+    LBracket
+    RBracket
+    LBrace
+    RBrace
+    Comma
+    Colon
+    Dot
+    DotDot
+    DotDotEq
+    Arrow
+    Plus
+    Minus
+    Star
+    Slash
+    Percent
+    Amp
+    Pipe
+    Caret
+    Tilde
+    Question
+    Shl
+    Shr
+    Assign
+    EqEq
+    Ne
+    Lt
+    Le
+    Gt
+    Ge
+    PlusEq
+    MinusEq
+    StarEq
+    SlashEq
+    PercentEq
+    Newline
+    Indent
+    Dedent
+    Eof
+    Comment(text: str)
+
+fn punct_list() -> [(str, Tok)]:
+    return [
+        ("(", Tok.LParen),
+        (")", Tok.RParen),
+        ("[", Tok.LBracket),
+        ("]", Tok.RBracket),
+        ("{", Tok.LBrace),
+        ("}", Tok.RBrace),
+        (",", Tok.Comma),
+        (":", Tok.Colon),
+        (".", Tok.Dot),
+        ("..", Tok.DotDot),
+        ("..=", Tok.DotDotEq),
+        ("->", Tok.Arrow),
+        ("+", Tok.Plus),
+        ("-", Tok.Minus),
+        ("*", Tok.Star),
+        ("/", Tok.Slash),
+        ("%", Tok.Percent),
+        ("&", Tok.Amp),
+        ("|", Tok.Pipe),
+        ("^", Tok.Caret),
+        ("~", Tok.Tilde),
+        ("?", Tok.Question),
+        ("<<", Tok.Shl),
+        (">>", Tok.Shr),
+        ("=", Tok.Assign),
+        ("==", Tok.EqEq),
+        ("!=", Tok.Ne),
+        ("<", Tok.Lt),
+        ("<=", Tok.Le),
+        (">", Tok.Gt),
+        (">=", Tok.Ge),
+        ("+=", Tok.PlusEq),
+        ("-=", Tok.MinusEq),
+        ("*=", Tok.StarEq),
+        ("/=", Tok.SlashEq),
+        ("%=", Tok.PercentEq)
+    ]
+
+fn punct_str(t: Tok) -> str:
+    for text, tt in punct_list():
+        if tt == t:
+            return text
+    return "?"
+
+fn describe(t: Tok) -> str:
+    match t:
+        case Tok.Ident(name):
+            return f"identifier `{name}`"
+        case Tok.Int(_):
+            return "integer literal"
+        case Tok.Float(_):
+            return "float literal"
+        case Tok.Str(_):
+            return "string literal"
+        case Tok.FStr(_):
+            return "f-string"
+        case Tok.Keyword(k):
+            return f"keyword `{kw_name(k)}`"
+        case Tok.Newline:
+            return "end of line"
+        case Tok.Indent:
+            return "indentation"
+        case Tok.Dedent:
+            return "end of block"
+        case Tok.Eof:
+            return "end of file"
+        case Tok.Comment(_):
+            return "comment"
+        case _:
+            return "`" + punct_str(t) + "`"
+
+struct Token:
+    tok: Tok
+    lo: int
+    hi: int
+
+fn is_layout(t: Tok) -> bool:
+    match t:
+        case Tok.Newline | Tok.Indent | Tok.Dedent:
+            return true
+        case _:
+            return false
+
+fn is_ident_char(c: str) -> bool:
+    return c.is_alnum() or c == "_"
+
+# the value of a digit in bases up to 36, or 99 for anything else
+fn digit_value(c: str) -> int:
+    if c.is_digit():
+        return ord(c) - ord("0")
+    if c.is_alpha():
+        return ord(c.lower()) - ord("a") + 10
+    return 99
+
+# number of bytes in the UTF-8 character that starts with byte `b`
+fn utf8_len(b: int) -> int:
+    if b < 0x80:
+        return 1
+    if b < 0xe0:
+        return 2
+    if b < 0xf0:
+        return 3
+    return 4
+
+# literals go up to `i128`'s maximum; the checker knows which type they need
+const MAX_LITERAL: u128 = 170141183460469231731687303715884105727
+
+# `digits` in base `radix` (2 to 36), or None if one isn't a digit or the value
+# doesn't fit in 64 bits
+fn parse_uint(digits: str, radix: int) -> Option[u128]:
+    requires 2 <= radix <= 36
+    if digits == "":
+        return None
+    let r = u128(radix)
+    var value: u128 = 0
+    for d in digits:
+        let v = digit_value(d)
+        if v >= radix:
+            return None
+        let dv = u128(v)
+        if value > (MAX_LITERAL - dv) / r:
+            return None
+        value = value * r + dv
+    return Some(value)
+
+struct Lexer:
+    text: str
+    bytes: [u8]
+    pos: int
+    base: int
+    toks: [Token]
+    diags: [Diag]
+    indents: [int]
+    depth: int
+    file: int
+    keep_comments: bool
+    layout: bool
+    at_line_start: bool
+    keywords: {str: Kw}
+    singles: {str: Tok}
+
+    # the one-character string at `i`, or "" past the end
+    fn at(self, i: int) -> str:
+        if 0 <= i < len(self.text):
+            return self.text[i]
+        return ""
+
+    fn peek(self) -> str:
+        return self.at(self.pos)
+
+    fn peek2(self) -> str:
+        return self.at(self.pos + 1)
+
+    fn done(self) -> bool:
+        return self.pos >= len(self.text)
+
+    fn push(ref self, tok: Tok, lo: int, hi: int):
+        self.toks.push(Token(tok=tok, lo=self.base + lo, hi=self.base + hi))
+
+    # the span of bytes `lo..hi` of this text, as offsets in the file
+    fn span(self, lo: int, hi: int) -> Span:
+        return Span(file=self.file, lo=self.base + lo, hi=self.base + hi)
+
+    fn error(ref self, code: str, msg: str, lo: int, hi: int, label: str, help: str):
+        var d = diag.error(code, msg).label(self.span(lo, hi), label)
+        if help != "":
+            d = d.with_help(help)
+        self.diags.push(d)
+
+    # an error with a suggested replacement for its span
+    fn error_fix(
+        self,
+        code: str,
+        msg: str,
+        lo: int,
+        hi: int,
+        label: str,
+        replacement: str,
+        fix_msg: str
+    ) -> Diag:
+        return diag.error(
+            code,
+            msg
+        ).label(self.span(lo, hi), label).fix(self.span(lo, hi), replacement, fix_msg)
+
+    fn run(ref self):
+        while true:
+            if self.at_line_start and self.layout and self.depth == 0:
+                if not self.handle_indent():
+                    break
+            # skip whitespace within the line
+            while self.peek() == " " or self.peek() == "\t" or self.peek() == "\r":
+                self.pos += 1
+            if self.done():
+                break
+            let c = self.peek()
+            let lo = self.pos
+            if c == "\n":
+                self.pos += 1
+                if self.layout and self.depth == 0:
+                    self.newline(lo)
+                    self.at_line_start = true
+            elif c == "#":
+                self.comment()
+            elif c == "\\" and (self.peek2() == "\n" or self.peek2() == "\r"):
+                # a backslash at the end of a line joins it with the next
+                self.pos += 1
+                while self.peek() == "\r" or self.peek() == "\n":
+                    let was_newline = self.peek() == "\n"
+                    self.pos += 1
+                    if was_newline:
+                        break
+            elif c.is_digit():
+                self.number()
+            elif c == "f" and (self.peek2() == "\"" or self.peek2() == "'"):
+                self.pos += 1
+                self.fstring(lo)
+            elif c.is_alpha() or c == "_":
+                self.ident()
+            elif c == "\"" or c == "'":
+                self.string()
+            else:
+                self.punct()
+        let end = len(self.text)
+        if self.layout:
+            self.newline(end)
+            while len(self.indents) > 1:
+                self.indents.pop()
+                self.push(Tok.Dedent, end, end)
+        self.push(Tok.Eof, end, end)
+
+    fn newline(ref self, at: int):
+        let n = len(self.toks)
+        if n == 0:
+            return
+        let last = self.toks[n - 1].tok
+        if is_layout(last):
+            return
+        match last:
+            case Tok.Comment(_):
+                # a comment-only line ends no statement; code before the comment does
+                if n >= 2 and not is_layout(self.toks[n - 2].tok):
+                    self.push(Tok.Newline, at, at)
+            case _:
+                self.push(Tok.Newline, at, at)
+
+    fn comment(ref self):
+        let lo = self.pos
+        while not self.done() and self.peek() != "\n":
+            self.pos += 1
+        if self.keep_comments:
+            self.push(Tok.Comment(self.text[lo:self.pos].rstrip()), lo, self.pos)
+
+    # Measure the indentation of the next non-blank line and emit INDENT/DEDENT.
+    # Returns false at the end of the input.
+    fn handle_indent(ref self) -> bool:
+        while true:
+            let line_start = self.pos
+            var width = 0
+            var tab_at = -1
+            while self.peek() == " " or self.peek() == "\t":
+                if self.peek() == "\t":
+                    if tab_at < 0:
+                        tab_at = self.pos
+                    width += 4
+                else:
+                    width += 1
+                self.pos += 1
+            if self.done():
+                return false
+            let c = self.peek()
+            if c == "\n" or c == "\r":
+                self.pos += 1
+                continue
+            if c == "#":
+                self.comment()
+                continue
+            if tab_at >= 0:
+                self.error(
+                    "E0104",
+                    "tabs are not allowed in indentation",
+                    tab_at,
+                    tab_at + 1,
+                    "tab character here",
+                    "brine uses spaces for indentation (4 per level); `brine fmt` fixes this automatically"
+                )
+            let top = self.indents[len(self.indents) - 1]
+            if width > top:
+                self.indents.push(width)
+                self.push(Tok.Indent, line_start, self.pos)
+            elif width < top:
+                while width < self.indents[len(self.indents) - 1]:
+                    self.indents.pop()
+                    self.push(Tok.Dedent, self.pos, self.pos)
+                if width != self.indents[len(self.indents) - 1]:
+                    self.error(
+                        "E0103",
+                        "inconsistent indentation",
+                        line_start,
+                        self.pos,
+                        "this line's indentation doesn't match any enclosing block",
+                        "indent with multiples of 4 spaces so each line lines up with a block above it"
+                    )
+                    self.indents.push(width)
+            self.at_line_start = false
+            return true
+        return false
+
+    fn ident(ref self):
+        let lo = self.pos
+        while is_ident_char(self.peek()):
+            self.pos += 1
+        let word = self.text[lo:self.pos]
+        match self.keywords.get(word):
+            case Some(k):
+                self.push(Tok.Keyword(k), lo, self.pos)
+            case None:
+                self.push(Tok.Ident(word), lo, self.pos)
+
+    fn number(ref self):
+        let lo = self.pos
+        let p2 = self.peek2().lower()
+        if self.peek() == "0" and (p2 == "x" or p2 == "b" or p2 == "o"):
+            let radix = 16 if p2 == "x" else 2 if p2 == "b" else 8
+            self.pos += 2
+            let ds = self.pos
+            while is_ident_char(self.peek()):
+                self.pos += 1
+            match parse_uint(self.text[ds:self.pos].replace("_", ""), radix):
+                case Some(v):
+                    self.push(Tok.Int(v), lo, self.pos)
+                case None:
+                    self.error(
+                        "E0101",
+                        "invalid integer literal",
+                        lo,
+                        self.pos,
+                        "not a valid number",
+                        ""
+                    )
+                    self.push(Tok.Int(0), lo, self.pos)
+            return
+        while self.peek().is_digit() or self.peek() == "_":
+            self.pos += 1
+        var is_float = false
+        if self.peek() == "." and self.peek2().is_digit():
+            is_float = true
+            self.pos += 1
+            while self.peek().is_digit() or self.peek() == "_":
+                self.pos += 1
+        if self.peek() == "e" or self.peek() == "E":
+            let save = self.pos
+            self.pos += 1
+            if self.peek() == "+" or self.peek() == "-":
+                self.pos += 1
+            if self.peek().is_digit():
+                is_float = true
+                while self.peek().is_digit():
+                    self.pos += 1
+            else:
+                self.pos = save
+        let s = self.text[lo:self.pos].replace("_", "")
+        if is_float:
+            self.push(Tok.Float(float(s)), lo, self.pos)
+            return
+        match parse_uint(s, 10):
+            case Some(v):
+                self.push(Tok.Int(v), lo, self.pos)
+            case None:
+                self.error("E0101", "integer literal is too large", lo, self.pos, "too large", "")
+                self.push(Tok.Int(0), lo, self.pos)
+
+    # The character an escape stands for; `pos` is just after the backslash.
+    fn escape(ref self) -> str:
+        let lo = self.pos - 1
+        if self.done() or self.peek() == "\n":
+            # the string is unterminated; let the caller report that
+            return ""
+        let c = self.peek()
+        self.pos += 1
+        match c:
+            case "n":
+                return "\n"
+            case "t":
+                return "\t"
+            case "r":
+                return "\r"
+            case "0":
+                return "\0"
+            case "\\" | "\"" | "'" | "{" | "}":
+                return c
+            case "u" if self.peek() == "{":
+                self.pos += 1
+                let s = self.pos
+                while digit_value(self.peek()) < 16:
+                    self.pos += 1
+                let hex = self.text[s:self.pos]
+                if self.peek() == "}":
+                    self.pos += 1
+                var code = 0
+                for d in hex:
+                    if code <= 0x10ffff:
+                        code = code * 16 + digit_value(d)
+                if len(hex) == 0 or code > 0x10ffff or 0xd800 <= code <= 0xdfff:
+                    self.error("E0101", "invalid unicode escape", lo, self.pos, "bad escape", "")
+                    return ""
+                return chr(code)
+            case _:
+                # step over the whole character, not just its first byte
+                self.pos += utf8_len(int(self.bytes[self.pos - 1])) - 1
+                self.error(
+                    "E0101",
+                    "unknown escape sequence",
+                    lo,
+                    self.pos,
+                    "unknown escape",
+                    "valid escapes: \\n \\t \\r \\0 \\\\ \\\" \\' \\{ \\} \\u{XXXX}"
+                )
+                return ""
+
+    # the whole character at `pos`
+    fn char_here(self) -> str:
+        return self.text[self.pos:self.pos + utf8_len(int(self.bytes[self.pos]))]
+
+    fn string(ref self):
+        let lo = self.pos
+        let q = self.peek()
+        self.pos += 1
+        var out = ""
+        while true:
+            if self.done() or self.peek() == "\n":
+                self.error(
+                    "E0102",
+                    "unterminated string literal",
+                    lo,
+                    self.pos,
+                    "string starts here",
+                    "close the string with a matching quote on the same line"
+                )
+                break
+            let c = self.peek()
+            if c == q:
+                self.pos += 1
+                break
+            if c == "\\":
+                self.pos += 1
+                out += self.escape()
+                continue
+            let ch = self.char_here()
+            out += ch
+            self.pos += len(ch)
+        self.push(Tok.Str(out), lo, self.pos)
+
+    fn fstring(ref self, lo: int):
+        let q = self.peek()
+        self.pos += 1
+        var parts: [FPart] = []
+        var lit = ""
+        while true:
+            if self.done() or self.peek() == "\n":
+                self.error(
+                    "E0102",
+                    "unterminated f-string",
+                    lo,
+                    self.pos,
+                    "f-string starts here",
+                    ""
+                )
+                break
+            let c = self.peek()
+            let c2 = self.peek2()
+            if c == q:
+                self.pos += 1
+                break
+            if c == "\\":
+                self.pos += 1
+                lit += self.escape()
+                continue
+            if (c == "{" or c == "}") and c2 == c:
+                lit += c
+                self.pos += 2
+                continue
+            if c == "}":
+                self.error(
+                    "E0102",
+                    "single `}` in f-string",
+                    self.pos,
+                    self.pos + 1,
+                    "unmatched",
+                    "use `}}` to write a literal brace"
+                )
+                self.pos += 1
+                continue
+            if c != "{":
+                let ch = self.char_here()
+                lit += ch
+                self.pos += len(ch)
+                continue
+            # `{expr}` or `{expr:spec}`
+            if lit != "":
+                parts.push(FPart.Lit(lit))
+                lit = ""
+            self.pos += 1
+            let es = self.pos
+            var depth = 0
+            var colon = -1
+            var closed = false
+            while not self.done() and self.peek() != "\n":
+                let ch = self.peek()
+                if ch == "(" or ch == "[" or ch == "{":
+                    depth += 1
+                elif ch == "}" and depth <= 0:
+                    closed = true
+                    break
+                elif ch == ")" or ch == "]" or ch == "}":
+                    depth -= 1
+                elif ch == ":" and depth == 0 and colon < 0:
+                    colon = self.pos
+                if ch == q:
+                    break
+                self.pos += 1
+            let ee = colon if colon >= 0 else self.pos
+            let src = self.text[es:ee]
+            var spec: Option[str] = None
+            if colon >= 0:
+                spec = Some(self.text[colon + 1:self.pos])
+            if not closed:
+                self.error(
+                    "E0102",
+                    "unclosed `{` in f-string",
+                    es - 1,
+                    self.pos,
+                    "expected `}`",
+                    "use `{{` to write a literal brace"
+                )
+            else:
+                self.pos += 1
+            if src.strip() == "":
+                self.error(
+                    "E0111",
+                    "empty expression in f-string",
+                    es - 1,
+                    self.pos,
+                    "expected an expression",
+                    ""
+                )
+            parts.push(FPart.Expr(src=src, offset=self.base + es, spec=spec))
+        if lit != "":
+            parts.push(FPart.Lit(lit))
+        self.push(Tok.FStr(parts), lo, self.pos)
+
+    fn punct(ref self):
+        let lo = self.pos
+        let c = self.peek()
+        let two = c + self.peek2()
+        let three = two + self.at(self.pos + 2)
+        if three == "..=":
+            self.op(Tok.DotDotEq, 3)
+            return
+        match two:
+            case ".." | "->" | "==" | "!=" | "<=" | ">=" | "<<" | ">>" | "+=" | "-=" | "*=" | "/=" | "%=":
+                self.op(self.singles[two], 2)
+                return
+            case "//":
+                let d = self.error_fix(
+                    "E0105",
+                    "`//` is not an operator in brine",
+                    lo,
+                    lo + 2,
+                    "use `/`",
+                    "/",
+                    "replace with `/`"
+                )
+                self.diags.push(
+                    d.note("`/` on integers already rounds down like Python's `//`; comments start with `#`")
+                )
+                self.op(Tok.Slash, 2)
+                return
+            case "&&":
+                self.diags.push(
+                    self.error_fix("E0105", "`&&` is not an operator in brine", lo, lo + 2, "use `and`", "and", "replace with `and`")
+                )
+                self.op(Tok.Keyword(Kw.And), 2)
+                return
+            case "||":
+                self.diags.push(
+                    self.error_fix("E0105", "`||` is not an operator in brine", lo, lo + 2, "use `or`", "or", "replace with `or`")
+                )
+                self.op(Tok.Keyword(Kw.Or), 2)
+                return
+            case "++" | "--":
+                let fix = "+= 1" if c == "+" else "-= 1"
+                self.error(
+                    "E0105",
+                    "brine has no increment/decrement operators",
+                    lo,
+                    lo + 2,
+                    "not supported",
+                    f"write `x {fix}` instead"
+                )
+                self.op(Tok.PlusEq if c == "+" else Tok.MinusEq, 2)
+                return
+            case _:
+                pass
+        match self.singles.get(c):
+            case Some(t):
+                self.op(t, 1)
+            case None:
+                if c == "!":
+                    self.diags.push(
+                        self.error_fix("E0105", "`!` is not an operator in brine", lo, lo + 1, "use `not`", "not ", "replace with `not`")
+                    )
+                    self.op(Tok.Keyword(Kw.Not), 1)
+                elif c == ";":
+                    self.diags.push(
+                        self.error_fix("E0106", "semicolons are not used in brine", lo, lo + 1, "remove this", "", "remove the semicolon")
+                    )
+                    self.pos += 1
+                else:
+                    let ch = self.char_here()
+                    self.error(
+                        "E0101",
+                        f"unexpected character `{ch}`",
+                        lo,
+                        lo + len(ch),
+                        "not valid here",
+                        ""
+                    )
+                    self.pos += len(ch)
+
+    # push an operator `n` bytes long, tracking bracket depth (newlines inside brackets don't count)
+    fn op(ref self, t: Tok, n: int):
+        match t:
+            case Tok.LParen | Tok.LBracket | Tok.LBrace:
+                self.depth += 1
+            case Tok.RParen | Tok.RBracket | Tok.RBrace:
+                self.depth = max(self.depth - 1, 0)
+            case _:
+                pass
+        let lo = self.pos
+        self.pos += n
+        self.push(t, lo, self.pos)
+
+# Lex `text`, the contents of file number `file`. `base` is added to every
+# offset (for f-string expressions); `layout` turns on NEWLINE/INDENT/DEDENT tokens.
+fn lex(text: str, file: int, base: int, keep_comments: bool, layout: bool) -> ([Token], [Diag]):
+    var keywords: {str: Kw} = {}
+    for name, k in keyword_list():
+        keywords[name] = k
+    var singles: {str: Tok} = {}
+    for p, t in punct_list():
+        singles[p] = t
+    var lx = Lexer(
+        text=text,
+        bytes=text.bytes(),
+        pos=0,
+        file=file,
+        base=base,
+        toks=[],
+        diags=[],
+        indents=[0],
+        depth=0,
+        keep_comments=keep_comments,
+        layout=layout,
+        at_line_start=true,
+        keywords=keywords,
+        singles=singles
+    )
+    lx.run()
+    return (lx.toks, lx.diags)
+
+# A token as one line of text; `src` is the token's source text.
+fn dump_tok(t: Tok, src: str) -> str:
+    match t:
+        case Tok.Ident(name):
+            return "ident " + name
+        case Tok.Int(v):
+            return f"int {v}"
+        case Tok.Float(_):
+            return "float " + src
+        case Tok.Str(s):
+            return "str " + quote(s)
+        case Tok.FStr(parts):
+            var out = "fstr"
+            for p in parts:
+                match p:
+                    case FPart.Lit(text):
+                        out += " lit " + quote(text)
+                    case FPart.Expr(e, offset, spec):
+                        out += f" expr {quote(e)}@{offset}"
+                        match spec:
+                            case Some(sp):
+                                out += ":" + quote(sp)
+                            case None:
+                                pass
+            return out
+        case Tok.Keyword(k):
+            return "kw " + kw_name(k)
+        case Tok.Newline:
+            return "newline"
+        case Tok.Indent:
+            return "indent"
+        case Tok.Dedent:
+            return "dedent"
+        case Tok.Eof:
+            return "eof"
+        case Tok.Comment(text):
+            return "comment " + quote(text)
+        case _:
+            return "punct " + punct_str(t)

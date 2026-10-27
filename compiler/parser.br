@@ -1,0 +1,1497 @@
+# The brine parser, written in brine: a port of src/parser.rs.
+# Recursive descent over the lexer's tokens. Errors are collected; after one,
+# the parser skips to the next line and keeps going.
+from diag import Span, Diag
+import diag
+from lexer import Tok, Kw, Token, FPart, lex, describe, kw_name
+from ast import TypeExpr, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Expr, ExprKind, mk
+from ast import LetPat, Pattern, PatKind, Case, ContractKind, Stmt, StmtKind, Block, stmt, pattern
+from ast import Param, FnDecl, FieldDecl, StructDecl, VariantDecl, EnumDecl, ConstDecl, Import, Module
+
+fn is_int(t: Tok) -> bool:
+    match t:
+        case Tok.Int(_):
+            return true
+        case _:
+            return false
+
+fn empty_block() -> Block:
+    return Block(stmts=[], span=Span(file=0, lo=0, hi=0))
+
+struct Parser:
+    toks: [Token]
+    pos: int
+    file: int
+    diags: [Diag]
+
+    # ------------------------------------------------------------ helpers
+    fn peek(self) -> Tok:
+        return self.toks[self.pos].tok
+
+    fn peek_at(self, n: int) -> Tok:
+        return self.toks[min(self.pos + n, len(self.toks) - 1)].tok
+
+    fn span(self) -> Span:
+        let t = self.toks[self.pos]
+        return Span(file=self.file, lo=t.lo, hi=t.hi)
+
+    fn prev_span(self) -> Span:
+        if self.pos == 0:
+            return self.span()
+        let t = self.toks[self.pos - 1]
+        return Span(file=self.file, lo=t.lo, hi=t.hi)
+
+    fn bump(ref self) -> Span:
+        let s = self.span()
+        if self.pos < len(self.toks) - 1:
+            self.pos += 1
+        return s
+
+    fn at(self, t: Tok) -> bool:
+        return self.peek() == t
+
+    fn at_kw(self, k: Kw) -> bool:
+        return self.peek() == Tok.Keyword(k)
+
+    fn eat(ref self, t: Tok) -> bool:
+        if self.at(t):
+            self.bump()
+            return true
+        return false
+
+    fn eat_kw(ref self, k: Kw) -> bool:
+        if self.at_kw(k):
+            self.bump()
+            return true
+        return false
+
+    fn error_here(self, code: str, msg: str, label: str) -> Diag:
+        return diag.error(code, msg).label(self.span(), label)
+
+    # report an error at the current token
+    fn report(ref self, code: str, msg: str, label: str):
+        self.diags.push(self.error_here(code, msg, label))
+
+    fn expect(ref self, t: Tok, what: str) -> Result[Span, ()]:
+        if self.at(t):
+            return Ok(self.bump())
+        let found = describe(self.peek())
+        var d = self.error_here("E0110", f"expected {what}, found {found}", f"expected {what}")
+        if t == Tok.Colon and self.at(Tok.Newline):
+            let s = self.prev_span()
+            d = d.with_help(
+                "blocks start with `:` at the end of the line"
+            ).fix(Span(file=s.file, lo=s.hi, hi=s.hi), ":", "add `:`")
+        elif t == Tok.Colon and self.at(Tok.LBrace):
+            d = diag.error(
+                "E0106",
+                "brine uses indentation for blocks, not braces"
+            ).label(self.span(), "unexpected brace")
+            d = d.with_help("end the line with `:` and indent the block by 4 spaces")
+        self.diags.push(d)
+        return Err(())
+
+    # A field name: any keyword works too after `.` (`any_kw`) or before `:`
+    # in a field declaration, e.g. `requires: [Expr]` and `f.requires`.
+    fn field_name(ref self, what: str, any_kw: bool) -> Result[(str, Span), ()]:
+        match self.peek():
+            case Tok.Keyword(k) if any_kw or self.peek_at(1) == Tok.Colon:
+                return Ok((kw_name(k), self.bump()))
+            case _:
+                return self.expect_ident(what)
+
+    fn expect_ident(ref self, what: str) -> Result[(str, Span), ()]:
+        match self.peek():
+            case Tok.Ident(s):
+                return Ok((s, self.bump()))
+            case Tok.Keyword(k):
+                self.report(
+                    "E0110",
+                    f"expected {what}, found keyword `{kw_name(k)}`",
+                    "keywords can't be used as names"
+                )
+                return Err(())
+            case t:
+                self.report("E0110", f"expected {what}, found {describe(t)}", f"expected {what}")
+                return Err(())
+
+    fn skip_newlines(ref self):
+        while self.at(Tok.Newline):
+            self.bump()
+
+    # Skip to the end of the current line (and any nested block).
+    fn sync_line(ref self):
+        var depth = 0
+        while true:
+            match self.peek():
+                case Tok.Eof:
+                    return
+                case Tok.Newline if depth == 0:
+                    self.bump()
+                    if self.at(Tok.Indent):
+                        depth += 1
+                        self.bump()
+                        continue
+                    return
+                case Tok.Indent:
+                    depth += 1
+                    self.bump()
+                case Tok.Dedent:
+                    if depth == 0:
+                        return
+                    depth -= 1
+                    self.bump()
+                    if depth == 0:
+                        return
+                case _:
+                    self.bump()
+
+    fn end_stmt(ref self) -> Result[(), ()]:
+        match self.peek():
+            case Tok.Newline:
+                self.bump()
+                return Ok(())
+            case Tok.Dedent | Tok.Eof:
+                return Ok(())
+            case t:
+                self.report(
+                    "E0110",
+                    f"expected end of line, found {describe(t)}",
+                    "unexpected here"
+                )
+                return Err(())
+
+    # ------------------------------------------------------------ items
+    fn module(ref self, name: str) -> Module:
+        var m = Module(
+            name=name,
+            file=self.file,
+            imports=[],
+            fns=[],
+            structs=[],
+            enums=[],
+            consts=[],
+            tests=[]
+        )
+        self.skip_newlines()
+        while not self.at(Tok.Eof):
+            if self.item(ref m).is_err():
+                self.sync_line()
+            self.skip_newlines()
+            while self.at(Tok.Dedent):
+                self.bump()
+                self.skip_newlines()
+        return m
+
+    fn item(ref self, ref m: Module) -> Result[(), ()]:
+        match self.peek():
+            case Tok.Keyword(Kw.Fn):
+                m.fns.push(self.fn_decl(None)?)
+            case Tok.Keyword(Kw.Struct):
+                self.struct_decl(ref m)?
+            case Tok.Keyword(Kw.Enum):
+                self.enum_decl(ref m)?
+            case Tok.Keyword(Kw.Const):
+                m.consts.push(self.const_decl()?)
+            case Tok.Keyword(Kw.Import):
+                m.imports.push(self.import_decl()?)
+            case Tok.Keyword(Kw.Test):
+                m.tests.push(self.test_decl()?)
+            case Tok.Keyword(Kw.Extern):
+                m.fns.push(self.extern_decl()?)
+            case Tok.Indent:
+                self.report(
+                    "E0103",
+                    "unexpected indentation",
+                    "this line is indented but isn't inside a block"
+                )
+                return Err(())
+            case Tok.Ident(s) if s == "def":
+                let sp = self.span()
+                self.diags.push(
+                    diag.error("E0110", "brine uses `fn` to define functions").label(sp, "use `fn` here").fix(sp, "fn", "replace `def` with `fn`")
+                )
+                return Err(())
+            case Tok.Ident(s) if s == "class":
+                let sp = self.span()
+                self.diags.push(
+                    diag.error("E0110", "brine uses `struct` to define types").label(sp, "use `struct` here").fix(sp, "struct", "replace `class` with `struct`")
+                )
+                return Err(())
+            case Tok.Ident(s) if s == "from":
+                m.imports.push(self.from_import()?)
+            case t:
+                let d = self.error_here(
+                    "E0110",
+                    f"expected a top-level item, found {describe(t)}",
+                    "expected `fn`, `struct`, `enum`, `const`, `import` or `test`"
+                )
+                self.diags.push(
+                    d.with_help("statements must be inside a function; put program code inside `fn main():`")
+                )
+                return Err(())
+        return Ok(())
+
+    fn module_path(ref self) -> Result[[str], ()]:
+        let (first, _) = self.expect_ident("module name")?
+        var path = [first]
+        while self.eat(Tok.Dot):
+            let (n, _) = self.expect_ident("module name")?
+            path.push(n)
+        return Ok(path)
+
+    fn import_decl(ref self) -> Result[Import, ()]:
+        let start = self.bump()
+        let path = self.module_path()?
+        var alias = path[len(path) - 1]
+        if self.eat_kw(Kw.As):
+            let (a, _) = self.expect_ident("alias")?
+            alias = a
+        let span = start.to(self.prev_span())
+        self.end_stmt()?
+        return Ok(Import(path=path, alias=alias, names=[], span=span))
+
+    # `from a.b import x, y` (`from` is only special at the start of a top-level line)
+    fn from_import(ref self) -> Result[Import, ()]:
+        let start = self.bump()
+        let path = self.module_path()?
+        if not self.eat_kw(Kw.Import):
+            let d = self.error_here(
+                "E0110",
+                "expected `import` after the module name",
+                "expected `import`"
+            )
+            self.diags.push(d.with_help("write `from module import name1, name2`"))
+            return Err(())
+        var names = [self.expect_ident("a name to import")?]
+        while self.eat(Tok.Comma):
+            names.push(self.expect_ident("a name to import")?)
+        let span = start.to(self.prev_span())
+        self.end_stmt()?
+        return Ok(Import(path=path, alias="", names=names, span=span))
+
+    fn const_decl(ref self) -> Result[ConstDecl, ()]:
+        let start = self.bump()
+        let (name, _) = self.expect_ident("constant name")?
+        var ty: Option[TypeExpr] = None
+        if self.eat(Tok.Colon):
+            ty = Some(self.type_expr()?)
+        self.expect(Tok.Assign, "`=`")?
+        let value = self.expr()?
+        let span = start.to(self.prev_span())
+        self.end_stmt()?
+        return Ok(ConstDecl(name=name, span=span, ty=ty, value=value))
+
+    # one line of a struct body: `name: type`, a method or `pass`
+    fn struct_member(
+        ref self,
+        owner: str,
+        ref fields: [FieldDecl],
+        ref m: Module
+    ) -> Result[(), ()]:
+        match self.peek():
+            case Tok.Keyword(Kw.Fn):
+                m.fns.push(self.fn_decl(Some(owner))?)
+            case Tok.Keyword(Kw.Pass):
+                self.bump()
+                self.end_stmt()?
+            case Tok.Newline:
+                self.bump()
+            case _:
+                let (fname, fspan) = self.field_name("field name", false)?
+                self.expect(Tok.Colon, "`:` and a type")?
+                let ty = self.type_expr()?
+                fields.push(FieldDecl(name=fname, span=fspan, ty=ty))
+                self.end_stmt()?
+        return Ok(())
+
+    fn struct_decl(ref self, ref m: Module) -> Result[(), ()]:
+        let start = self.bump()
+        let (name, _) = self.expect_ident("struct name")?
+        let tparams = self.tparams()?
+        self.expect(Tok.Colon, "`:`")?
+        self.expect(Tok.Newline, "a new line after `:`")?
+        if not self.eat(Tok.Indent):
+            self.report(
+                "E0110",
+                "expected an indented list of fields",
+                "struct body must be indented"
+            )
+            return Err(())
+        var fields: [FieldDecl] = []
+        while not self.at(Tok.Dedent) and not self.at(Tok.Eof):
+            if self.struct_member(name, ref fields, ref m).is_err():
+                self.sync_line()
+        self.eat(Tok.Dedent)
+        m.structs.push(StructDecl(name=name, span=start, tparams=tparams, fields=fields))
+        return Ok(())
+
+    # one line of an enum body: a variant (`Circle(radius: float)` or `Empty`), a method or `pass`
+    fn enum_member(
+        ref self,
+        owner: str,
+        ref variants: [VariantDecl],
+        ref m: Module
+    ) -> Result[(), ()]:
+        match self.peek():
+            case Tok.Keyword(Kw.Fn):
+                m.fns.push(self.fn_decl(Some(owner))?)
+            case Tok.Keyword(Kw.Pass):
+                self.bump()
+                self.end_stmt()?
+            case Tok.Newline:
+                self.bump()
+            case _:
+                let (vname, vspan) = self.expect_ident("variant name")?
+                var fields: [FieldDecl] = []
+                if self.eat(Tok.LParen):
+                    while not self.at(Tok.RParen):
+                        let (fname, fspan) = self.field_name("field name", false)?
+                        if not self.at(Tok.Colon):
+                            let d = self.error_here(
+                                "E0110",
+                                f"variant field `{fname}` needs a type",
+                                "expected `: type`"
+                            )
+                            self.diags.push(
+                                d.with_help(f"write `{vname}({fname}: int)` (or another type)")
+                            )
+                            return Err(())
+                        self.bump()
+                        let ty = self.type_expr()?
+                        fields.push(FieldDecl(name=fname, span=fspan, ty=ty))
+                        if not self.eat(Tok.Comma):
+                            break
+                    self.expect(Tok.RParen, "`)`")?
+                variants.push(VariantDecl(name=vname, span=vspan, fields=fields))
+                self.end_stmt()?
+        return Ok(())
+
+    fn enum_decl(ref self, ref m: Module) -> Result[(), ()]:
+        let start = self.bump()
+        let (name, _) = self.expect_ident("enum name")?
+        let tparams = self.tparams()?
+        self.expect(Tok.Colon, "`:`")?
+        self.expect(Tok.Newline, "a new line after `:`")?
+        if not self.eat(Tok.Indent):
+            let d = self.error_here(
+                "E0110",
+                "expected an indented list of variants",
+                "enum body must be indented"
+            )
+            self.diags.push(
+                d.with_help("list one variant per line, e.g. `Circle(radius: float)` or `Empty`")
+            )
+            return Err(())
+        var variants: [VariantDecl] = []
+        while not self.at(Tok.Dedent) and not self.at(Tok.Eof):
+            if self.enum_member(name, ref variants, ref m).is_err():
+                self.sync_line()
+        self.eat(Tok.Dedent)
+        m.enums.push(EnumDecl(name=name, span=start, tparams=tparams, variants=variants))
+        return Ok(())
+
+    fn params(ref self, method: bool) -> Result[[Param], ()]:
+        self.expect(Tok.LParen, "`(`")?
+        var ps: [Param] = []
+        while not self.at(Tok.RParen):
+            let mut_span = self.span()
+            let by_ref = self.eat_kw(Kw.Ref)
+            let mutable = not by_ref and self.eat_kw(Kw.Mut)
+            let (name, span) = self.expect_ident("parameter name")?
+            if mutable and name == "self":
+                let d = diag.error(
+                    "E0402",
+                    "use `ref self` for a method that changes its receiver"
+                ).label(mut_span.to(span), "`mut self` would only change a copy")
+                self.diags.push(d.fix(mut_span, "ref", "replace with `ref`"))
+            var ty: Option[TypeExpr] = None
+            if not (name == "self" and len(ps) == 0 and method):
+                if not self.at(Tok.Colon):
+                    let d = self.error_here(
+                        "E0110",
+                        f"parameter `{name}` needs a type",
+                        "expected `: type`"
+                    )
+                    self.diags.push(d.with_help(f"write `{name}: int` (or another type)"))
+                    return Err(())
+                self.bump()
+                ty = Some(self.type_expr()?)
+            ps.push(Param(name=name, span=span, ty=ty, by_ref=by_ref, mutable=mutable))
+            if not self.eat(Tok.Comma):
+                break
+        self.expect(Tok.RParen, "`)`")?
+        return Ok(ps)
+
+    fn ret_type(ref self) -> Result[Option[TypeExpr], ()]:
+        if self.eat(Tok.Arrow):
+            return Ok(Some(self.type_expr()?))
+        return Ok(None)
+
+    fn fn_decl(ref self, method_of: Option[str]) -> Result[FnDecl, ()]:
+        let start = self.bump()
+        let (name, name_span) = self.expect_ident("function name")?
+        let tparams = self.tparams()?
+        let params = self.params(method_of.is_some())?
+        let ret = self.ret_type()?
+        let sig_span = start.to(self.prev_span())
+        self.expect(Tok.Colon, "`:`")?
+        let (body, contracts) = self.block([ContractKind.Requires, ContractKind.Ensures])?
+        var pre: [Expr] = []
+        var post: [Expr] = []
+        for k, e in contracts:
+            if k == ContractKind.Requires:
+                pre.push(e)
+            else:
+                post.push(e)
+        return Ok(
+            FnDecl(name=name, name_span=name_span, params=params, ret=ret, requires=pre, ensures=post, body=body, span=sig_span, is_extern=false, method_of=method_of, tparams=tparams, test_name=None, id=0, locals=[], param_locals=[], result_local=None)
+        )
+
+    fn extern_decl(ref self) -> Result[FnDecl, ()]:
+        let start = self.bump()
+        if not self.at_kw(Kw.Fn):
+            self.report("E0110", "expected `fn` after `extern`", "expected `fn`")
+            return Err(())
+        self.bump()
+        let (name, name_span) = self.expect_ident("function name")?
+        let params = self.params(false)?
+        let ret = self.ret_type()?
+        let span = start.to(self.prev_span())
+        self.end_stmt()?
+        return Ok(
+            FnDecl(name=name, name_span=name_span, params=params, ret=ret, requires=[], ensures=[], body=empty_block(), span=span, is_extern=true, method_of=None, tparams=[], test_name=None, id=0, locals=[], param_locals=[], result_local=None)
+        )
+
+    fn test_decl(ref self) -> Result[FnDecl, ()]:
+        let start = self.bump()
+        var name = ""
+        match self.peek():
+            case Tok.Str(s):
+                self.bump()
+                name = s
+            case _:
+                self.report("E0110", "expected a test name string", "e.g. test \"adds numbers\":")
+                return Err(())
+        let span = start.to(self.prev_span())
+        self.expect(Tok.Colon, "`:`")?
+        let (body, _) = self.block([])?
+        return Ok(
+            FnDecl(name="test_0", name_span=span, params=[], ret=None, requires=[], ensures=[], body=body, span=span, is_extern=false, method_of=None, tparams=[], test_name=Some(name), id=0, locals=[], param_locals=[], result_local=None)
+        )
+
+    # ------------------------------------------------------------ types
+    # Optional type parameters: `[T, U]`.
+    fn tparams(ref self) -> Result[[(str, Span)], ()]:
+        var ps: [(str, Span)] = []
+        if not self.eat(Tok.LBracket):
+            return Ok(ps)
+        while true:
+            let (n, sp) = self.expect_ident("type parameter name")?
+            for p, _ in ps:
+                if p == n:
+                    self.diags.push(
+                        diag.error("E0202", f"type parameter `{n}` is declared twice").label(sp, "duplicate")
+                    )
+                    break
+            ps.push((n, sp))
+            if not self.eat(Tok.Comma):
+                break
+            if self.at(Tok.RBracket):
+                break
+        self.expect(Tok.RBracket, "`]`")?
+        return Ok(ps)
+
+    fn type_expr(ref self) -> Result[TypeExpr, ()]:
+        let start = self.span()
+        match self.peek():
+            case Tok.LBracket:
+                self.bump()
+                let elem = self.type_expr()?
+                self.expect(Tok.RBracket, "`]`")?
+                return Ok(TypeExpr.Array(elem, start.to(self.prev_span())))
+            case Tok.LBrace:
+                self.bump()
+                let key = self.type_expr()?
+                self.expect(Tok.Colon, "`:` between the key and value types")?
+                let val = self.type_expr()?
+                self.expect(Tok.RBrace, "`}`")?
+                return Ok(TypeExpr.Map(key, val, start.to(self.prev_span())))
+            case Tok.LParen:
+                self.bump()
+                var elems: [TypeExpr] = []
+                while not self.at(Tok.RParen):
+                    elems.push(self.type_expr()?)
+                    if not self.eat(Tok.Comma):
+                        break
+                self.expect(Tok.RParen, "`)`")?
+                return Ok(TypeExpr.Tuple(elems, start.to(self.prev_span())))
+            case Tok.Ident(_):
+                let (first, _) = self.expect_ident("type")?
+                var path = [first]
+                while self.at(Tok.Dot):
+                    self.bump()
+                    let (n, _) = self.expect_ident("type name")?
+                    path.push(n)
+                var args: [TypeExpr] = []
+                if self.eat(Tok.LBracket):
+                    while true:
+                        args.push(self.type_expr()?)
+                        if not self.eat(Tok.Comma):
+                            break
+                        if self.at(Tok.RBracket):
+                            break
+                    self.expect(Tok.RBracket, "`]`")?
+                return Ok(TypeExpr.Named(path, args, start.to(self.prev_span())))
+            case t:
+                self.report(
+                    "E0110",
+                    f"expected a type, found {describe(t)}",
+                    "expected a type like `int`, `[float]` or `Point`"
+                )
+                return Err(())
+
+    # ------------------------------------------------------------ blocks & statements
+
+    # Parses `NEWLINE INDENT stmts DEDENT` (or a single simple statement on the
+    # same line). Leading contract statements of the allowed kinds are returned
+    # separately.
+    fn block(ref self, allow: [ContractKind]) -> Result[(Block, [(ContractKind, Expr)]), ()]:
+        let start = self.span()
+        var stmts: [Stmt] = []
+        if not self.at(Tok.Newline):
+            # single-line block: `if x: return 1`
+            stmts.push(self.simple_stmt()?)
+        else:
+            self.bump()
+            if not self.eat(Tok.Indent):
+                let d = self.error_here(
+                    "E0103",
+                    "expected an indented block",
+                    "this should be indented"
+                )
+                self.diags.push(
+                    d.with_help("indent the body of the block by 4 spaces (use `pass` for an empty block)")
+                )
+                return Err(())
+            while not self.at(Tok.Dedent) and not self.at(Tok.Eof):
+                match self.stmt():
+                    case Ok(s):
+                        stmts.push(s)
+                    case Err(_):
+                        self.sync_line()
+                self.skip_newlines()
+            self.eat(Tok.Dedent)
+        let span = start.to(self.prev_span())
+        # pull out leading contracts
+        var contracts: [(ContractKind, Expr)] = []
+        var leading = true
+        var kept: [Stmt] = []
+        for s in stmts:
+            match s.kind:
+                case StmtKind.Contract(k, e):
+                    if leading and k in allow:
+                        contracts.push((k, e))
+                    else:
+                        let where = "at the start of a `while` or `for` loop body" if k == ContractKind.Invariant else "at the start of a function body"
+                        let d = diag.error(
+                            "E0112",
+                            f"`{k.keyword()}` is only allowed {where}"
+                        ).label(s.span, "misplaced contract")
+                        self.diags.push(
+                            d.with_help("move it to the top of the body, before any other statement")
+                        )
+                case _:
+                    leading = false
+                    kept.push(s)
+        return Ok((Block(stmts=kept, span=span), contracts))
+
+    fn stmt(ref self) -> Result[Stmt, ()]:
+        let start = self.span()
+        match self.peek():
+            case Tok.Keyword(Kw.If):
+                return self.if_stmt()
+            case Tok.Keyword(Kw.While):
+                self.bump()
+                let cond = self.expr()?
+                self.expect(Tok.Colon, "`:`")?
+                let (body, invs) = self.block([ContractKind.Invariant])?
+                return Ok(stmt(StmtKind.While(cond, [e for _, e in invs], body), start))
+            case Tok.Keyword(Kw.For):
+                return self.for_stmt(false)
+            case Tok.Keyword(Kw.Match):
+                return self.match_stmt()
+            case Tok.Keyword(Kw.Par) if self.peek_at(1) == Tok.Keyword(Kw.For):
+                self.bump()
+                return self.for_stmt(true)
+            case _:
+                return self.simple_stmt()
+
+    # `: type` after a loop variable, if written
+    fn loop_var_type(ref self) -> Result[Option[TypeExpr], ()]:
+        if self.eat(Tok.Colon):
+            return Ok(Some(self.type_expr()?))
+        return Ok(None)
+
+    fn for_stmt(ref self, is_par: bool) -> Result[Stmt, ()]:
+        let start = self.bump()
+        var (name, name_span) = self.expect_ident("loop variable")?
+        var t = self.loop_var_type()?
+        # `for k, v in m.items():` loops over a hidden variable and unpacks it first thing
+        var names: [(str, Span)] = []
+        var unpack_ty: Option[TypeExpr] = None
+        if self.at(Tok.Comma):
+            names.push((name, name_span))
+            var tys: [Option[TypeExpr]] = [t]
+            t = None
+            while self.eat(Tok.Comma):
+                names.push(self.expect_ident("loop variable")?)
+                tys.push(self.loop_var_type()?)
+            let (_, first) = names[0]
+            let (_, last) = names[len(names) - 1]
+            name_span = first.to(last)
+            name = f"for'{name_span.lo}"
+            # `for k: str, v: int in ...`: all typed or none
+            let typed = len([x for x in tys if x.is_some()])
+            if typed == len(tys):
+                let elems = [x.unwrap() for x in tys]
+                let tspan = elems[0].span().to(elems[len(elems) - 1].span())
+                unpack_ty = Some(TypeExpr.Tuple(elems, tspan))
+            elif typed > 0:
+                self.diags.push(
+                    diag.error("E0110", "give every loop variable a type, or none").label(name_span, "some of these have types and some don't")
+                )
+                return Err(())
+        if not self.eat_kw(Kw.In):
+            self.report("E0110", "expected `in` after the loop variable", "expected `in`")
+            return Err(())
+        let iter = self.or_expr()?
+        self.expect(Tok.Colon, "`:`")?
+        var (body, invs) = self.block([ContractKind.Invariant])?
+        if len(names) > 0:
+            let init = mk(ExprKind.Ident(name), name_span)
+            let unpack = stmt(
+                StmtKind.Let(false, LetPat.Tuple(names), unpack_ty, init, false),
+                name_span
+            )
+            body.stmts.insert(0, unpack)
+        return Ok(
+            stmt(StmtKind.For(name, name_span, t, iter, [e for _, e in invs], body, is_par), start.to(name_span))
+        )
+
+    fn case_clause(ref self) -> Result[Case, ()]:
+        if not self.at_kw(Kw.Case):
+            self.report(
+                "E0110",
+                f"expected `case`, found {describe(self.peek())}",
+                "expected `case pattern:`"
+            )
+            return Err(())
+        let cstart = self.bump()
+        let pat = self.pattern()?
+        var guard: Option[Expr] = None
+        if self.eat_kw(Kw.If):
+            guard = Some(self.expr()?)
+        let span = cstart.to(self.prev_span())
+        self.expect(Tok.Colon, "`:`")?
+        let (body, _) = self.block([])?
+        return Ok(Case(pat=pat, guard=guard, body=body, span=span))
+
+    fn match_stmt(ref self) -> Result[Stmt, ()]:
+        let start = self.bump()
+        let scrut = self.expr()?
+        self.expect(Tok.Colon, "`:`")?
+        self.expect(Tok.Newline, "a new line after `:`")?
+        if not self.eat(Tok.Indent):
+            let d = self.error_here(
+                "E0103",
+                "expected an indented list of `case`s",
+                "this should be indented"
+            )
+            self.diags.push(d.with_help("write each case on its own line: `case pattern:`"))
+            return Err(())
+        var cases: [Case] = []
+        while not self.at(Tok.Dedent) and not self.at(Tok.Eof):
+            if self.eat(Tok.Newline):
+                continue
+            match self.case_clause():
+                case Ok(c):
+                    cases.push(c)
+                case Err(_):
+                    self.sync_line()
+            self.skip_newlines()
+        self.eat(Tok.Dedent)
+        if len(cases) == 0:
+            self.diags.push(
+                diag.error("E0110", "`match` needs at least one `case`").label(start, "no cases")
+            )
+        return Ok(stmt(StmtKind.Match(scrut, cases), start))
+
+    fn pattern(ref self) -> Result[Pattern, ()]:
+        let first = self.closed_pattern()?
+        if not self.at(Tok.Pipe):
+            return Ok(first)
+        var alts = [first]
+        while self.eat(Tok.Pipe):
+            alts.push(self.closed_pattern()?)
+        let span = alts[0].span.to(alts[len(alts) - 1].span)
+        return Ok(pattern(PatKind.Or(alts), span))
+
+    fn closed_pattern(ref self) -> Result[Pattern, ()]:
+        let start = self.span()
+        var kind = PatKind.Wild
+        match self.peek():
+            case Tok.Int(v):
+                self.bump()
+                kind = PatKind.Int(i128(v))
+            case Tok.Minus if is_int(self.peek_at(1)):
+                self.bump()
+                match self.peek():
+                    case Tok.Int(v):
+                        kind = PatKind.Int(-i128(v))
+                    case _:
+                        pass
+                self.bump()
+            case Tok.Str(s):
+                self.bump()
+                kind = PatKind.Str(s)
+            case Tok.Keyword(Kw.True):
+                self.bump()
+                kind = PatKind.Bool(true)
+            case Tok.Keyword(Kw.False):
+                self.bump()
+                kind = PatKind.Bool(false)
+            case Tok.Float(_):
+                let d = self.error_here(
+                    "E0110",
+                    "floats can't be used as patterns",
+                    "float pattern"
+                )
+                self.diags.push(
+                    d.with_help("compare floats with `if`/`elif`, or bind the value and add a guard: `case x if x < 0.5:`")
+                )
+                return Err(())
+            case Tok.LParen:
+                self.bump()
+                var elems: [Pattern] = []
+                while not self.at(Tok.RParen):
+                    elems.push(self.pattern()?)
+                    if not self.eat(Tok.Comma):
+                        break
+                self.expect(Tok.RParen, "`)`")?
+                if len(elems) == 1:
+                    return Ok(pattern(elems[0].kind, start.to(self.prev_span())))
+                kind = PatKind.Tuple(elems)
+            case Tok.Ident(name):
+                self.bump()
+                if not self.at(Tok.Dot) and not self.at(Tok.LParen):
+                    kind = PatKind.Wild if name == "_" else PatKind.Bind(name)
+                else:
+                    var path = [name]
+                    while self.eat(Tok.Dot):
+                        let (n, _) = self.expect_ident("variant name")?
+                        path.push(n)
+                    var args: Option[[(Option[(str, Span)], Pattern)]] = None
+                    if self.eat(Tok.LParen):
+                        var xs: [(Option[(str, Span)], Pattern)] = []
+                        while not self.at(Tok.RParen):
+                            var kw: Option[(str, Span)] = None
+                            match (self.peek(), self.peek_at(1)):
+                                case (Tok.Ident(n), Tok.Assign):
+                                    let sp = self.bump()
+                                    self.bump()
+                                    kw = Some((n, sp))
+                                case (Tok.Keyword(k), Tok.Assign):
+                                    let sp = self.bump()
+                                    self.bump()
+                                    kw = Some((kw_name(k), sp))
+                                case _:
+                                    pass
+                            let p = self.pattern()?
+                            xs.push((kw, p))
+                            if not self.eat(Tok.Comma):
+                                break
+                        self.expect(Tok.RParen, "`)`")?
+                        args = Some(xs)
+                    kind = PatKind.Variant(path, args)
+            case t:
+                let d = self.error_here(
+                    "E0110",
+                    f"expected a pattern, found {describe(t)}",
+                    "expected a pattern"
+                )
+                self.diags.push(
+                    d.with_help("patterns look like `_`, `name`, `0`, `\"text\"`, `Shape.Circle(r)` or `(a, b)`")
+                )
+                return Err(())
+        return Ok(pattern(kind, start.to(self.prev_span())))
+
+    # `cond: block` after `if`/`elif`
+    fn branch(ref self) -> Result[(Expr, Block), ()]:
+        let c = self.expr()?
+        self.expect(Tok.Colon, "`:`")?
+        let (b, _) = self.block([])?
+        return Ok((c, b))
+
+    fn if_stmt(ref self) -> Result[Stmt, ()]:
+        let start = self.bump()
+        var branches = [self.branch()?]
+        var els: Option[Block] = None
+        while true:
+            self.skip_newlines_before_else()
+            if self.at_kw(Kw.Elif):
+                self.bump()
+                branches.push(self.branch()?)
+            elif self.at_kw(Kw.Else):
+                let else_span = self.bump()
+                if self.at_kw(Kw.If):
+                    let sp = else_span.to(self.span())
+                    self.diags.push(
+                        diag.error("E0114", "use `elif` instead of `else if`").label(sp, "write `elif`").fix(sp, "elif", "replace with `elif`")
+                    )
+                    self.bump()
+                    branches.push(self.branch()?)
+                    continue
+                self.expect(Tok.Colon, "`:`")?
+                let (b, _) = self.block([])?
+                els = Some(b)
+                break
+            else:
+                break
+        return Ok(stmt(StmtKind.If(branches, els), start))
+
+    fn skip_newlines_before_else(ref self):
+        # blocks end with DEDENT; `elif`/`else` follow directly
+        var i = self.pos
+        while self.toks[i].tok == Tok.Newline:
+            i += 1
+        let t = self.toks[i].tok
+        if t == Tok.Keyword(Kw.Elif) or t == Tok.Keyword(Kw.Else):
+            self.pos = i
+
+    fn let_pat(ref self) -> Result[LetPat, ()]:
+        if self.at(Tok.LParen):
+            self.bump()
+            var names: [(str, Span)] = []
+            while not self.at(Tok.RParen):
+                names.push(self.expect_ident("variable name")?)
+                if not self.eat(Tok.Comma):
+                    break
+            self.expect(Tok.RParen, "`)`")?
+            return Ok(LetPat.Tuple(names))
+        let (first, first_span) = self.expect_ident("variable name")?
+        if not self.at(Tok.Comma):
+            return Ok(LetPat.Name(first, first_span))
+        var names = [(first, first_span)]
+        while self.eat(Tok.Comma):
+            names.push(self.expect_ident("variable name")?)
+        return Ok(LetPat.Tuple(names))
+
+    fn simple_kind(ref self) -> Result[StmtKind, ()]:
+        match self.peek():
+            case Tok.Keyword(Kw.Let) | Tok.Keyword(Kw.Var):
+                let mutable = self.at_kw(Kw.Var)
+                self.bump()
+                let pat = self.let_pat()?
+                var ty: Option[TypeExpr] = None
+                if self.eat(Tok.Colon):
+                    ty = Some(self.type_expr()?)
+                if not self.at(Tok.Assign):
+                    let d = self.error_here(
+                        "E0110",
+                        "variables must be initialized",
+                        "expected `=` and a value"
+                    )
+                    self.diags.push(
+                        d.with_help("write `var x = 0` — every variable starts with a value")
+                    )
+                    return Err(())
+                self.bump()
+                let is_ref = self.eat_kw(Kw.Ref)
+                let init = self.expr()?
+                return Ok(StmtKind.Let(mutable, pat, ty, init, is_ref))
+            case Tok.Keyword(Kw.Return):
+                self.bump()
+                match self.peek():
+                    case Tok.Newline | Tok.Dedent | Tok.Eof:
+                        return Ok(StmtKind.Return(None))
+                    case _:
+                        return Ok(StmtKind.Return(Some(self.expr()?)))
+            case Tok.Keyword(Kw.Break):
+                self.bump()
+                return Ok(StmtKind.Break)
+            case Tok.Keyword(Kw.Continue):
+                self.bump()
+                return Ok(StmtKind.Continue)
+            case Tok.Keyword(Kw.Pass):
+                self.bump()
+                return Ok(StmtKind.Pass)
+            case Tok.Keyword(Kw.Requires):
+                self.bump()
+                return Ok(StmtKind.Contract(ContractKind.Requires, self.expr()?))
+            case Tok.Keyword(Kw.Ensures):
+                self.bump()
+                return Ok(StmtKind.Contract(ContractKind.Ensures, self.expr()?))
+            case Tok.Keyword(Kw.Invariant):
+                self.bump()
+                return Ok(StmtKind.Contract(ContractKind.Invariant, self.expr()?))
+            case Tok.Keyword(Kw.Assert):
+                self.bump()
+                let cond = self.expr()?
+                var msg: Option[Expr] = None
+                if self.eat(Tok.Comma):
+                    msg = Some(self.expr()?)
+                return Ok(StmtKind.Assert(cond, msg))
+            case Tok.Keyword(Kw.Prove):
+                self.bump()
+                return Ok(StmtKind.Prove(self.expr()?))
+            case Tok.Keyword(Kw.If) | Tok.Keyword(Kw.While) | Tok.Keyword(Kw.For):
+                self.report(
+                    "E0110",
+                    "compound statements must start on their own line",
+                    "move this to a new line"
+                )
+                return Err(())
+            case _:
+                let e = self.expr()?
+                var op: Option[BinOp] = None
+                match self.peek():
+                    case Tok.Assign:
+                        pass
+                    case Tok.PlusEq:
+                        op = Some(BinOp.Add)
+                    case Tok.MinusEq:
+                        op = Some(BinOp.Sub)
+                    case Tok.StarEq:
+                        op = Some(BinOp.Mul)
+                    case Tok.SlashEq:
+                        op = Some(BinOp.Div)
+                    case Tok.PercentEq:
+                        op = Some(BinOp.Mod)
+                    case _:
+                        return Ok(StmtKind.ExprStmt(e))
+                self.bump()
+                let value = self.expr()?
+                return Ok(StmtKind.Assign(e, op, value))
+
+    fn simple_stmt(ref self) -> Result[Stmt, ()]:
+        let start = self.span()
+        let kind = self.simple_kind()?
+        let span = start.to(self.prev_span())
+        self.end_stmt()?
+        return Ok(stmt(kind, span))
+
+    # ------------------------------------------------------------ expressions
+    fn expr(ref self) -> Result[Expr, ()]:
+        let e = self.or_expr()?
+        if not self.at_kw(Kw.If):
+            return Ok(e)
+        # conditional expression: a if cond else b
+        self.bump()
+        let cond = self.or_expr()?
+        if not self.eat_kw(Kw.Else):
+            let d = self.error_here(
+                "E0110",
+                "expected `else` in conditional expression",
+                "expected `else`"
+            )
+            self.diags.push(d.with_help("write `a if cond else b`"))
+            return Err(())
+        let els = self.expr()?
+        let span = e.span.to(els.span)
+        return Ok(mk(ExprKind.IfElse(cond, e, els), span))
+
+    fn or_expr(ref self) -> Result[Expr, ()]:
+        var l = self.and_expr()?
+        while self.at_kw(Kw.Or):
+            self.bump()
+            let r = self.and_expr()?
+            let span = l.span.to(r.span)
+            l = mk(ExprKind.Binary(BinOp.Or, l, r), span)
+        return Ok(l)
+
+    fn and_expr(ref self) -> Result[Expr, ()]:
+        var l = self.not_expr()?
+        while self.at_kw(Kw.And):
+            self.bump()
+            let r = self.not_expr()?
+            let span = l.span.to(r.span)
+            l = mk(ExprKind.Binary(BinOp.And, l, r), span)
+        return Ok(l)
+
+    fn not_expr(ref self) -> Result[Expr, ()]:
+        if self.at_kw(Kw.Not):
+            let s = self.bump()
+            let e = self.not_expr()?
+            let span = s.to(e.span)
+            return Ok(mk(ExprKind.Unary(UnOp.Not, e), span))
+        return self.comparison()
+
+    fn cmp_op(self) -> Option[CmpOp]:
+        match self.peek():
+            case Tok.EqEq:
+                return Some(CmpOp.Eq)
+            case Tok.Ne:
+                return Some(CmpOp.Ne)
+            case Tok.Lt:
+                return Some(CmpOp.Lt)
+            case Tok.Le:
+                return Some(CmpOp.Le)
+            case Tok.Gt:
+                return Some(CmpOp.Gt)
+            case Tok.Ge:
+                return Some(CmpOp.Ge)
+            case _:
+                return None
+
+    fn comparison(ref self) -> Result[Expr, ()]:
+        let first = self.range_expr()?
+        let neg = self.at_kw(Kw.Not) and self.peek_at(1) == Tok.Keyword(Kw.In)
+        if self.at_kw(Kw.In) or neg:
+            self.bump()
+            if neg:
+                self.bump()
+            let coll = self.range_expr()?
+            let span = first.span.to(coll.span)
+            return Ok(mk(ExprKind.Contains(first, coll, neg), span))
+        var rest: [(CmpOp, Expr)] = []
+        while true:
+            match self.cmp_op():
+                case Some(op):
+                    self.bump()
+                    rest.push((op, self.range_expr()?))
+                case None:
+                    break
+        if len(rest) == 0:
+            return Ok(first)
+        let (_, last) = rest[len(rest) - 1]
+        let span = first.span.to(last.span)
+        return Ok(mk(ExprKind.Compare(first, rest), span))
+
+    fn range_expr(ref self) -> Result[Expr, ()]:
+        let lo = self.binary(0)?
+        if self.at(Tok.DotDot) or self.at(Tok.DotDotEq):
+            let inclusive = self.at(Tok.DotDotEq)
+            self.bump()
+            let hi = self.binary(0)?
+            let span = lo.span.to(hi.span)
+            return Ok(mk(ExprKind.Range(lo, hi, inclusive), span))
+        return Ok(lo)
+
+    # The operator at the current token, if it belongs to precedence `level`
+    # (0 binds loosest: `|`, then `^`, `&`, shifts, `+ -`, `* / %`).
+    fn bin_op(self, level: int) -> Option[BinOp]:
+        match (level, self.peek()):
+            case (0, Tok.Pipe):
+                return Some(BinOp.BitOr)
+            case (1, Tok.Caret):
+                return Some(BinOp.BitXor)
+            case (2, Tok.Amp):
+                return Some(BinOp.BitAnd)
+            case (3, Tok.Shl):
+                return Some(BinOp.Shl)
+            case (3, Tok.Shr):
+                return Some(BinOp.Shr)
+            case (4, Tok.Plus):
+                return Some(BinOp.Add)
+            case (4, Tok.Minus):
+                return Some(BinOp.Sub)
+            case (5, Tok.Star):
+                return Some(BinOp.Mul)
+            case (5, Tok.Slash):
+                return Some(BinOp.Div)
+            case (5, Tok.Percent):
+                return Some(BinOp.Mod)
+            case _:
+                return None
+
+    fn operand(ref self, level: int) -> Result[Expr, ()]:
+        if level >= 5:
+            return self.unary()
+        return self.binary(level + 1)
+
+    fn binary(ref self, level: int) -> Result[Expr, ()]:
+        var l = self.operand(level)?
+        while true:
+            match self.bin_op(level):
+                case Some(op):
+                    self.bump()
+                    let r = self.operand(level)?
+                    let span = l.span.to(r.span)
+                    l = mk(ExprKind.Binary(op, l, r), span)
+                case None:
+                    break
+        return Ok(l)
+
+    fn unary(ref self) -> Result[Expr, ()]:
+        var op = UnOp.Neg
+        match self.peek():
+            case Tok.Minus:
+                op = UnOp.Neg
+            case Tok.Tilde:
+                op = UnOp.BitNot
+            case _:
+                return self.postfix()
+        let s = self.bump()
+        let e = self.unary()?
+        let span = s.to(e.span)
+        return Ok(mk(ExprKind.Unary(op, e), span))
+
+    # call arguments; the `(` is already consumed
+    fn args(ref self) -> Result[[Arg], ()]:
+        var args: [Arg] = []
+        while not self.at(Tok.RParen):
+            let mut_span = self.span()
+            var by_ref = false
+            if self.eat_kw(Kw.Mut):
+                self.diags.push(
+                    diag.error("E0402", "pass references with `ref`, not `mut`").label(mut_span, "write `ref` here").fix(mut_span, "ref", "replace with `ref`")
+                )
+                by_ref = true
+            else:
+                by_ref = self.eat_kw(Kw.Ref)
+            var name: Option[(str, Span)] = None
+            match (self.peek(), self.peek_at(1)):
+                case (Tok.Ident(n), Tok.Assign):
+                    let sp = self.bump()
+                    self.bump()
+                    name = Some((n, sp))
+                # `Fn(requires=[])`: a keyword names a field here
+                case (Tok.Keyword(k), Tok.Assign):
+                    let sp = self.bump()
+                    self.bump()
+                    name = Some((kw_name(k), sp))
+                case _:
+                    pass
+            let e = self.expr()?
+            if self.at_kw(Kw.For) and len(args) == 0 and name.is_none():
+                let comp = self.comp_tail(e, CompKind.Gen)?
+                args.push(Arg(by_ref=by_ref, name=name, expr=comp))
+                break
+            args.push(Arg(by_ref=by_ref, name=name, expr=e))
+            if not self.eat(Tok.Comma):
+                break
+        self.expect(Tok.RParen, "`)`")?
+        return Ok(args)
+
+    fn comp_tail(ref self, body: Expr, kind: CompKind) -> Result[Expr, ()]:
+        self.bump()
+        var (name, name_span) = self.expect_ident("loop variable")?
+        # `[v for k, v in pairs]`: unpack each element
+        var unpack: [(str, Span)] = []
+        if self.at(Tok.Comma):
+            unpack.push((name, name_span))
+            while self.eat(Tok.Comma):
+                unpack.push(self.expect_ident("loop variable")?)
+            name_span = unpack[0].1.to(unpack[len(unpack) - 1].1)
+            name = f"for'{name_span.lo}"
+        if not self.eat_kw(Kw.In):
+            self.report("E0110", "expected `in`", "expected `in`")
+            return Err(())
+        let iter = self.or_expr()?
+        var filter: Option[Expr] = None
+        if self.eat_kw(Kw.If):
+            filter = Some(self.or_expr()?)
+        if self.at_kw(Kw.For):
+            self.report(
+                "E0110",
+                "nested comprehensions are not supported yet",
+                "only one `for` per comprehension"
+            )
+            return Err(())
+        let span = body.span.to(self.prev_span())
+        let c = Comp(
+            kind=kind,
+            body=body,
+            name=name,
+            name_span=name_span,
+            unpack=unpack,
+            iter=iter,
+            filter=filter,
+            par=false
+        )
+        return Ok(mk(ExprKind.Comp(c), span))
+
+    # the rest of a slice after `:`, up to and including `]`
+    fn slice_hi(ref self) -> Result[Option[Expr], ()]:
+        if self.at(Tok.RBracket):
+            return Ok(None)
+        return Ok(Some(self.expr()?))
+
+    fn postfix(ref self) -> Result[Expr, ()]:
+        var e = self.primary()?
+        while true:
+            match self.peek():
+                case Tok.LParen:
+                    self.bump()
+                    let args = self.args()?
+                    let span = e.span.to(self.prev_span())
+                    match e.kind:
+                        case ExprKind.Field(recv, name, name_span):
+                            e = mk(ExprKind.MethodCall(recv, name, name_span, args), span)
+                        case _:
+                            e = mk(ExprKind.Call(e, args), span)
+                case Tok.Question:
+                    self.bump()
+                    let span = e.span.to(self.prev_span())
+                    e = mk(ExprKind.Try(e), span)
+                case Tok.LBracket:
+                    self.bump()
+                    if self.eat(Tok.Colon):
+                        let hi = self.slice_hi()?
+                        self.expect(Tok.RBracket, "`]`")?
+                        let span = e.span.to(self.prev_span())
+                        e = mk(ExprKind.Slice(e, None, hi), span)
+                        continue
+                    var idx = self.expr()?
+                    if self.at(Tok.Comma):
+                        # `Pair[int, str]`: type arguments, read as a tuple like Python does
+                        var elems = [idx]
+                        while self.eat(Tok.Comma):
+                            if self.at(Tok.RBracket):
+                                break
+                            elems.push(self.expr()?)
+                        let sp = elems[0].span.to(self.prev_span())
+                        idx = mk(ExprKind.Tuple(elems), sp)
+                    if self.eat(Tok.Colon):
+                        let hi = self.slice_hi()?
+                        if self.at(Tok.Colon):
+                            self.report(
+                                "E0110",
+                                "slices with a step are not supported",
+                                "remove the step"
+                            )
+                            return Err(())
+                        self.expect(Tok.RBracket, "`]`")?
+                        let span = e.span.to(self.prev_span())
+                        e = mk(ExprKind.Slice(e, Some(idx), hi), span)
+                        continue
+                    self.expect(Tok.RBracket, "`]`")?
+                    let span = e.span.to(self.prev_span())
+                    e = mk(ExprKind.Index(e, idx), span)
+                case Tok.Dot:
+                    self.bump()
+                    var name = ""
+                    var name_span = self.span()
+                    match self.peek():
+                        case Tok.Int(n):
+                            name_span = self.bump()
+                            name = f"{n}"
+                        case Tok.Float(_):
+                            # `t.0.1` lexes as a float; not supported
+                            self.report(
+                                "E0110",
+                                "nested tuple indexing needs parentheses",
+                                "write `(t.0).1`"
+                            )
+                            return Err(())
+                        case _:
+                            let (n, ns) = self.field_name("field or method name", true)?
+                            name = n
+                            name_span = ns
+                    let span = e.span.to(name_span)
+                    e = mk(ExprKind.Field(e, name, name_span), span)
+                case _:
+                    return Ok(e)
+        return Ok(e)
+
+    # `(a, b)` after `(`; a single parenthesized expression keeps its kind
+    fn paren(ref self, sp: Span) -> Result[Expr, ()]:
+        if self.at(Tok.RParen):
+            self.bump()
+            return Ok(mk(ExprKind.Tuple([]), sp.to(self.prev_span())))
+        let first = self.expr()?
+        if self.eat(Tok.Comma):
+            var elems = [first]
+            while not self.at(Tok.RParen):
+                elems.push(self.expr()?)
+                if not self.eat(Tok.Comma):
+                    break
+            self.expect(Tok.RParen, "`)`")?
+            return Ok(mk(ExprKind.Tuple(elems), sp.to(self.prev_span())))
+        self.expect(Tok.RParen, "`)`")?
+        return Ok(mk(first.kind, sp.to(self.prev_span())))
+
+    fn bracket(ref self, sp: Span) -> Result[Expr, ()]:
+        if self.at(Tok.RBracket):
+            self.bump()
+            return Ok(mk(ExprKind.Array([]), sp.to(self.prev_span())))
+        let first = self.expr()?
+        if self.at_kw(Kw.For):
+            let c = self.comp_tail(first, CompKind.List)?
+            self.expect(Tok.RBracket, "`]`")?
+            return Ok(mk(c.kind, sp.to(self.prev_span())))
+        var elems = [first]
+        while self.eat(Tok.Comma):
+            if self.at(Tok.RBracket):
+                break
+            elems.push(self.expr()?)
+        self.expect(Tok.RBracket, "`]`")?
+        return Ok(mk(ExprKind.Array(elems), sp.to(self.prev_span())))
+
+    fn brace(ref self, sp: Span) -> Result[Expr, ()]:
+        var entries: [(Expr, Expr)] = []
+        while not self.at(Tok.RBrace):
+            let k = self.expr()?
+            self.expect(Tok.Colon, "`:` between the key and value")?
+            let v = self.expr()?
+            entries.push((k, v))
+            if not self.eat(Tok.Comma):
+                break
+        self.expect(Tok.RBrace, "`}`")?
+        return Ok(mk(ExprKind.Map(entries), sp.to(self.prev_span())))
+
+    fn primary(ref self) -> Result[Expr, ()]:
+        let before = self.pos
+        let tok = self.peek()
+        let sp = self.bump()
+        match tok:
+            case Tok.Int(v):
+                return Ok(mk(ExprKind.Int(i128(v)), sp))
+            case Tok.Float(v):
+                return Ok(mk(ExprKind.Float(v), sp))
+            case Tok.Str(s):
+                return Ok(mk(ExprKind.Str(s), sp))
+            case Tok.FStr(parts):
+                let segs = self.fstring(parts)?
+                return Ok(mk(ExprKind.FStr(segs), sp.to(self.prev_span())))
+            case Tok.Keyword(Kw.True):
+                return Ok(mk(ExprKind.Bool(true), sp))
+            case Tok.Keyword(Kw.False):
+                return Ok(mk(ExprKind.Bool(false), sp))
+            case Tok.Ident(name):
+                # Python-style constants that don't exist
+                if name == "True" or name == "False":
+                    let f = name.lower()
+                    self.diags.push(
+                        diag.error("E0201", f"`{name}` is not defined").label(sp, f"did you mean `{f}`?").fix(sp, f, f"replace with `{f}`")
+                    )
+                    return Ok(mk(ExprKind.Bool(name == "True"), sp))
+                return Ok(mk(ExprKind.Ident(name), sp))
+            case Tok.LParen:
+                return self.paren(sp)
+            case Tok.LBracket:
+                return self.bracket(sp)
+            case Tok.LBrace:
+                return self.brace(sp)
+            case Tok.Keyword(Kw.Par):
+                return self.par_expr(sp)
+            case Tok.Keyword(Kw.Not):
+                # allow `not` in operand positions (e.g. after `==`)
+                let e = self.unary()?
+                return Ok(mk(ExprKind.Unary(UnOp.Not, e), sp.to(e.span)))
+            case _:
+                self.pos = before
+                var d = self.error_here(
+                    "E0111",
+                    f"expected an expression, found {describe(tok)}",
+                    "expected an expression"
+                )
+                if tok == Tok.Newline:
+                    d = d.with_help(
+                        "the expression is incomplete; continue it on this line or wrap it in parentheses to span lines"
+                    )
+                self.diags.push(d)
+                return Err(())
+
+    fn par_expr(ref self, start: Span) -> Result[Expr, ()]:
+        match self.peek():
+            case Tok.LParen:
+                self.bump()
+                var elems: [Expr] = []
+                while not self.at(Tok.RParen):
+                    elems.push(self.expr()?)
+                    if not self.eat(Tok.Comma):
+                        break
+                self.expect(Tok.RParen, "`)`")?
+                let span = start.to(self.prev_span())
+                if len(elems) < 2:
+                    let d = diag.error(
+                        "E0113",
+                        "`par(...)` needs at least two expressions to run in parallel"
+                    ).label(span, "only one expression")
+                    self.diags.push(d.with_help("write `par(f(x), g(y))`"))
+                return Ok(mk(ExprKind.ParTuple(elems), span))
+            case Tok.LBracket:
+                let e = self.primary()?
+                let span = start.to(e.span)
+                match e.kind:
+                    case ExprKind.Comp(c):
+                        var pc = c
+                        pc.par = true
+                        return Ok(mk(ExprKind.Comp(pc), span))
+                    case _:
+                        let d = diag.error(
+                            "E0113",
+                            "`par [...]` must be a list comprehension"
+                        ).label(span, "not a comprehension")
+                        self.diags.push(d.with_help("write `par [f(i) for i in 0..n]`"))
+                        return Err(())
+            case Tok.Ident(_):
+                let e = self.postfix()?
+                let span = start.to(e.span)
+                match e.kind:
+                    case ExprKind.Call(callee, args):
+                        if len(args) > 0:
+                            let a = args[0]
+                            match a.expr.kind:
+                                case ExprKind.Comp(c) if c.kind == CompKind.Gen:
+                                    var new_args = args
+                                    var pc = c
+                                    pc.par = true
+                                    let comp = mk(ExprKind.Comp(pc), a.expr.span)
+                                    new_args[0] = Arg(by_ref=a.by_ref, name=a.name, expr=comp)
+                                    return Ok(mk(ExprKind.Call(callee, new_args), span))
+                                case _:
+                                    pass
+                    case _:
+                        pass
+                self.diags.push(
+                    diag.error("E0113", "`par` must be followed by a reduction over a generator").label(span, "expected e.g. `par sum(x * x for x in xs)`")
+                )
+                return Err(())
+            case _:
+                let d = self.error_here(
+                    "E0113",
+                    "`par` must be followed by `for`, `[...]`, `(a, b)` or a reduction",
+                    "unexpected after `par`"
+                )
+                self.diags.push(
+                    d.with_help("examples: `par for i in 0..n:`, `par [f(i) for i in 0..n]`, `par sum(x for x in xs)`, `par(f(a), g(b))`")
+                )
+                return Err(())
+
+    fn fstring(ref self, parts: [FPart]) -> Result[[FSeg], ()]:
+        var segs: [FSeg] = []
+        for p in parts:
+            match p:
+                case FPart.Lit(s):
+                    segs.push(FSeg.Lit(s))
+                case FPart.Expr(src, offset, spec):
+                    let (toks, lex_diags) = lex(src, self.file, offset, false, false)
+                    self.diags.extend(lex_diags)
+                    var sub = Parser(toks=toks, pos=0, file=self.file, diags=[])
+                    let r = sub.expr()
+                    if r.is_ok() and not sub.at(Tok.Eof):
+                        sub.diags.push(
+                            sub.error_here("E0110", "unexpected tokens in f-string expression", "unexpected")
+                        )
+                    self.diags.extend(sub.diags)
+                    let e = r?
+                    var trimmed: Option[str] = None
+                    match spec:
+                        case Some(s):
+                            trimmed = Some(s.strip())
+                        case None:
+                            pass
+                    segs.push(FSeg.Part(e, trimmed))
+        return Ok(segs)
+
+# Parse a whole file: the module and every error, the lexer's first.
+fn parse_module(text: str, file: int, name: str) -> (Module, [Diag]):
+    let (toks, lex_diags) = lex(text, file, 0, false, true)
+    var p = Parser(toks=toks, pos=0, file=file, diags=[])
+    let m = p.module(name)
+    var diags = lex_diags
+    diags.extend(p.diags)
+    return (m, diags)

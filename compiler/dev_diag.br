@@ -1,0 +1,488 @@
+# A test driver for the rendering parts of diag.br.
+#
+#   dev_diag <file> [--json] [--color always|never]
+#
+# parses <file> and prints its syntax errors exactly as `brine check <file>` does:
+# rendered to stderr followed by the "could not compile" line, or as JSON lines
+# on stdout with --json.
+import diag
+import parser
+from diag import SourceMap, Diag, Colors, Span, edit_distance, best_match
+
+fn usage():
+    eprint("usage: dev_diag <file> [--json] [--color always|never]")
+    exit(2)
+
+# The path as `brine check` shows it: forward slashes, no leading "./".
+fn display_path(p: str) -> str:
+    let s = p.replace("\\", "/")
+    if s.starts_with("./"):
+        return s[2:]
+    return s
+
+# The summary line `brine check` prints after the diagnostics (from diag_list in src/main.rs).
+fn summary(ds: [Diag], color: bool) -> str:
+    var errs = 0
+    for d in ds:
+        if d.is_error():
+            errs += 1
+    let warns = len(ds) - errs
+    if errs == 0:
+        return ""
+    let c = Colors(on=color)
+    var tail = ""
+    if warns > 0:
+        tail = f" and {warns} warning" + ("" if warns == 1 else "s")
+    return c.bold() + c.red() + "error" + c.reset() + c.bold() + ": could not compile due to " + str(errs) + " error" + ("" if errs == 1 else "s") + tail + c.reset()
+
+# Print diagnostics the way diag_list in src/main.rs does.
+fn emit(ds: [Diag], sm: SourceMap, json: bool, color: bool):
+    for d in ds:
+        if json:
+            print(diag.to_json(d, sm))
+        else:
+            let r = diag.render(d, sm, color)
+            eprint(r[:len(r) - 1])
+    if not json:
+        let s = summary(ds, color)
+        if s != "":
+            eprint(s)
+
+fn main():
+    let a = args()
+    var json = false
+    var color = false
+    var replay = false
+    var path = ""
+    var i = 0
+    while i < len(a):
+        if a[i] == "--json":
+            json = true
+        elif a[i] == "--replay":
+            replay = true
+        elif a[i] == "--color" and i + 1 < len(a):
+            color = a[i + 1] == "always"
+            i += 1
+        else:
+            path = a[i]
+        i += 1
+    if path == "":
+        usage()
+    match read_file(path):
+        case Ok(raw):
+            let text = raw.replace("\r\n", "\n")
+            if replay:
+                var r = Replay(sm=SourceMap.new(), ids={})
+                var rds: [Diag] = []
+                for line in text.lines():
+                    if line.starts_with("{\"severity\"") and not ("\"code\":null" in line):
+                        var jr = JsonReader(text=line, bytes=line.bytes(), pos=0)
+                        let o = jr.value()
+                        rds.push(r.diag_of(o))
+                emit(rds, r.sm, json, color)
+            else:
+                var sm = SourceMap.new()
+                let fid = sm.add(display_path(path), text)
+                let (_, ds) = parser.parse_module(text, fid, "main")
+                emit(ds, sm, json, color)
+        case Err(e):
+            eprint("error:", e)
+            exit(1)
+
+# ---------------------------------------------------------------- replay
+#
+# `dev_diag --replay <out.json>` reads the `--json` output of `brine check` (for
+# checker errors, which the parser alone can't produce), rebuilds each diagnostic
+# with byte offsets found from its lines and columns, and prints it again. This
+# tests rendering of secondary labels, labels in other files and warnings.
+
+enum Json:
+    Null
+    Num(value: int)
+    Str(value: str)
+    Arr(items: [Json])
+    Obj(fields: [(str, Json)])
+
+struct JsonReader:
+    text: str
+    bytes: [u8]
+    pos: int
+
+    fn skip_ws(ref self):
+        while self.pos < len(self.bytes) and is_ws(int(self.bytes[self.pos])):
+            self.pos += 1
+
+    fn value(ref self) -> Json:
+        self.skip_ws()
+        let b = int(self.bytes[self.pos])
+        if b == 123:
+            return self.object()
+        if b == 91:
+            return self.array()
+        if b == 34:
+            return Json.Str(self.string())
+        if b == 110 or b == 116:
+            # null, true
+            self.pos += 4
+            return Json.Null
+        if b == 102:
+            self.pos += 5
+            return Json.Null
+        return Json.Num(self.number())
+
+    fn object(ref self) -> Json:
+        self.pos += 1
+        var fields: [(str, Json)] = []
+        self.skip_ws()
+        if self.bytes[self.pos] == 125:
+            self.pos += 1
+            return Json.Obj(fields)
+        while true:
+            self.skip_ws()
+            let k = self.string()
+            self.skip_ws()
+            # ':'
+            self.pos += 1
+            let v = self.value()
+            fields.push((k, v))
+            self.skip_ws()
+            let c = self.bytes[self.pos]
+            self.pos += 1
+            if c == 125:
+                break
+        return Json.Obj(fields)
+
+    fn array(ref self) -> Json:
+        self.pos += 1
+        var items: [Json] = []
+        self.skip_ws()
+        if self.bytes[self.pos] == 93:
+            self.pos += 1
+            return Json.Arr(items)
+        while true:
+            let v = self.value()
+            items.push(v)
+            self.skip_ws()
+            let c = self.bytes[self.pos]
+            self.pos += 1
+            if c == 93:
+                break
+        return Json.Arr(items)
+
+    fn string(ref self) -> str:
+        self.pos += 1
+        var parts: [str] = []
+        var start = self.pos
+        while self.bytes[self.pos] != 34:
+            if self.bytes[self.pos] == 92:
+                parts.push(self.text[start:self.pos])
+                let e = int(self.bytes[self.pos + 1])
+                if e == 110:
+                    parts.push("\n")
+                elif e == 114:
+                    parts.push("\r")
+                elif e == 116:
+                    parts.push("\t")
+                elif e == 117:
+                    var n = 0
+                    for k in self.pos + 2..self.pos + 6:
+                        n = n * 16 + hex_digit(int(self.bytes[k]))
+                    parts.push(chr(n))
+                    self.pos += 4
+                else:
+                    parts.push(self.text[self.pos + 1:self.pos + 2])
+                self.pos += 2
+                start = self.pos
+            else:
+                self.pos += 1
+        parts.push(self.text[start:self.pos])
+        self.pos += 1
+        return "".join(parts)
+
+    fn number(ref self) -> int:
+        var neg = false
+        if self.bytes[self.pos] == 45:
+            neg = true
+            self.pos += 1
+        var n = 0
+        while self.pos < len(self.bytes) and 48 <= self.bytes[self.pos] <= 57:
+            n = n * 10 + int(self.bytes[self.pos]) - 48
+            self.pos += 1
+        if neg:
+            return -n
+        return n
+
+fn is_ws(b: int) -> bool:
+    return b == 32 or b == 10 or b == 13 or b == 9
+
+fn hex_digit(b: int) -> int:
+    if b >= 97:
+        return b - 87
+    if b >= 65:
+        return b - 55
+    return b - 48
+
+fn has(o: Json, key: str) -> bool:
+    match o:
+        case Json.Obj(fields):
+            for k, _ in fields:
+                if k == key:
+                    return true
+        case _:
+            pass
+    return false
+
+fn get(o: Json, key: str) -> Json:
+    match o:
+        case Json.Obj(fields):
+            for k, v in fields:
+                if k == key:
+                    return v
+        case _:
+            pass
+    return Json.Null
+
+fn as_str(j: Json) -> str:
+    match j:
+        case Json.Str(s):
+            return s
+        case _:
+            return ""
+
+fn as_int(j: Json) -> int:
+    match j:
+        case Json.Num(n):
+            return n
+        case _:
+            return 0
+
+fn items(j: Json) -> [Json]:
+    match j:
+        case Json.Arr(xs):
+            return xs
+        case _:
+            return []
+
+fn utf8_len(b: int) -> int:
+    if b < 0x80:
+        return 1
+    if b < 0xe0:
+        return 2
+    if b < 0xf0:
+        return 3
+    return 4
+
+# The byte offset of 1-based (line, column) in `f`: the inverse of line_col.
+fn offset(f: diag.SourceFile, line: int, col: int) -> int:
+    if line < 1 or line > len(f.line_starts):
+        return len(f.text)
+    var pos = f.line_starts[line - 1]
+    var k = 1
+    while k < col and pos < len(f.bytes):
+        pos += utf8_len(int(f.bytes[pos]))
+        k += 1
+    return pos
+
+struct Replay:
+    sm: SourceMap
+    # file path -> file id
+    ids: {str: int}
+
+    fn file_id(ref self, path: str) -> int:
+        if path in self.ids:
+            return self.ids[path]
+        var src = path
+        if path == "<prelude>":
+            src = "runtime/prelude.br"
+        var text = ""
+        match read_file(src):
+            case Ok(t):
+                text = t.replace("\r\n", "\n")
+            case Err(e):
+                eprint("replay: cannot read", src, e)
+        let id = self.sm.add(path, text)
+        self.ids[path] = id
+        return id
+
+    # The span described by the "file", "line", "column", "end_line" and
+    # "end_column" fields of `o`.
+    fn span(ref self, o: Json) -> Span:
+        match get(o, "file"):
+            case Json.Str(path):
+                let id = self.file_id(path)
+                let f = self.sm.files[id]
+                let lo = offset(f, as_int(get(o, "line")), as_int(get(o, "column")))
+                let hi = offset(f, as_int(get(o, "end_line")), as_int(get(o, "end_column")))
+                return Span(file=id, lo=lo, hi=hi)
+            case _:
+                # "file": null, a span outside every file
+                return Span(file=1000000, lo=0, hi=0)
+
+    fn diag_of(ref self, o: Json) -> Diag:
+        var d = diag.error(as_str(get(o, "code")), as_str(get(o, "message")))
+        d.error = as_str(get(o, "severity")) == "error"
+        if has(o, "label"):
+            let sp = self.span(o)
+            d = d.label(sp, as_str(get(o, "label")))
+        for rel in items(get(o, "related")):
+            let rsp = self.span(rel)
+            d = d.label(rsp, as_str(get(rel, "label")))
+        for nt in items(get(o, "notes")):
+            d = d.note(as_str(nt))
+        for h in items(get(o, "help")):
+            d = d.with_help(as_str(h))
+        for fx in items(get(o, "fixes")):
+            let fsp = self.span(fx)
+            d = d.fix(fsp, as_str(get(fx, "replacement")), as_str(get(fx, "message")))
+        return d
+
+# ---------------------------------------------------------------- unit tests
+
+test "edit_distance basics":
+    assert edit_distance("", "") == 0
+    assert edit_distance("abc", "") == 3
+    assert edit_distance("", "abcd") == 4
+    assert edit_distance("abc", "abc") == 0
+    assert edit_distance("kitten", "sitting") == 3
+    assert edit_distance("flaw", "lawn") == 2
+
+test "edit_distance counts an adjacent swap as 1":
+    assert edit_distance("bulid", "build") == 1
+    assert edit_distance("ab", "ba") == 1
+    assert edit_distance("abc", "bca") == 2
+    # optimal string alignment: no edits inside a swapped pair
+    assert edit_distance("ca", "abc") == 3
+
+test "edit_distance counts characters, not bytes":
+    assert edit_distance("héllo", "hello") == 1
+    assert edit_distance("日本", "本日") == 1
+    assert edit_distance("é", "") == 1
+
+test "edit_distance is case sensitive":
+    assert edit_distance("Name", "name") == 1
+
+test "best_match picks the closest within a third of the length":
+    assert best_match("lenght", ["length", "len"]) == Some("length")
+    assert best_match("prnt", ["print", "eprint"]) == Some("print")
+    assert best_match("xyz", ["abc"]) == None
+    # limit is len / 3, at least 1
+    assert best_match("ab", ["cd"]) == None
+    assert best_match("ab", ["ac"]) == Some("ac")
+    assert best_match("abcdef", ["abxyef"]) == Some("abxyef")
+    assert best_match("abcdef", ["axxxef"]) == None
+
+test "best_match skips the name itself":
+    assert best_match("foo", ["foo"]) == None
+    assert best_match("foo", ["foo", "fob"]) == Some("fob")
+
+test "best_match ties go to the first candidate":
+    assert best_match("cat", ["bat", "rat", "hat"]) == Some("bat")
+    assert best_match("cat", ["cart", "bat"]) == Some("cart")
+    # a strictly closer later candidate wins
+    assert best_match("abcdefgh", ["abcdefxx", "abcdefgx"]) == Some("abcdefgx")
+
+test "best_match: ASCII case-insensitive equality counts as 0":
+    assert best_match("Point", ["Pont", "point"]) == Some("point")
+    assert best_match("POINT", ["point"]) == Some("point")
+    assert best_match("abc", ["abd", "ABC"]) == Some("ABC")
+
+test "best_match limit counts bytes":
+    # "héé" is 5 bytes: limit 1
+    assert best_match("héé", ["hee"]) == None
+    assert best_match("héé", ["hée"]) == Some("hée")
+    # "ééé" is 6 bytes: limit 2
+    assert best_match("ééé", ["eee"]) == None
+    assert best_match("ééé", ["eeé"]) == Some("eeé")
+
+test "best_match with no candidates":
+    let none: [str] = []
+    assert best_match("x", none) == None
+
+test "json_str escapes":
+    assert diag.json_str("") == "\"\""
+    assert diag.json_str("a\"b\\c") == "\"a\\\"b\\\\c\""
+    assert diag.json_str("\n\r\t") == "\"\\n\\r\\t\""
+    assert diag.json_str("\u{1}\u{1f}\u{0}") == "\"\\u0001\\u001f\\u0000\""
+    assert diag.json_str("\u{7f}é日") == "\"\u{7f}é日\""
+
+test "line_col counts characters":
+    var sm = SourceMap.new()
+    let id = sm.add("f.br", "aé日b\nxy\n")
+    let f = sm.file(id)
+    assert f.line_col(0) == (1, 1)
+    assert f.line_col(1) == (1, 2)
+    assert f.line_col(3) == (1, 3)
+    # inside a character: rounds down to its start
+    assert f.line_col(2) == (1, 2)
+    assert f.line_col(4) == (1, 3)
+    assert f.line_col(5) == (1, 3)
+    assert f.line_col(6) == (1, 4)
+    assert f.line_col(7) == (1, 5)
+    assert f.line_col(8) == (2, 1)
+    assert f.line_col(10) == (2, 3)
+    assert f.line_col(11) == (3, 1)
+    assert f.line_col(100) == (3, 1)
+    assert f.line_text(1) == "aé日b"
+    assert f.line_text(3) == ""
+    assert f.line_text(4) == ""
+    assert f.line_text(0) == ""
+    assert sm.loc(Span(file=id, lo=9, hi=10)) == "f.br:2:2"
+    assert sm.snippet(Span(file=id, lo=1, hi=6)) == "é日"
+    assert sm.snippet(Span(file=id, lo=2, hi=7)) == ""
+    assert sm.snippet(Span(file=id, lo=7, hi=3)) == ""
+    assert sm.snippet(Span(file=id, lo=8, hi=100)) == "xy\n"
+
+test "line_text trims every trailing CR and LF":
+    var sm = SourceMap.new()
+    let id = sm.add("f.br", "ab\r\r\ncd\r")
+    assert sm.file(id).line_text(1) == "ab"
+    assert sm.file(id).line_text(2) == "cd"
+
+test "render: warning with secondary labels, notes and help":
+    var sm = SourceMap.new()
+    let a = sm.add("a.br", "let x = 1\nlet y = x + 2\n")
+    let b = sm.add("b.br", "fn f():\n    pass\n")
+    var d = diag.warning("E0999", "something odd")
+    d = d.label(Span(file=a, lo=14, hi=15), "used here")
+    d = d.label(Span(file=a, lo=4, hi=5), "defined here")
+    d = d.label(Span(file=a, lo=18, hi=23), "and here")
+    d = d.label(Span(file=b, lo=3, hi=4), "elsewhere")
+    d = d.label(Span(file=7, lo=0, hi=1), "no such file")
+    d = d.note("a note").with_help("some help")
+    let want = "warning[E0999]: something odd\n" + " --> a.br:2:5\n" + "  |\n" + "2 | let y = x + 2\n" + "  |     ^ used here\n" + "1 | let x = 1\n" + "  |     - defined here\n" + "2 | let y = x + 2\n" + "  |         ----- and here\n" + " ::: b.br:1:4\n" + "  |\n" + "1 | fn f():\n" + "  |    - elsewhere\n" + "  |\n" + "  = note: a note\n" + "  = help: some help\n" + "  = run `brine explain E0999` for more about this error\n"
+    assert diag.render(d, sm, false) == want
+
+test "render: label spanning lines, and an empty label":
+    var sm = SourceMap.new()
+    let a = sm.add("a.br", "abc\ndef\n")
+    var d = diag.error("E0001", "m")
+    d = d.label(Span(file=a, lo=1, hi=6), "multi")
+    d = d.label(Span(file=a, lo=3, hi=3), "empty")
+    let want = "error[E0001]: m\n" + " --> a.br:1:2\n" + "  |\n" + "1 | abc\n" + "  |  ^^ multi\n" + "  |    - empty\n" + "  = run `brine explain E0001` for more about this error\n"
+    assert diag.render(d, sm, false) == want
+
+test "render: no labels, wide gutter, color":
+    var sm = SourceMap.new()
+    let d0 = diag.error("E0002", "nothing").note("n")
+    let want0 = "error[E0002]: nothing\n  = note: n\n  = run `brine explain E0002` for more about this error\n"
+    assert diag.render(d0, sm, false) == want0
+    let a = sm.add("a.br", "\n\n\n\n\n\n\n\n\nx\n")
+    let d = diag.error("E0003", "ten").label(Span(file=a, lo=9, hi=10), "here")
+    let want = "\u{1b}[1m\u{1b}[31merror[E0003]\u{1b}[0m\u{1b}[1m: ten\u{1b}[0m\n" + "  \u{1b}[34m--> a.br:10:1\u{1b}[0m\n" + "   \u{1b}[34m|\u{1b}[0m\n" + "\u{1b}[34m10 |\u{1b}[0m x\n" + "   \u{1b}[34m|\u{1b}[0m \u{1b}[31m^ here\u{1b}[0m\n" + "   \u{1b}[34m=\u{1b}[0m run `brine explain E0003` for more about this error\n"
+    assert diag.render(d, sm, true) == want
+
+test "to_json with related labels, fixes and a missing file":
+    var sm = SourceMap.new()
+    let a = sm.add("a\\b.br", "é = 1\n")
+    var d = diag.warning("E0004", "say \"hi\"")
+    d = d.label(Span(file=a, lo=0, hi=2), "x")
+    d = d.label(Span(file=a, lo=3, hi=4), "y")
+    d = d.label(Span(file=5, lo=0, hi=0), "z")
+    d = d.note("n1").note("n2").fix(Span(file=a, lo=0, hi=2), "e", "rename")
+    let want = "{\"severity\":\"warning\",\"code\":\"E0004\",\"message\":\"say \\\"hi\\\"\",\"file\":\"a\\\\b.br\",\"line\":1,\"column\":1,\"end_line\":1,\"end_column\":2,\"label\":\"x\",\"related\":[{\"file\":\"a\\\\b.br\",\"line\":1,\"column\":3,\"end_line\":1,\"end_column\":4,\"label\":\"y\"},{\"file\":null,\"label\":\"z\"}],\"notes\":[\"n1\",\"n2\"],\"help\":[],\"fixes\":[{\"file\":\"a\\\\b.br\",\"line\":1,\"column\":1,\"end_line\":1,\"end_column\":2,\"replacement\":\"e\",\"message\":\"rename\"}]}"
+    assert diag.to_json(d, sm) == want
+    let e = diag.error("E0005", "bare")
+    assert diag.to_json(
+        e,
+        sm
+    ) == "{\"severity\":\"error\",\"code\":\"E0005\",\"message\":\"bare\",\"related\":[],\"notes\":[],\"help\":[],\"fixes\":[]}"

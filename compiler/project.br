@@ -1,0 +1,278 @@
+# Projects: `brine.toml`, `brine new`, `brine init`. A port of src/project.rs.
+# Paths are strings; `join` and `parent` behave like Rust's Path::join and
+# Path::parent, so messages show the same paths as the Rust CLI.
+
+struct Project:
+    root: str
+    name: str
+    version: str
+    main: str
+    # `[check] typed = true`: every variable needs a written type
+    typed: bool
+
+# ---------------------------------------------------------------- paths
+
+fn is_windows() -> bool:
+    return os.name() == "windows"
+
+fn is_sep(c: str) -> bool:
+    return c == "/" or (c == "\\" and is_windows())
+
+# Length of the root prefix: "/" or, on Windows, "C:", "C:\" or "\".
+fn root_len(p: str) -> int:
+    if is_windows() and len(p) >= 2 and p[1] == ":" and is_ascii_alpha(p[0]):
+        if len(p) >= 3 and is_sep(p[2]):
+            return 3
+        return 2
+    if len(p) >= 1 and is_sep(p[0]):
+        return 1
+    return 0
+
+fn is_absolute(p: str) -> bool:
+    return root_len(p) > 0
+
+# `a/b` with the platform's separator, like Rust's `Path::join`.
+fn join(a: str, b: str) -> str:
+    if a == "" or is_absolute(b):
+        return b
+    if is_sep(a[len(a) - 1]):
+        return a + b
+    if is_windows():
+        return a + "\\" + b
+    return a + "/" + b
+
+# The directory containing `p`, like Rust's `Path::parent`: None for a root or "",
+# "" for a bare name.
+fn parent(p: str) -> Option[str]:
+    let root = root_len(p)
+    var n = len(p)
+    while n > root and is_sep(p[n - 1]):
+        n -= 1
+    if n <= root:
+        return None
+    var i = n
+    while i > root and not is_sep(p[i - 1]):
+        i -= 1
+    while i > root and is_sep(p[i - 1]):
+        i -= 1
+    return Some(p[0:i])
+
+# The last part of a path, like Rust's `Path::file_name`.
+fn file_name(p: str) -> Option[str]:
+    let root = root_len(p)
+    var n = len(p)
+    while n > root and is_sep(p[n - 1]):
+        n -= 1
+    if n <= root:
+        return None
+    var i = n
+    while i > root and not is_sep(p[i - 1]):
+        i -= 1
+    let last = p[i:n]
+    if last == ".." or last == ".":
+        return None
+    return Some(last)
+
+# ---------------------------------------------------------------- text helpers
+
+# Rust's `char::is_whitespace` (the Unicode White_Space property).
+fn is_ws(c: str) -> bool:
+    let o = ord(c)
+    return (
+        o >= 9 and o <= 13
+    ) or o == 32 or o == 0x85 or o == 0xa0 or o == 0x1680 or (o >= 0x2000 and o <= 0x200a) or o == 0x2028 or o == 0x2029 or o == 0x202f or o == 0x205f or o == 0x3000
+
+# Rust's `str::trim`.
+fn trim(s: str) -> str:
+    let cs = s.chars()
+    var lo = 0
+    var hi = len(cs)
+    while lo < hi and is_ws(cs[lo]):
+        lo += 1
+    while hi > lo and is_ws(cs[hi - 1]):
+        hi -= 1
+    return "".join(cs[lo:hi])
+
+# Rust's `str::lines`: split at "\n", dropping a "\r" before it.
+fn lines(text: str) -> [str]:
+    var out: [str] = []
+    var at = 0
+    while at < len(text):
+        var j = at
+        while j < len(text) and text[j] != "\n":
+            j += 1
+        var end = j
+        if j < len(text) and end > at and text[end - 1] == "\r":
+            end -= 1
+        out.push(text[at:end])
+        at = j + 1
+    return out
+
+# ---------------------------------------------------------------- brine.toml
+
+# Minimal TOML subset: `[section]` headers and `key = "string"` / `key = 123`.
+# Returns (section, key, value) triples.
+fn parse_toml(text: str) -> Result[[(str, str, str)], str]:
+    var out: [(str, str, str)] = []
+    var section = ""
+    let ls = lines(text)
+    for i in 0..len(ls):
+        let raw = ls[i]
+        var line = raw
+        match raw.find("#"):
+            case Some(p):
+                if not ("\"" in raw[0:p]):
+                    line = raw[0:p]
+            case None:
+                pass
+        line = trim(line)
+        if line == "":
+            continue
+        if line.starts_with("["):
+            if not line.ends_with("]"):
+                return Err(f"line {i + 1}: expected `]`")
+            section = trim(line[1:len(line) - 1])
+            continue
+        let eq = line.find("=")
+        if eq.is_none():
+            return Err(f"line {i + 1}: expected `key = value`")
+        let at = eq.unwrap()
+        let key = trim(line[0:at])
+        var val = trim(line[at + 1:len(line)])
+        if val.starts_with("\""):
+            let v = val[1:len(val)]
+            match v.find("\""):
+                case Some(end):
+                    val = v[0:end]
+                case None:
+                    return Err(f"line {i + 1}: unterminated string")
+        out.push((section, key, val))
+    return Ok(out)
+
+fn toml_get(kv: [(str, str, str)], sec: str, k: str) -> Option[str]:
+    for t in kv:
+        let (s, kk, v) = t
+        if s == sec and kk == k:
+            return Some(v)
+    return None
+
+# Find `brine.toml` in `start` or any parent directory.
+fn find(start: str) -> Option[Result[Project, str]]:
+    var dir = Some(start)
+    while dir.is_some():
+        let d = dir.unwrap()
+        if os.is_file(join(d, "brine.toml")):
+            return Some(load(d))
+        dir = parent(d)
+    return None
+
+fn load(root: str) -> Result[Project, str]:
+    let path = join(root, "brine.toml")
+    var text = ""
+    match read_file(path):
+        case Ok(t):
+            text = t
+        case Err(e):
+            # same words as Rust's io::Error where they differ
+            if e.ends_with("the file is not valid UTF-8 text"):
+                return Err(f"cannot read {path}: stream did not contain valid UTF-8")
+            return Err(e)
+    var kv: [(str, str, str)] = []
+    match parse_toml(text):
+        case Ok(x):
+            kv = x
+        case Err(e):
+            return Err("brine.toml: " + e)
+    let name = toml_get(kv, "package", "name")
+    if name.is_none():
+        return Err("brine.toml: missing `name` in [package]")
+    let version = toml_get(kv, "package", "version").unwrap_or("0.1.0")
+    let main = join(root, toml_get(kv, "build", "main").unwrap_or("src/main.br"))
+    var typed = false
+    match toml_get(kv, "check", "typed"):
+        case None:
+            pass
+        case Some(v):
+            if v == "true":
+                typed = true
+            elif v != "false":
+                return Err(f"brine.toml: `typed` in [check] must be true or false, not `{v}`")
+    return Ok(Project(root=root, name=name.unwrap(), version=version, main=main, typed=typed))
+
+# ---------------------------------------------------------------- new projects
+
+fn is_ascii_alpha(c: str) -> bool:
+    return len(c) == 1 and ((c >= "a" and c <= "z") or (c >= "A" and c <= "Z"))
+
+fn is_ascii_digit(c: str) -> bool:
+    return len(c) == 1 and c >= "0" and c <= "9"
+
+# A letter or `_`, then letters, digits, `_` and `-` (ASCII only).
+fn valid_name(n: str) -> bool:
+    if n == "":
+        return false
+    var first = true
+    for c in n:
+        if first:
+            if not (is_ascii_alpha(c) or c == "_"):
+                return false
+            first = false
+        elif not (is_ascii_alpha(c) or is_ascii_digit(c) or c == "_" or c == "-"):
+            return false
+    return true
+
+fn main_template() -> str:
+    return embed("templates/main.br.txt")
+
+fn agents_md(name: str) -> str:
+    return embed("templates/AGENTS.md.txt").replace("{name}", name)
+
+fn readme(name: str) -> str:
+    return f"# {name}\n\nA brine project.\n\n```sh\nbrine run     # build and run\nbrine test    # run tests\n```\n"
+
+fn gitignore() -> str:
+    return "/target\n"
+
+fn toml(name: str) -> str:
+    return f"[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"
+
+# Write `content` to `dir/rel` unless that file exists; true if it was written.
+fn write_new(dir: str, rel: str, content: str) -> Result[bool, str]:
+    let p = join(dir, rel)
+    if file_exists(p):
+        return Ok(false)
+    write_file(p, content)?
+    return Ok(true)
+
+# Create the project files in `dir` (which may already exist but must not contain
+# brine.toml). Returns the files it made.
+fn create(dir: str, name: str) -> Result[[str], str]:
+    if file_exists(join(dir, "brine.toml")):
+        return Err(f"`{dir}` already contains a brine project")
+    os.make_dir(join(dir, "src"))?
+    var made: [str] = []
+    let files = [
+        ("brine.toml", toml(name)),
+        ("src/main.br", main_template()),
+        (".gitignore", gitignore()),
+        ("AGENTS.md", agents_md(name)),
+        ("README.md", readme(name))
+    ]
+    for f in files:
+        let (rel, content) = f
+        if write_new(dir, rel, content)?:
+            made.push(rel)
+    # initialize git like most project tools do, unless we're already inside a repo
+    var inside = true
+    match os.spawn(["git", "-C", dir, "rev-parse", "--is-inside-work-tree"], {}, true, false):
+        case Ok(p):
+            inside = os.wait(p) == 0
+        case Err(_):
+            pass
+    if not inside:
+        match os.spawn(["git", "-C", dir, "init", "-q"], {}, false, true):
+            case Ok(p):
+                os.wait(p)
+            case Err(_):
+                pass
+    return Ok(made)

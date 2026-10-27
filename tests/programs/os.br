@@ -1,0 +1,168 @@
+# The `os` module: files, directories and processes. Output is the same on every OS.
+
+fn shell(windows: str, posix: str) -> [str]:
+    if os.name() == "windows":
+        return ["cmd", "/c", windows]
+    return ["sh", "-c", posix]
+
+fn unwrap(r: Result[(), str], what: str):
+    match r:
+        case Ok(_):
+            pass
+        case Err(e):
+            print(what, "failed:", e)
+
+fn names(dir: str) -> str:
+    match os.list_dir(dir):
+        case Ok(xs):
+            return ", ".join(xs)
+        case Err(e):
+            return "error: " + e
+
+fn main():
+    let dir = os.temp_dir() + "/brine-os-test-" + str(os.pid())
+    unwrap(os.make_dir(dir + "/sub/deeper"), "make_dir")
+    unwrap(os.make_dir(dir + "/sub"), "make_dir again")
+    unwrap(write_file(dir + "/b.txt", "bee"), "write")
+    unwrap(write_file(dir + "/a.txt", "ay"), "write")
+    unwrap(write_file(dir + "/sub/c.txt", "sea"), "write")
+    print("list:", names(dir))
+    print("is_dir:", os.is_dir(dir + "/sub"), os.is_dir(dir + "/a.txt"), os.is_dir(dir + "/nope"))
+    print(
+        "is_file:",
+        os.is_file(dir + "/a.txt"),
+        os.is_file(dir + "/sub"),
+        os.is_file(dir + "/nope")
+    )
+    unwrap(os.rename(dir + "/a.txt", dir + "/z.txt"), "rename")
+    unwrap(os.rename(dir + "/b.txt", dir + "/z.txt"), "rename over")
+    print("renamed:", names(dir))
+    match read_file(dir + "/z.txt"):
+        case Ok(t):
+            print("z.txt:", t)
+        case Err(e):
+            print(e)
+    unwrap(os.remove_file(dir + "/z.txt"), "remove")
+    print("removed:", names(dir))
+    match os.remove_file(dir + "/z.txt"):
+        case Ok(_):
+            print("removed twice?")
+        case Err(e):
+            print("remove missing:", e.ends_with("(os error 2)"))
+    print("list missing:", names(dir + "/nope").starts_with("error: "))
+    match os.make_dir(dir + "/sub/c.txt"):
+        case Ok(_):
+            print("made a dir over a file?")
+        case Err(_):
+            print("make_dir over a file: error")
+    match os.abs_path(dir + "/sub/../sub"):
+        case Ok(p):
+            let win = os.name() == "windows"
+            print(
+                "abs_path:",
+                p.ends_with("sub"),
+                not win or p.starts_with("\\\\?\\"),
+                win or p.starts_with("/")
+            )
+        case Err(e):
+            print("abs_path failed:", e)
+    print("abs_path missing:", os.abs_path(dir + "/nope").is_err())
+    print("cwd:", len(os.cwd()) > 0, os.is_dir(os.cwd()))
+    print("temp_dir:", not os.temp_dir().ends_with("/") and not os.temp_dir().ends_with("\\"))
+    print(
+        "name:",
+        os.name() in ["windows", "macos", "linux", "freebsd", "openbsd", "netbsd"],
+        len(os.arch()) > 0
+    )
+    print("pid, cpus:", os.pid() > 0, os.cpu_count() >= 1)
+    let t0 = clock()
+    os.sleep(0.05)
+    print("slept:", clock() - t0 >= 0.04)
+    print("is_terminal(7):", os.is_terminal(7))
+    os.enable_ansi()
+    match os.free_ports(3):
+        case Ok(ps):
+            print(
+                "ports:",
+                len(ps),
+                ps[0] != ps[1] and ps[1] != ps[2] and ps[0] != ps[2],
+                all(p > 0 for p in ps)
+            )
+        case Err(e):
+            print("free_ports failed:", e)
+
+    # a child with captured output and an exit code
+    match os.spawn(
+        shell("echo out& 1>&2 echo err& exit 3", "echo out; echo err 1>&2; exit 3"),
+        {},
+        true,
+        false
+    ):
+        case Ok(p):
+            print("exit:", os.wait(p))
+            let (o, e) = os.output(p)
+            print("out:", o.replace("\r\n", "\n").strip(), "err:", e.replace("\r\n", "\n").strip())
+            print("poll after wait:", os.poll(p))
+        case Err(e):
+            print("spawn failed:", e)
+    # environment overrides
+    match os.spawn(
+        shell("echo %BRINE_OS_TEST%", "echo $BRINE_OS_TEST"),
+        {"BRINE_OS_TEST": "from parent"},
+        true,
+        false
+    ):
+        case Ok(p):
+            let code = os.wait(p)
+            let (o, _) = os.output(p)
+            print("env:", code, o.strip())
+        case Err(e):
+            print("spawn failed:", e)
+    # output goes straight through when not captured
+    print("before child")
+    match os.spawn(shell("echo child", "echo child"), {}, false, false):
+        case Ok(p):
+            os.wait(p)
+            print("after child", os.output(p))
+        case Err(e):
+            print("spawn failed:", e)
+    # a long-running child can be polled and killed
+    match os.spawn(shell("ping -n 30 127.0.0.1 >nul", "sleep 30"), {}, true, false):
+        case Ok(p):
+            print("running:", os.poll(p))
+            os.kill(p)
+            print("killed:", os.poll(p).is_some(), os.wait(p) != 0)
+        case Err(e):
+            print("spawn failed:", e)
+    # stdin is the null device
+    match os.spawn(["sort"], {}, true, false):
+        case Ok(p):
+            let code = os.wait(p)
+            let (o, _) = os.output(p)
+            print("sort:", code, len(o))
+        case Err(e):
+            print("spawn failed:", e)
+    match os.spawn(["no-such-program-brine"], {}, true, false):
+        case Ok(_):
+            print("started a missing program?")
+        case Err(e):
+            print("missing program:", len(e) > 0)
+    match os.spawn([], {}, false, false):
+        case Ok(_):
+            print("started nothing?")
+        case Err(e):
+            print("empty command:", e)
+
+    # clean up
+    unwrap(os.remove_file(dir + "/sub/c.txt"), "remove")
+    print("left:", names(dir), "|", names(dir + "/sub"))
+    match os.spawn(
+        shell("rmdir /s /q " + dir.replace("/", "\\"), "rm -r '" + dir + "'"),
+        {},
+        false,
+        false
+    ):
+        case Ok(p):
+            print("cleaned:", os.wait(p), os.is_dir(dir))
+        case Err(e):
+            print("spawn failed:", e)

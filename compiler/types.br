@@ -1,0 +1,536 @@
+# Types and name resolutions: the parts of src/ast.rs the checker fills in.
+from diag import Span
+
+enum IntTy:
+    I8
+    I16
+    I32
+    I64
+    I128
+    U8
+    U16
+    U32
+    U64
+    U128
+
+    fn bits(self) -> int:
+        match self:
+            case IntTy.I8 | IntTy.U8:
+                return 8
+            case IntTy.I16 | IntTy.U16:
+                return 16
+            case IntTy.I32 | IntTy.U32:
+                return 32
+            case IntTy.I64 | IntTy.U64:
+                return 64
+            case _:
+                return 128
+
+    fn signed(self) -> bool:
+        match self:
+            case IntTy.I8 | IntTy.I16 | IntTy.I32 | IntTy.I64 | IntTy.I128:
+                return true
+            case _:
+                return false
+
+    fn min(self) -> i128:
+        if self.signed():
+            return -i128(self.umax()) - 1
+        return 0
+
+    # The largest value, capped at the largest i128 (`u128`'s real maximum is larger; see `umax`).
+    fn max(self) -> i128:
+        let u = self.umax()
+        if u > u128(I128_MAX):
+            return I128_MAX
+        return i128(u)
+
+    # The largest value.
+    fn umax(self) -> u128:
+        let b = self.bits()
+        if self.signed():
+            return (u128(1) << u128(b - 1)) - 1
+        if b == 128:
+            return u128_max()
+        return (u128(1) << u128(b)) - 1
+
+    fn name(self) -> str:
+        match self:
+            case IntTy.I64:
+                return "int"
+            case _:
+                return self.suffix()
+
+    # short suffix used for runtime helper names
+    fn suffix(self) -> str:
+        match self:
+            case IntTy.I8:
+                return "i8"
+            case IntTy.I16:
+                return "i16"
+            case IntTy.I32:
+                return "i32"
+            case IntTy.I64:
+                return "i64"
+            case IntTy.I128:
+                return "i128"
+            case IntTy.U8:
+                return "u8"
+            case IntTy.U16:
+                return "u16"
+            case IntTy.U32:
+                return "u32"
+            case IntTy.U64:
+                return "u64"
+            case IntTy.U128:
+                return "u128"
+
+    fn c_type(self) -> str:
+        match self:
+            case IntTy.I8:
+                return "int8_t"
+            case IntTy.I16:
+                return "int16_t"
+            case IntTy.I32:
+                return "int32_t"
+            case IntTy.I64:
+                return "int64_t"
+            case IntTy.I128:
+                return "brine_i128"
+            case IntTy.U8:
+                return "uint8_t"
+            case IntTy.U16:
+                return "uint16_t"
+            case IntTy.U32:
+                return "uint32_t"
+            case IntTy.U64:
+                return "uint64_t"
+            case IntTy.U128:
+                return "brine_u128"
+
+const I128_MAX: i128 = 170141183460469231731687303715884105727
+const I128_MIN: i128 = -170141183460469231731687303715884105727 - 1
+
+fn u128_max() -> u128:
+    let half: u128 = 170141183460469231731687303715884105727
+    return (half << 1) + 1
+
+enum FloatTy:
+    F32
+    F64
+
+enum Ty:
+    Int(k: IntTy)
+    Float(k: FloatTy)
+    Bool
+    Str
+    Unit
+    Array(elem: Ty)
+    # `{K: V}`: a hash map that remembers insertion order
+    Map(key: Ty, val: Ty)
+    Tuple(elems: [Ty])
+    Struct(id: int)
+    Enum(id: int)
+    Range
+    Never
+    Error
+    Unknown
+
+    fn is_int(self) -> bool:
+        match self:
+            case Ty.Int(_):
+                return true
+            case _:
+                return false
+
+    fn is_float(self) -> bool:
+        match self:
+            case Ty.Float(_):
+                return true
+            case _:
+                return false
+
+    fn is_numeric(self) -> bool:
+        return self.is_int() or self.is_float()
+
+    fn is_error(self) -> bool:
+        match self:
+            case Ty.Error | Ty.Unknown:
+                return true
+            case _:
+                return false
+
+    fn elem(self) -> Ty:
+        match self:
+            case Ty.Array(e):
+                return e
+            case _:
+                return Ty.Error
+
+    fn name(self, structs: [str], enums: [str]) -> str:
+        match self:
+            case Ty.Int(i):
+                return i.name()
+            case Ty.Float(FloatTy.F64):
+                return "float"
+            case Ty.Float(FloatTy.F32):
+                return "f32"
+            case Ty.Bool:
+                return "bool"
+            case Ty.Str:
+                return "str"
+            case Ty.Unit:
+                return "()"
+            case Ty.Array(e):
+                return "[" + e.name(structs, enums) + "]"
+            case Ty.Map(k, v):
+                return "{" + k.name(structs, enums) + ": " + v.name(structs, enums) + "}"
+            case Ty.Tuple(ts):
+                return "(" + ", ".join([t.name(structs, enums) for t in ts]) + ")"
+            case Ty.Struct(i):
+                if 0 <= i < len(structs):
+                    return structs[i]
+                return "?"
+            case Ty.Enum(i):
+                if 0 <= i < len(enums):
+                    return enums[i]
+                return "?"
+            case Ty.Range:
+                return "range"
+            case Ty.Never:
+                return "never"
+            case _:
+                return "?"
+
+fn int_ty() -> Ty:
+    return Ty.Int(IntTy.I64)
+
+fn float_ty() -> Ty:
+    return Ty.Float(FloatTy.F64)
+
+# ---------------------------------------------------------------- resolution
+
+enum Res:
+    Unresolved
+    Local(id: int)
+    Const(id: int)
+    Fn(id: int)
+    Struct(id: int)
+    Enum(id: int)
+    Module(id: int)
+    World
+    # the built-in `os` module: `os.cwd()`
+    Os
+    # a variant without fields, used as a value: `Color.Red`
+    Variant(eid: int, vi: int)
+
+# String methods implemented by `brine_s_<name>` in the runtime.
+enum StrM:
+    Find
+    Split
+    SplitWs
+    Join
+    StartsWith
+    EndsWith
+    Strip
+    LStrip
+    RStrip
+    Replace
+    Upper
+    Lower
+    Lines
+    IsDigit
+    IsAlpha
+    IsSpace
+    IsAlnum
+    Count
+    Bytes
+    Chars
+    Repeat
+
+    fn c_name(self) -> str:
+        match self:
+            case StrM.Find:
+                return "brine_s_find"
+            case StrM.Split:
+                return "brine_s_split"
+            case StrM.SplitWs:
+                return "brine_s_split_ws"
+            case StrM.Join:
+                return "brine_s_join"
+            case StrM.StartsWith:
+                return "brine_s_starts_with"
+            case StrM.EndsWith:
+                return "brine_s_ends_with"
+            case StrM.Strip:
+                return "brine_s_strip"
+            case StrM.LStrip:
+                return "brine_s_lstrip"
+            case StrM.RStrip:
+                return "brine_s_rstrip"
+            case StrM.Replace:
+                return "brine_s_replace"
+            case StrM.Upper:
+                return "brine_s_upper"
+            case StrM.Lower:
+                return "brine_s_lower"
+            case StrM.Lines:
+                return "brine_s_lines"
+            case StrM.IsDigit:
+                return "brine_s_is_digit"
+            case StrM.IsAlpha:
+                return "brine_s_is_alpha"
+            case StrM.IsSpace:
+                return "brine_s_is_space"
+            case StrM.IsAlnum:
+                return "brine_s_is_alnum"
+            case StrM.Count:
+                return "brine_s_count"
+            case StrM.Bytes:
+                return "brine_s_bytes"
+            case StrM.Chars:
+                return "brine_s_chars"
+            case StrM.Repeat:
+                return "brine_s_repeat"
+
+enum Builtin:
+    Print
+    Len
+    Abs
+    Min
+    Max
+    Sqrt
+    Sin
+    Cos
+    Tan
+    Exp
+    Log
+    Pow
+    Floor
+    Ceil
+    Round
+    Clock
+    Args
+    Exit
+    Panic
+    Push
+    Pop
+    # `ord("a")`: the code point of a one-character string
+    Ord
+    # `chr(97)`: the one-character string for a code point
+    Chr
+    # `eprint(...)`: like print, to stderr
+    Eprint
+    # `enumerate(xs)`: `[(0, xs[0]), (1, xs[1]), ...]`
+    Enumerate
+    ReadFile
+    WriteFile
+    FileExists
+    Getenv
+    Run
+    # `embed("file.txt") -> str`: a file's contents, read at compile time
+    Embed
+    # string methods that are plain runtime functions
+    Str(m: StrM)
+    # array methods
+    Insert
+    Extend
+    IndexOf
+    Sort
+    Reverse
+    Clear
+    # `xs.pop(i)`
+    PopAt
+    # `m.get(k)` / `m.get(k, default)`
+    Get
+    # `m.remove(k)`
+    Remove
+    Keys
+    Values
+    Items
+
+    # Does this method change its receiver in place?
+    fn mutates_recv(self) -> bool:
+        match self:
+            case Builtin.Push | Builtin.Pop | Builtin.Remove | Builtin.Insert | Builtin.Extend:
+                return true
+            case Builtin.Sort | Builtin.Reverse | Builtin.Clear | Builtin.PopAt:
+                return true
+            case _:
+                return false
+
+fn builtins() -> [(str, Builtin)]:
+    return [
+        ("print", Builtin.Print),
+        ("len", Builtin.Len),
+        ("abs", Builtin.Abs),
+        ("min", Builtin.Min),
+        ("max", Builtin.Max),
+        ("sqrt", Builtin.Sqrt),
+        ("sin", Builtin.Sin),
+        ("cos", Builtin.Cos),
+        ("tan", Builtin.Tan),
+        ("exp", Builtin.Exp),
+        ("log", Builtin.Log),
+        ("pow", Builtin.Pow),
+        ("floor", Builtin.Floor),
+        ("ceil", Builtin.Ceil),
+        ("round", Builtin.Round),
+        ("clock", Builtin.Clock),
+        ("args", Builtin.Args),
+        ("exit", Builtin.Exit),
+        ("panic", Builtin.Panic),
+        ("ord", Builtin.Ord),
+        ("chr", Builtin.Chr),
+        ("eprint", Builtin.Eprint),
+        ("enumerate", Builtin.Enumerate),
+        ("read_file", Builtin.ReadFile),
+        ("write_file", Builtin.WriteFile),
+        ("file_exists", Builtin.FileExists),
+        ("getenv", Builtin.Getenv),
+        ("run", Builtin.Run),
+        ("embed", Builtin.Embed)
+    ]
+
+enum Reducer:
+    Sum
+    Product
+    Min
+    Max
+    Any
+    All
+
+enum WorldOp:
+    Rank
+    Size
+    Barrier
+    Shift
+    Exchange
+    Broadcast
+    Sum
+    Min
+    Max
+    GatherAll
+
+fn world_ops() -> [(str, WorldOp)]:
+    return [
+        ("rank", WorldOp.Rank),
+        ("size", WorldOp.Size),
+        ("barrier", WorldOp.Barrier),
+        ("shift", WorldOp.Shift),
+        ("exchange", WorldOp.Exchange),
+        ("broadcast", WorldOp.Broadcast),
+        ("sum", WorldOp.Sum),
+        ("min", WorldOp.Min),
+        ("max", WorldOp.Max),
+        ("gather_all", WorldOp.GatherAll)
+    ]
+
+# Functions of the `os` module.
+enum OsOp:
+    ListDir
+    IsDir
+    IsFile
+    MakeDir
+    RemoveFile
+    Rename
+    Cwd
+    SetCwd
+    ExePath
+    TempDir
+    AbsPath
+    Name
+    Arch
+    Pid
+    CpuCount
+    Sleep
+    IsTerminal
+    EnableAnsi
+    FreePorts
+    Spawn
+    Wait
+    Poll
+    Kill
+    Output
+
+    # Changes the outside world (files, processes, time), so it can't run inside `par`.
+    fn has_effects(self) -> bool:
+        match self:
+            case OsOp.Spawn | OsOp.Wait | OsOp.Poll | OsOp.Kill | OsOp.MakeDir | OsOp.RemoveFile | OsOp.Rename | OsOp.SetCwd:
+                return true
+            case OsOp.Sleep | OsOp.EnableAnsi:
+                return true
+            case _:
+                return false
+
+    # The same on every rank of a `world` program; every other result is rank-dependent.
+    fn uniform(self) -> bool:
+        match self:
+            case OsOp.Name | OsOp.Arch:
+                return true
+            case _:
+                return false
+
+fn os_ops() -> [(str, OsOp)]:
+    return [
+        ("list_dir", OsOp.ListDir),
+        ("is_dir", OsOp.IsDir),
+        ("is_file", OsOp.IsFile),
+        ("make_dir", OsOp.MakeDir),
+        ("remove_file", OsOp.RemoveFile),
+        ("rename", OsOp.Rename),
+        ("cwd", OsOp.Cwd),
+        ("set_cwd", OsOp.SetCwd),
+        ("exe_path", OsOp.ExePath),
+        ("temp_dir", OsOp.TempDir),
+        ("abs_path", OsOp.AbsPath),
+        ("name", OsOp.Name),
+        ("arch", OsOp.Arch),
+        ("pid", OsOp.Pid),
+        ("cpu_count", OsOp.CpuCount),
+        ("sleep", OsOp.Sleep),
+        ("is_terminal", OsOp.IsTerminal),
+        ("enable_ansi", OsOp.EnableAnsi),
+        ("free_ports", OsOp.FreePorts),
+        ("spawn", OsOp.Spawn),
+        ("wait", OsOp.Wait),
+        ("poll", OsOp.Poll),
+        ("kill", OsOp.Kill),
+        ("output", OsOp.Output)
+    ]
+
+enum CallRes:
+    Unresolved
+    # Plain function call (also module-qualified and static methods).
+    Fn(id: int)
+    # Method call: receiver is passed as the first argument.
+    Method(id: int)
+    Ctor(id: int)
+    # constructing an enum variant with fields: `Shape.Circle(1.0)`
+    Variant(eid: int, vi: int)
+    Builtin(b: Builtin)
+    Reduce(r: Reducer)
+    World(op: WorldOp)
+    Os(op: OsOp)
+    Convert(t: Ty)
+    # `range(...)` used as an iterable
+    Range
+
+# ---------------------------------------------------------------- locals
+
+enum LocalKind:
+    Let
+    Var
+    Param
+    RefParam
+    ForVar
+    # element binding of `for x in xs`, borrowed from the array
+    ForElem
+    Result
+
+struct LocalInfo:
+    name: str
+    ty: Ty
+    kind: LocalKind
+    par_level: int
+    span: Span

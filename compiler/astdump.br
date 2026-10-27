@@ -1,0 +1,400 @@
+# The syntax tree as indented text, in the format of `brine parse`
+# (src/astdump.rs), so the two parsers can be compared.
+from diag import Span, quote
+from ast import TypeExpr, UnOp, FSeg, Arg, CompKind, Expr, ExprKind, LetPat, Pattern, PatKind, Stmt, StmtKind, Block, FnDecl, Module
+
+fn sp(s: Span) -> str:
+    return f"{s.lo}:{s.hi}"
+
+fn at(name: str, s: Span) -> str:
+    return f"{name}@{s.lo}:{s.hi}"
+
+fn tparams(ps: [(str, Span)]) -> str:
+    var out = ""
+    for n, s in ps:
+        out += " " + at(n, s)
+    return out
+
+fn ty(t: TypeExpr) -> str:
+    match t:
+        case TypeExpr.Named(path, args, span):
+            var a = ""
+            if len(args) > 0:
+                a = "[" + ", ".join([ty(x) for x in args]) + "]"
+            return ".".join(path) + a + "@" + sp(span)
+        case TypeExpr.Array(elem, span):
+            return "[" + ty(elem) + "]@" + sp(span)
+        case TypeExpr.Map(key, val, span):
+            return "{" + ty(key) + ": " + ty(val) + "}@" + sp(span)
+        case TypeExpr.Tuple(elems, span):
+            return "(" + ", ".join([ty(x) for x in elems]) + ")@" + sp(span)
+
+fn pat(p: Pattern) -> str:
+    var body = ""
+    match p.kind:
+        case PatKind.Wild:
+            body = "_"
+        case PatKind.Bind(name):
+            body = name
+        case PatKind.Int(v):
+            body = f"{v}"
+        case PatKind.Str(s):
+            body = quote(s)
+        case PatKind.Bool(b):
+            body = f"{b}"
+        case PatKind.Variant(path, args):
+            body = ".".join(path)
+            match args:
+                case Some(xs):
+                    var parts: [str] = []
+                    for name, sub in xs:
+                        match name:
+                            case Some((n, ns)):
+                                parts.push(at(n, ns) + "=" + pat(sub))
+                            case None:
+                                parts.push(pat(sub))
+                    body += "(" + ", ".join(parts) + ")"
+                case None:
+                    pass
+        case PatKind.Tuple(ps):
+            body = "(" + ", ".join([pat(x) for x in ps]) + ")"
+        case PatKind.Or(ps):
+            body = "(" + " | ".join([pat(x) for x in ps]) + ")"
+    return body + "@" + sp(p.span)
+
+struct Dump:
+    src: str
+    out: [str]
+
+    fn line(ref self, depth: int, s: str):
+        self.out.push("  ".repeat(depth) + s)
+
+    fn func(ref self, f: FnDecl):
+        var h = "fn " + at(f.name, f.name_span) + " " + sp(f.span)
+        match f.method_of:
+            case Some(m):
+                h += " method=" + m
+            case None:
+                pass
+        if f.is_extern:
+            h += " extern"
+        match f.test_name:
+            case Some(t):
+                h += " test=" + quote(t)
+            case None:
+                pass
+        h += tparams(f.tparams)
+        self.line(0, h)
+        for p in f.params:
+            var s = "param"
+            if p.by_ref:
+                s += " ref"
+            if p.mutable:
+                s += " mut"
+            s += " " + at(p.name, p.span)
+            match p.ty:
+                case Some(t):
+                    s += " " + ty(t)
+                case None:
+                    pass
+            self.line(1, s)
+        match f.ret:
+            case Some(t):
+                self.line(1, "ret " + ty(t))
+            case None:
+                pass
+        for e in f.requires:
+            self.line(1, "requires")
+            self.expr(2, e)
+        for e in f.ensures:
+            self.line(1, "ensures")
+            self.expr(2, e)
+        if not f.is_extern:
+            self.block(1, f.body)
+
+    fn block(ref self, d: int, b: Block):
+        self.line(d, "block " + sp(b.span))
+        for s in b.stmts:
+            self.stmt(d + 1, s)
+
+    fn stmt(ref self, d: int, s: Stmt):
+        let span = sp(s.span)
+        match s.kind:
+            case StmtKind.Let(mutable, lp, t, init, is_ref):
+                var p = ""
+                match lp:
+                    case LetPat.Name(n, ns):
+                        p = at(n, ns)
+                    case LetPat.Tuple(names):
+                        p = "(" + ", ".join([at(n, ns) for n, ns in names]) + ")"
+                var h = ("var " if mutable else "let ") + span + " " + p
+                match t:
+                    case Some(x):
+                        h += " : " + ty(x)
+                    case None:
+                        pass
+                if is_ref:
+                    h += " ref"
+                self.line(d, h)
+                self.expr(d + 1, init)
+            case StmtKind.Assign(target, op, value):
+                var o = "="
+                match op:
+                    case Some(x):
+                        o = x.sym() + "="
+                    case None:
+                        pass
+                self.line(d, "assign " + span + " " + o)
+                self.expr(d + 1, target)
+                self.expr(d + 1, value)
+            case StmtKind.ExprStmt(e):
+                self.line(d, "expr " + span)
+                self.expr(d + 1, e)
+            case StmtKind.If(branches, els):
+                self.line(d, "if " + span)
+                for c, b in branches:
+                    self.line(d + 1, "branch")
+                    self.expr(d + 2, c)
+                    self.block(d + 2, b)
+                match els:
+                    case Some(b):
+                        self.line(d + 1, "else")
+                        self.block(d + 2, b)
+                    case None:
+                        pass
+            case StmtKind.While(cond, invariants, body):
+                self.line(d, "while " + span)
+                self.expr(d + 1, cond)
+                self.invariants(d + 1, invariants)
+                self.block(d + 1, body)
+            case StmtKind.For(name, name_span, t, iter, invariants, body, is_par):
+                var h = ("par-for " if is_par else "for ") + span + " " + at(name, name_span)
+                match t:
+                    case Some(x):
+                        h += " : " + ty(x)
+                    case None:
+                        pass
+                self.line(d, h)
+                self.expr(d + 1, iter)
+                self.invariants(d + 1, invariants)
+                self.block(d + 1, body)
+            case StmtKind.Match(scrut, cases):
+                self.line(d, "match " + span)
+                self.expr(d + 1, scrut)
+                for c in cases:
+                    self.line(d + 1, "case " + sp(c.span) + " " + pat(c.pat))
+                    match c.guard:
+                        case Some(g):
+                            self.line(d + 2, "guard")
+                            self.expr(d + 3, g)
+                        case None:
+                            pass
+                    self.block(d + 2, c.body)
+            case StmtKind.Return(value):
+                self.line(d, "return " + span)
+                match value:
+                    case Some(e):
+                        self.expr(d + 1, e)
+                    case None:
+                        pass
+            case StmtKind.Break:
+                self.line(d, "break " + span)
+            case StmtKind.Continue:
+                self.line(d, "continue " + span)
+            case StmtKind.Pass:
+                self.line(d, "pass " + span)
+            case StmtKind.Assert(cond, msg):
+                self.line(d, "assert " + span)
+                self.expr(d + 1, cond)
+                match msg:
+                    case Some(m):
+                        self.expr(d + 1, m)
+                    case None:
+                        pass
+            case StmtKind.Prove(e):
+                self.line(d, "prove " + span)
+                self.expr(d + 1, e)
+            case StmtKind.Contract(k, e):
+                self.line(d, "contract " + k.keyword() + " " + span)
+                self.expr(d + 1, e)
+
+    fn invariants(ref self, d: int, invs: [Expr]):
+        for e in invs:
+            self.line(d, "invariant")
+            self.expr(d + 1, e)
+
+    fn args(ref self, d: int, args: [Arg]):
+        for a in args:
+            var h = "arg"
+            if a.by_ref:
+                h += " ref"
+            match a.name:
+                case Some((n, s)):
+                    h += " " + at(n, s)
+                case None:
+                    pass
+            self.line(d, h)
+            self.expr(d + 1, a.expr)
+
+    fn opt(ref self, d: int, e: Option[Expr]):
+        match e:
+            case Some(x):
+                self.expr(d, x)
+            case None:
+                pass
+
+    fn expr(ref self, d: int, e: Expr):
+        let span = sp(e.span)
+        match e.kind:
+            case ExprKind.Int(v):
+                self.line(d, f"int {span} {v}")
+            case ExprKind.Float(_):
+                self.line(d, f"float {span} " + self.src[e.span.lo:e.span.hi])
+            case ExprKind.Bool(b):
+                self.line(d, f"bool {span} {b}")
+            case ExprKind.Str(s):
+                self.line(d, f"str {span} " + quote(s))
+            case ExprKind.FStr(segs):
+                self.line(d, "fstr " + span)
+                for seg in segs:
+                    match seg:
+                        case FSeg.Lit(t):
+                            self.line(d + 1, "lit " + quote(t))
+                        case FSeg.Part(x, spec):
+                            match spec:
+                                case Some(s):
+                                    self.line(d + 1, "part " + quote(s))
+                                case None:
+                                    self.line(d + 1, "part")
+                            self.expr(d + 2, x)
+            case ExprKind.Ident(name):
+                self.line(d, f"ident {span} {name}")
+            case ExprKind.Unary(op, x):
+                var o = "-"
+                match op:
+                    case UnOp.Neg:
+                        o = "-"
+                    case UnOp.Not:
+                        o = "not"
+                    case UnOp.BitNot:
+                        o = "~"
+                self.line(d, f"unary {span} {o}")
+                self.expr(d + 1, x)
+            case ExprKind.Try(x):
+                self.line(d, "try " + span)
+                self.expr(d + 1, x)
+            case ExprKind.Binary(op, l, r):
+                self.line(d, f"binary {span} " + op.sym())
+                self.expr(d + 1, l)
+                self.expr(d + 1, r)
+            case ExprKind.Compare(first, rest):
+                self.line(d, f"compare {span} " + " ".join([op.sym() for op, _ in rest]))
+                self.expr(d + 1, first)
+                for _, x in rest:
+                    self.expr(d + 1, x)
+            case ExprKind.IfElse(cond, then, els):
+                self.line(d, "ifelse " + span)
+                self.expr(d + 1, cond)
+                self.expr(d + 1, then)
+                self.expr(d + 1, els)
+            case ExprKind.Call(callee, args):
+                self.line(d, "call " + span)
+                self.expr(d + 1, callee)
+                self.args(d + 1, args)
+            case ExprKind.MethodCall(recv, name, name_span, args):
+                self.line(d, f"method {span} " + at(name, name_span))
+                self.expr(d + 1, recv)
+                self.args(d + 1, args)
+            case ExprKind.Field(x, name, name_span):
+                self.line(d, f"field {span} " + at(name, name_span))
+                self.expr(d + 1, x)
+            case ExprKind.Index(x, idx):
+                self.line(d, "index " + span)
+                self.expr(d + 1, x)
+                self.expr(d + 1, idx)
+            case ExprKind.Slice(x, lo, hi):
+                self.line(
+                    d,
+                    "slice " + span + (" lo" if lo.is_some() else "") + (" hi" if hi.is_some() else "")
+                )
+                self.expr(d + 1, x)
+                self.opt(d + 1, lo)
+                self.opt(d + 1, hi)
+            case ExprKind.Array(elems):
+                self.line(d, "array " + span)
+                for x in elems:
+                    self.expr(d + 1, x)
+            case ExprKind.Map(entries):
+                self.line(d, "map " + span)
+                for k, v in entries:
+                    self.expr(d + 1, k)
+                    self.expr(d + 1, v)
+            case ExprKind.Contains(item, coll, neg):
+                self.line(d, ("not-in " if neg else "in ") + span)
+                self.expr(d + 1, item)
+                self.expr(d + 1, coll)
+            case ExprKind.Tuple(elems):
+                self.line(d, "tuple " + span)
+                for x in elems:
+                    self.expr(d + 1, x)
+            case ExprKind.Range(lo, hi, inclusive):
+                self.line(d, f"range {span} " + ("..=" if inclusive else ".."))
+                self.expr(d + 1, lo)
+                self.expr(d + 1, hi)
+            case ExprKind.Comp(c):
+                let k = "list" if c.kind == CompKind.List else "gen"
+                let f = " filter" if c.filter.is_some() else ""
+                var names = ""
+                for n, s in c.unpack:
+                    names += " " + at(n, s)
+                self.line(
+                    d,
+                    ("par-comp " if c.par else "comp ") + span + " " + k + " " + at(c.name, c.name_span) + names + f
+                )
+                self.expr(d + 1, c.iter)
+                self.opt(d + 1, c.filter)
+                self.expr(d + 1, c.body)
+            case ExprKind.ParTuple(elems):
+                self.line(d, "par " + span)
+                for x in elems:
+                    self.expr(d + 1, x)
+            case ExprKind.Repeat(x, n):
+                self.line(d, "repeat " + span)
+                self.expr(d + 1, x)
+                self.expr(d + 1, n)
+            case ExprKind.Error:
+                self.line(d, "error " + span)
+
+fn dump_module(m: Module, src: str) -> [str]:
+    var d = Dump(src=src, out=[])
+    for i in m.imports:
+        if i.alias == "":
+            d.line(0, "from " + ".".join(i.path) + " " + sp(i.span))
+            for n, s in i.names:
+                d.line(1, "name " + at(n, s))
+        else:
+            d.line(0, "import " + ".".join(i.path) + " as " + i.alias + " " + sp(i.span))
+    for s in m.structs:
+        d.line(0, "struct " + s.name + " " + sp(s.span) + tparams(s.tparams))
+        for f in s.fields:
+            d.line(1, "field " + at(f.name, f.span) + " " + ty(f.ty))
+    for e in m.enums:
+        d.line(0, "enum " + e.name + " " + sp(e.span) + tparams(e.tparams))
+        for v in e.variants:
+            d.line(1, "variant " + at(v.name, v.span))
+            for f in v.fields:
+                d.line(2, "field " + at(f.name, f.span) + " " + ty(f.ty))
+    for c in m.consts:
+        var t = ""
+        match c.ty:
+            case Some(x):
+                t = " " + ty(x)
+            case None:
+                pass
+        d.line(0, "const " + c.name + " " + sp(c.span) + t)
+        d.expr(1, c.value)
+    for f in m.fns:
+        d.func(f)
+    for f in m.tests:
+        d.func(f)
+    return d.out
