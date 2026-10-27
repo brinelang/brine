@@ -204,8 +204,17 @@ void brine_rt_arr(void *p) { brine_arr_retain(*(brine_arr **)p); }
 void brine_rl_arr(void *p) { brine_arr_release(*(brine_arr **)p); }
 
 /* ============================================================ strings */
+/* The bytes allocated for a string of length n, rounded up (by at most a
+   quarter) so `+=` can usually grow it in place. Every heap string is at least
+   this big for its length, which is what brine_str_append relies on. */
+static size_t br_str_size(int64_t n) {
+    size_t t = sizeof(brine_str) + (size_t)n + 1;
+    if (t <= 64) return (t + 15) & ~(size_t)15;
+    size_t g = (size_t)1 << (61 - __builtin_clzll(t));
+    return (t + g - 1) & ~(g - 1);
+}
 static brine_str *br_str_alloc(int64_t n) {
-    brine_str *s = (brine_str *)brine_alloc((int64_t)sizeof(brine_str) + n + 1);
+    brine_str *s = (brine_str *)brine_alloc((int64_t)br_str_size(n));
     BR_LIVE(1);
     s->rc = 1;
     s->len = n;
@@ -222,6 +231,30 @@ brine_str *brine_str_concat(brine_str *a, brine_str *b) {
     memcpy(s->data, a->data, (size_t)a->len);
     memcpy(s->data + a->len, b->data, (size_t)b->len);
     return s;
+}
+/* `s += b`: grows s in place when nothing else holds it */
+void brine_str_append(brine_str **ps, brine_str *b) {
+    brine_str *a = *ps;
+    if (b->len == 0) return;
+    if (__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) != 1) {
+        *ps = brine_str_concat(a, b);
+        brine_str_release(a);
+        return;
+    }
+    int64_t n = a->len + b->len, blen = b->len;
+    bool self = a == b;
+    brine_str *s = a;
+    if (br_str_size(n) > br_str_size(a->len)) {
+        s = (brine_str *)realloc(a, br_str_size(n));
+        if (!s) {
+            fprintf(stderr, "out of memory\n");
+            abort();
+        }
+    }
+    memcpy(s->data + s->len, self ? s->data : b->data, (size_t)blen);
+    s->len = n;
+    s->data[n] = 0;
+    *ps = s;
 }
 bool brine_str_eq(brine_str *a, brine_str *b) {
     return a == b || (a->len == b->len && memcmp(a->data, b->data, (size_t)a->len) == 0);

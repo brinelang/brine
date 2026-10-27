@@ -137,6 +137,7 @@ void brine_rl_map(void *p);
 /* ------------------------------------------------------------ strings */
 brine_str *brine_str_new(const char *p, int64_t n);
 brine_str *brine_str_concat(brine_str *a, brine_str *b);
+void brine_str_append(brine_str **ps, brine_str *b);
 bool brine_str_eq(brine_str *a, brine_str *b);
 bool brine_str_contains(brine_str *s, brine_str *sub);
 /* `s[i]`: the byte at i as a one-character string (never allocates) */
