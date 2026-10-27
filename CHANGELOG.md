@@ -5,6 +5,34 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) 
 
 ## [Unreleased]
 
+## [0.3.0]
+### Added
+- `print` takes `sep=` and `end=`: `print(a, b, sep=", ", end="")`.
+- Nested and parenthesized tuple unpacking in `for`, `let` and comprehensions:
+  `for i, (k, v) in enumerate(pairs):`, `let (a, (b, c)) = t`.
+- `s.contains(x)` on strings and `xs.contains(x)` on arrays (the same as `x in s`).
+- Integer literals up to the largest `u128` (2^128 - 1); above `i128`'s maximum
+  only a `u128` holds them.
+- Native code has unwind tables (`.pdata`/`.xdata` on Windows, `.eh_frame` on
+  Linux), so debuggers and profilers can walk through brine frames.
+
+### Changed
+- `upper()`, `lower()`, `strip()`, `split()` and `is_alpha`/`is_alnum`/`is_space`
+  follow Unicode, as in Python (`"straße".upper()` is `"STRASSE"`). `is_digit` stays
+  `0`-`9`, the digits `int()` reads.
+- The compiler parses imported modules and proves functions in parallel (building
+  the compiler itself: 0.85 s to 0.61 s).
+- Faster native code: reference counting is inlined and values just stored aren't
+  read back from memory.
+- A build whose backend `BRINE_BACKEND` overrides goes to its own folder (`dev-c`),
+  so it can't replace a default build's executable while that one runs.
+
+### Fixed
+- A function returning a call that returns nothing (`return f()` in a `-> ()`
+  function, as in the prelude's `Result[(), E].unwrap()`) was rejected with E0301.
+- Native calls whose 128-bit result is unused, and stack slots aligned to more than
+  16 bytes.
+
 ## [0.2.0]
 ### Added
 - A native x86-64 backend: dev builds on Windows and Linux go straight from the
