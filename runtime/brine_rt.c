@@ -1355,6 +1355,11 @@ static void br_check_rank(int64_t r, const char *what, const char *loc) {
 
 static void br_send(int64_t dest, int64_t chan, int64_t kind, const void *data, int64_t len, const char *loc) {
     br_check_rank(dest, "destination", loc);
+    /* what this rank printed so far comes out before anything another rank
+       prints after hearing from it (ranks share stdout, each with its own buffer) */
+    br_lock(&br_io_mu);
+    fflush(stdout);
+    br_unlock(&br_io_mu);
     br_peer *pr = &br_peers[dest];
     if (dest == br_rank) {
         br_msg *m = (br_msg *)brine_alloc((int64_t)sizeof(br_msg) + len);
