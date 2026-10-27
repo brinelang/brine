@@ -79,36 +79,36 @@ fn verify_program(ref prog: Program, info: ProgramInfo, sm: SourceMap) -> Report
                 specs[
                     f.id
                 ] = Some(FnSpec(name=f.name, params=f.param_locals, requires=f.requires, ensures=f.ensures, result=f.result_local))
+    # functions are proven independently, so in parallel; the results are
+    # applied in order, which keeps the output deterministic
+    var fns: [FnDecl] = []
+    for m in prog.modules:
+        fns.extend(m.fns)
+        fns.extend(m.tests)
+    let done = par [verify_fn(info, specs, sm, f) for f in fns]
+    # let go of the bodies, so rewriting them below doesn't copy them
+    fns = []
     var report = Report(diags=[], remaining=[], proven=0)
     # `BRINE_TIMES=2`: the functions that take the prover long
     let slow_fns = getenv("BRINE_TIMES") == Some("2")
+    var at = 0
     for mi in 0..len(prog.modules):
         let nf = len(prog.modules[mi].fns)
         let nt = len(prog.modules[mi].tests)
         for k in 0..nf + nt:
-            let f = prog.modules[mi].fns[k] if k < nf else prog.modules[mi].tests[k - nf]
-            if f.is_extern:
-                continue
-            let t0 = clock()
-            var v = new_vf(info, specs, sm, f)
-            v.run(f)
-            if slow_fns:
-                let dt = clock() - t0
-                if dt > 0.02:
-                    eprint(f"  verify {f.name}: {dt:.3f}s")
-            report.diags.extend(v.diags)
-            report.remaining.extend(v.remaining)
-            var proven: {(int, int, int, int): bool} = {}
-            for p in v.proven.keys():
-                if p not in v.failed:
-                    proven[p] = true
-            report.proven += len(proven)
-            if len(proven) == 0:
+            let r = done[at]
+            at += 1
+            if slow_fns and r.time > 0.02:
+                eprint(f"  verify {r.name}: {r.time:.3f}s")
+            report.diags.extend(r.diags)
+            report.remaining.extend(r.remaining)
+            report.proven += len(r.proven)
+            if len(r.proven) == 0:
                 continue
             if k < nf:
-                apply_block(ref prog.modules[mi].fns[k].body, proven)
+                apply_block(ref prog.modules[mi].fns[k].body, r.proven)
             else:
-                apply_block(ref prog.modules[mi].tests[k - nf].body, proven)
+                apply_block(ref prog.modules[mi].tests[k - nf].body, r.proven)
     # by position (stable), then without repeats
     var keys: [(int, int, int)] = []
     for i, r in enumerate(report.remaining):
@@ -124,6 +124,32 @@ fn verify_program(ref prog: Program, info: ProgramInfo, sm: SourceMap) -> Report
         out.push(r)
     report.remaining = out
     return report
+
+struct FnResult:
+    name: str
+    diags: [Diag]
+    remaining: [(Span, str)]
+    # the checks proven everywhere they're reached
+    proven: {(int, int, int, int): bool}
+    time: float
+
+fn verify_fn(info: ProgramInfo, specs: [Option[FnSpec]], sm: SourceMap, f: FnDecl) -> FnResult:
+    let t0 = clock()
+    if f.is_extern:
+        return FnResult(name=f.name, diags=[], remaining=[], proven={}, time=0.0)
+    var v = new_vf(info, specs, sm, f)
+    v.run(f)
+    var proven: {(int, int, int, int): bool} = {}
+    for p in v.proven.keys():
+        if p not in v.failed:
+            proven[p] = true
+    return FnResult(
+        name=f.name,
+        diags=v.diags,
+        remaining=v.remaining,
+        proven=proven,
+        time=clock() - t0
+    )
 
 fn key_lt(a: (int, int, int), b: (int, int, int)) -> bool:
     if a.0 != b.0:
