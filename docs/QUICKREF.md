@@ -329,6 +329,7 @@ os.make_dir(path)       # Result[(), str]: creates missing parents; Ok if it exi
 os.remove_file(path), os.rename(src, dst)    # Result[(), str]; rename replaces dst
 os.cwd(), os.temp_dir() # str (temp_dir has no trailing separator)
 os.set_cwd(path)        # Result[(), str]: change the working directory
+os.write_bytes(path, b) # Result[(), str]: write a [u8] as a binary file
 os.exe_path()           # str: the absolute path of the running program
 os.abs_path(path)       # Result[str, str]: canonical; on Windows `\\?\C:\...`
 os.name(), os.arch()    # "windows"/"macos"/"linux"..., "x86_64"/"aarch64"...

@@ -267,6 +267,8 @@ bool brine_os_remove_file(brine_str *path, brine_str **err);
 bool brine_os_rename(brine_str *src, brine_str *dst, brine_str **err);
 brine_str *brine_os_cwd(void);
 bool brine_os_set_cwd(brine_str *path, brine_str **err);
+/* writes the bytes of a `[u8]` */
+bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err);
 brine_str *brine_os_exe_path(void);
 brine_str *brine_os_temp_dir(void);
 bool brine_os_abs_path(brine_str *path, brine_str **out, brine_str **err);

@@ -1966,6 +1966,26 @@ bool brine_write_file(brine_str *path, brine_str *text, brine_str **err) {
     return !bad;
 }
 
+bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err) {
+    char *p = br_cstr(path);
+    if (!p) {
+        *err = br_strf("cannot write a path containing a NUL byte");
+        return false;
+    }
+    FILE *f = br_open(p, "wb");
+    if (!f) {
+        *err = br_strf("cannot write %s: %s", p, strerror(errno));
+        free(p);
+        return false;
+    }
+    size_t put = data->len ? fwrite(data->data, 1, (size_t)data->len, f) : 0;
+    int bad = put != (size_t)data->len;
+    if (fclose(f) != 0) bad = 1;
+    if (bad) *err = br_strf("cannot write %s: write error (is the disk full?)", p);
+    free(p);
+    return !bad;
+}
+
 bool brine_file_exists(brine_str *path) {
     char *p = br_cstr(path);
     if (!p) return false;
