@@ -30,7 +30,8 @@ fn main():
   the program with a clear message, unless the compiler proved they can't happen.
   In that case the check is removed.
 * **Natively parallel.** `par for`, `par [...]`, `par sum(...)` and `par(a, b)` are
-  data-race free by construction, and reductions are deterministic.
+  data-race free by construction, and reductions are deterministic. Big ones run
+  on an NVIDIA GPU when that is faster, with the same results.
 * **Multi-process built in.** The `world` module gives every program MPI-style
   ranks, messages and collectives. `brine run --ranks 4`.
 * **Fast.** Compiles to native code through C. There is no garbage collector, and
@@ -47,7 +48,7 @@ build it once from the bootstrap seed (see [bootstrap/README.md](bootstrap/READM
 
 ```sh
 # from the repository root (Windows: add .exe and use -lws2_32 -lshell32)
-cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread
+cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread -ldl
 brine doctor                   # checks your toolchain
 brine new hello && cd hello
 brine run

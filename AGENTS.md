@@ -19,8 +19,8 @@ the docs and the tests. Read `docs/DESIGN.md` for the why and `docs/QUICKREF.md`
 
 ## Build
 ```sh
-# once, from the seed (Windows: brine.exe and -lws2_32 -lshell32 instead of -lm -lpthread)
-cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread
+# once, from the seed (Windows: brine.exe and -lws2_32 -lshell32 instead of -lm -lpthread -ldl)
+cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread -ldl
 # after changing the compiler
 ./brine build compiler/main.br -o brine2
 ```

@@ -382,6 +382,17 @@ a sequential `sum`, usually by being more accurate). Integer overflow of any par
 result in that order traps.
 `BRINE_THREADS=n` or `brine run --threads n` sets the thread count.
 
+**GPUs.** `par for`, `par [...]` and `par` reductions also run on an NVIDIA GPU
+when the runtime expects that to be faster (big constructs with much work per byte
+copied); the results are the same bits, and a failing check panics as on the CPU.
+Nothing to write or install beyond the driver: the compiler makes a kernel of every
+body that only uses int/float arithmetic, comparisons, branches, loops, structs,
+tuples, reads of outer arrays and scalars, `out[i]` writes, `sqrt`, `abs`, `floor`,
+`ceil`, `round`, `min`, `max`, and calls to functions that do the same. Strings,
+maps, new arrays, printing, `sin`/`exp`/`log`/`pow` and the like keep a body on the
+CPU. `BRINE_GPU=off|on|auto` (default `auto`; `on` uses the GPU whenever it can),
+`BRINE_GPU_LOG=1` prints where each construct ran and why.
+
 ## Multiple processes and machines: `world`
 
 ```python

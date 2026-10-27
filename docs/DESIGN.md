@@ -138,6 +138,45 @@ precision than a left-to-right sum.
 
 Threads: `BRINE_THREADS=n` or `brine run --threads n` (default: all cores).
 
+**GPUs.** A `par for`, `par [...]` or `par` reduction can also run on an NVIDIA GPU,
+with no annotation and no change in meaning: the results are the same bits as on the
+CPU, and a check that fails on the device panics exactly as it would on the CPU.
+* *Which constructs:* the compiler decides. A body can run on a GPU when it (and
+  every function it calls) uses only int and float arithmetic up to 64 bits,
+  comparisons, branches, loops, structs and tuples, reads of captured scalars and of
+  arrays (also arrays of arrays and of structs), writes to `out[i]`, `sqrt`, `abs`,
+  `floor`, `ceil`, `round`, `min` and `max`. It can't allocate (no strings, maps,
+  enums with payloads or new arrays), print, use `world`, call function values, or
+  call `sin`, `cos`, `exp`, `log`, `pow` and the like, whose last bit depends on
+  the C library. `BRINE_GPU_LOG=1` says why a construct stayed on the CPU.
+* *When:* the runtime decides, per launch. It skips constructs under 4096 elements
+  and nested ones, and otherwise compares the CPU's time (estimated by running the
+  first elements for about 100 µs, then measured) with the device's (guessed from
+  that, then measured), plus copies and launches. It uses the device when that is
+  at least 25% faster. Getting the device ready takes 0.1-0.7 s, so a construct that
+  would gain only later starts it in the background and stays on the CPU until it
+  is ready. `BRINE_GPU=off` never uses a GPU, `BRINE_GPU=on` uses one whenever it
+  can.
+* *How:* the compiler turns the lifted body of each eligible construct into a PTX
+  kernel (`compiler/ptx.br`), and the program carries the PTX. The runtime loads the
+  CUDA driver (`nvcuda.dll`, `libcuda.so.1`) when it first needs it and lets the
+  driver compile the PTX for the device. Without a driver or a device, programs run
+  on the CPU as before; there is no build-time dependency on CUDA.
+* *Same results:* the kernels use the CPU's semantics, not the device's defaults:
+  every float operation rounds to nearest even with no fused multiply-add, `/` and
+  `sqrt` are exactly rounded, and integer division, conversions and shifts follow
+  the runtime's rules. A reduction runs the same leaves and the same tree (each
+  launch reduces an aligned subtree of up to 2^24 leaves; the CPU folds the
+  subtrees' results). Checks (overflow, bounds, division by zero, contracts) set a
+  flag instead of panicking; when it is set, the device's results are dropped and
+  the construct reruns on the CPU, which panics with the usual message. Results are
+  only copied back after a launch succeeded, and a body may only write `out[i]`, so
+  rerunning is safe.
+* *Copies:* every launch copies the arrays the body reads to the device and the ones
+  it writes back (arrays are values, so nothing else can see them in between).
+  Keeping arrays on the device between constructs is future work, so constructs
+  that do little work per byte (a plain sum of an array) stay on the CPU.
+
 ### 2.4 Multi-process / multi-machine (`world`)
 
 ```python
@@ -231,6 +270,11 @@ reads it:
   (Windows) or ELF (Linux) object directly, in well under a second for the whole
   compiler. It's the default for dev builds there. The runtime is still C,
   compiled once and cached, and the system C compiler links.
+* **PTX** (`ptx.br`): GPU kernels for the `par` constructs that can run on a GPU
+  (§2.3), next to the x86-64 or C code for the CPU. Lowering marks each construct
+  with a descriptor (`brine_kernel`: kernel name, the layout of its captured
+  context, a cost estimate) and the runtime picks a side per launch.
+  `BRINE_DUMP_PTX=file` writes the module when building.
 * **C** (`ir_c.br`): one statement per IR instruction. gcc/clang at `-O2`/`-O3`
   make it as fast as hand-written C, so it serves `--release`, `--debug` (with
   `#line`) and every platform without a native backend. It's also the bootstrap
@@ -312,8 +356,9 @@ parallel translation units with per-unit caching.
 
 **Backends:** ARM64 and Mach-O (macOS); debug info (DWARF, CodeView) for native code;
 register allocation and optimization passes on the IR; a built-in linker and a
-prebuilt runtime, so builds don't need a C toolchain at all; SIMD, GPU offload for
-`par` loops, MSVC support for the C backend.
+prebuilt runtime, so builds don't need a C toolchain at all; SIMD, MSVC support for
+the C backend. GPUs (§2.3): arrays kept on the device between constructs, `par(...)`
+forks and nested constructs, other vendors (SPIR-V, Metal).
 
 **Proofs:** generic bodies checked once against constraints (rather than per
 instance), quantifiers in specs (`forall i in 0..n: a[i] >= 0`), array-content
