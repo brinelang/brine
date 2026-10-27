@@ -2138,10 +2138,15 @@ static void br_world_init(void) {
     br_sock ls = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+    /* when every rank is on this machine, listen on loopback only: nothing
+       outside can reach it, and firewalls don't ask about it */
+    bool local = true;
+    for (int64_t i = 0; i < br_size; i++)
+        if (strncmp(hosts[i], "127.", 4) != 0 && strcmp(hosts[i], "localhost") != 0) local = false;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = htonl(local ? INADDR_LOOPBACK : INADDR_ANY);
     addr.sin_port = htons((unsigned short)atoi(ports[br_rank]));
     if (bind(ls, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(ls, (int)br_size + 4) != 0) {
         fprintf(stderr, "brine: rank %lld could not listen on port %s\n", (long long)br_rank, ports[br_rank]);
