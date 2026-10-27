@@ -20,7 +20,7 @@
 # at a line, variables are in memory where the debug info says.
 
 from ir import K, Op, Inst, Func, Module
-from opt import promote
+from opt import promote, reads
 from dwarf import Dwarf, DFn, DRow, DLocal, new_dwarf, loc_breg, loc_deref, write_dwarf
 from obj import ObjFile, OSym, ORel, new_obj, write_coff, write_elf, put16, put32, put64, set32, uleb, sleb, log2
 from obj import SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, SEC_UNWIND, R_PC32, R_CALL, R_ABS64, R_GOT, R_RVA32
@@ -265,6 +265,16 @@ struct X:
     reg: [int]
     # callee-saved registers the function uses (pushed after rbp)
     saved: [int]
+    # the xmm register holding a float vreg for the whole function, or -1
+    freg: [int]
+    # Windows: the xmm registers used (callee-saved there) and where the
+    # prologue saves them
+    fsaved: [int]
+    fsave_at: [int]
+    # Linux (no callee-saved xmm): the code range in which a float vreg
+    # in a register is live, to save it around calls
+    flo: [int]
+    fhi: [int]
     fold: [int]
     fval: [int]
     nuse: [int]
@@ -555,6 +565,38 @@ struct X:
     fn fstore(ref self, fl: int, m: Mem, x: int):
         self.rm(242 if fl == 1 else 243, 0, 3857, x, m, 0)
 
+    # xmm x = float vreg v
+    fn fld(ref self, fl: int, x: int, v: int):
+        let r = self.freg[v]
+        if r < 0:
+            self.fload(fl, x, self.vm(v))
+        elif r != x:
+            # movaps
+            self.rr(0, 0, 3880, x, r)
+
+    # float vreg v = xmm x
+    fn fst(ref self, fl: int, v: int, x: int):
+        let r = self.freg[v]
+        if r < 0:
+            self.fstore(fl, self.vm(v), x)
+        elif r != x:
+            self.rr(0, 0, 3880, r, x)
+
+    # an SSE instruction `op xmm x, v` (pfx: its mandatory prefix)
+    fn fop(ref self, pfx: int, op: int, x: int, v: int):
+        let r = self.freg[v]
+        if r < 0:
+            self.rm(pfx, 0, op, x, self.vm(v), 0)
+        else:
+            self.rr(pfx, 0, op, x, r)
+
+    # movups [m], xmm x / movups xmm x, [m]
+    fn xsave(ref self, m: Mem, x: int):
+        self.rm(0, 0, 3857, x, m, 0)
+
+    fn xrestore(ref self, x: int, m: Mem):
+        self.rm(0, 0, 3856, x, m, 0)
+
     # rel8 jumps inside one instruction's expansion
     fn j8(ref self, cc: int) -> int:
         self.b(112 + cc)
@@ -628,7 +670,7 @@ struct X:
 
     # Is v in its stack slot (not folded, not in a register)?
     fn inmem(self, v: int) -> bool:
-        return self.fold[v] == F_NONE and self.reg[v] < 0
+        return self.fold[v] == F_NONE and self.reg[v] < 0 and self.freg[v] < 0
 
     # Does register creg hold v's slot? (Yes right after a store or load of
     # it, until more code is emitted or a jump can land here.)
@@ -657,6 +699,9 @@ struct X:
         if f == F_NONE:
             if self.reg[v] >= 0:
                 self.mov_rr(r, self.reg[v])
+            elif self.freg[v] >= 0:
+                # movq r, xmm
+                self.rr(102, 1, 3966, self.freg[v], r)
             elif self.hit(v):
                 self.mov_rr(r, self.creg)
             else:
@@ -672,6 +717,9 @@ struct X:
     fn st(ref self, r: int, d: int):
         if self.reg[d] >= 0:
             self.mov_rr(self.reg[d], r)
+        elif self.freg[d] >= 0:
+            # movq xmm, r
+            self.rr(102, 1, 3950, self.freg[d], r)
         else:
             let at = self.pos()
             self.mov_mr(self.vm(d), r)
@@ -710,7 +758,7 @@ struct X:
             self.alu_rr(op, r, self.reg[v])
         elif self.fold[v] == F_NONE and self.hit(v):
             self.alu_rr(op, r, self.creg)
-        elif self.fold[v] == F_NONE:
+        elif self.inmem(v):
             self.alu_rm(op, r, self.vm(v))
         else:
             self.ld(RCX, v)
@@ -796,16 +844,27 @@ struct X:
             if l >= L_STACK:
                 pass
             elif l >= L_XMM:
-                self.fload(a.fl, l - L_XMM, self.vm(a.v))
+                self.fld(a.fl, l - L_XMM, a.v)
             else:
                 self.arg_int(self.int_reg(l), a)
+        if sym < 0:
+            self.ld(R11, fp)
+        # System V: calls change every xmm register, so floats live across
+        # this one go to their homes and back
+        var keep: [int] = []
+        if not self.win:
+            for v in 0..len(self.freg):
+                if self.freg[v] >= 0 and self.flo[v] < self.cur and self.cur <= self.fhi[v]:
+                    keep.push(v)
+                    self.fstore(fl_of(self.vk[v]), self.vm(v), self.freg[v])
         if sym >= 0:
             self.b(232)
             self.reloc(R_CALL, sym, -4)
             self.b32(0)
         else:
-            self.ld(R11, fp)
             self.rr(0, 0, 255, 2, R11)
+        for v in keep:
+            self.fload(fl_of(self.vk[v]), self.freg[v], self.vm(v))
 
     fn call_rt(ref self, name: str, args: [CArg]):
         let s = self.sym_ref(name)
@@ -815,7 +874,7 @@ struct X:
     fn store_ret(ref self, d: int):
         let k = self.vk[d]
         if k.is_float():
-            self.fstore(fl_of(k), self.vm(d), 0)
+            self.fst(fl_of(k), d, 0)
         elif not k.is_wide():
             self.norm(RAX, k)
             self.st(RAX, d)
@@ -878,6 +937,14 @@ struct X:
 
     fn ir_call(ref self, x: Inst):
         if x.op == Op.Call and x.b == 1 and self.inline_rc(x):
+            return
+        if x.op == Op.Call and x.b == 1 and (
+            x.s == "brine_f_sqrt" or x.s == "brine_f_sqrtf"
+        ) and x.d >= 0:
+            # sqrtsd / sqrtss
+            let fl = fl_of(self.vk[x.d])
+            self.fop(242 if fl == 1 else 243, 3921, 0, x.args[0])
+            self.fst(fl, x.d, 0)
             return
         var args: [CArg] = []
         let ind = x.op == Op.CallInd
@@ -986,6 +1053,11 @@ struct X:
         for x in f.code:
             if x.op == Op.Call or x.op == Op.CallInd:
                 nstack = max(nstack, self.call_stack(x))
+        self.freg = [-1] * nv
+        self.fsaved = []
+        self.fsave_at = []
+        self.flo = []
+        self.fhi = []
         if self.dbg:
             self.reg = [-1] * nv
             self.saved = []
@@ -1055,6 +1127,10 @@ struct X:
                 self.slot_base.push(RSP)
                 high += s.size
                 realign = max(realign, a)
+        # the callee-saved xmm registers the body uses (Windows)
+        for _ in self.fsaved:
+            off = align_up(off + 16, 16)
+            self.fsave_at.push(-off)
         off = align_up(off + 16, 16)
         self.scratch = -off
         let frame = align_up(off + high, 16)
@@ -1110,6 +1186,12 @@ struct X:
             self.alu_ri(ADD, RSP, realign - 16)
             self.alu_ri(AND, RSP, -realign)
         self.u.pro_end = self.pos()
+        # Saved after the prologue, with no unwind codes: they would need
+        # offsets from the frame base, which is above this allocation. Unwinding
+        # through brine code only happens in debuggers and profilers, which
+        # don't need these registers back.
+        for i, x in enumerate(self.fsaved):
+            self.xsave(mrb(self.fsave_at[i]), x)
         self.store_params(f)
         # body
         self.ipos = [-1] * (ncode + 1)
@@ -1158,6 +1240,8 @@ struct X:
         self.b(op + (r & 7))
 
     fn epilogue(ref self):
+        for i, x in enumerate(self.fsaved):
+            self.xrestore(x, mrb(self.fsave_at[i]))
         if len(self.saved) == 0:
             # leave
             self.b(201)
@@ -1447,6 +1531,80 @@ struct X:
                 break
             self.reg[best] = r
             self.saved.push(r)
+        # floats: xmm6-15 are callee-saved on Windows (the prologue saves the
+        # ones used); System V has none, so xmm8-15 are kept across calls by
+        # do_call, which needs to know where each float is live
+        let first = 6 if self.win else 8
+        for x in first..16:
+            var best = -1
+            var bw = least - 1
+            for v in 0..nv:
+                if w[
+                    v
+                ] > bw and self.freg[v] < 0 and self.fold[v] == F_NONE and (ndef[v] > 0 or v < f.nparams):
+                    if f.vk[v].is_float():
+                        best = v
+                        bw = w[v]
+            if best < 0:
+                break
+            self.freg[best] = x
+            if self.win:
+                self.fsaved.push(x)
+        if not self.win:
+            self.live_ranges(f, lat, ndef)
+
+    # flo[v]..fhi[v]: the instructions where float register vreg v may be live.
+    # From its first to its last mention, and over any loop it is live around.
+    fn live_ranges(ref self, f: Func, lat: [int], ndef: [int]):
+        let nv = len(f.vk)
+        let ncode = len(f.code)
+        var lo = [ncode] * nv
+        var hi = [-1] * nv
+        var dat = [-1] * nv
+        for v in 0..f.nparams:
+            lo[v] = -1
+            dat[v] = -1
+        for i in 0..ncode:
+            let x = f.code[i]
+            if x.d >= 0 and self.freg[x.d] >= 0:
+                lo[x.d] = min(lo[x.d], i)
+                hi[x.d] = max(hi[x.d], i)
+                dat[x.d] = i
+            for v in reads(x, nv):
+                if self.freg[v] >= 0:
+                    lo[v] = min(lo[v], i)
+                    hi[v] = max(hi[v], i)
+        var back: [int] = []
+        for i in 0..ncode:
+            let x = f.code[i]
+            if x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot:
+                let l = lat[x.n]
+                if l >= 0 and l <= i:
+                    back.push(l)
+                    back.push(i)
+        var changed = true
+        while changed:
+            changed = false
+            for v in 0..nv:
+                if self.freg[v] < 0:
+                    continue
+                var j = 0
+                while j < len(back):
+                    let l = back[j]
+                    let i = back[j + 1]
+                    j += 2
+                    if hi[v] < l or lo[v] > i or (lo[v] <= l and hi[v] >= i):
+                        continue
+                    # made once in the loop before any use, and used only there
+                    if ndef[
+                        v
+                    ] == 1 and v >= f.nparams and dat[v] == lo[v] and lo[v] >= l and hi[v] <= i:
+                        continue
+                    lo[v] = min(lo[v], l)
+                    hi[v] = max(hi[v], i)
+                    changed = true
+        self.flo = lo
+        self.fhi = hi
 
     fn store_params(ref self, f: Func):
         let h = 1 if f.has_ret and f.ret.is_wide() else 0
@@ -1465,11 +1623,13 @@ struct X:
             elif l >= L_STACK:
                 if self.reg[i] >= 0:
                     self.load_k(self.reg[i], self.vm(i), k)
+                elif self.freg[i] >= 0:
+                    self.fload(fl_of(k), self.freg[i], self.vm(i))
                 elif k.size() < 8 and not k.is_float():
                     self.load_k(RAX, self.vm(i), k)
                     self.st(RAX, i)
             elif l >= L_XMM:
-                self.fstore(fl_of(k), self.vm(i), l - L_XMM)
+                self.fst(fl_of(k), i, l - L_XMM)
             else:
                 let r = self.int_reg(l)
                 self.norm(r, k)
@@ -1493,8 +1653,13 @@ struct X:
                 self.st(RAX, x.d)
             case Op.Mov:
                 if x.d != x.a:
-                    if self.vk[x.d].is_wide():
+                    let k = self.vk[x.d]
+                    if k.is_wide():
                         self.copy16(self.vm(x.d), self.vm(x.a))
+                    elif self.freg[x.d] >= 0:
+                        self.fld(fl_of(k), self.freg[x.d], x.a)
+                    elif self.freg[x.a] >= 0:
+                        self.fst(fl_of(k), x.d, self.freg[x.a])
                     else:
                         self.set_v(x.d, x.a)
             case Op.Add | Op.Sub | Op.Mul | Op.Div | Op.Rem | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
@@ -1530,6 +1695,8 @@ struct X:
                 let m = self.addr(x.a, x.n, R10)
                 if k.is_wide():
                     self.copy16(self.vm(x.d), m)
+                elif self.freg[x.d] >= 0:
+                    self.fload(fl_of(k), self.freg[x.d], m)
                 else:
                     let r = self.dst(x.d)
                     self.load_k(r, m, k)
@@ -1540,6 +1707,8 @@ struct X:
                 let m = self.addr(x.a, x.n, R10)
                 if k.is_wide():
                     self.copy16(m, self.vm(x.b))
+                elif self.freg[x.b] >= 0:
+                    self.fstore(fl_of(k), m, self.freg[x.b])
                 elif self.imm(x.b):
                     self.mov_mi(m, self.fval[x.b], k.size())
                 else:
@@ -1599,7 +1768,7 @@ struct X:
         elif k.is_float():
             self.mov_ri(RAX, x.n)
             self.rr(242 if k == K.F64 else 243, 1, 3882, 0, RAX)
-            self.fstore(fl_of(k), self.vm(x.d), 0)
+            self.fst(fl_of(k), x.d, 0)
         else:
             let v = canon(x.n, k)
             if self.reg[x.d] >= 0:
@@ -1618,7 +1787,7 @@ struct X:
                 self.copy16(mreg(R11, 0), self.vm(x.a))
                 self.mov_rr(RAX, R11)
             elif k.is_float():
-                self.fload(fl_of(k), 0, self.vm(x.a))
+                self.fld(fl_of(k), 0, x.a)
             else:
                 self.ld(RAX, x.a)
         self.epilogue()
@@ -1718,9 +1887,13 @@ struct X:
         elif x.op == Op.Div:
             op = 94
         let pfx = 242 if fl == 1 else 243
-        self.fload(fl, 0, self.vm(x.a))
-        self.rm(pfx, 0, 3840 + op, 0, self.vm(x.b), 0)
-        self.fstore(fl, self.vm(x.d), 0)
+        # in d's own register unless that is b's
+        var r = self.freg[x.d]
+        if r < 0 or x.b == x.d:
+            r = 0
+        self.fld(fl, r, x.a)
+        self.fop(pfx, 3840 + op, r, x.b)
+        self.fst(fl, x.d, r)
 
     fn wide_bin(ref self, x: Inst):
         let k = self.vk[x.d]
@@ -1813,9 +1986,9 @@ struct X:
             if x.op == Op.Lt or x.op == Op.Le:
                 p = x.b
                 q = x.a
-            self.fload(fl, 0, self.vm(p))
-            # ucomisd / ucomiss xmm0, [q]
-            self.rm(102 if fl == 1 else 0, 0, 3886, 0, self.vm(q), 0)
+            self.fld(fl, 0, p)
+            # ucomisd / ucomiss xmm0, q
+            self.fop(102 if fl == 1 else 0, 3886, 0, q)
             match x.op:
                 case Op.Eq:
                     return CC_FEQ
@@ -2036,8 +2209,8 @@ struct X:
             return
         if ks.is_float() and kd.is_float():
             # cvtss2sd / cvtsd2ss
-            self.rm(243 if ks == K.F32 else 242, 0, 3930, 0, self.vm(x.a), 0)
-            self.fstore(fl_of(kd), self.vm(x.d), 0)
+            self.fop(243 if ks == K.F32 else 242, 3930, 0, x.a)
+            self.fst(fl_of(kd), x.d, 0)
             return
         if ks.is_wide():
             if kd.is_wide():
@@ -2093,12 +2266,12 @@ struct X:
             else:
                 self.ld(RAX, x.a)
                 self.rr(pfx, 1, 3882, 0, RAX)
-            self.fstore(fl_of(kd), self.vm(x.d), 0)
+            self.fst(fl_of(kd), x.d, 0)
             return
         if ks.is_float():
             let pfx = 242 if ks == K.F64 else 243
             if kd == K.U64 or kd == K.Ptr:
-                self.fload(fl_of(ks), 0, self.vm(x.a))
+                self.fld(fl_of(ks), 0, x.a)
                 if ks == K.F64:
                     self.mov_ri(RAX, TWO63_F64)
                     self.rr(102, 1, 3950, 1, RAX)
@@ -2115,6 +2288,9 @@ struct X:
                 self.rr(0, 1, 4026, 7, RAX)
                 self.b(63)
                 self.here8(done)
+            elif self.freg[x.a] >= 0:
+                self.rr(pfx, 1, 3884, RAX, self.freg[x.a])
+                self.norm(RAX, kd)
             else:
                 self.rm(pfx, 1, 3884, RAX, self.vm(x.a), 0)
                 self.norm(RAX, kd)
@@ -2176,6 +2352,11 @@ fn emit(m: Module, windows: bool, dbg: bool, src: str, comp_dir: str, producer: 
         home=[],
         reg=[],
         saved=[],
+        freg=[],
+        fsaved=[],
+        fsave_at=[],
+        flo=[],
+        fhi=[],
         fold=[],
         fval=[],
         nuse=[],
