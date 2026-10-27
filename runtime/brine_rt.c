@@ -3391,7 +3391,7 @@ static int br_gpu_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx
     }
     /* subtrees of up to 2^h leaves, about BR_GPU_SLICE each */
     int h = 12;
-    while (h < 24 && gpu_ns * BRINE_LEAF * (double)((int64_t)1 << (h + 1)) < BR_GPU_SLICE * 1e9) h++;
+    while (h < 24 && ((int64_t)1 << h) < nleaves && gpu_ns * BRINE_LEAF * (double)((int64_t)1 << (h + 1)) < BR_GPU_SLICE * 1e9) h++;
     int64_t room = (int64_t)1 << h;
     int64_t sz = br_vk_size[k->vk];
     uint64_t half = BR_ALIGN((uint64_t)(room * (sz + 1)), 256);
