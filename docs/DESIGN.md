@@ -21,8 +21,8 @@
    command has `--json` output. `brine explain <code>` and `brine guide` are
    built in.
 5. **Cross-platform.** macOS, Linux and Windows are first-class. Code goes
-   through brine's own IR to a native x86-64 backend (quick dev builds on
-   Windows and Linux) or to portable C11 for whatever C compiler is present
+   through brine's own IR to native x86-64 and AArch64 backends (quick dev
+   builds on Windows and Linux) or to portable C11 for whatever C compiler is present
    (optimized builds, every other platform; clang or gcc, MSVC planned).
 6. **Clean and easy to understand.** Small language surface. No hidden control
    flow, no implicit conversions, no aliasing surprises.
@@ -232,6 +232,7 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
       ─► verifier (symbolic execution + solver; proves contracts, elides runtime checks)
       ─► lowering to brine IR (lower.br)
       ─► x86-64 machine code (x64.br, COFF/ELF objects)    dev and --debug builds on x86-64 Windows/Linux
+       └► AArch64 machine code (a64.br, ELF objects)        dev and --debug builds on AArch64 Linux
        └► C11 (ir_c.br) ─► system C compiler               --release, other platforms
       ─► link with the brine_rt runtime ─► native binary
 ```
@@ -245,7 +246,7 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
 * **Memory:** values are refcounted with atomic counts; generated code releases
   every temporary and local at scope exit. `BRINE_LEAKCHECK=1` prints the number of
   live strings/arrays at exit (the test suite requires 0).
-* **Debugging:** on x86-64 Windows and Linux, `brine build --debug` is native with
+* **Debugging:** on x86-64 Windows and Linux and on AArch64 Linux, `brine build --debug` is native with
   DWARF (`dwarf.br`): lines, brine function names (`Point.norm`), and every local
   and parameter by its brine name and type, in its scope. Debug code keeps each
   value in its stack slot (no register allocation, no value caching), so `print`
@@ -277,6 +278,8 @@ reads it:
   compiler. It's the default for dev and debug builds there (debug builds add
   DWARF and skip the optimizations). The runtime is still C,
   compiled once and cached, and the system C compiler links.
+* **AArch64** (`a64.br`): the same design for 64-bit ARM, writing ELF objects
+  (Linux) through `obj.br`, with .eh_frame unwind info and the same DWARF.
 * **PTX** (`ptx.br`): GPU kernels for the `par` constructs that can run on a GPU
   (§2.3), next to the x86-64 or C code for the CPU. Lowering marks each construct
   with a descriptor (`brine_kernel`: kernel name, the layout of its captured
@@ -361,7 +364,7 @@ lot to do before then. The order below is a plan, not a promise.
 **Done (0.2):** brine IR; native x86-64 backend (COFF and ELF); C from the IR, in
 parallel translation units with per-unit caching.
 
-**Backends:** ARM64 and Mach-O (macOS); CodeView debug info (for Visual Studio/WinDbg);
+**Backends:** Mach-O objects, so macOS on Apple silicon gets native dev builds; CodeView debug info (for Visual Studio/WinDbg);
 register allocation and optimization passes on the IR; a built-in linker and a
 prebuilt runtime, so builds don't need a C toolchain at all; SIMD, MSVC support for
 the C backend. GPUs (§2.3): arrays kept on the device between constructs, `par(...)`

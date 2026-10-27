@@ -77,7 +77,7 @@ brine run
 
 brine is young (v0.x): the language and tools still change. The compiler is
 written in brine (`compiler/`) and builds itself; `bootstrap/brinec.c` is its own
-generated C, used to build it from scratch. Dev builds on x86-64 Windows and Linux
+generated C, used to build it from scratch. Dev builds on x86-64 Windows and Linux and on ARM64 Linux
 go straight to machine code (the whole compiler builds in under a second);
 `--release` builds and other platforms go through C. The runtime is written in C
 (`runtime/`). It runs on Windows, Linux and macOS.

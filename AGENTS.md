@@ -8,7 +8,8 @@ the docs and the tests. Read `docs/DESIGN.md` for the why and `docs/QUICKREF.md`
 ## Layout
 - `compiler/` — the compiler and CLI, in brine. `main.br` is the entry point
   (lexer → parser → check → uniform → verify (prover) → lower (to the IR in `ir.br`)
-  → `x64.br` (x86-64 machine code, `obj.br` writes the object) or `ir_c.br` (C)
+  → `x64.br` / `a64.br` (x86-64 / AArch64 machine code, `obj.br` writes the
+  object) or `ir_c.br` (C)
   → link). `driver.br` picks the backend and runs the system toolchain.
 - `runtime/` — the C runtime (`brine_rt.h`, `brine_rt.c`), embedded in the compiler.
 - `bootstrap/brinec.c` — the compiler's own generated C: builds brine with only a C compiler.
@@ -47,7 +48,7 @@ characters. A body explains why, when that isn't obvious.
 - types: `feat` (new behavior), `fix` (bug fix), `perf` (faster, same behavior),
   `refactor`, `docs`, `test`, `build` (bootstrap, toolchain), `chore` (releases, tidying).
 - scopes (optional): `lexer`, `parser`, `check`, `verify`, `solver`, `ir` (the IR
-  and lowering), `native` (x86-64 and objects), `c` (the C backend), `driver`,
+  and lowering), `native` (x86-64, AArch64 and objects), `c` (the C backend), `driver`,
   `runtime`, `cli`, `fmt`, `tests`, `docs`, `bootstrap`.
 - A change that breaks existing programs or command-line use: `feat(check)!: ...`
   plus a `BREAKING CHANGE: ...` paragraph saying what breaks and how to migrate.
