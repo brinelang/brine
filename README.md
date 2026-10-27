@@ -41,9 +41,9 @@ fn main():
 
 ## Getting started
 
-Requirements: a C compiler (`gcc` or `clang`, or MinGW on Windows). The compiler
-is written in brine; build it once from the bootstrap seed (see
-[bootstrap/README.md](bootstrap/README.md)):
+Requirements: a C compiler (`gcc` or `clang`, or MinGW on Windows): it builds the
+runtime, links, and compiles `--release` builds. The compiler is written in brine;
+build it once from the bootstrap seed (see [bootstrap/README.md](bootstrap/README.md)):
 
 ```sh
 # from the repository root (Windows: add .exe and use -lws2_32 -lshell32)
@@ -76,7 +76,9 @@ brine run
 
 brine is young (v0.x): the language and tools still change. The compiler is
 written in brine (`compiler/`) and builds itself; `bootstrap/brinec.c` is its own
-generated C, used to build it from scratch. The runtime is written in C
+generated C, used to build it from scratch. Dev builds on x86-64 Windows and Linux
+go straight to machine code (the whole compiler builds in under a second);
+`--release` builds and other platforms go through C. The runtime is written in C
 (`runtime/`). It runs on Windows, Linux and macOS.
 
 `brine test tests/integration.br` (from the repository root) runs the end-to-end

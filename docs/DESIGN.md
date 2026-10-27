@@ -20,9 +20,10 @@
    human explanation, and (where possible) a machine-applicable fix. Every CLI
    command has `--json` output. `brine explain <code>` and `brine guide` are
    built in.
-5. **Cross-platform.** macOS, Linux and Windows are first-class. The C
-   backend emits portable C11 and uses whatever C compiler is present
-   (clang or gcc; MSVC planned).
+5. **Cross-platform.** macOS, Linux and Windows are first-class. Code goes
+   through brine's own IR to a native x86-64 backend (quick dev builds on
+   Windows and Linux) or to portable C11 for whatever C compiler is present
+   (optimized builds, every other platform; clang or gcc, MSVC planned).
 6. **Clean and easy to understand.** Small language surface. No hidden control
    flow, no implicit conversions, no aliasing surprises.
 
@@ -181,8 +182,12 @@ on the roadmap).
 ```
 source ─► lexer (indentation-aware) ─► parser ─► AST
       ─► checker (names, types, mutability, race-freedom)
+      ─► uniform (deadlock freedom for `world`)
       ─► verifier (symbolic execution + solver; proves contracts, elides runtime checks)
-      ─► C11 codegen (+ brine_rt runtime) ─► system C compiler ─► native binary
+      ─► lowering to brine IR (lower.br)
+      ─► x86-64 machine code (x64.br, COFF/ELF objects)    dev builds on x86-64 Windows/Linux
+       └► C11 (ir_c.br) ─► system C compiler               --release, --debug, other platforms
+      ─► link with the brine_rt runtime ─► native binary
 ```
 
 * **Written in brine** (`compiler/`). It builds itself; `bootstrap/brinec.c` (its own
@@ -194,25 +199,41 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
 * **Memory:** values are refcounted with atomic counts; generated code releases
   every temporary and local at scope exit. `BRINE_LEAKCHECK=1` prints the number of
   live strings/arrays at exit (the test suite requires 0).
-* **Debugging:** `brine build --debug` emits `#line` directives so gdb/lldb step
-  through `.br` source with brine variable names. `brine debug` launches the debugger.
-* **Caching:** identical generated C skips the C compile (`.brine-hash` stamp).
+* **Debugging:** `brine build --debug` goes through C with `#line` directives so
+  gdb/lldb step through `.br` source with brine variable names (`x_3`). `brine debug`
+  launches the debugger. Native objects have no debug info yet.
+* **Caching:** objects are named by a hash of what they're made from. C output is
+  split into one translation unit per core (by a hash of each function's name, each
+  unit declaring only what it uses), compiled in parallel; an edit recompiles only
+  the units it touches. An unchanged program skips the link (`.brine-hash` stamp).
+* **Timing:** `BRINE_TIMES=1` prints the time of each phase; `BRINE_TIMES=2` also
+  names the functions the prover is slow on. `BRINE_BACKEND=c` or `=native` picks
+  the backend.
 
-### Why C as the first backend?
-It's the most portable target and lets the language design move fast. C is the
-*first* backend, not the only one: brine must be able to produce machine code
-itself (and/or through LLVM) later. To keep that door open:
+### Backends
+The **brine IR** (`compiler/ir.br`) sits between the verifier and code generation:
+virtual registers with machine kinds (`i8`..`u128`, `f32`, `f64`, `ptr`, `bool`),
+explicit control flow, explicit checks (only those the prover couldn't remove),
+explicit reference counting, stack slots and data with relocations. Every backend
+reads it:
 
-* The self-hosted compiler puts a typed, backend-neutral **brine IR** between the
-  verifier and code generation (explicit control flow, explicit checks with the
-  prover's "proven safe" marks, explicit refcount operations). C becomes one
-  backend that reads the IR; a native x86-64/ARM64 backend reads the same IR.
-* Nothing above the IR may depend on C: no C-only semantics leak into the checker
-  or the verifier.
-* The runtime ABI (value layouts, refcounting, panics) is specified independently
-  of C, so native code and the C runtime can link together.
-* The bootstrap seed (the compiler's own generated C) only exists to build the
-  compiler from scratch; it doesn't tie user programs to C.
+* **x86-64** (`x64.br`, objects by `obj.br`): writes machine code and a COFF
+  (Windows) or ELF (Linux) object directly, in well under a second for the whole
+  compiler. It's the default for dev builds there. The runtime is still C,
+  compiled once and cached, and the system C compiler links.
+* **C** (`ir_c.br`): one statement per IR instruction. gcc/clang at `-O2`/`-O3`
+  make it as fast as hand-written C, so it serves `--release`, `--debug` (with
+  `#line`) and every platform without a native backend. It's also the bootstrap
+  seed (`bootstrap/brinec.c`).
+
+Rules that keep this working:
+* Nothing above the IR may depend on a backend: no C-only semantics leak into the
+  checker or the verifier.
+* The runtime ABI (value layouts, refcounting, panics, `brine_x_*` entry points for
+  helpers that are `static inline` in C) is fixed, so native code and the C
+  runtime link together.
+* Every backend passes the same end-to-end suite, and the compiler built by each
+  one builds itself to the same object.
 
 Speed note: C compiled by clang/gcc at `-O2` is already near the best that
 hand-written C gets. A native backend's main wins are compile speed, no C
@@ -276,9 +297,13 @@ lot to do before then. The order below is a plan, not a promise.
 `for a, b in`, `enumerate`, `?`, file and process I/O, modules, contracts + prover,
 `par` constructs, `world`, tests, CLI, fmt, explain, guide; the self-hosted compiler.
 
-**Backends:** brine IR and a native machine-code backend (x86-64 first, then ARM64),
-so builds don't need a C compiler for generated code; then optimization passes on the
-IR, SIMD, GPU offload for `par` loops, MSVC support for the C backend.
+**Done (0.2):** brine IR; native x86-64 backend (COFF and ELF); C from the IR, in
+parallel translation units with per-unit caching.
+
+**Backends:** ARM64 and Mach-O (macOS); debug info (DWARF, CodeView) for native code;
+register allocation and optimization passes on the IR; a built-in linker and a
+prebuilt runtime, so builds don't need a C toolchain at all; SIMD, GPU offload for
+`par` loops, MSVC support for the C backend.
 
 **Proofs:** generic bodies checked once against constraints (rather than per
 instance), quantifiers in specs (`forall i in 0..n: a[i] >= 0`), array-content
