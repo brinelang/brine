@@ -349,6 +349,37 @@ BR_MINMAX(double, )
 BR_MINMAX(float, f)
 
 /* ------------------------------------------------------------ checked integer arithmetic */
+/* r = a * b; true when it overflows. Clang turns a signed 128-bit overflow
+ * check into a call to __muloti4, which only its own runtime library has, and
+ * on Linux it links libgcc instead, so there i128 goes through an unsigned
+ * multiply. */
+#define BR_MULO(T, S) \
+    static inline bool brine_mulo_##S(T a, T b, T *r) { return __builtin_mul_overflow(a, b, r); }
+BR_MULO(int8_t, i8)
+BR_MULO(int16_t, i16)
+BR_MULO(int32_t, i32)
+BR_MULO(int64_t, i64)
+BR_MULO(uint8_t, u8)
+BR_MULO(uint16_t, u16)
+BR_MULO(uint32_t, u32)
+BR_MULO(uint64_t, u64)
+BR_MULO(brine_u128, u128)
+#if defined(__clang__)
+static inline bool brine_mulo_i128(brine_i128 a, brine_i128 b, brine_i128 *r) {
+    brine_u128 ua = a < 0 ? (brine_u128)0 - (brine_u128)a : (brine_u128)a;
+    brine_u128 ub = b < 0 ? (brine_u128)0 - (brine_u128)b : (brine_u128)b;
+    brine_u128 p;
+    bool ovf = __builtin_mul_overflow(ua, ub, &p);
+    bool neg = (a < 0) != (b < 0) && p != 0;
+    /* the largest magnitude: 2^127 for a negative result, 2^127 - 1 otherwise */
+    brine_u128 lim = ((brine_u128)1 << 127) - (neg ? 0 : 1);
+    *r = (brine_i128)(neg ? (brine_u128)0 - p : p);
+    return ovf || p > lim;
+}
+#else
+BR_MULO(brine_i128, i128)
+#endif
+
 /* UT is the unsigned type shifts are done in */
 #define BR_COMMON(T, S, UT)                                                                   \
     static inline T brine_add_##S(T a, T b, const char *loc) {                                 \
@@ -363,7 +394,7 @@ BR_MINMAX(float, f)
     }                                                                                          \
     static inline T brine_mul_##S(T a, T b, const char *loc) {                                 \
         T r;                                                                                   \
-        if (BR_UNLIKELY(__builtin_mul_overflow(a, b, &r))) brine_panic_ovf("multiplication", loc); \
+        if (BR_UNLIKELY(brine_mulo_##S(a, b, &r))) brine_panic_ovf("multiplication", loc); \
         return r;                                                                              \
     }                                                                                          \
     static inline T brine_shl_##S(T a, int64_t b, const char *loc) {                           \
