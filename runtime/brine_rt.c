@@ -2011,12 +2011,6 @@ static int64_t br_get8(br_msg *m) {
     free(m);
     return v;
 }
-static brine_arr *br_msg_arr(br_msg *m) {
-    brine_arr *a = brine_arr_new(m->len / 8, 8, NULL, NULL, "<recv>");
-    memcpy(a->data, m->data, (size_t)m->len);
-    free(m);
-    return a;
-}
 /* Messages are encoded from a type description string, which the compiler
  * derives from the static type:  i = int, f = float, b = bool, s = str,
  * a<T> = array of <T>.  Every rank reaches the same collective call (the
@@ -2038,10 +2032,6 @@ static void br_buf_put(br_buf *b, const void *data, int64_t n) {
     b->len += n;
 }
 
-static const char *br_desc_skip(const char *d) {
-    while (*d == 'a') d++;
-    return d + 1;
-}
 static int64_t br_desc_size(const char *d) {
     switch (*d) {
     case 'b': return (int64_t)sizeof(bool);
