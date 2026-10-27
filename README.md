@@ -1,5 +1,8 @@
 # brine
 
+[![CI](https://github.com/brinelang/brine/actions/workflows/ci.yml/badge.svg)](https://github.com/brinelang/brine/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/brinelang/brine?include_prereleases&sort=semver)](https://github.com/brinelang/brine/releases)
+
 A compiled systems language with Python-like syntax, compile-time proofs, and
 parallelism built into the language.
 
@@ -41,18 +44,41 @@ fn main():
   machine-readable output, `brine explain` explains every error code, and
   `brine guide` prints the whole language on one page.
 
-## Getting started
+## Install
 
-Requirements: a C compiler (`gcc` or `clang`, or MinGW on Windows): it builds the
-runtime, links, and compiles `--release` builds. The compiler is written in brine;
-build it once from the bootstrap seed (see [bootstrap/README.md](bootstrap/README.md)):
+Linux and macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/brinelang/brine/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/brinelang/brine/main/install.ps1 | iex
+```
+
+The installers put `brine` in `~/.brine/bin` and add it to your `PATH`; run them
+again to upgrade. Set `BRINE_VERSION=0.4.0` first to install a given version. There
+are builds for Linux (x64, ARM64), macOS (Apple silicon, Intel) and Windows (x64),
+also on the [releases page](https://github.com/brinelang/brine/releases).
+
+brine needs a C compiler (`gcc` or `clang`, or MinGW on Windows): it builds the
+runtime, links, and compiles `--release` builds. `brine doctor` checks it.
+
+```sh
+brine new hello && cd hello
+brine run
+```
+
+### From source
+
+The compiler is written in brine; build it once from the bootstrap seed (see
+[bootstrap/README.md](bootstrap/README.md)):
 
 ```sh
 # from the repository root (Windows: add .exe and use -lws2_32 -lshell32)
 cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread -ldl
-brine doctor                   # checks your toolchain
-brine new hello && cd hello
-brine run
 ```
 
 | Command | What it does |
@@ -72,7 +98,8 @@ brine run
 
 * [docs/QUICKREF.md](docs/QUICKREF.md): the whole language on one page (`brine guide`)
 * [docs/DESIGN.md](docs/DESIGN.md): philosophy, architecture, roadmap, open decisions
-* [examples/](examples/): hello, contracts, parallel, world (multi-process), shapes (structs, enums, modules)
+* [examples/](examples/): hello, contracts, parallel, world (multi-process), shapes (structs, enums, modules),
+  find_signal (proofs and the GPU together)
 
 ## Status
 
