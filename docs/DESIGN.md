@@ -185,8 +185,8 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
       ─► uniform (deadlock freedom for `world`)
       ─► verifier (symbolic execution + solver; proves contracts, elides runtime checks)
       ─► lowering to brine IR (lower.br)
-      ─► x86-64 machine code (x64.br, COFF/ELF objects)    dev builds on x86-64 Windows/Linux
-       └► C11 (ir_c.br) ─► system C compiler               --release, --debug, other platforms
+      ─► x86-64 machine code (x64.br, COFF/ELF objects)    dev and --debug builds on x86-64 Windows/Linux
+       └► C11 (ir_c.br) ─► system C compiler               --release, other platforms
       ─► link with the brine_rt runtime ─► native binary
 ```
 
@@ -199,9 +199,15 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
 * **Memory:** values are refcounted with atomic counts; generated code releases
   every temporary and local at scope exit. `BRINE_LEAKCHECK=1` prints the number of
   live strings/arrays at exit (the test suite requires 0).
-* **Debugging:** `brine build --debug` goes through C with `#line` directives so
-  gdb/lldb step through `.br` source with brine variable names (`x_3`). `brine debug`
-  launches the debugger. Native objects have no debug info yet.
+* **Debugging:** on x86-64 Windows and Linux, `brine build --debug` is native with
+  DWARF (`dwarf.br`): lines, brine function names (`Point.norm`), and every local
+  and parameter by its brine name and type, in its scope. Debug code keeps each
+  value in its stack slot (no register allocation, no value caching), so `print`
+  is always right. `brine debug` launches gdb (or lldb) and loads
+  `runtime/brine_gdb.py`, which prints values the way brine does (`"hello"`,
+  `[1, 2, 3]`, `Shape.Rect(w=2, h=3)`) and skips the C runtime when stepping.
+  Elsewhere, and with `BRINE_BACKEND=c`, `--debug` goes through C with `#line`
+  directives (variables then show as C names, `x_3`).
 * **Caching:** objects are named by a hash of what they're made from. C output is
   split into one translation unit per core (by a hash of each function's name, each
   unit declaring only what it uses), compiled in parallel; an edit recompiles only
@@ -222,11 +228,12 @@ reads it:
 
 * **x86-64** (`x64.br`, objects by `obj.br`): writes machine code and a COFF
   (Windows) or ELF (Linux) object directly, in well under a second for the whole
-  compiler. It's the default for dev builds there. The runtime is still C,
+  compiler. It's the default for dev and debug builds there (debug builds add
+  DWARF and skip the optimizations). The runtime is still C,
   compiled once and cached, and the system C compiler links.
 * **C** (`ir_c.br`): one statement per IR instruction. gcc/clang at `-O2`/`-O3`
-  make it as fast as hand-written C, so it serves `--release`, `--debug` (with
-  `#line`) and every platform without a native backend. It's also the bootstrap
+  make it as fast as hand-written C, so it serves `--release` and every
+  platform without a native backend (with `#line` for `--debug` there). It's also the bootstrap
   seed (`bootstrap/brinec.c`).
 
 Rules that keep this working:
@@ -303,7 +310,7 @@ lot to do before then. The order below is a plan, not a promise.
 **Done (0.2):** brine IR; native x86-64 backend (COFF and ELF); C from the IR, in
 parallel translation units with per-unit caching.
 
-**Backends:** ARM64 and Mach-O (macOS); debug info (DWARF, CodeView) for native code;
+**Backends:** ARM64 and Mach-O (macOS); CodeView debug info (for Visual Studio/WinDbg);
 register allocation and optimization passes on the IR; a built-in linker and a
 prebuilt runtime, so builds don't need a C toolchain at all; SIMD, GPU offload for
 `par` loops, MSVC support for the C backend.
