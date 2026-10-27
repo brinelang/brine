@@ -454,8 +454,30 @@ enum {
 };
 /* folds elements [lo, hi) of leaf `leaf` into *val; sets *has unless all were filtered out */
 typedef void (*brine_leaf_fn)(void *ctx, int64_t leaf, int64_t lo, int64_t hi, void *val, bool *has);
+
+/* A parallel construct, as the compiler describes it for the GPU (lower.br,
+ * `gpu_emit`). `ptx` is NULL when the body can't run on a GPU. */
+typedef struct brine_kernel {
+    const char *ptx;   /* the program's PTX module */
+    const char *entry; /* the kernel */
+    const char *where; /* file:line:col, for BRINE_GPU_LOG */
+    int64_t kind;      /* 0 `par for`, 1 map, 2 reduction */
+    int64_t op, vk;    /* reductions: BRINE_RED_*, BRINE_VK_* */
+    int64_t ctx_size;
+    /* the arrays in the context: [nfields, (offset, flags, node)*, nodes...],
+     * a node [element size, n, (offset in an element, node)*], nodes numbered
+     * from the first; flags 1: written by the body, 2: not read */
+    const int64_t *ptrs;
+    int64_t cost, cost64; /* estimated instructions per element (f64 ones) */
+    const char *comb;     /* reductions: the combine kernel */
+    void *state;          /* the runtime's */
+    const char *why;      /* why it can't run on a GPU */
+} brine_kernel;
+
+/* Runs fn over [0, n) on the thread pool, or on a GPU when that pays. */
+void brine_par_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn fn);
 /* *val and *has: the accumulator (the reducer's start value, false); set when an element had a value */
-void brine_par_reduce(int64_t n, brine_leaf_fn fn, void *ctx, int64_t op, int64_t vk, void *val, bool *has, const char *loc);
+void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, void *val, bool *has, const char *loc);
 
 /* ------------------------------------------------------------ world (multi-process) */
 int64_t brine_world_rank(void);
