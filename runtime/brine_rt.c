@@ -5944,6 +5944,7 @@ brine_str *brine_x_str_at(brine_str *s, int64_t i, const char *loc) { return bri
 brine_str *brine_x_str_byte(brine_str *s, int64_t i) { return brine_str_byte(s, i); }
 void brine_x_str_add(brine_str **ps, brine_str *b) { brine_str_add(ps, b); }
 void brine_x_str_add_byte(brine_str **ps, uint8_t c) { brine_str_add_byte(ps, c); }
+void brine_x_str_reset(brine_str **ps, brine_str *lit) { brine_str_reset(ps, lit); }
 bool brine_x_str_eq(brine_str *a, brine_str *b) { return brine_str_eq(a, b); }
 uint64_t brine_x_hash_str(brine_str *s) { return brine_hash_str(s); }
 bool brine_x_map_has(brine_map *m, const void *k) { return brine_map_has(m, k); }

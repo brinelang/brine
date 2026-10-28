@@ -244,6 +244,27 @@ static inline void brine_str_add_byte(brine_str **ps, uint8_t c) {
     }
     brine_str_add_byte_slow(ps, c);
 }
+/* `var s = lit` run again (a loop body's variable): keeps s's block when
+   nothing else holds it, instead of freeing it here and allocating again at
+   the next `+=`. lit is a literal, so it needs no reference. */
+static inline void brine_str_reset(brine_str **ps, brine_str *lit) {
+    brine_str *a = *ps;
+    int64_t n = lit->len;
+    if (__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 && n <= brine_str_room(a->len)) {
+        /* a short literal goes in as one word store, so the next append's
+           word load forwards from it */
+        if (n < 8)
+            brine_st8(a->data, brine_ld8(lit->data) & brine_lowmask((uint64_t)n));
+        else {
+            brine_copy(a->data, lit->data, n);
+            a->data[n] = 0;
+        }
+        a->len = n;
+        return;
+    }
+    brine_str_release(a);
+    *ps = lit;
+}
 bool brine_str_eq_long(brine_str *a, brine_str *b);
 static inline bool brine_str_eq(brine_str *a, brine_str *b) {
     if (a == b) return true;

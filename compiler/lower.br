@@ -141,6 +141,9 @@ struct FnCx:
     hit_map: int
     hit_key: int
     hit_e: int
+    # loop-body `var s = "..."` variables whose string block `reset_strs`
+    # keeps from one iteration to the next
+    reset: {int: bool}
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -187,7 +190,8 @@ fn new_cx(f: Func) -> FnCx:
         twin_ptrs=[],
         hit_map=-1,
         hit_key=-1,
-        hit_e=-1
+        hit_e=-1,
+        reset={}
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -2086,6 +2090,16 @@ struct Lower:
             self.cx.fb.line(l, file.path)
         match s.kind:
             case StmtKind.Let(_, pat, _, init, _):
+                if len(s.locals) == 1 and s.locals[0] in self.cx.reset:
+                    match init.kind:
+                        case ExprKind.Str(lit):
+                            # see `reset_strs`
+                            let home = self.local_ptr(s.locals[0])
+                            let l = self.str_lit(lit)
+                            self.cx.fb.rt_void("brine_str_reset", [home, l])
+                            return
+                        case _:
+                            pass
                 self.push_frame()
                 self.cx.bits_init = len(s.locals) > 0 and s.locals[0] in self.cx.packed
                 self.cx.narrow_init = len(s.locals) > 0 and s.locals[0] in self.cx.narrow
@@ -2149,6 +2163,7 @@ struct Lower:
                 let head = self.cx.fb.label()
                 let brk = self.cx.fb.label()
                 let saved = self.loop_arrays([cond], body)
+                let rs = self.reset_strs(body)
                 self.cx.fb.place(head)
                 self.push_frame()
                 let c = self.expr(cond)
@@ -2157,6 +2172,7 @@ struct Lower:
                 self.cx.loops.push(Loop(depth=len(self.cx.scopes), brk=brk, cont=head))
                 self.block(body)
                 self.cx.loops.pop()
+                self.unreset(rs)
                 if not self.cx.fb.ends():
                     self.cx.fb.jmp(head)
                 self.cx.fb.place(brk)
@@ -2185,10 +2201,12 @@ struct Lower:
                     let dom = self.domain(iter, true)
                     self.pop_frame()
                     let saved = self.loop_arrays([iter], body)
+                    let rs = self.reset_strs(body)
                     let lc = self.loop_open(dom, s.local)
                     self.cx.loops.push(Loop(depth=len(self.cx.scopes), brk=lc.brk, cont=lc.cont))
                     self.block(body)
                     self.cx.loops.pop()
+                    self.unreset(rs)
                     self.loop_close(dom, lc)
                     self.cx.arrc = saved
                     self.pop_scope()
@@ -2412,6 +2430,43 @@ struct Lower:
                 return (l, h)
             case _:
                 return (-1, -1)
+
+    # `var s = "lit"` at the top level of a loop body: s gets its home before
+    # the loop, holding the literal, in the scope around the loop (which
+    # releases it), and each iteration resets it with brine_str_reset. So a
+    # string the body builds with `+=` keeps its block from one iteration to
+    # the next instead of being freed and allocated again. Not in `par`
+    # bodies, nor in debug builds, where a variable belongs to its block.
+    # Returns the variables, for `unreset` once the body is lowered.
+    fn reset_strs(ref self, body: Block) -> [int]:
+        var ids: [int] = []
+        if self.opts.debug or self.cx.lifted:
+            return ids
+        for s in body.stmts:
+            # one variable, initialized with a literal: a plain name
+            if len(s.locals) != 1 or self.flocals[s.locals[0]].ty != Ty.Str:
+                continue
+            let id = s.locals[0]
+            match s.kind:
+                case StmtKind.Let(mutable, _, _, init, is_ref):
+                    match init.kind:
+                        case ExprKind.Str(lit):
+                            if mutable and not is_ref:
+                                let home = self.new_local(id, Ty.Str)
+                                let l = self.str_lit(lit)
+                                self.cx.fb.store(home, 0, l)
+                                self.add_home(home, Ty.Str)
+                                self.cx.reset[id] = true
+                                ids.push(id)
+                        case _:
+                            pass
+                case _:
+                    pass
+        return ids
+
+    fn unreset(ref self, ids: [int]):
+        for id in ids:
+            self.cx.reset.remove(id)
 
     # ============================================================ range versioning
     # A loop ranges.br found free of overflow while its inputs are within a
