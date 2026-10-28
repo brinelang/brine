@@ -65,6 +65,8 @@ const TAG_ARITH = 0
 const MERGE_MAX = 256
 const TAG_INDEX = 1
 const TAG_ASSERT = 2
+# the overflow check of a compound assignment (`x += 1`), keyed by the statement
+const TAG_COMPOUND = 3
 
 fn key(span: Span, tag: int) -> (int, int, int, int):
     return (span.file, span.lo, span.hi, tag)
@@ -207,6 +209,8 @@ fn apply_stmt(ref s: Stmt, p: {(int, int, int, int): bool}):
             apply_expr(ref t, p)
             apply_expr(ref v, p)
             s.kind = StmtKind.Assign(t, op, v)
+            if key(s.span, TAG_COMPOUND) in p:
+                s.proven = true
         case StmtKind.ExprStmt(e):
             var x = e
             apply_expr(ref x, p)
@@ -882,6 +886,17 @@ struct Vf:
             self.remaining.push((span, what))
         self.assume(goal)
 
+    # A check that is proven or not, without being listed in `--report`:
+    # compound assignments (`x += 1`) were never listed there.
+    fn implicit_quiet(ref self, span: Span, tag: int, goal: F):
+        if self.spec or not self.live:
+            return
+        if self.holds(goal):
+            self.proven[key(span, tag)] = true
+        else:
+            self.failed[key(span, tag)] = true
+        self.assume(goal)
+
     # Start running with an extra temporary assumption; `end_assume` drops the facts added since.
     fn begin_assume(ref self, extra: F) -> (Option[St], int):
         let saved = self.cur()
@@ -1117,9 +1132,11 @@ struct Vf:
                                         let r = self.arith_val(o, a, b, k)
                                         match r:
                                             case V.Int(l):
-                                                # compound assignment is always checked at runtime
-                                                if not self.spec:
-                                                    self.assume(in_range(l, k))
+                                                let f = in_range(l, k)
+                                                if o == BinOp.Add or o == BinOp.Sub or o == BinOp.Mul:
+                                                    self.implicit_quiet(s.span, TAG_COMPOUND, f)
+                                                elif not self.spec:
+                                                    self.assume(f)
                                             case _:
                                                 pass
                                         new = r
