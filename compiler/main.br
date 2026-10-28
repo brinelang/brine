@@ -20,7 +20,7 @@ const GUIDE = embed("../docs/QUICKREF.md")
 
 fn help_text() -> str:
     return "\n".join(
-        ["brine — a verified, natively parallel systems language", "", "Usage: brine <command> [options]", "", "Project:", "  new <name>            Create a new project in ./<name>", "  init                  Create a project in the current directory", "", "Build and run:", "  run [file] [-- args]  Build and run (default: the current project)", "      --release           optimize more", "      --threads <n>       worker threads for `par` (default: all cores)", "      --ranks <n>         run <n> cooperating processes (the `world` module)", "      --target wasm       build WebAssembly and run it with Node.js", "  build [file]          Build a native executable", "      --release | --debug   optimization profile (default: dev)", "      -o <path>             output path", "      --emit-c              also write the generated C next to the output", "      --target <t>          host (default), wasm (a .wasm module) or web (a page)", "  check [file]          Type-check and verify without building (fastest)", "      --report              list every runtime check the prover could not remove", "  test [file] [filter]  Run `test \"...\":` blocks in parallel (also --target wasm)", "  debug [file] [-- args]  Debug build, then launch gdb or lldb", "", "Tools:", "  fmt [files] [--check] Format source files (default: the whole project)", "  explain <code>        Explain an error code, e.g. `brine explain E0601`", "  guide                 Print the language quick reference", "  doctor                Check that your toolchain works", "  version               Print the version", "", "Global options:", "  --json                Machine-readable output (one JSON object per line)", "  --color <when>        auto | always | never", "  -q, --quiet           Only print errors", ""]
+        ["brine — a verified, natively parallel systems language", "", "Usage: brine <command> [options]", "", "Project:", "  new <name>            Create a new project in ./<name>", "  init                  Create a project in the current directory", "", "Build and run:", "  run [file] [-- args]  Build and run (default: the current project)", "      --release           optimize more", "      --threads <n>       worker threads for `par` (default: all cores)", "      --ranks <n>         run <n> cooperating processes (the `world` module)", "      --target wasm       build WebAssembly and run it with Node.js", "  build [file]          Build a native executable", "      --release | --debug   optimization profile (default: dev)", "      -o <path>             output path", "      --emit-c              also write the generated C next to the output", "      --target <t>          host (default), wasm (a .wasm module) or web (a page)", "  check [file]          Type-check and verify without building (fastest)", "      --report              list every runtime check the prover could not remove", "  test [file] [filter]  Run `test \"...\":` blocks in parallel (also --target wasm)", "      --timeout <s>       stop a test after <s> seconds (default 300; 0: no limit)", "  debug [file] [-- args]  Debug build, then launch gdb or lldb", "", "Tools:", "  fmt [files] [--check] Format source files (default: the whole project)", "  explain <code>        Explain an error code, e.g. `brine explain E0601`", "  guide                 Print the language quick reference", "  doctor                Check that your toolchain works", "  version               Print the version", "", "Global options:", "  --json                Machine-readable output (one JSON object per line)", "  --color <when>        auto | always | never", "  -q, --quiet           Only print errors", ""]
     )
 
 # Print text that already ends with a newline (`print` adds one).
@@ -149,7 +149,7 @@ struct Args:
         return Ok(())
 
 fn parse_args(raw: [str]) -> Result[Args, str]:
-    let value_flags = ["--ranks", "--threads", "-o", "--color", "--target"]
+    let value_flags = ["--ranks", "--threads", "-o", "--color", "--target", "--timeout"]
     var a = Args(pos=[], flags=[], rest=[])
     var i = 0
     while i < len(raw):
@@ -729,6 +729,9 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
         )
     return Ok(0)
 
+# Seconds a test may run before `brine test` stops it.
+const TEST_TIMEOUT = 300
+
 # What a failed test's output doesn't say: that it crashed, or that it
 # stopped without a word.
 fn exit_note(code: int, out: str) -> str:
@@ -761,10 +764,21 @@ struct TestResult:
     secs: float
 
 fn cmd_test(g: G, a: Args) -> Result[int, str]:
-    a.check_flags(["--release", "--typed", "--target"])?
+    a.check_flags(["--release", "--typed", "--target", "--timeout"])?
     let plat = platform_of(a)?
     if plat == Platform.Web:
         return Err("tests run with `--target wasm` (Node.js), not in a browser")
+    # a test that never finishes would hang the whole run
+    var timeout = TEST_TIMEOUT
+    match a.val("--timeout"):
+        case Some(v):
+            match parse_int(v):
+                case Some(n):
+                    timeout = n
+                case None:
+                    return Err("`--timeout` must be a number of seconds (0: no limit)")
+        case None:
+            pass
     # `brine test foo.br [filter]` or `brine test [filter]` inside a project
     var file: Option[str] = None
     var filter: Option[str] = None
@@ -848,7 +862,18 @@ fn cmd_test(g: G, a: Args) -> Result[int, str]:
                     ] = TestResult(k=r.k, name=r.name, ok=code == 0, text=text, secs=clock() - r.start)
                     finished = true
                 case None:
-                    still.push(r)
+                    let secs = clock() - r.start
+                    if timeout > 0 and secs > float(timeout):
+                        os.kill(r.handle)
+                        os.wait(r.handle)
+                        let (o, e) = os.output(r.handle)
+                        let note = f"timed out after {timeout}s and was stopped (`brine test --timeout <seconds>` changes the limit; 0: none)"
+                        results[
+                            r.k
+                        ] = TestResult(k=r.k, name=r.name, ok=false, text=with_note(o + e, note), secs=secs)
+                        finished = true
+                    else:
+                        still.push(r)
         running = still
         if not finished and len(running) > 0:
             os.sleep(0.002)

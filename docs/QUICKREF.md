@@ -487,7 +487,8 @@ test "clamp keeps values in range":
     assert clamp(-5, 0, 10) == 0
 ```
 `brine test` runs each test in its own process, in parallel. `$BRINE` is set to the
-`brine` running the tests, so a test can run the compiler.
+`brine` running the tests, so a test can run the compiler. A test that runs longer
+than 300 seconds is stopped and fails (`brine test --timeout <seconds>`; 0: no limit).
 
 ## C interop
 
