@@ -295,6 +295,22 @@ print("a\nb".lines(), s.chars(), s.bytes())  # [str], [str], [u8]
 print("42".is_digit(), "ab".is_alpha(), " ".is_space(), "a1".is_alnum())
 print(ord("a"), chr(97))                   # 97 "a"
 ```
+Text over several lines goes between `"""` quotes (also `f"""..."""`). A line
+break right after the opening quotes is dropped, and so is the indentation all
+the lines share (the closing quotes' line counts, blank lines don't); `\` at the
+end of a line joins it with the next:
+
+```python
+fn usage(name: str) -> str:
+    return f"""
+        usage: {name} [--verbose] FILE
+          --verbose   say more
+        """
+# usage("app") == "usage: app [--verbose] FILE\n  --verbose   say more\n"
+```
+An f-string field holds any expression, strings included: `f"{d["key"]}"`,
+`f"{", ".join(names)}"`.
+
 Case conversion and `is_alpha`/`is_space` follow Unicode, as in Python
 (`"straße".upper()` is `"STRASSE"`); `is_digit` is `0`-`9`, the digits `int()`
 reads. `str(x)` converts any
