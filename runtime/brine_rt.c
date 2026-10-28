@@ -72,6 +72,7 @@ static void br_ws_start(void) {
 #include <unistd.h>
 #include <time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #else
 #include <pthread.h>
 #include <dlfcn.h>
@@ -79,6 +80,7 @@ static void br_ws_start(void) {
 #include <time.h>
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -2197,11 +2199,30 @@ brine_str *brine_sb_finish(brine_sb *sb) {
     sb->p = NULL;
     return s;
 }
+/* stdout going to a terminal or a pipe is flushed at the end of each line,
+ * since something may be reading it as it comes (a person, or a program
+ * talking a line protocol); to a file it's written when the buffer fills.
+ * (C's line buffering would do, but the Windows C library has none.) */
+static int br_out_lines;
+static int br_stdout_streams(void) {
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h == NULL || h == INVALID_HANDLE_VALUE) return 0;
+    DWORD t = GetFileType(h), mode;
+    /* NUL is a character device too, but not a console */
+    return t == FILE_TYPE_PIPE || (t == FILE_TYPE_CHAR && GetConsoleMode(h, &mode));
+#else
+    struct stat st;
+    if (fstat(1, &st) != 0) return 0;
+    return S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) || isatty(1);
+#endif
+}
 /* write a finished builder (and free it); `print` adds its own `end` */
 void brine_out_sb(brine_sb *sb) {
     if (BR_UNLIKELY(__atomic_load_n(&br_panicking, __ATOMIC_RELAXED))) br_park();
     br_lock(&br_io_mu);
     fwrite(sb->p, 1, (size_t)sb->len, stdout);
+    if (br_out_lines && memchr(sb->p, '\n', (size_t)sb->len)) fflush(stdout);
     br_unlock(&br_io_mu);
     free(sb->p);
     sb->p = NULL;
@@ -2214,6 +2235,11 @@ void brine_err_sb(brine_sb *sb) {
     br_unlock(&br_io_mu);
     free(sb->p);
     sb->p = NULL;
+}
+void brine_flush(void) {
+    br_lock(&br_io_mu);
+    fflush(stdout);
+    br_unlock(&br_io_mu);
 }
 void brine_print_sb(brine_sb *sb) {
     brine_sb_cat(sb, "\n", 1);
@@ -4637,6 +4663,7 @@ void brine_rt_init(int argc, char **argv) {
     br_gpu_setup();
     static char outbuf[1 << 16];
     setvbuf(stdout, outbuf, _IOFBF, sizeof outbuf);
+    br_out_lines = br_stdout_streams();
     br_world_init();
 }
 
@@ -4883,6 +4910,8 @@ static void br_quote_arg(brine_sb *sb, const char *a) {
 /* Run a program and wait for it. false (with *err set) if it couldn't be started. */
 bool brine_run(brine_arr *argv, int64_t *code, brine_str **err) {
     *code = 0;
+    /* the child writes to the same stdout: what we printed comes first */
+    brine_flush();
     if (argv->len == 0) {
         *err = br_strf("run() needs a program name, but the command list is empty");
         return false;
@@ -6031,6 +6060,7 @@ static bool br_start(br_proc *rec, char **cv, int64_t n, char **ek, char **ev, i
 
 bool brine_os_spawn(brine_arr *cmd, brine_map *env, bool capture, bool in, int64_t *handle, brine_str **err) {
     *handle = 0;
+    if (!capture) brine_flush();
     if (!br_proc_mu_ready) {
         br_mutex_init(&br_proc_mu);
         br_proc_mu_ready = 1;

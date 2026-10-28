@@ -662,6 +662,7 @@ int64_t brine_os_wait(int64_t handle, const char *loc);
 bool brine_os_poll(int64_t handle, int64_t *code, const char *loc);
 void brine_os_kill(int64_t handle, const char *loc);
 void brine_os_output(int64_t handle, brine_str **out, brine_str **err, const char *loc);
+void brine_flush(void);
 void brine_rt_init(int argc, char **argv);
 void brine_rt_shutdown(void);
 

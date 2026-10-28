@@ -317,7 +317,12 @@ Keys can be integers, `bool`, `str`, enums, or arrays/tuples/structs of those
 them: `print(x, end="")`), `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`, `cos`,
 `tan`, `exp`, `log`, `pow(x, y)`, `floor`, `ceil`, `round`, `clock()` (seconds),
 `args()` (command-line arguments), `exit(code)`, `panic(msg)`, `eprint(...)`
-(print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`.
+(print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`, `flush()`.
+
+`print` output to a terminal or a pipe is written at the end of each line; to a
+file it is buffered (and written at exit, or when `eprint`, `run` or `flush()`
+needs it out). `flush()` writes out what is buffered, such as a prompt printed
+with `end=""`.
 
 Files and processes (all failures are values, never crashes):
 
