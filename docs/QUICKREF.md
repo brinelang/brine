@@ -129,6 +129,9 @@ fn main():
     d[0] = 1                         # changes `data`
 ```
 Arguments are passed by value (cheaply: arrays and strings are copy-on-write).
+`x = f(x)` (also `xs[i] = f(xs[i])`, `x = x.step()`) moves x's value into `f`, so
+an `f` that starts with `var t = x` changes it in place instead of copying it
+(unless something else shares the value).
 References can't be stored in structs or arrays or returned, so they never dangle.
 `main` may return `int` (the exit code). Parameter types are required;
 local types are inferred.
@@ -431,7 +434,8 @@ a sequential `sum`, usually by being more accurate). Integer overflow of any par
 result in that order traps.
 `BRINE_THREADS=n` or `brine run --threads n` sets the thread count.
 Cost: reference counts use locked (atomic) instructions only while a `par` construct
-is running; the rest of the program updates them with plain ones.
+is running; the rest of the program updates them with plain ones. In `par for i`,
+`out[i] = f(out[i])` hands `out[i]` to `f` without copying it, as outside `par`.
 
 **GPUs.** `par for`, `par [...]` and `par` reductions also run on a GPU (NVIDIA
 through CUDA, Apple silicon through Metal) when the runtime expects that to be

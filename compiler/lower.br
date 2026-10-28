@@ -99,6 +99,8 @@ struct FnCx:
     scopes: [[Owned]]
     loops: [Loop]
     par_writes: {int: bool}
+    # the loop variable of the `par for` this body was lifted from (else -1)
+    par_var: int
     # arrays no enclosing loop can share, grow or replace: their pointers
     # are loaded once before the loop (and made unique if the loop writes them)
     arrc: {int: ArrCache}
@@ -198,6 +200,7 @@ fn new_cx(f: Func) -> FnCx:
         scopes=[],
         loops=[],
         par_writes={},
+        par_var=-1,
         arrc={},
         lslot={},
         lptr={},
@@ -2777,13 +2780,34 @@ struct Lower:
     # Moving an array between a variable and a place instead of retaining it
     # and releasing what it replaces: only in plain straight-line lowering.
     fn moves_ok(self) -> bool:
+        return not self.cx.lifted and self.moves_ok_lifted()
+
+    # the same, but in a lifted body too (for its own elements, `par_elem`)
+    fn moves_ok_lifted(self) -> bool:
         return (
             not self.opts.debug
-            and not self.cx.lifted
             and len(self.cx.jx.act) == 0
             and self.cx.twin == 0
             and not self.cx.fb.ends()
         )
+
+    # Is `t` a place inside `out[i]`, out an array this `par for i` body writes?
+    fn par_elem(self, t: Expr) -> bool:
+        match t.kind:
+            case ExprKind.Index(b, i):
+                match local_of(b):
+                    case Some(w):
+                        return (
+                            w in self.cx.par_writes
+                            and self.cx.par_var >= 0
+                            and local_of(i) == Some(self.cx.par_var)
+                        )
+                    case None:
+                        return self.par_elem(b)
+            case ExprKind.Field(b, _, _):
+                return self.par_elem(b)
+            case _:
+                return false
 
     fn movable(self, id: int) -> bool:
         let lc = self.flocals[id]
@@ -4157,8 +4181,13 @@ struct Lower:
     # f that owns the parameter, and store the result without releasing the
     # old value (the clone did), so f changes it in place instead of copying.
     # Nothing else in the call may read x, which is stale until the store.
+    # In a `par for i` body that also works for `out[i] = f(out[i])`: no
+    # other iteration may touch out[i] (E0502).
     fn own_call(ref self, target: Expr, value: Expr) -> bool:
-        if not self.moves_ok() or not self.managed(target.ty) or not array_place(target):
+        let pe = self.cx.lifted and self.par_elem(target)
+        if not self.managed(target.ty) or not array_place(target):
+            return false
+        if not self.moves_ok() and not (pe and self.moves_ok_lifted()):
             return false
         var id = -1
         var recv: Option[Expr] = None
@@ -4211,7 +4240,7 @@ struct Lower:
         if (
             root in self.cx.packed
             or root in self.cx.narrow
-            or root in self.cx.lptr and self.flocals[root].kind != LocalKind.RefParam
+            or root in self.cx.lptr and self.flocals[root].kind != LocalKind.RefParam and not pe
         ):
             return false
         var ai = -1
@@ -6762,6 +6791,7 @@ struct Lower:
             captures,
             par_writes
         )
+        self.cx.par_var = local
         let lc = self.chunk_open(dom, pc, local)
         self.cx.loops.push(Loop(depth=len(self.cx.scopes), brk=lc.brk, cont=lc.cont))
         self.block(body)
