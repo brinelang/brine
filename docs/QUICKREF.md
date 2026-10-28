@@ -314,6 +314,8 @@ them: `print(x, end="")`), `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`
 `tan`, `exp`, `log`, `pow(x, y)`, `floor`, `ceil`, `round`, `clock()` (seconds),
 `args()` (command-line arguments), `exit(code)`, `panic(msg)`, `eprint(...)`
 (print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`.
+On floats, `min` and `max` ignore a NaN (the other argument wins; both NaN gives
+NaN) and order `-0.0` below `0.0`, the same on every target.
 
 Files and processes (all failures are values, never crashes):
 
