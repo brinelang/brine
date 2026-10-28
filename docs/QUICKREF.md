@@ -324,6 +324,7 @@ match line.to_int():                      # Option[int]; blanks around it are fi
         print("not a number")
 "200".to_int[u8]()                        # Some(200): other types; None if out of range
 "2.5".to_float[f32]()                     # Some(2.5)
+str.from_utf8(bytes)                      # Result[str, str]: Err names the bad byte
 ```
 Both accept `_` between digits (`"1_000"`), as `int()` and `float()` do.
 
@@ -374,6 +375,21 @@ file it is buffered (and written at exit, or when `eprint`, `run` or `flush()`
 needs it out). `flush()` writes out what is buffered, such as a prompt printed
 with `end=""`.
 
+Standard input, from a terminal, a pipe or a file:
+
+```python
+while true:
+    match input("> "):                  # Option[str]: a line without its "\n"
+        case Some(line):                # (or "\r\n"), None at the end of input
+            print(line.upper())
+        case None:
+            break
+let all = read_stdin()                  # Result[str, str]: everything that is left
+```
+`input(prompt)` writes the prompt first. Text that isn't UTF-8 becomes U+FFFD in
+`input()` and an `Err` from `read_stdin()`. On Windows a console's input is read
+as UTF-8 too. A web page has no stdin: `input()` gives `None` there.
+
 Files and processes (all failures are values, never crashes):
 
 ```python
@@ -383,12 +399,13 @@ match read_file("in.txt"):              # Result[str, str]; text must be UTF-8
     case Err(e):
         eprint(e)                       # "cannot read in.txt: No such file or directory"
 write_file("out.txt", "hi\n")          # Result[(), str]
+append_file("log.txt", "one more\n")   # Result[(), str]: creates the file if needed
 file_exists("out.txt")                  # bool
 getenv("HOME")                          # Option[str]
 run(["cc", "-O2", "-o", "app", "app.c"])  # Result[int, str]: Ok(exit code), Err if it can't start
 ```
-`write_file` and `run` can't be used inside `par` (their effects would happen in
-an unpredictable order).
+`write_file`, `append_file`, `run`, `input` and `read_stdin` can't be used inside
+`par` (their effects would happen in an unpredictable order).
 
 The `os` module (built in, no import; errors are `Err` values with the OS's
 message, e.g. `"The system cannot find the file specified. (os error 2)"`):
@@ -401,6 +418,8 @@ os.remove_file(path), os.rename(src, dst)    # Result[(), str]; rename replaces 
 os.cwd(), os.temp_dir() # str (temp_dir has no trailing separator)
 os.set_cwd(path)        # Result[(), str]: change the working directory
 os.write_bytes(path, b) # Result[(), str]: write a [u8] as a binary file
+os.append_bytes(path, b)                     # Result[(), str]: add to the end
+os.read_bytes(path)     # Result[[u8], str]: a file's bytes, whatever they are
 os.exe_path()           # str: the absolute path of the running program
 os.abs_path(path)       # Result[str, str]: canonical; on Windows `\\?\C:\...`
 os.name(), os.arch()    # "windows"/"macos"/"linux"..., "x86_64"/"aarch64"...

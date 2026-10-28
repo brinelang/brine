@@ -392,6 +392,8 @@ double brine_parse_f64(brine_str *s, const char *loc);
  * type; otherwise the value (`bits` wide; an f32 if `f32`) goes to *out */
 bool brine_try_parse_int(brine_str *s, int64_t bits, bool sgn, void *out);
 bool brine_try_parse_float(brine_str *s, bool f32, void *out);
+/* `str.from_utf8(bytes)` */
+bool brine_str_from_utf8(brine_arr *a, brine_str **out);
 /* `xs.index(x, start)`: start, when 0 <= start <= len */
 int64_t brine_start_chk(int64_t start, int64_t len, const char *loc);
 
@@ -695,6 +697,13 @@ brine_str *brine_os_cwd(void);
 bool brine_os_set_cwd(brine_str *path, brine_str **err);
 /* writes the bytes of a `[u8]` */
 bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err);
+bool brine_os_append_bytes(brine_str *path, brine_arr *data, brine_str **err);
+bool brine_os_read_bytes(brine_str *path, brine_arr **out, brine_str **err);
+bool brine_append_file(brine_str *path, brine_str *text, brine_str **err);
+/* stdin: `input(prompt)` is a line without its end (NULL at the end of the
+ * input), `read_stdin()` all that is left */
+brine_str *brine_input(brine_str *prompt);
+bool brine_read_stdin(brine_str **out);
 brine_str *brine_os_exe_path(void);
 brine_str *brine_os_temp_dir(void);
 bool brine_os_abs_path(brine_str *path, brine_str **out, brine_str **err);

@@ -4609,9 +4609,27 @@ struct Checker:
             case Builtin.ReadFile:
                 self.builtin_args(name, ref args, [Ty.Str], span)
                 return self.result_of(Ty.Str, Ty.Str, span)
-            case Builtin.WriteFile | Builtin.Run:
+            case Builtin.WriteFile | Builtin.Run | Builtin.AppendFile | Builtin.Input | Builtin.ReadStdin:
                 if b == Builtin.Run:
                     self.builtin_args(name, ref args, [Ty.Array(Ty.Str)], span)
+                elif b == Builtin.ReadStdin:
+                    self.nargs(name, ref args, 0, span)
+                elif b == Builtin.Input:
+                    if len(args) > 1:
+                        self.err(
+                            diag.error(
+                                "E0302",
+                                f"`input` takes 0 or 1 arguments but {len(args)} were given"
+                            )
+                            .label(span, "wrong number of arguments")
+                            .with_help(
+                                "`input()` reads a line; `input(prompt)` prints `prompt` first"
+                            )
+                        )
+                        self.check_all(ref args)
+                    elif len(args) == 1:
+                        self.check_expr(ref args[0].expr, Some(Ty.Str))
+                        self.expect_ty(Ty.Str, args[0].expr)
                 else:
                     self.builtin_args(name, ref args, [Ty.Str, Ty.Str], span)
                 if len(self.par_stack) > 0:
@@ -4622,6 +4640,10 @@ struct Checker:
                             "its effects would happen in an unpredictable order; do it before or after the `par`"
                         )
                     )
+                if b == Builtin.Input:
+                    return self.option_of(Ty.Str, span)
+                if b == Builtin.ReadStdin:
+                    return self.result_of(Ty.Str, Ty.Str, span)
                 let ok = int_ty() if b == Builtin.Run else Ty.Unit
                 return self.result_of(ok, Ty.Str, span)
             case Builtin.FileExists:
@@ -4659,7 +4681,7 @@ struct Checker:
                         e.kind = ExprKind.Contains(a2[0].expr, r2, false)
                         return t
                     # `float.from_bits(u)`: a plain call; the type name is no value
-                    case CallRes.Builtin(Builtin.FromBits):
+                    case CallRes.Builtin(Builtin.FromBits) | CallRes.Builtin(Builtin.FromUtf8):
                         e.kind = ExprKind.Call(r2, a2)
                         e.cres = res
                         return t
@@ -5296,9 +5318,12 @@ struct Checker:
             case OsOp.Rename:
                 self.builtin_args(oname, ref args, [Ty.Str, Ty.Str], span)
                 return self.result_of(Ty.Unit, Ty.Str, span)
-            case OsOp.WriteBytes:
+            case OsOp.WriteBytes | OsOp.AppendBytes:
                 self.builtin_args(oname, ref args, [Ty.Str, Ty.Array(Ty.Int(IntTy.U8))], span)
                 return self.result_of(Ty.Unit, Ty.Str, span)
+            case OsOp.ReadBytes:
+                self.builtin_args(oname, ref args, [Ty.Str], span)
+                return self.result_of(Ty.Array(Ty.Int(IntTy.U8)), Ty.Str, span)
             case OsOp.Cwd | OsOp.ExePath | OsOp.TempDir | OsOp.Name | OsOp.Arch:
                 self.nargs(oname, ref args, 0, span)
                 return Ty.Str
@@ -5632,7 +5657,7 @@ struct Checker:
         self.check_all(ref args)
         return Ty.Error
 
-    # Functions of the built-in types: `float.from_bits(u)` and `f32.from_bits(u)`.
+    # Functions of the built-in types: `float.from_bits(u)`, `str.from_utf8(bytes)`.
     fn prim_static(
         ref self,
         pt: Ty,
@@ -5652,6 +5677,12 @@ struct Checker:
                     let ut = Ty.Int(IntTy.U32 if k == FloatTy.F32 else IntTy.U64)
                     self.typed_args(f"{tname}.from_bits", ref args, [ut], span)
                     return pt
+            case Ty.Str:
+                if name == "from_utf8":
+                    res = CallRes.Builtin(Builtin.FromUtf8)
+                    let bytes = Ty.Array(Ty.Int(IntTy.U8))
+                    self.typed_args("str.from_utf8", ref args, [bytes], span)
+                    return self.result_of(Ty.Str, Ty.Str, span)
             case _:
                 pass
         var d = diag.error(
@@ -5664,7 +5695,7 @@ struct Checker:
             )
         else:
             d = d.note(
-                "functions of built-in types: `float.from_bits(u)` and `f32.from_bits(u)` (from the IEEE bits)"
+                "functions of built-in types: `float.from_bits(u)`, `f32.from_bits(u)`, `str.from_utf8(bytes)`"
             )
         self.err(d)
         self.check_all(ref args)

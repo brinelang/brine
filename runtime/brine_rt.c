@@ -5302,7 +5302,8 @@ static brine_str *br_strf(const char *fmt, ...) {
     return brine_str_new(buf, n);
 }
 
-static int br_valid_utf8(const unsigned char *p, int64_t n) {
+/* the index of the first byte that starts no UTF-8 character, or -1 */
+static int64_t br_utf8_bad(const unsigned char *p, int64_t n) {
     int64_t i = 0;
     while (i < n) {
         if (p[i] < 0x80) {
@@ -5310,10 +5311,38 @@ static int br_valid_utf8(const unsigned char *p, int64_t n) {
             continue;
         }
         int64_t k = br_utf8_len(p + i, n - i);
-        if (k == 1) return 0;
+        if (k == 1) return i;
         i += k;
     }
-    return 1;
+    return -1;
+}
+static int br_valid_utf8(const unsigned char *p, int64_t n) { return br_utf8_bad(p, n) < 0; }
+
+bool brine_str_from_utf8(brine_arr *a, brine_str **out) {
+    int64_t bad = br_utf8_bad((const unsigned char *)a->data, a->len);
+    if (bad >= 0) {
+        *out = br_strf("invalid UTF-8: byte %lld (0x%02x) starts no character", (long long)bad,
+                       (unsigned)(unsigned char)a->data[bad]);
+        return false;
+    }
+    *out = brine_str_new(a->data, a->len);
+    return true;
+}
+
+/* text read from outside as a string: bytes that aren't UTF-8 become U+FFFD */
+static brine_str *br_lossy_str(const char *p, int64_t n) {
+    if (br_utf8_bad((const unsigned char *)p, n) < 0) return brine_str_new(p, n);
+    brine_sb sb;
+    brine_sb_init(&sb);
+    for (int64_t i = 0; i < n;) {
+        int64_t k = ((unsigned char)p[i] < 0x80) ? 1 : br_utf8_len((const unsigned char *)p + i, n - i);
+        if (k == 1 && (unsigned char)p[i] >= 0x80)
+            brine_sb_cat(&sb, "\xef\xbf\xbd", 3);
+        else
+            brine_sb_cat(&sb, p + i, k);
+        i += k;
+    }
+    return brine_sb_finish(&sb);
 }
 
 #ifdef _WIN32
@@ -5338,82 +5367,243 @@ static FILE *br_open(const char *path, const char *mode) {
 #endif
 }
 
-bool brine_read_file(brine_str *path, brine_str **out) {
+/* All of the file at `path` (malloc'd, in *buf and *len), or false with the
+ * message in *err. */
+static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
-        *out = br_strf("cannot read a path containing a NUL byte");
+        *err = br_strf("cannot read a path containing a NUL byte");
         return false;
     }
     FILE *f = br_open(p, "rb");
     if (!f) {
-        *out = br_strf("cannot read %s: %s", p, strerror(errno));
+        *err = br_strf("cannot read %s: %s", p, strerror(errno));
         free(p);
         return false;
     }
-    char *buf = NULL;
-    size_t len = 0, cap = 0;
+    char *b = NULL;
+    size_t n = 0, cap = 0;
     for (;;) {
-        if (len == cap) {
+        if (n == cap) {
             cap = cap ? cap * 2 : 65536;
-            buf = (char *)br_grow(buf, cap);
+            b = (char *)br_grow(b, cap);
         }
-        size_t got = fread(buf + len, 1, cap - len, f);
-        len += got;
+        size_t got = fread(b + n, 1, cap - n, f);
+        n += got;
         if (got == 0) break;
     }
     int bad = ferror(f);
     fclose(f);
     if (bad) {
-        *out = br_strf("cannot read %s: read error", p);
-    } else if (!br_valid_utf8((const unsigned char *)buf, (int64_t)len)) {
-        *out = br_strf("cannot read %s: the file is not valid UTF-8 text", p);
-        bad = 1;
+        *err = br_strf("cannot read %s: read error", p);
+        free(b);
     } else {
+        *buf = b;
+        *len = n;
+    }
+    free(p);
+    return !bad;
+}
+
+bool brine_read_file(brine_str *path, brine_str **out) {
+    char *buf;
+    size_t len;
+    if (!br_slurp(path, &buf, &len, out)) return false;
+    bool ok = br_valid_utf8((const unsigned char *)buf, (int64_t)len);
+    if (ok) {
         *out = brine_str_new(buf, (int64_t)len);
+    } else {
+        char *p = br_cstr(path);
+        *out = br_strf("cannot read %s: the file is not valid UTF-8 text", p);
+        free(p);
     }
     free(buf);
+    return ok;
+}
+
+bool brine_os_read_bytes(brine_str *path, brine_arr **out, brine_str **err) {
+    char *buf;
+    size_t len;
+    if (!br_slurp(path, &buf, &len, err)) return false;
+    brine_arr *a = brine_arr_new((int64_t)len, 1, NULL, NULL, "");
+    if (len) memcpy(a->data, buf, len);
+    free(buf);
+    *out = a;
+    return true;
+}
+
+/* writes (mode "wb") or appends ("ab") n bytes to the file at `path` */
+static bool br_put_file(brine_str *path, const char *data, int64_t n, const char *mode, brine_str **err) {
+    const char *verb = mode[0] == 'a' ? "append to" : "write";
+    char *p = br_cstr(path);
+    if (!p) {
+        *err = br_strf("cannot %s a path containing a NUL byte", verb);
+        return false;
+    }
+    FILE *f = br_open(p, mode);
+    if (!f) {
+        *err = br_strf("cannot %s %s: %s", verb, p, strerror(errno));
+        free(p);
+        return false;
+    }
+    size_t put = n ? fwrite(data, 1, (size_t)n, f) : 0;
+    int bad = put != (size_t)n;
+    if (fclose(f) != 0) bad = 1;
+    if (bad) *err = br_strf("cannot %s %s: write error (is the disk full?)", verb, p);
     free(p);
     return !bad;
 }
 
 bool brine_write_file(brine_str *path, brine_str *text, brine_str **err) {
-    char *p = br_cstr(path);
-    if (!p) {
-        *err = br_strf("cannot write a path containing a NUL byte");
-        return false;
-    }
-    FILE *f = br_open(p, "wb");
-    if (!f) {
-        *err = br_strf("cannot write %s: %s", p, strerror(errno));
-        free(p);
-        return false;
-    }
-    size_t put = text->len ? fwrite(text->data, 1, (size_t)text->len, f) : 0;
-    int bad = put != (size_t)text->len;
-    if (fclose(f) != 0) bad = 1;
-    if (bad) *err = br_strf("cannot write %s: write error (is the disk full?)", p);
-    free(p);
-    return !bad;
+    return br_put_file(path, text->data, text->len, "wb", err);
+}
+bool brine_append_file(brine_str *path, brine_str *text, brine_str **err) {
+    return br_put_file(path, text->data, text->len, "ab", err);
+}
+bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err) {
+    return br_put_file(path, data->data, data->len, "wb", err);
+}
+bool brine_os_append_bytes(brine_str *path, brine_arr *data, brine_str **err) {
+    return br_put_file(path, data->data, data->len, "ab", err);
 }
 
-bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err) {
-    char *p = br_cstr(path);
-    if (!p) {
-        *err = br_strf("cannot write a path containing a NUL byte");
+/* ============================================================ stdin */
+/* Read with read() / ReadFile, which return what has arrived, so a program
+ * talking a line protocol through a pipe gets each line as it comes (C's
+ * fread would wait for a full buffer). A Windows console is read as UTF-16
+ * (ReadConsoleW), so typed text arrives as UTF-8 whatever the code page. */
+static struct {
+    char *p;
+    int64_t len, pos, cap;
+    bool eof;
+    int err;
+} br_in;
+#ifdef _WIN32
+static int br_in_console = -1;
+static wchar_t br_in_hi; /* a high surrogate whose pair comes in the next read */
+#endif
+/* reads more of stdin into br_in.p[len..]; false at its end or on an error */
+static bool br_in_fill(void) {
+    if (br_in.eof) return false;
+    if (br_in.pos > 0) {
+        memmove(br_in.p, br_in.p + br_in.pos, (size_t)(br_in.len - br_in.pos));
+        br_in.len -= br_in.pos;
+        br_in.pos = 0;
+    }
+    if (br_in.cap - br_in.len < 16384) {
+        br_in.cap = br_in.cap ? br_in.cap * 2 : 65536;
+        br_in.p = (char *)br_grow(br_in.p, (size_t)br_in.cap);
+    }
+    int64_t room = br_in.cap - br_in.len, got = 0;
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (h == NULL || h == INVALID_HANDLE_VALUE) {
+        br_in.eof = true;
         return false;
     }
-    FILE *f = br_open(p, "wb");
-    if (!f) {
-        *err = br_strf("cannot write %s: %s", p, strerror(errno));
-        free(p);
+    if (br_in_console < 0) {
+        DWORD mode;
+        br_in_console = GetConsoleMode(h, &mode) ? 1 : 0;
+    }
+    if (br_in_console) {
+        /* at most 3 UTF-8 bytes per UTF-16 unit (a pair makes 4) */
+        wchar_t w[4096];
+        DWORD k = br_in_hi ? 1 : 0, n = 0;
+        w[0] = br_in_hi;
+        br_in_hi = 0;
+        DWORD want = (DWORD)(room / 3 - 1 < 4095 ? room / 3 - 1 : 4095) - k;
+        if (!ReadConsoleW(h, w + k, want, &n, NULL)) {
+            br_in.err = EIO;
+            br_in.eof = true;
+            return false;
+        }
+        n += k;
+        /* Ctrl+Z at the start of a line ends the input, as in the C library */
+        if (n == 0 || w[0] == 0x1a) {
+            br_in.eof = true;
+            return false;
+        }
+        if (w[n - 1] >= 0xd800 && w[n - 1] < 0xdc00) br_in_hi = w[--n];
+        int b = n ? WideCharToMultiByte(CP_UTF8, 0, w, (int)n, br_in.p + br_in.len, (int)room, NULL, NULL) : 0;
+        /* the console ends lines with \r\n */
+        char *q = br_in.p + br_in.len;
+        int m = 0;
+        for (int i = 0; i < b; i++)
+            if (!(q[i] == '\r' && i + 1 < b && q[i + 1] == '\n')) q[m++] = q[i];
+        got = m;
+        if (got == 0) return br_in_fill();
+    } else {
+        DWORD n = 0;
+        if (!ReadFile(h, br_in.p + br_in.len, (DWORD)(room < (1 << 30) ? room : (1 << 30)), &n, NULL)) {
+            DWORD e = GetLastError();
+            if (e != ERROR_BROKEN_PIPE && e != ERROR_HANDLE_EOF) br_in.err = EIO;
+            br_in.eof = true;
+            return false;
+        }
+        got = (int64_t)n;
+    }
+#else
+    ssize_t n;
+    do n = read(0, br_in.p + br_in.len, (size_t)room);
+    while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        br_in.err = errno;
+        br_in.eof = true;
         return false;
     }
-    size_t put = data->len ? fwrite(data->data, 1, (size_t)data->len, f) : 0;
-    int bad = put != (size_t)data->len;
-    if (fclose(f) != 0) bad = 1;
-    if (bad) *err = br_strf("cannot write %s: write error (is the disk full?)", p);
-    free(p);
-    return !bad;
+    got = (int64_t)n;
+#endif
+    if (got == 0) {
+        br_in.eof = true;
+        return false;
+    }
+    br_in.len += got;
+    return true;
+}
+brine_str *brine_input(brine_str *prompt) {
+    br_lock(&br_io_mu);
+    if (prompt && prompt->len) fwrite(prompt->data, 1, (size_t)prompt->len, stdout);
+    /* what was printed before (a prompt with `end=""`) shows before the wait */
+    fflush(stdout);
+    br_unlock(&br_io_mu);
+    int64_t seen = 0, n;
+    for (;;) {
+        const char *at = br_in.p + br_in.pos;
+        int64_t have = br_in.len - br_in.pos;
+        const char *nl = have > seen ? (const char *)memchr(at + seen, '\n', (size_t)(have - seen)) : NULL;
+        if (nl) {
+            n = nl - at;
+            break;
+        }
+        seen = have;
+        if (!br_in_fill()) {
+            if (br_in.len == br_in.pos) return NULL;
+            n = br_in.len - br_in.pos;
+            break;
+        }
+    }
+    const char *line = br_in.p + br_in.pos;
+    br_in.pos += n < br_in.len - br_in.pos ? n + 1 : n;
+    if (n > 0 && line[n - 1] == '\r') n--;
+    return br_lossy_str(line, n);
+}
+bool brine_read_stdin(brine_str **out) {
+    brine_flush();
+    while (br_in_fill()) {
+    }
+    if (br_in.err) {
+        *out = br_strf("cannot read stdin: %s", strerror(br_in.err));
+        return false;
+    }
+    const char *p = br_in.p + br_in.pos;
+    int64_t n = br_in.len - br_in.pos;
+    br_in.pos = br_in.len;
+    if (!br_valid_utf8((const unsigned char *)p, n)) {
+        *out = br_strf("cannot read stdin: the input is not valid UTF-8 text");
+        return false;
+    }
+    *out = brine_str_new(n ? p : "", n);
+    return true;
 }
 
 bool brine_file_exists(brine_str *path) {
