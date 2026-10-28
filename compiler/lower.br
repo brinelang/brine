@@ -166,6 +166,8 @@ struct FnCx:
     own_arg: int
     own_slot: int
     own_mask: int
+    # a `__br` clone: results are returned borrowed (see `bret_ok`)
+    bret: bool
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -222,7 +224,8 @@ fn new_cx(f: Func) -> FnCx:
         body_depth=-1,
         own_arg=-1,
         own_slot=-1,
-        own_mask=0
+        own_mask=0,
+        bret=false
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -315,6 +318,10 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         own_clones=[],
         own_seen={},
         own_body=0,
+        bret={},
+        br_clones=[],
+        br_seen={},
+        br_body=false,
         khints={},
         kernels=[]
     )
@@ -363,6 +370,12 @@ struct Lower:
     own_clones: [(int, int)]
     own_seen: {str: bool}
     own_body: int
+    # functions that may return borrowed results (see `bret_ok`), and the
+    # `__br` clones to make
+    bret: {int: bool}
+    br_clones: [int]
+    br_seen: {int: bool}
+    br_body: bool
     # the array lengths callers pass (kernel.br), and the kernels made
     khints: {int: [int]}
     kernels: [str]
@@ -392,8 +405,15 @@ struct Lower:
             self.gen_main()
         var ci = 0
         var oi = 0
-        while ci < len(self.clones) or oi < len(self.own_clones):
-            if ci < len(self.clones):
+        var bi = 0
+        while ci < len(self.clones) or oi < len(self.own_clones) or bi < len(self.br_clones):
+            if bi < len(self.br_clones):
+                let id = self.br_clones[bi]
+                self.br_body = true
+                self.gen_body(self.odecls[id], self.info.fns[id].c_name + "__br", false)
+                self.br_body = false
+                bi += 1
+            elif ci < len(self.clones):
                 let f = self.fdecls[self.clones[ci]]
                 self.nc_body = true
                 self.gen_body(f, self.info.fns[f.id].c_name + "__nc", false)
@@ -452,6 +472,7 @@ struct Lower:
         self.flocals = f.locals
         self.cx = new_cx(new_func(name, ks, has, rk))
         self.cx.nc = self.nc_body
+        self.cx.bret = self.br_body
         if self.opts.debug:
             self.dbg_func(f, is_test)
         elif self.opts.fast:
@@ -485,7 +506,9 @@ struct Lower:
                     self.cx.fb.store(a, 0, v)
             if self.tracks_caller(f.id):
                 self.cx.loc = len(ks) - 1
-            elif f.id in self.khints and not self.nc_body and self.own_body == 0:
+            elif (
+                f.id in self.khints and not self.nc_body and not self.br_body and self.own_body == 0
+            ):
                 self.kernel_entry(f, name)
         var nw = narrow.Narrow(arrs={}, guards=[])
         if self.opts.fast and not self.opts.debug and self.own_body == 0:
@@ -2576,7 +2599,8 @@ struct Lower:
                 match value:
                     case Some(e):
                         self.push_frame()
-                        let v = self.owned(e)
+                        # (a `__br` clone returns a part of a parameter, borrowed)
+                        let v = self.expr(e) if self.cx.bret else self.owned(e)
                         var r = -1
                         if self.cx.sret >= 0:
                             let lay = self.lay(e.ty)
@@ -4903,14 +4927,148 @@ struct Lower:
                 cargs[base + i] = self.lvalue(it.0)
         if self.tracks_caller(id):
             cargs.push(self.loc(span))
+        # a result borrowed from the arguments, which live to the end of
+        # the statement: read like a field of a temp, not released
+        var br = false
+        if own_arg < 0 and sig.c_name == self.info.fns[id].c_name and self.bret_ok(id):
+            br = true
+            if id not in self.br_seen:
+                self.br_seen[id] = true
+                self.br_clones.push(id)
+            sig.c_name = sig.c_name + "__br"
         if sret >= 0:
             self.cx.fb.call_void(sig.c_name, cargs)
+            if br:
+                return sret
             return self.temp(sret, sig.ret)
         if not self.ret_has(sig.ret):
             self.cx.fb.call_void(sig.c_name, cargs)
             return self.unit()
         let r = self.cx.fb.call(self.kind(sig.ret), sig.c_name, cargs)
+        if br:
+            return r
         return self.temp(r, sig.ret)
+
+    # Can function `id` return its result borrowed (a `__br` clone)? When
+    # every `return` gives a part of a by-value parameter, which the caller
+    # keeps alive to the end of the statement, or a constant, the caller can
+    # read the result like a field of a temp: `case Lit(v): return v` then
+    # costs no retain in the callee and no release in the caller (atomic,
+    # and contended when threads share the value).
+    fn bret_ok(ref self, id: int) -> bool:
+        match self.bret.get(id):
+            case Some(b):
+                return b
+            case None:
+                pass
+        var ok = false
+        if id in self.odecls and not self.opts.debug:
+            let f = self.odecls[id]
+            let sig = self.info.fns[id]
+            ok = self.managed(sig.ret) and not any(p.by_ref for p in sig.params)
+            if ok:
+                var roots: {int: bool} = {}
+                for l in f.param_locals:
+                    roots[l] = true
+                var rets = 0
+                ok = self.bret_block(f.body, ref roots, ref rets) and rets > 0
+        self.bret[id] = ok
+        return ok
+
+    # Are the returns in `b` borrowable (see `bret_ok`)? `roots`: the locals
+    # holding parts of parameters; `rets` counts the returns.
+    fn bret_block(self, b: Block, ref roots: {int: bool}, ref rets: int) -> bool:
+        for s in b.stmts:
+            for e in stmt_exprs(s):
+                if has_try(e):
+                    return false
+            match s.kind:
+                case StmtKind.Return(value):
+                    match value:
+                        case Some(e):
+                            rets += 1
+                            if not self.bret_place(e, roots) and not self.const_expr(e):
+                                return false
+                        case None:
+                            return false
+                case StmtKind.Let(mutable, pat, _, init, is_ref):
+                    if (
+                        not mutable
+                        and not is_ref
+                        and is_name(pat)
+                        and len(s.locals) == 1
+                        and self.bret_place(init, roots)
+                    ):
+                        roots[s.locals[0]] = true
+                case StmtKind.Match(scrut, cases):
+                    if self.bret_place(scrut, roots):
+                        for c in cases:
+                            pat_locals(c.pat, ref roots)
+                case StmtKind.For(_, _, _, iter, _, _, is_par):
+                    match iter.ty:
+                        case Ty.Array(_):
+                            if not is_par and self.bret_place(iter, roots):
+                                roots[s.local] = true
+                        case _:
+                            pass
+                case _:
+                    pass
+            for sb in stmt_blocks(s):
+                if not self.bret_block(sb, ref roots, ref rets):
+                    return false
+        return true
+
+    # `e` names a part of a root (fields, tuple fields and array elements).
+    fn bret_place(self, e: Expr, roots: {int: bool}) -> bool:
+        match e.kind:
+            case ExprKind.Ident(_):
+                match local_of(e):
+                    case Some(l):
+                        return l in roots
+                    case None:
+                        return false
+            case ExprKind.Field(b, _, _):
+                match b.ty:
+                    case Ty.Struct(_) | Ty.Tuple(_):
+                        return self.bret_place(b, roots)
+                    case _:
+                        return false
+            case ExprKind.Index(b, _):
+                match b.ty:
+                    case Ty.Array(_):
+                        return self.bret_place(b, roots)
+                    case _:
+                        return false
+            case _:
+                return false
+
+    # A value that holds no reference anyone must release: scalars, literal
+    # strings (immortal), variants without fields, and structs, tuples and
+    # inline variants of those.
+    fn const_expr(self, e: Expr) -> bool:
+        match e.kind:
+            case ExprKind.Int(
+                _
+            ) | ExprKind.UInt(_) | ExprKind.Float(_) | ExprKind.Bool(_) | ExprKind.Str(_):
+                return true
+            case ExprKind.Tuple(es):
+                return all(self.const_expr(x) for x in es)
+            case ExprKind.Ident(_) | ExprKind.Field(_, _, _):
+                match e.res:
+                    case Res.Variant(_, _):
+                        return true
+                    case _:
+                        return false
+            case ExprKind.Call(_, args):
+                match e.cres:
+                    case CallRes.Ctor(_):
+                        return all(self.const_expr(a.expr) for a in args)
+                    case CallRes.Variant(eid, _):
+                        return self.inl_e(eid) and all(self.const_expr(a.expr) for a in args)
+                    case _:
+                        return false
+            case _:
+                return false
 
     # `x?`: return `None`/`Err` from the function, or continue with the value inside.
     fn try_expr(ref self, x: Expr, e: Expr) -> int:
@@ -7051,6 +7209,22 @@ fn self_append(target: Expr, value: Expr) -> Option[[Expr]]:
             return None
         case None:
             return None
+
+# The locals pattern `p` binds.
+fn pat_locals(p: Pattern, ref out: {int: bool}):
+    match p.kind:
+        case PatKind.Bind(_):
+            out[p.local] = true
+        case PatKind.Tuple(ps):
+            for q in ps:
+                pat_locals(q, ref out)
+        case PatKind.Or(alts):
+            for q in alts:
+                pat_locals(q, ref out)
+        case _:
+            pass
+    for q in p.fields:
+        pat_locals(q, ref out)
 
 fn has_try(e: Expr) -> bool:
     match e.kind:
