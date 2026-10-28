@@ -382,11 +382,20 @@ int64_t brine_s_count(brine_str *s, brine_str *sub, const char *loc);
 brine_arr *brine_s_bytes(brine_str *s, const char *loc);
 brine_arr *brine_s_chars(brine_str *s, const char *loc);
 brine_str *brine_s_repeat(brine_str *s, int64_t n, const char *loc);
+int64_t brine_s_find_from(brine_str *s, brine_str *sub, int64_t start, const char *loc);
 int brine_str_cmp(brine_str *a, brine_str *b);
 int64_t brine_parse_i64(brine_str *s, const char *loc);
 brine_i128 brine_parse_i128(brine_str *s, const char *loc);
 brine_u128 brine_parse_u128(brine_str *s, const char *loc);
 double brine_parse_f64(brine_str *s, const char *loc);
+/* `s.to_int()` / `s.to_float()`: false for text that isn't a number of the
+ * type; otherwise the value (`bits` wide; an f32 if `f32`) goes to *out */
+bool brine_try_parse_int(brine_str *s, int64_t bits, bool sgn, void *out);
+bool brine_try_parse_float(brine_str *s, bool f32, void *out);
+/* `str.from_utf8(bytes)` */
+bool brine_str_from_utf8(brine_arr *a, brine_str **out);
+/* `xs.index(x, start)`: start, when 0 <= start <= len */
+int64_t brine_start_chk(int64_t start, int64_t len, const char *loc);
 
 /* ------------------------------------------------------------ arrays */
 brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_fn rl, const char *loc);
@@ -523,6 +532,9 @@ void brine_arr_pop_at(brine_arr **pa, int64_t i, void *out, const char *loc);
 /* takes ownership of *elem */
 void brine_arr_insert(brine_arr **pa, int64_t i, const void *elem, const char *loc);
 void brine_arr_extend(brine_arr **pa, brine_arr *b);
+brine_arr *brine_arr_concat(brine_arr *a, brine_arr *b, const char *loc);
+char *brine_cstr(brine_str *s, const char *loc);
+void brine_cstr_free(char *p);
 void brine_arr_reverse(brine_arr **pa);
 void brine_arr_clear(brine_arr **pa);
 /* push, pop and clear with their common case inline: the array is this
@@ -655,6 +667,7 @@ void brine_sb_fmt_i128(brine_sb *sb, brine_i128 v, int kind);
 void brine_sb_fmt_u128(brine_sb *sb, brine_u128 v, int kind);
 void brine_sb_fmt_f64(brine_sb *sb, double v, int prec, int kind);
 void brine_sb_pad(brine_sb *sb, int64_t start, int64_t width, bool left, bool zero);
+void brine_sb_group(brine_sb *sb, int64_t start);
 brine_str *brine_sb_finish(brine_sb *sb);
 void brine_out_sb(brine_sb *sb);
 void brine_err_sb(brine_sb *sb);
@@ -684,6 +697,13 @@ brine_str *brine_os_cwd(void);
 bool brine_os_set_cwd(brine_str *path, brine_str **err);
 /* writes the bytes of a `[u8]` */
 bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err);
+bool brine_os_append_bytes(brine_str *path, brine_arr *data, brine_str **err);
+bool brine_os_read_bytes(brine_str *path, brine_arr **out, brine_str **err);
+bool brine_append_file(brine_str *path, brine_str *text, brine_str **err);
+/* stdin: `input(prompt)` is a line without its end (NULL at the end of the
+ * input), `read_stdin()` all that is left */
+brine_str *brine_input(brine_str *prompt);
+bool brine_read_stdin(brine_str **out);
 brine_str *brine_os_exe_path(void);
 brine_str *brine_os_temp_dir(void);
 bool brine_os_abs_path(brine_str *path, brine_str **out, brine_str **err);
@@ -744,6 +764,9 @@ double brine_m_hypot(double x, double y);
 static inline double brine_f_pow(double a, double b) { return brine_m_pow(a, b); }
 static inline double brine_f_atan2(double y, double x) { return brine_m_atan2(y, x); }
 static inline double brine_f_hypot(double x, double y) { return brine_m_hypot(x, y); }
+static inline float brine_f_powf(float a, float b) { return (float)brine_m_pow((double)a, (double)b); }
+static inline float brine_f_atan2f(float y, float x) { return (float)brine_m_atan2((double)y, (double)x); }
+static inline float brine_f_hypotf(float x, float y) { return (float)brine_m_hypot((double)x, (double)y); }
 /* float `%` also takes the sign of the divisor, like Python */
 static inline double brine_f_fmod(double a, double b) { double r = fmod(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
 static inline float brine_f_fmodf(float a, float b) { float r = fmodf(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
@@ -784,6 +807,24 @@ static inline T brine_f_fmax##S(T a, T b) {                                     
 #endif
 BR_MINMAX(double, uint64_t, )
 BR_MINMAX(float, uint32_t, f)
+
+/* ------------------------------------------------------------ bit counts */
+/* `x.count_ones()`, `leading_zeros()`, `trailing_zeros()` of the bits
+ * zero-extended to 64 (or 128); the counts of 0 are the width */
+static inline int64_t brine_popcnt_u64(uint64_t x) { return __builtin_popcountll(x); }
+static inline int64_t brine_clz_u64(uint64_t x) { return x ? __builtin_clzll(x) : 64; }
+static inline int64_t brine_ctz_u64(uint64_t x) { return x ? __builtin_ctzll(x) : 64; }
+static inline int64_t brine_popcnt_u128(brine_u128 x) {
+    return brine_popcnt_u64((uint64_t)x) + brine_popcnt_u64((uint64_t)(x >> 64));
+}
+static inline int64_t brine_clz_u128(brine_u128 x) {
+    uint64_t hi = (uint64_t)(x >> 64);
+    return hi ? brine_clz_u64(hi) : 64 + brine_clz_u64((uint64_t)x);
+}
+static inline int64_t brine_ctz_u128(brine_u128 x) {
+    uint64_t lo = (uint64_t)x;
+    return lo ? brine_ctz_u64(lo) : 64 + brine_ctz_u64((uint64_t)(x >> 64));
+}
 
 /* ------------------------------------------------------------ checked integer arithmetic */
 /* r = a * b; true when it overflows. Clang turns a signed 128-bit overflow

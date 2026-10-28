@@ -235,7 +235,8 @@ fn features() -> [str]:
         "tests/programs/float_minmax.br",
         "tests/programs/take_put.br",
         "tests/programs/own_update.br",
-        "tests/programs/borrow_let.br"
+        "tests/programs/borrow_let.br",
+        "tests/programs/stdlib.br"
     ]
 
 test "language features":
@@ -789,7 +790,10 @@ test "os and embed errors":
         == ["E0503@4", "E0503@5", "E0206@7", "E0310@8", "E0302@9", "E0301@9"]
     )
     # `os` results (except `os.name()`/`os.arch()`) differ between ranks
-    assert error_codes("tests/programs/os_deadlock_errors.br") == ["E0510@5", "E0510@6"]
+    assert (
+        error_codes("tests/programs/os_deadlock_errors.br")
+        == ["E0510@5", "E0510@6", "E0510@13", "E0510@14"]
+    )
     assert (
         error_codes("tests/programs/world_type_errors.br")
         == [
@@ -807,6 +811,87 @@ test "os and embed errors":
         error_codes("tests/programs/embed_errors.br")
         == ["E0707@3", "E0707@4", "E0707@5", "E0707@6", "E0302@7"]
     )
+
+test "standard library errors":
+    assert (
+        error_codes("tests/programs/stdlib_errors.br")
+        == [
+            "E0305@5",
+            "E0301@5",
+            "E0302@5",
+            "E0206@5",
+            "E0206@5",
+            "E0206@6",
+            "E0301@6",
+            "E0206@6",
+            "E0334@7",
+            "E0334@7",
+            "E0318@8",
+            "E0318@8",
+            "E0318@8",
+            "E0318@8",
+            "E0305@9",
+            "E0305@9",
+            "E0305@9",
+            "E0311@11",
+            "E0311@13",
+            "E0301@17",
+            "E0301@17",
+            "E0302@17",
+            "E0302@17",
+            "E0503@19",
+            "E0503@20",
+            "E0503@21",
+            "E0503@22"
+        ]
+    )
+
+# A shell command that runs `prog args` with stdin from `input` (a file, or
+# `cat`/`type` piped into it).
+fn stdin_cmd(prog: str, args: str, input: str, pipe: bool) -> [str]:
+    if os.name() == "windows":
+        let p = prog.replace("/", "\\")
+        let i = input.replace("/", "\\")
+        if pipe:
+            return ["cmd", "/c", f"type {i} | {p} {args}"]
+        return ["cmd", "/c", f"{p} {args} < {i}"]
+    if pipe:
+        return ["sh", "-c", f"cat '{input}' | '{prog}' {args}"]
+    return ["sh", "-c", f"'{prog}' {args} < '{input}'"]
+
+# `input()` and `read_stdin()` with stdin a file, a pipe and the null device
+test "programs read their standard input":
+    let d = scratch("stdin")
+    let prog = exe(d + "/stdin")
+    let b = brine(["build", "-q", "tests/programs/stdin.br", "-o", prog])
+    assert b.code == 0, b.all()
+    # CR LF, an empty line, a byte that is not UTF-8, no newline at the end
+    var bytes = "first\r\nsecond\n\nhé".bytes()
+    bytes.push(u8(255))
+    bytes.extend("x\nlast".bytes())
+    match os.write_bytes(d + "/in.txt", bytes):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+    write(d + "/ok.txt", "a\r\nb\n")
+    let lines = "0> [first]\n1> [second]\n2> []\n3> [hé\u{fffd}x]\n4> [last]\n5> end after 5\n"
+    let all_ok = "5 bytes: a<CR><LF>b<LF>\n"
+    let cases = [
+        (stdin_cmd(prog, "", d + "/in.txt", false), lines),
+        (stdin_cmd(prog, "", d + "/in.txt", true), lines),
+        (stdin_cmd(prog, "all", d + "/ok.txt", false), all_ok),
+        (stdin_cmd(prog, "all", d + "/ok.txt", true), all_ok),
+        (
+            stdin_cmd(prog, "all", d + "/in.txt", false),
+            "error: cannot read stdin: the input is not valid UTF-8 text\n"
+        ),
+        ([prog], "0> end after 0\n"),
+        ([prog, "all"], "0 bytes: \n")
+    ]
+    for cmd, want in cases:
+        let o = exec(cmd, {})
+        assert o.code == 0 and o.out == want, f"{cmd}: {o.all()}"
 
 test "proof errors":
     assert (

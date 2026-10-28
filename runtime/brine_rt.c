@@ -886,6 +886,16 @@ int64_t brine_s_find(brine_str *s, brine_str *sub, const char *loc) {
     (void)loc;
     return br_find(s, sub, 0);
 }
+int64_t brine_s_find_from(brine_str *s, brine_str *sub, int64_t start, const char *loc) {
+    if (start < 0 || start > s->len)
+        br_panicf(loc, "find() start %lld is out of range for a string of %lld bytes", (long long)start, (long long)s->len);
+    return br_find(s, sub, start);
+}
+int64_t brine_start_chk(int64_t start, int64_t len, const char *loc) {
+    if (start < 0 || start > len)
+        br_panicf(loc, "index() start %lld is out of range for an array of length %lld", (long long)start, (long long)len);
+    return start;
+}
 /* a `[str]`: its elements are pointer slots (BR_PSLOT, brine_rt.h) */
 static brine_arr *br_strs(void) { return brine_arr_new(0, BR_PSLOT, brine_rt_str, brine_rl_str, ""); }
 static void br_push_str(brine_arr **a, brine_str *s) {
@@ -1520,16 +1530,10 @@ int brine_str_cmp(brine_str *a, brine_str *b) {
     if (c) return c;
     return a->len < b->len ? -1 : (a->len > b->len ? 1 : 0);
 }
-int64_t brine_parse_i64(brine_str *s, const char *loc) {
-    char *end;
-    errno = 0;
-    long long v = strtoll(s->data, &end, 10);
-    while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
-    if (s->len == 0 || errno || end != s->data + s->len)
-        br_panicf(loc, "invalid integer: \"%.*s\"", (int)s->len, s->data);
-    return (int64_t)v;
-}
-/* 128-bit parsing by hand: the C library stops at 64 bits */
+/* Integer text as `int()` reads it: blanks around it, a sign, decimal digits,
+ * and `_` between two digits, as in literals (`1_000`). By hand: the C
+ * library stops at 64 bits and knows no `_`. False if it isn't one or
+ * doesn't fit in 128 bits. */
 static bool br_parse_128(brine_str *s, bool *neg, brine_u128 *out) {
     const char *p = (const char *)s->data, *e = p + s->len;
     while (p < e && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++;
@@ -1537,14 +1541,51 @@ static bool br_parse_128(brine_str *s, bool *neg, brine_u128 *out) {
     *neg = false;
     if (p < e && (*p == '+' || *p == '-')) *neg = *p++ == '-';
     if (p == e) return false;
-    brine_u128 v = 0;
+    const char *first = p;
+    uint64_t v = 0;
     for (; p < e; p++) {
+        if (*p == '_' && p > first && p + 1 < e && p[1] >= '0' && p[1] <= '9') continue;
+        if (*p < '0' || *p > '9') return false;
+        if (v > (UINT64_MAX - 9) / 10) break;
+        v = v * 10 + (uint64_t)(*p - '0');
+    }
+    brine_u128 w = v;
+    for (; p < e; p++) {
+        if (*p == '_' && p + 1 < e && p[1] >= '0' && p[1] <= '9') continue;
         if (*p < '0' || *p > '9') return false;
         unsigned d = (unsigned)(*p - '0');
-        if (v > (BR_U128_MAX - d) / 10) return false;
-        v = v * 10 + d;
+        if (w > (BR_U128_MAX - d) / 10) return false;
+        w = w * 10 + d;
     }
-    *out = v;
+    *out = w;
+    return true;
+}
+int64_t brine_parse_i64(brine_str *s, const char *loc) {
+    bool neg;
+    brine_u128 u;
+    if (!br_parse_128(s, &neg, &u) || u > (brine_u128)INT64_MAX + (neg ? 1 : 0))
+        br_panicf(loc, "invalid integer: \"%.*s\"", (int)s->len, s->data);
+    return neg ? (int64_t)(0 - (uint64_t)u) : (int64_t)u;
+}
+bool brine_try_parse_int(brine_str *s, int64_t bits, bool sgn, void *out) {
+    bool neg;
+    brine_u128 u;
+    if (!br_parse_128(s, &neg, &u)) return false;
+    brine_u128 max = bits >= 128 ? BR_U128_MAX : ((brine_u128)1 << bits) - 1;
+    if (sgn) max >>= 1;
+    if (neg ? (sgn ? u > max + 1 : u != 0) : u > max) return false;
+    brine_u128 v = neg ? 0 - u : u;
+    uint8_t b8 = (uint8_t)v;
+    uint16_t b16 = (uint16_t)v;
+    uint32_t b32 = (uint32_t)v;
+    uint64_t b64 = (uint64_t)v;
+    switch (bits) {
+    case 8: memcpy(out, &b8, 1); break;
+    case 16: memcpy(out, &b16, 2); break;
+    case 32: memcpy(out, &b32, 4); break;
+    case 64: memcpy(out, &b64, 8); break;
+    default: memcpy(out, &v, 16); break;
+    }
     return true;
 }
 brine_i128 brine_parse_i128(brine_str *s, const char *loc) {
@@ -1624,15 +1665,55 @@ static bool br_parse_f64_fast(const char *p, const char *end, double *out) {
     *out = neg ? -v : v;
     return true;
 }
+static bool br_is_digit(char c) { return c >= '0' && c <= '9'; }
+/* Float text as `float()` reads it (`_` between digits too); false if it isn't one. */
+static bool br_parse_float(brine_str *s, double *out) {
+    const char *p = s->data;
+    int64_t n = s->len;
+    char *tmp = NULL;
+    if (n && memchr(p, '_', (size_t)n)) {
+        tmp = (char *)brine_alloc(n + 1);
+        int64_t m = 0;
+        for (int64_t i = 0; i < n; i++) {
+            if (p[i] != '_') {
+                tmp[m++] = p[i];
+                continue;
+            }
+            if (i == 0 || i + 1 == n || !br_is_digit(p[i - 1]) || !br_is_digit(p[i + 1])) {
+                free(tmp);
+                return false;
+            }
+        }
+        tmp[m] = 0;
+        p = tmp;
+        n = m;
+    }
+    double v = 0;
+    bool ok = br_parse_f64_fast(p, p + n, &v);
+    if (!ok) {
+        char *end;
+        v = strtod(p, &end);
+        while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
+        ok = n != 0 && end == p + n;
+    }
+    free(tmp);
+    *out = v;
+    return ok;
+}
 double brine_parse_f64(brine_str *s, const char *loc) {
-    double fast;
-    if (br_parse_f64_fast(s->data, s->data + s->len, &fast)) return fast;
-    char *end;
-    errno = 0;
-    double v = strtod(s->data, &end);
-    while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
-    if (s->len == 0 || end != s->data + s->len) br_panicf(loc, "invalid float: \"%.*s\"", (int)s->len, s->data);
+    double v;
+    if (!br_parse_float(s, &v)) br_panicf(loc, "invalid float: \"%.*s\"", (int)s->len, s->data);
     return v;
+}
+bool brine_try_parse_float(brine_str *s, bool f32, void *out) {
+    double v;
+    if (!br_parse_float(s, &v)) return false;
+    if (f32) {
+        float f = (float)v;
+        memcpy(out, &f, 4);
+    } else
+        memcpy(out, &v, 8);
+    return true;
 }
 
 /* ============================================================ arrays */
@@ -1777,6 +1858,32 @@ void brine_arr_extend(brine_arr **pa, brine_arr *b) {
         for (int64_t i = 0; i < n; i++) a->retain(a->data + (a->len + i) * a->esz);
     a->len += n;
     brine_arr_release(b);
+}
+/* a `str` argument of an `extern fn`: a NUL-terminated copy for the call */
+char *brine_cstr(brine_str *s, const char *loc) {
+    const char *z = (const char *)memchr(s->data, 0, (size_t)s->len);
+    if (BR_UNLIKELY(z != NULL))
+        br_panicf(loc, "a string passed to an extern function contains a NUL byte (at %lld)",
+                  (long long)(z - s->data));
+    char *p = (char *)brine_alloc(s->len + 1);
+    memcpy(p, s->data, (size_t)s->len);
+    p[s->len] = 0;
+    return p;
+}
+void brine_cstr_free(char *p) { free(p); }
+/* `a + b`: a new array (or a shared one when a side is empty) */
+brine_arr *brine_arr_concat(brine_arr *a, brine_arr *b, const char *loc) {
+    if (a->len == 0 || b->len == 0) {
+        brine_arr *r = a->len == 0 ? b : a;
+        brine_arr_retain(r);
+        return r;
+    }
+    brine_arr *r = brine_arr_new(a->len + b->len, a->esz, a->retain, a->release, loc);
+    memcpy(r->data, a->data, (size_t)(a->len * a->esz));
+    memcpy(r->data + a->len * a->esz, b->data, (size_t)(b->len * b->esz));
+    if (r->retain)
+        for (int64_t i = 0; i < r->len; i++) r->retain(r->data + i * r->esz);
+    return r;
 }
 void brine_arr_reverse(brine_arr **pa) {
     brine_arr_unique(pa);
@@ -2122,7 +2229,7 @@ void brine_sb_i128(brine_sb *sb, brine_i128 v) {
 void brine_sb_fmt_u128(brine_sb *sb, brine_u128 v, int kind) {
     if (kind == 'x' || kind == 'b')
         br_sb_u128_base(sb, v, kind == 'x' ? 16 : 2);
-    else if (kind == 'f' || kind == 'e')
+    else if (kind == 'f' || kind == 'e' || kind == 'g')
         brine_sb_fmt_f64(sb, (double)v, -1, kind);
     else
         brine_sb_u128(sb, v);
@@ -2131,7 +2238,7 @@ void brine_sb_fmt_i128(brine_sb *sb, brine_i128 v, int kind) {
     if (kind == 'x' || kind == 'b') {
         if (v < 0) brine_sb_cat(sb, "-", 1);
         br_sb_u128_base(sb, v < 0 ? (brine_u128)(-(v + 1)) + 1 : (brine_u128)v, kind == 'x' ? 16 : 2);
-    } else if (kind == 'f' || kind == 'e')
+    } else if (kind == 'f' || kind == 'e' || kind == 'g')
         brine_sb_fmt_f64(sb, (double)v, -1, kind);
     else
         brine_sb_i128(sb, v);
@@ -2235,7 +2342,7 @@ void brine_sb_fmt_i64(brine_sb *sb, int64_t v, int kind) {
             br_sb_bin(sb, u);
         return;
     }
-    if (kind == 'f' || kind == 'e') {
+    if (kind == 'f' || kind == 'e' || kind == 'g') {
         brine_sb_fmt_f64(sb, (double)v, -1, kind);
         return;
     }
@@ -2248,7 +2355,7 @@ void brine_sb_fmt_u64(brine_sb *sb, uint64_t v, int kind) {
         br_sb_cstr(sb, b);
     } else if (kind == 'b')
         br_sb_bin(sb, v);
-    else if (kind == 'f' || kind == 'e')
+    else if (kind == 'f' || kind == 'e' || kind == 'g')
         brine_sb_fmt_f64(sb, (double)v, -1, kind);
     else
         brine_sb_u64(sb, v);
@@ -2264,8 +2371,30 @@ void brine_sb_fmt_f64(brine_sb *sb, double v, int prec, int kind) {
     } else if (kind == 'e') {
         snprintf(b, sizeof b, "%.*e", prec < 0 ? 6 : prec, v);
         br_sb_cstr(sb, b);
+    } else if (kind == 'g') {
+        snprintf(b, sizeof b, "%.*g", prec < 0 ? 6 : prec, v);
+        br_sb_cstr(sb, b);
     } else
         brine_sb_f64(sb, v);
+}
+/* `{x:,}`: commas between groups of three digits in the integer part of the
+ * number written from `start` on */
+void brine_sb_group(brine_sb *sb, int64_t start) {
+    int64_t a = start;
+    if (a < sb->len && (sb->p[a] == '-' || sb->p[a] == '+')) a++;
+    int64_t b = a;
+    while (b < sb->len && sb->p[b] >= '0' && sb->p[b] <= '9') b++;
+    int64_t n = b - a, k = (n - 1) / 3;
+    if (n <= 3) return;
+    br_sb_reserve(sb, k);
+    memmove(sb->p + b + k, sb->p + b, (size_t)(sb->len - b));
+    sb->len += k;
+    /* from the right: copy digits, a comma after every third */
+    int64_t from = b - 1, to = b + k - 1;
+    for (int64_t i = 0; from >= a; i++) {
+        if (i > 0 && i % 3 == 0) sb->p[to--] = ',';
+        sb->p[to--] = sb->p[from--];
+    }
 }
 void brine_sb_pad(brine_sb *sb, int64_t start, int64_t width, bool left, bool zero) {
     int64_t n = sb->len - start;
@@ -5173,7 +5302,8 @@ static brine_str *br_strf(const char *fmt, ...) {
     return brine_str_new(buf, n);
 }
 
-static int br_valid_utf8(const unsigned char *p, int64_t n) {
+/* the index of the first byte that starts no UTF-8 character, or -1 */
+static int64_t br_utf8_bad(const unsigned char *p, int64_t n) {
     int64_t i = 0;
     while (i < n) {
         if (p[i] < 0x80) {
@@ -5181,10 +5311,38 @@ static int br_valid_utf8(const unsigned char *p, int64_t n) {
             continue;
         }
         int64_t k = br_utf8_len(p + i, n - i);
-        if (k == 1) return 0;
+        if (k == 1) return i;
         i += k;
     }
-    return 1;
+    return -1;
+}
+static int br_valid_utf8(const unsigned char *p, int64_t n) { return br_utf8_bad(p, n) < 0; }
+
+bool brine_str_from_utf8(brine_arr *a, brine_str **out) {
+    int64_t bad = br_utf8_bad((const unsigned char *)a->data, a->len);
+    if (bad >= 0) {
+        *out = br_strf("invalid UTF-8: byte %lld (0x%02x) starts no character", (long long)bad,
+                       (unsigned)(unsigned char)a->data[bad]);
+        return false;
+    }
+    *out = brine_str_new(a->data, a->len);
+    return true;
+}
+
+/* text read from outside as a string: bytes that aren't UTF-8 become U+FFFD */
+static brine_str *br_lossy_str(const char *p, int64_t n) {
+    if (br_utf8_bad((const unsigned char *)p, n) < 0) return brine_str_new(p, n);
+    brine_sb sb;
+    brine_sb_init(&sb);
+    for (int64_t i = 0; i < n;) {
+        int64_t k = ((unsigned char)p[i] < 0x80) ? 1 : br_utf8_len((const unsigned char *)p + i, n - i);
+        if (k == 1 && (unsigned char)p[i] >= 0x80)
+            brine_sb_cat(&sb, "\xef\xbf\xbd", 3);
+        else
+            brine_sb_cat(&sb, p + i, k);
+        i += k;
+    }
+    return brine_sb_finish(&sb);
 }
 
 #ifdef _WIN32
@@ -5209,82 +5367,243 @@ static FILE *br_open(const char *path, const char *mode) {
 #endif
 }
 
-bool brine_read_file(brine_str *path, brine_str **out) {
+/* All of the file at `path` (malloc'd, in *buf and *len), or false with the
+ * message in *err. */
+static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
-        *out = br_strf("cannot read a path containing a NUL byte");
+        *err = br_strf("cannot read a path containing a NUL byte");
         return false;
     }
     FILE *f = br_open(p, "rb");
     if (!f) {
-        *out = br_strf("cannot read %s: %s", p, strerror(errno));
+        *err = br_strf("cannot read %s: %s", p, strerror(errno));
         free(p);
         return false;
     }
-    char *buf = NULL;
-    size_t len = 0, cap = 0;
+    char *b = NULL;
+    size_t n = 0, cap = 0;
     for (;;) {
-        if (len == cap) {
+        if (n == cap) {
             cap = cap ? cap * 2 : 65536;
-            buf = (char *)br_grow(buf, cap);
+            b = (char *)br_grow(b, cap);
         }
-        size_t got = fread(buf + len, 1, cap - len, f);
-        len += got;
+        size_t got = fread(b + n, 1, cap - n, f);
+        n += got;
         if (got == 0) break;
     }
     int bad = ferror(f);
     fclose(f);
     if (bad) {
-        *out = br_strf("cannot read %s: read error", p);
-    } else if (!br_valid_utf8((const unsigned char *)buf, (int64_t)len)) {
-        *out = br_strf("cannot read %s: the file is not valid UTF-8 text", p);
-        bad = 1;
+        *err = br_strf("cannot read %s: read error", p);
+        free(b);
     } else {
+        *buf = b;
+        *len = n;
+    }
+    free(p);
+    return !bad;
+}
+
+bool brine_read_file(brine_str *path, brine_str **out) {
+    char *buf;
+    size_t len;
+    if (!br_slurp(path, &buf, &len, out)) return false;
+    bool ok = br_valid_utf8((const unsigned char *)buf, (int64_t)len);
+    if (ok) {
         *out = brine_str_new(buf, (int64_t)len);
+    } else {
+        char *p = br_cstr(path);
+        *out = br_strf("cannot read %s: the file is not valid UTF-8 text", p);
+        free(p);
     }
     free(buf);
+    return ok;
+}
+
+bool brine_os_read_bytes(brine_str *path, brine_arr **out, brine_str **err) {
+    char *buf;
+    size_t len;
+    if (!br_slurp(path, &buf, &len, err)) return false;
+    brine_arr *a = brine_arr_new((int64_t)len, 1, NULL, NULL, "");
+    if (len) memcpy(a->data, buf, len);
+    free(buf);
+    *out = a;
+    return true;
+}
+
+/* writes (mode "wb") or appends ("ab") n bytes to the file at `path` */
+static bool br_put_file(brine_str *path, const char *data, int64_t n, const char *mode, brine_str **err) {
+    const char *verb = mode[0] == 'a' ? "append to" : "write";
+    char *p = br_cstr(path);
+    if (!p) {
+        *err = br_strf("cannot %s a path containing a NUL byte", verb);
+        return false;
+    }
+    FILE *f = br_open(p, mode);
+    if (!f) {
+        *err = br_strf("cannot %s %s: %s", verb, p, strerror(errno));
+        free(p);
+        return false;
+    }
+    size_t put = n ? fwrite(data, 1, (size_t)n, f) : 0;
+    int bad = put != (size_t)n;
+    if (fclose(f) != 0) bad = 1;
+    if (bad) *err = br_strf("cannot %s %s: write error (is the disk full?)", verb, p);
     free(p);
     return !bad;
 }
 
 bool brine_write_file(brine_str *path, brine_str *text, brine_str **err) {
-    char *p = br_cstr(path);
-    if (!p) {
-        *err = br_strf("cannot write a path containing a NUL byte");
-        return false;
-    }
-    FILE *f = br_open(p, "wb");
-    if (!f) {
-        *err = br_strf("cannot write %s: %s", p, strerror(errno));
-        free(p);
-        return false;
-    }
-    size_t put = text->len ? fwrite(text->data, 1, (size_t)text->len, f) : 0;
-    int bad = put != (size_t)text->len;
-    if (fclose(f) != 0) bad = 1;
-    if (bad) *err = br_strf("cannot write %s: write error (is the disk full?)", p);
-    free(p);
-    return !bad;
+    return br_put_file(path, text->data, text->len, "wb", err);
+}
+bool brine_append_file(brine_str *path, brine_str *text, brine_str **err) {
+    return br_put_file(path, text->data, text->len, "ab", err);
+}
+bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err) {
+    return br_put_file(path, data->data, data->len, "wb", err);
+}
+bool brine_os_append_bytes(brine_str *path, brine_arr *data, brine_str **err) {
+    return br_put_file(path, data->data, data->len, "ab", err);
 }
 
-bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err) {
-    char *p = br_cstr(path);
-    if (!p) {
-        *err = br_strf("cannot write a path containing a NUL byte");
+/* ============================================================ stdin */
+/* Read with read() / ReadFile, which return what has arrived, so a program
+ * talking a line protocol through a pipe gets each line as it comes (C's
+ * fread would wait for a full buffer). A Windows console is read as UTF-16
+ * (ReadConsoleW), so typed text arrives as UTF-8 whatever the code page. */
+static struct {
+    char *p;
+    int64_t len, pos, cap;
+    bool eof;
+    int err;
+} br_in;
+#ifdef _WIN32
+static int br_in_console = -1;
+static wchar_t br_in_hi; /* a high surrogate whose pair comes in the next read */
+#endif
+/* reads more of stdin into br_in.p[len..]; false at its end or on an error */
+static bool br_in_fill(void) {
+    if (br_in.eof) return false;
+    if (br_in.pos > 0) {
+        memmove(br_in.p, br_in.p + br_in.pos, (size_t)(br_in.len - br_in.pos));
+        br_in.len -= br_in.pos;
+        br_in.pos = 0;
+    }
+    if (br_in.cap - br_in.len < 16384) {
+        br_in.cap = br_in.cap ? br_in.cap * 2 : 65536;
+        br_in.p = (char *)br_grow(br_in.p, (size_t)br_in.cap);
+    }
+    int64_t room = br_in.cap - br_in.len, got = 0;
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (h == NULL || h == INVALID_HANDLE_VALUE) {
+        br_in.eof = true;
         return false;
     }
-    FILE *f = br_open(p, "wb");
-    if (!f) {
-        *err = br_strf("cannot write %s: %s", p, strerror(errno));
-        free(p);
+    if (br_in_console < 0) {
+        DWORD mode;
+        br_in_console = GetConsoleMode(h, &mode) ? 1 : 0;
+    }
+    if (br_in_console) {
+        /* at most 3 UTF-8 bytes per UTF-16 unit (a pair makes 4) */
+        wchar_t w[4096];
+        DWORD k = br_in_hi ? 1 : 0, n = 0;
+        w[0] = br_in_hi;
+        br_in_hi = 0;
+        DWORD want = (DWORD)(room / 3 - 1 < 4095 ? room / 3 - 1 : 4095) - k;
+        if (!ReadConsoleW(h, w + k, want, &n, NULL)) {
+            br_in.err = EIO;
+            br_in.eof = true;
+            return false;
+        }
+        n += k;
+        /* Ctrl+Z at the start of a line ends the input, as in the C library */
+        if (n == 0 || w[0] == 0x1a) {
+            br_in.eof = true;
+            return false;
+        }
+        if (w[n - 1] >= 0xd800 && w[n - 1] < 0xdc00) br_in_hi = w[--n];
+        int b = n ? WideCharToMultiByte(CP_UTF8, 0, w, (int)n, br_in.p + br_in.len, (int)room, NULL, NULL) : 0;
+        /* the console ends lines with \r\n */
+        char *q = br_in.p + br_in.len;
+        int m = 0;
+        for (int i = 0; i < b; i++)
+            if (!(q[i] == '\r' && i + 1 < b && q[i + 1] == '\n')) q[m++] = q[i];
+        got = m;
+        if (got == 0) return br_in_fill();
+    } else {
+        DWORD n = 0;
+        if (!ReadFile(h, br_in.p + br_in.len, (DWORD)(room < (1 << 30) ? room : (1 << 30)), &n, NULL)) {
+            DWORD e = GetLastError();
+            if (e != ERROR_BROKEN_PIPE && e != ERROR_HANDLE_EOF) br_in.err = EIO;
+            br_in.eof = true;
+            return false;
+        }
+        got = (int64_t)n;
+    }
+#else
+    ssize_t n;
+    do n = read(0, br_in.p + br_in.len, (size_t)room);
+    while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        br_in.err = errno;
+        br_in.eof = true;
         return false;
     }
-    size_t put = data->len ? fwrite(data->data, 1, (size_t)data->len, f) : 0;
-    int bad = put != (size_t)data->len;
-    if (fclose(f) != 0) bad = 1;
-    if (bad) *err = br_strf("cannot write %s: write error (is the disk full?)", p);
-    free(p);
-    return !bad;
+    got = (int64_t)n;
+#endif
+    if (got == 0) {
+        br_in.eof = true;
+        return false;
+    }
+    br_in.len += got;
+    return true;
+}
+brine_str *brine_input(brine_str *prompt) {
+    br_lock(&br_io_mu);
+    if (prompt && prompt->len) fwrite(prompt->data, 1, (size_t)prompt->len, stdout);
+    /* what was printed before (a prompt with `end=""`) shows before the wait */
+    fflush(stdout);
+    br_unlock(&br_io_mu);
+    int64_t seen = 0, n;
+    for (;;) {
+        const char *at = br_in.p + br_in.pos;
+        int64_t have = br_in.len - br_in.pos;
+        const char *nl = have > seen ? (const char *)memchr(at + seen, '\n', (size_t)(have - seen)) : NULL;
+        if (nl) {
+            n = nl - at;
+            break;
+        }
+        seen = have;
+        if (!br_in_fill()) {
+            if (br_in.len == br_in.pos) return NULL;
+            n = br_in.len - br_in.pos;
+            break;
+        }
+    }
+    const char *line = br_in.p + br_in.pos;
+    br_in.pos += n < br_in.len - br_in.pos ? n + 1 : n;
+    if (n > 0 && line[n - 1] == '\r') n--;
+    return br_lossy_str(line, n);
+}
+bool brine_read_stdin(brine_str **out) {
+    brine_flush();
+    while (br_in_fill()) {
+    }
+    if (br_in.err) {
+        *out = br_strf("cannot read stdin: %s", strerror(br_in.err));
+        return false;
+    }
+    const char *p = br_in.p + br_in.pos;
+    int64_t n = br_in.len - br_in.pos;
+    br_in.pos = br_in.len;
+    if (!br_valid_utf8((const unsigned char *)p, n)) {
+        *out = br_strf("cannot read stdin: the input is not valid UTF-8 text");
+        return false;
+    }
+    *out = brine_str_new(n ? p : "", n);
+    return true;
 }
 
 bool brine_file_exists(brine_str *path) {
@@ -6760,6 +7079,15 @@ BR_X_MATH1(fabs)
 double brine_x_f_pow(double a, double b) { return brine_f_pow(a, b); }
 double brine_x_f_atan2(double y, double x) { return brine_f_atan2(y, x); }
 double brine_x_f_hypot(double x, double y) { return brine_f_hypot(x, y); }
+float brine_x_f_powf(float a, float b) { return brine_f_powf(a, b); }
+float brine_x_f_atan2f(float y, float x) { return brine_f_atan2f(y, x); }
+float brine_x_f_hypotf(float x, float y) { return brine_f_hypotf(x, y); }
+int64_t brine_x_popcnt_u64(uint64_t x) { return brine_popcnt_u64(x); }
+int64_t brine_x_clz_u64(uint64_t x) { return brine_clz_u64(x); }
+int64_t brine_x_ctz_u64(uint64_t x) { return brine_ctz_u64(x); }
+int64_t brine_x_popcnt_u128(const brine_u128 *x) { return brine_popcnt_u128(*x); }
+int64_t brine_x_clz_u128(const brine_u128 *x) { return brine_clz_u128(*x); }
+int64_t brine_x_ctz_u128(const brine_u128 *x) { return brine_ctz_u128(*x); }
 double brine_x_f_fmod(double a, double b) { return brine_f_fmod(a, b); }
 float brine_x_f_fmodf(float a, float b) { return brine_f_fmodf(a, b); }
 double brine_x_f_fmin(double a, double b) { return brine_f_fmin(a, b); }

@@ -3,7 +3,7 @@
 from diag import Span, Diag, best_match
 import diag
 from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalKind, LocalInfo
-from types import int_ty, float_ty, builtins, world_ops, os_ops
+from types import int_ty, float_ty, builtins, world_ops, os_ops, NumM, num_methods
 from ast import TypeExpr, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Expr, ExprKind, mk
 from ast import LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, stmt, pattern
 from ast import children, stmt_exprs, stmt_blocks, local_of, lvalue_root, parse_fmt_spec
@@ -116,6 +116,13 @@ fn prim_type(name: str) -> Option[Ty]:
             return Some(Ty.Str)
         case _:
             return None
+
+fn is_array_ty(t: Ty) -> bool:
+    match t:
+        case Ty.Array(_):
+            return true
+        case _:
+            return false
 
 fn reducer_by_name(n: str) -> Option[Reducer]:
     match n:
@@ -420,17 +427,24 @@ struct Checker:
                         let ps = params[pi]
                         var ok = false
                         match ps.ty:
-                            case Ty.Int(_) | Ty.Float(_) | Ty.Bool:
+                            case Ty.Int(_) | Ty.Float(_) | Ty.Bool | Ty.Str:
                                 ok = true
                             case _:
                                 pass
                         if not ok or p.by_ref or p.mutable:
-                            self.err(
-                                diag.error(
-                                    "E0311",
-                                    "extern functions may only take integers, floats and bools"
-                                ).label(p.span, "parameter has type " + self.tn(ps.ty))
-                            )
+                            var d = diag.error(
+                                "E0311",
+                                "extern functions may only take integers, floats, bools and strings"
+                            ).label(p.span, "parameter has type " + self.tn(ps.ty))
+                            if p.by_ref or p.mutable:
+                                d = d.with_help(
+                                    "C can't change a brine variable: take the value, and return what changes"
+                                )
+                            else:
+                                d = d.note(
+                                    "a C function can't know a brine type's layout, or that its arrays and strings are shared and copied on write"
+                                )
+                            self.err(d)
                     var rok = false
                     match ret:
                         case Ty.Int(_) | Ty.Float(_) | Ty.Bool | Ty.Unit:
@@ -438,12 +452,15 @@ struct Checker:
                         case _:
                             pass
                     if not rok:
-                        self.err(
-                            diag.error(
-                                "E0311",
-                                "extern functions may only return integers, floats, bools or nothing"
-                            ).label(f.span, "unsupported return type")
-                        )
+                        var d = diag.error(
+                            "E0311",
+                            "extern functions may only return integers, floats, bools or nothing"
+                        ).label(f.span, "unsupported return type")
+                        if ret == Ty.Str:
+                            d = d.note(
+                                "a returned `char *` may be NULL, and brine can't tell who frees it or how long it stays valid"
+                            ).with_help("for now, wrap it in C so it returns a number (a length, a status code)")
+                        self.err(d)
                 self.info.fns[id].params = params
                 self.info.fns[id].ret = ret
                 self.info.fns[id].has_self = has_self
@@ -2827,18 +2844,40 @@ struct Checker:
                                                 diag.error("E0318", f"invalid format spec `{sp}`")
                                                 .label(x2.span, "in this f-string field")
                                                 .with_help(
-                                                    "supported: `.2f` (fixed), `.3e` (scientific), `8` (width), `<8` (left-align), `08` (zero-pad), `x` (hex), `b` (binary)"
+                                                    "supported: `.2f` (fixed), `.3e` (scientific), `.6g` (general), `,` (thousands: `,.2f`), `8` (width), `<8` (left-align), `08` (zero-pad), `x` (hex), `b` (binary)"
                                                 )
                                             )
                                         case Some(fs):
                                             let k = fs.kind.unwrap_or("")
-                                            if (k == "f" or k == "e") and not t.is_numeric():
+                                            if (
+                                                (k == "f" or k == "e" or k == "g")
+                                                and not t.is_numeric()
+                                            ):
                                                 self.err(
                                                     diag.error(
                                                         "E0318",
-                                                        "`f`/`e` format specs require a number"
+                                                        "`f`/`e`/`g` format specs require a number"
                                                     ).label(x2.span, "has type " + self.tn(t))
                                                 )
+                                            if fs.group:
+                                                var why = ""
+                                                if not t.is_numeric() and not t.is_error():
+                                                    why = (
+                                                        "`,` (thousands separators) needs a number, found "
+                                                        + self.tn(t)
+                                                    )
+                                                elif k == "x" or k == "b":
+                                                    why = "`,` can't be combined with `x` or `b`"
+                                                elif fs.zero:
+                                                    why = "`,` can't be combined with zero-padding (`0`)"
+                                                if why != "":
+                                                    self.err(
+                                                        diag.error("E0318", why)
+                                                        .label(x2.span, "in this f-string field")
+                                                        .with_help(
+                                                            "e.g. `{n:,}` gives `1,234,567`, `{x:>12,.2f}` gives `  1,234.57`"
+                                                        )
+                                                    )
                                             if (k == "x" or k == "b") and not t.is_int():
                                                 self.err(
                                                     diag.error(
@@ -2877,7 +2916,14 @@ struct Checker:
                                         diag.error(
                                             "E0305",
                                             f"cannot negate an unsigned `{k.name()}`"
-                                        ).label(span, "unsigned")
+                                        )
+                                        .label(span, "unsigned")
+                                        .with_help(
+                                            "for the two's complement (`0 - x`, wrapping around) use `x.wrapping_neg()`"
+                                        )
+                                        .note(
+                                            "an unsigned number has no negative values; `-x` would be out of range for every `x` but 0"
+                                        )
                                     )
                             case _:
                                 if not t.is_float():
@@ -2927,15 +2973,29 @@ struct Checker:
                 var oexp: Option[Ty] = None
                 match exp:
                     case Some(t):
-                        if t.is_numeric():
+                        if t.is_numeric() or op == BinOp.Add and is_array_ty(t):
                             oexp = Some(t)
                     case None:
                         pass
-                var lt = self.check_expr(ref l2, oexp)
-                var rexp: Option[Ty] = None
-                if lt.is_numeric():
-                    rexp = Some(lt)
-                let rt = self.check_expr(ref r2, rexp)
+                # `[] + xs`: the empty array takes its type from the right
+                var empty_left = false
+                if op == BinOp.Add and oexp.is_none():
+                    match l2.kind:
+                        case ExprKind.Array(xs):
+                            empty_left = len(xs) == 0
+                        case _:
+                            pass
+                var lt = Ty.Error
+                var rt = Ty.Error
+                if empty_left:
+                    rt = self.check_expr(ref r2, None)
+                    lt = self.check_expr(ref l2, Some(rt) if is_array_ty(rt) else None)
+                else:
+                    lt = self.check_expr(ref l2, oexp)
+                    var rexp: Option[Ty] = None
+                    if lt.is_numeric() or op == BinOp.Add and is_array_ty(lt):
+                        rexp = Some(lt)
+                    rt = self.check_expr(ref r2, rexp)
                 if l2.is_literal() and not r2.is_literal() and rt.is_numeric() and lt != rt:
                     lt = self.check_expr(ref l2, Some(rt))
                 e.kind = ExprKind.Binary(op, l2, r2)
@@ -3688,6 +3748,12 @@ struct Checker:
             case BinOp.Add | BinOp.Sub | BinOp.Mul | BinOp.Div | BinOp.Mod:
                 if op == BinOp.Add and lt == Ty.Str and rt == Ty.Str:
                     return Ty.Str
+                # `xs + ys`: a new array, the elements of `xs` then those of `ys`
+                if op == BinOp.Add and is_array_ty(lt) and lt == rt:
+                    return lt
+                # `"ab" * 3` is "ababab"
+                if op == BinOp.Mul and lt == Ty.Str and rt.is_int():
+                    return Ty.Str
                 if lt.is_numeric() and lt == rt:
                     return lt
                 var verb = "take the remainder of"
@@ -3712,6 +3778,12 @@ struct Checker:
                     )
                 elif (lt == Ty.Str or rt == Ty.Str) and op == BinOp.Add:
                     d = d.with_help("convert with `str(x)`, or use an f-string: f\"{a}{b}\"")
+                elif op == BinOp.Add and is_array_ty(lt) and rt == lt.elem():
+                    d = d.with_help(
+                        "to add one element write `xs + [x]`, or `xs.push(x)` to change `xs`"
+                    )
+                elif op == BinOp.Mul and lt.is_int() and rt == Ty.Str:
+                    d = d.with_help("put the string first: `s * n`")
                 self.err(d)
                 return Ty.Error
             case BinOp.BitAnd | BinOp.BitOr | BinOp.BitXor:
@@ -3911,7 +3983,15 @@ struct Checker:
                         ).label(span, "wrong number of arguments")
                     )
                     return target
-                let at = self.check_expr(ref args[0].expr, None)
+                # `u64(0xcbf29ce484222325)`: an integer literal takes the type it's converted to
+                var aexp: Option[Ty] = None
+                if target.is_int() and args[0].expr.is_literal():
+                    match args[0].expr.kind:
+                        case ExprKind.Int(_) | ExprKind.UInt(_):
+                            aexp = Some(target)
+                        case _:
+                            pass
+                let at = self.check_expr(ref args[0].expr, aexp)
                 if at.is_error():
                     return target
                 var ok = false
@@ -4295,6 +4375,42 @@ struct Checker:
                     ).label(args[i].expr.span, "not printable")
                 )
 
+    # `pow(x, y)`, `atan2(y, x)`, `hypot(x, y)`: two floats of one type, which is the result's.
+    fn float_pair(ref self, name: str, ref args: [Arg], exp: Option[Ty], span: Span) -> Ty:
+        var guide = float_ty()
+        match exp:
+            case Some(Ty.Float(k)):
+                guide = Ty.Float(k)
+            case _:
+                pass
+        var t0 = self.check_expr(ref args[0].expr, Some(guide))
+        if t0.is_float():
+            guide = t0
+        let t1 = self.check_expr(ref args[1].expr, Some(guide))
+        if (
+            args[0].expr.is_literal()
+            and not args[1].expr.is_literal()
+            and t1.is_float()
+            and t0 != t1
+        ):
+            t0 = self.check_expr(ref args[0].expr, Some(t1))
+        if t0.is_error() or t1.is_error():
+            return guide
+        if not t0.is_float() or t0 != t1:
+            self.err(
+                diag.error(
+                    "E0301",
+                    f"`{name}` needs two floats of the same type, found "
+                    + self.tn(t0)
+                    + " and "
+                    + self.tn(t1)
+                )
+                .label(span, "mismatched arguments")
+                .with_help("convert with `float(...)` or `f32(...)`")
+            )
+            return guide
+        return t0
+
     fn check_builtin(ref self, b: Builtin, ref args: [Arg], exp: Option[Ty], span: Span) -> Ty:
         var name = "?"
         for n, x in builtins():
@@ -4399,19 +4515,31 @@ struct Checker:
                 if t.is_error():
                     return float_ty()
                 return t
-            case Builtin.Pow:
+            case Builtin.Math1(_):
+                if not self.nargs(name, ref args, 1, span):
+                    return float_ty()
+                var guide = float_ty()
+                match exp:
+                    case Some(Ty.Float(k)):
+                        guide = Ty.Float(k)
+                    case _:
+                        pass
+                let t = self.check_expr(ref args[0].expr, Some(guide))
+                if not t.is_error() and not t.is_float():
+                    self.err(
+                        diag.error(
+                            "E0301",
+                            f"`{name}` needs a float, found " + self.tn(t)
+                        ).label(args[0].expr.span, "convert with `float(...)`")
+                    )
+                    return float_ty()
+                if t.is_error():
+                    return float_ty()
+                return t
+            case Builtin.Pow | Builtin.Math2(_):
                 if not self.nargs(name, ref args, 2, span):
                     return float_ty()
-                for i in 0..len(args):
-                    let t = self.check_expr(ref args[i].expr, Some(float_ty()))
-                    if not t.is_error() and t != float_ty():
-                        self.err(
-                            diag.error(
-                                "E0301",
-                                "`pow` needs float arguments"
-                            ).label(args[i].expr.span, "found " + self.tn(t))
-                        )
-                return float_ty()
+                return self.float_pair(name, ref args, exp, span)
             case Builtin.Clock:
                 self.nargs(name, ref args, 0, span)
                 return float_ty()
@@ -4481,9 +4609,27 @@ struct Checker:
             case Builtin.ReadFile:
                 self.builtin_args(name, ref args, [Ty.Str], span)
                 return self.result_of(Ty.Str, Ty.Str, span)
-            case Builtin.WriteFile | Builtin.Run:
+            case Builtin.WriteFile | Builtin.Run | Builtin.AppendFile | Builtin.Input | Builtin.ReadStdin:
                 if b == Builtin.Run:
                     self.builtin_args(name, ref args, [Ty.Array(Ty.Str)], span)
+                elif b == Builtin.ReadStdin:
+                    self.nargs(name, ref args, 0, span)
+                elif b == Builtin.Input:
+                    if len(args) > 1:
+                        self.err(
+                            diag.error(
+                                "E0302",
+                                f"`input` takes 0 or 1 arguments but {len(args)} were given"
+                            )
+                            .label(span, "wrong number of arguments")
+                            .with_help(
+                                "`input()` reads a line; `input(prompt)` prints `prompt` first"
+                            )
+                        )
+                        self.check_all(ref args)
+                    elif len(args) == 1:
+                        self.check_expr(ref args[0].expr, Some(Ty.Str))
+                        self.expect_ty(Ty.Str, args[0].expr)
                 else:
                     self.builtin_args(name, ref args, [Ty.Str, Ty.Str], span)
                 if len(self.par_stack) > 0:
@@ -4494,6 +4640,10 @@ struct Checker:
                             "its effects would happen in an unpredictable order; do it before or after the `par`"
                         )
                     )
+                if b == Builtin.Input:
+                    return self.option_of(Ty.Str, span)
+                if b == Builtin.ReadStdin:
+                    return self.result_of(Ty.Str, Ty.Str, span)
                 let ok = int_ty() if b == Builtin.Run else Ty.Unit
                 return self.result_of(ok, Ty.Str, span)
             case Builtin.FileExists:
@@ -4529,6 +4679,11 @@ struct Checker:
                 match res:
                     case CallRes.In:
                         e.kind = ExprKind.Contains(a2[0].expr, r2, false)
+                        return t
+                    # `float.from_bits(u)`: a plain call; the type name is no value
+                    case CallRes.Builtin(Builtin.FromBits) | CallRes.Builtin(Builtin.FromUtf8):
+                        e.kind = ExprKind.Call(r2, a2)
+                        e.cres = res
                         return t
                     case _:
                         pass
@@ -4624,6 +4779,19 @@ struct Checker:
                             if rname == "os":
                                 recv.res = Res.Os
                                 return self.check_os(name, name_span, ref args, ref res, span)
+                            match prim_type(rname):
+                                case Some(pt):
+                                    return self.prim_static(
+                                        pt,
+                                        rname,
+                                        name,
+                                        name_span,
+                                        ref args,
+                                        ref res,
+                                        span
+                                    )
+                                case None:
+                                    pass
                         case _:
                             pass
             case ExprKind.Field(base, sname, _):
@@ -4743,6 +4911,10 @@ struct Checker:
             match rt:
                 case Ty.Struct(_) | Ty.Enum(_) | Ty.Error:
                     pass
+                case Ty.Str:
+                    # `s.to_int[u8]()`
+                    if name != "to_int" and name != "to_float":
+                        self.no_targs(name, span)
                 case _:
                     self.no_targs(name, span)
         match rt:
@@ -4754,7 +4926,9 @@ struct Checker:
             case Ty.Array(el):
                 return self.array_method(recv, el, name, name_span, ref args, ref res, span)
             case Ty.Str:
-                return self.str_method(name, name_span, ref args, ref res, span)
+                return self.str_method(name, name_span, ref args, ref res, span, targs)
+            case Ty.Int(_) | Ty.Float(_):
+                return self.num_method(rt, name, name_span, ref args, ref res, span)
             case Ty.Struct(_) | Ty.Enum(_):
                 self.inst_method(rt, name, span)
                 let (tname, methods, fields) = self.members(rt)
@@ -5144,9 +5318,12 @@ struct Checker:
             case OsOp.Rename:
                 self.builtin_args(oname, ref args, [Ty.Str, Ty.Str], span)
                 return self.result_of(Ty.Unit, Ty.Str, span)
-            case OsOp.WriteBytes:
+            case OsOp.WriteBytes | OsOp.AppendBytes:
                 self.builtin_args(oname, ref args, [Ty.Str, Ty.Array(Ty.Int(IntTy.U8))], span)
                 return self.result_of(Ty.Unit, Ty.Str, span)
+            case OsOp.ReadBytes:
+                self.builtin_args(oname, ref args, [Ty.Str], span)
+                return self.result_of(Ty.Array(Ty.Int(IntTy.U8)), Ty.Str, span)
             case OsOp.Cwd | OsOp.ExePath | OsOp.TempDir | OsOp.Name | OsOp.Arch:
                 self.nargs(oname, ref args, 0, span)
                 return Ty.Str
@@ -5264,7 +5441,8 @@ struct Checker:
         name_span: Span,
         ref args: [Arg],
         ref res: CallRes,
-        span: Span
+        span: Span,
+        targs: Option[[Ty]]
     ) -> Ty:
         let strs = Ty.Array(Ty.Str)
         var m = StrM.Find
@@ -5274,7 +5452,12 @@ struct Checker:
             case "find":
                 m = StrM.Find
                 params = [Ty.Str]
+                if len(args) == 2:
+                    m = StrM.FindFrom
+                    params = [Ty.Str, int_ty()]
                 ret = self.option_of(int_ty(), span)
+            case "to_int" | "to_float":
+                return self.parse_method(name, ref args, ref res, span, targs)
             case "split":
                 if len(args) == 0:
                     m = StrM.SplitWs
@@ -5356,7 +5539,7 @@ struct Checker:
                             d = d.with_help("use an f-string: f\"x = {x}\"")
                         case _:
                             d = d.note(
-                                "string methods: find, contains, split, join, starts_with, ends_with, strip, lstrip, rstrip, replace, upper, lower, lines, is_digit, is_alpha, is_space, is_alnum, count, bytes, chars, repeat"
+                                "string methods: find, contains, split, join, starts_with, ends_with, strip, lstrip, rstrip, replace, upper, lower, lines, is_digit, is_alpha, is_space, is_alnum, count, bytes, chars, repeat, to_int, to_float"
                             )
                 self.err(d)
                 self.check_all(ref args)
@@ -5366,6 +5549,157 @@ struct Checker:
         res = CallRes.Builtin(Builtin.Str(m))
         self.typed_args(name, ref args, params, span)
         return ret
+
+    # `s.to_int()` / `s.to_float()`: `Some(n)` or `None`; `s.to_int[u8]()` picks the type.
+    fn parse_method(
+        ref self,
+        name: str,
+        ref args: [Arg],
+        ref res: CallRes,
+        span: Span,
+        targs: Option[[Ty]]
+    ) -> Ty:
+        let want_int = name == "to_int"
+        var t = int_ty() if want_int else float_ty()
+        match targs:
+            case Some(ts):
+                var ok = len(ts) == 1
+                if ok:
+                    ok = ts[0].is_int() if want_int else ts[0].is_float()
+                    if ok:
+                        t = ts[0]
+                if not ok:
+                    let what = "an integer type" if want_int else "`float` or `f32`"
+                    let eg = "s.to_int[u8]()" if want_int else "s.to_float[f32]()"
+                    self.err(
+                        diag.error("E0334", f"`{name}` takes one type argument: {what}")
+                        .label(span, "wrong type arguments")
+                        .with_help(f"e.g. `{eg}`")
+                    )
+            case None:
+                pass
+        if self.in_spec:
+            self.spec_err(span)
+        res = CallRes.Builtin(Builtin.ToInt if want_int else Builtin.ToFloat)
+        self.typed_args(name, ref args, [], span)
+        return self.option_of(t, span)
+
+    # Methods of numbers: wrapping arithmetic and bit counts on integers, `to_bits` on floats.
+    fn num_method(
+        ref self,
+        rt: Ty,
+        name: str,
+        name_span: Span,
+        ref args: [Arg],
+        ref res: CallRes,
+        span: Span
+    ) -> Ty:
+        var found: Option[NumM] = None
+        for n, m in num_methods():
+            if n == name and (m == NumM.ToBits) == rt.is_float():
+                found = Some(m)
+                break
+        let tn = self.tn(rt)
+        match found:
+            case Some(m):
+                if self.in_spec:
+                    self.spec_err(span)
+                res = CallRes.Builtin(Builtin.Num(m))
+                match m:
+                    case NumM.WrappingAdd | NumM.WrappingSub | NumM.WrappingMul:
+                        self.typed_args(name, ref args, [rt], span)
+                        return rt
+                    case NumM.WrappingNeg:
+                        self.typed_args(name, ref args, [], span)
+                        return rt
+                    case NumM.RotateLeft | NumM.RotateRight:
+                        self.typed_args(name, ref args, [int_ty()], span)
+                        return rt
+                    case NumM.CountOnes | NumM.LeadingZeros | NumM.TrailingZeros:
+                        self.typed_args(name, ref args, [], span)
+                        return int_ty()
+                    case NumM.ToBits:
+                        self.typed_args(name, ref args, [], span)
+                        if rt == Ty.Float(FloatTy.F32):
+                            return Ty.Int(IntTy.U32)
+                        return Ty.Int(IntTy.U64)
+            case None:
+                pass
+        var names: [str] = []
+        for n, m in num_methods():
+            if (m == NumM.ToBits) == rt.is_float():
+                names.push(n)
+        var d = diag.error(
+            "E0206",
+            f"{tn} has no method `{name}`"
+        ).label(name_span, "unknown method")
+        match name:
+            case "abs" | "sqrt" | "floor" | "ceil" | "round" | "exp" | "log" | "sin" | "cos" | "tan":
+                d = d.with_help(f"use `{name}(x)`")
+            case "pow":
+                d = d.with_help("use `pow(x, y)` (floats)")
+            case "to_bits":
+                d = d.with_help(
+                    "`to_bits` is a method of floats (`x.to_bits()`, `float.from_bits(u)`)"
+                )
+            case "to_string" | "to_str":
+                d = d.with_help("use `str(x)`")
+            case "len" | "length":
+                d = d.with_help("numbers have no length")
+            case _:
+                match best_match(name, names):
+                    case Some(b):
+                        d = d.with_help(f"did you mean `{b}`?").fix(name_span, b, "replace")
+                    case None:
+                        let kind = "float" if rt.is_float() else "integer"
+                        d = d.note(f"{kind} methods: " + ", ".join(names))
+        self.err(d)
+        self.check_all(ref args)
+        return Ty.Error
+
+    # Functions of the built-in types: `float.from_bits(u)`, `str.from_utf8(bytes)`.
+    fn prim_static(
+        ref self,
+        pt: Ty,
+        tname: str,
+        name: str,
+        name_span: Span,
+        ref args: [Arg],
+        ref res: CallRes,
+        span: Span
+    ) -> Ty:
+        if self.in_spec:
+            self.spec_err(span)
+        match pt:
+            case Ty.Float(k):
+                if name == "from_bits":
+                    res = CallRes.Builtin(Builtin.FromBits)
+                    let ut = Ty.Int(IntTy.U32 if k == FloatTy.F32 else IntTy.U64)
+                    self.typed_args(f"{tname}.from_bits", ref args, [ut], span)
+                    return pt
+            case Ty.Str:
+                if name == "from_utf8":
+                    res = CallRes.Builtin(Builtin.FromUtf8)
+                    let bytes = Ty.Array(Ty.Int(IntTy.U8))
+                    self.typed_args("str.from_utf8", ref args, [bytes], span)
+                    return self.result_of(Ty.Str, Ty.Str, span)
+            case _:
+                pass
+        var d = diag.error(
+            "E0206",
+            f"`{tname}` has no function `{name}`"
+        ).label(name_span, "unknown")
+        if name == "parse" or name == "from_str":
+            d = d.with_help(
+                "to read a number from text use `s.to_int()` or `s.to_float()` (`None` if it isn't one), or `int(s)` (panics if it isn't)"
+            )
+        else:
+            d = d.note(
+                "functions of built-in types: `float.from_bits(u)`, `f32.from_bits(u)`, `str.from_utf8(bytes)`"
+            )
+        self.err(d)
+        self.check_all(ref args)
+        return Ty.Error
 
     # `s.contains(sub)` and `xs.contains(x)` mean `sub in s` and `x in xs`.
     fn contains_method(
@@ -5441,6 +5775,9 @@ struct Checker:
             case "index":
                 b = Builtin.IndexOf
                 params = [el]
+                if len(args) == 2:
+                    b = Builtin.IndexFrom
+                    params = [el, int_ty()]
                 ret = self.option_of(int_ty(), span)
             case _:
                 var d = diag.error(
@@ -5464,7 +5801,7 @@ struct Checker:
                         d = d.with_help("use `xs.sort()` on a `var` copy")
                     case _:
                         d = d.note(
-                            "array methods: push(x), pop(), pop(i), insert(i, x), extend(ys), index(x), contains(x), sort(), reverse(), clear()"
+                            "array methods: push(x), pop(), pop(i), insert(i, x), extend(ys), index(x), index(x, start), contains(x), sort(), reverse(), clear()"
                         )
                 self.err(d)
                 self.check_all(ref args)
@@ -5480,7 +5817,7 @@ struct Checker:
                     "arrays of " + self.tn(el) + " can't be sorted"
                 ).label(span, "only numbers and strings can be ordered")
             )
-        if b == Builtin.IndexOf and not equatable(el):
+        if (b == Builtin.IndexOf or b == Builtin.IndexFrom) and not equatable(el):
             self.err(
                 diag.error(
                     "E0305",

@@ -38,7 +38,9 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
 | structs | `Point(x=1, y=2)` or `Point(1, 2)` |
 
 * No implicit conversions. Convert explicitly: `float(i)`, `int(x)` (truncates),
-  `i32(n)` (checked), `str(v)`, `int("42")` (parses), `float("2.5")`.
+  `i32(n)` (checked), `str(v)`, `int("42")` (parses), `float("2.5")`. A literal
+  takes the type it is converted to: `u64(0xcbf29ce484222325)` is fine, `u8(300)`
+  is a compile-time error.
 * Literals adapt to context: `let b: u8 = 200`, `let f: f32 = 1`,
   `let big: i128 = 10_000_000_000_000_000_000_000`. Integer literals go up to
   `u128`'s maximum (2^128 - 1); above `i128`'s maximum only a `u128` holds them.
@@ -57,7 +59,17 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
   Unlike `+` and `*`, `<<` doesn't check for overflow: bits shifted past the type's
   width are dropped (`u64(1) << 63` is 2^63, `3 << 63` is `-2^63`). `>>` keeps the
   sign of signed types (`-8 >> 1 == -4`) and fills unsigned ones with zeros. A shift
-  by a negative amount or by the type's width or more panics.
+  by a negative amount or by the type's width or more panics. Each has a compound
+  assignment: `x &= m`, `x |= m`, `x ^= m`, `x <<= 2`, `x >>= 2`.
+* Methods of integers (any width; the result has the receiver's type):
+  `a.wrapping_add(b)`, `wrapping_sub`, `wrapping_mul` and `a.wrapping_neg()` wrap
+  around instead of panicking (hashes, random number generators); `-x` on an
+  unsigned type is an error, `x.wrapping_neg()` is the two's complement.
+  `x.rotate_left(n)` / `rotate_right(n)` rotate the bits (`n` modulo the width).
+  `x.count_ones()`, `x.leading_zeros()`, `x.trailing_zeros()` give an `int`
+  (the width for 0: `u64(0).trailing_zeros() == 64`).
+* Float bits: `x.to_bits()` is the IEEE 754 encoding of a `float` as a `u64` (of
+  an `f32` as a `u32`); `float.from_bits(u)` and `f32.from_bits(u)` go back.
 * Values are **values**: `let b = a` copies (cheaply, copy-on-write). Changing `b`
   never changes `a`. To share a variable on purpose, use `ref` (see Functions).
 
@@ -268,8 +280,10 @@ xs.sort()               # numbers and strings; stable
 xs.reverse()
 xs.clear()
 print(len(xs), xs == [3, 1, 2], 3 in xs, xs.index(3))  # index: Option[int]
+print([3, 1, 3].index(3, 1))    # Some(2): searching from index 1 (0 to len, else a panic)
 print(xs.contains(3))   # the same as `3 in xs`
 print(xs[1:3], xs[:2], xs[2:])   # slices are copies; out of range panics
+let both = xs + [4, 5]  # a new array; `xs += ys` extends xs in place
 ```
 There are no negative indexes: write `xs[len(xs) - 1]`. A statement can't both
 change a variable and read it elsewhere (`print(xs.pop(), xs)` is an error), so
@@ -287,8 +301,9 @@ compare with ASCII (`s[i] == " "`). A slice must not cut a character in two:
 let s = "hello, brine"
 print(s[0], s[7:], s + "!", "ri" in s, s.contains("ri"), f"{s} has {len(s)} bytes")
 print(s.find("brine"))                    # Some(7); None if absent
+print(s.find("e", 2))                     # Some(11): searching from byte 2 (0 to len(s))
 print(s.split(", "), "a b  c".split())    # ["hello", "brine"], ["a", "b", "c"]
-print("-".join(["a", "b"]), "ab".repeat(3), s.replace("l", "L"))
+print("-".join(["a", "b"]), "ab".repeat(3), "ab" * 3, s.replace("l", "L"))
 print(s.starts_with("he"), s.ends_with("!"), s.count("l"))
 print("  x ".strip(), "  x".lstrip(), "x  ".rstrip(), s.upper(), s.lower())
 print("a\nb".lines(), s.chars(), s.bytes())  # [str], [str], [u8]
@@ -298,8 +313,26 @@ print(ord("a"), chr(97))                   # 97 "a"
 Case conversion and `is_alpha`/`is_space` follow Unicode, as in Python
 (`"straße".upper()` is `"STRASSE"`); `is_digit` is `0`-`9`, the digits `int()`
 reads. `str(x)` converts any
-printable value; `int("42")` and `float("2.5")` parse (and panic on bad input, so
-check with `is_digit` first when the text comes from outside).
+printable value; `int("42")` and `float("2.5")` parse (and panic on bad input).
+For text from outside, `s.to_int()` and `s.to_float()` give `None` instead:
+
+```python
+match line.to_int():                      # Option[int]; blanks around it are fine
+    case Some(n):
+        print(n + 1)
+    case None:
+        print("not a number")
+"200".to_int[u8]()                        # Some(200): other types; None if out of range
+"2.5".to_float[f32]()                     # Some(2.5)
+str.from_utf8(bytes)                      # Result[str, str]: Err names the bad byte
+```
+Both accept `_` between digits (`"1_000"`), as `int()` and `float()` do.
+
+Format specs in f-strings, as in Python: `{x:.2f}` (fixed), `{x:.3e}`
+(scientific), `{x:g}` / `{x:.10g}` (general: the shorter of the two, trailing
+zeros dropped), `{n:,}` / `{x:,.2f}` (thousands separators: `1,234,567.89`),
+`{n:x}` / `{n:b}` (hex, binary), a width `{n:8}` (`<8` to left-align, `08` to pad
+with zeros) and combinations like `{x:>12,.2f}`.
 
 ## Maps
 
@@ -324,7 +357,9 @@ Keys can be integers, `bool`, `str`, enums, or arrays/tuples/structs of those
 
 `print(a, b, ...)` (`sep=" "` goes between the values and `end="\n"` after
 them: `print(x, end="")`), `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`, `cos`,
-`tan`, `exp`, `log`, `pow(x, y)`, `floor`, `ceil`, `round`, `clock()` (seconds),
+`tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `sinh`, `cosh`, `tanh`, `exp`, `exp2`,
+`log`, `log2`, `log10`, `cbrt`, `pow(x, y)`, `hypot(x, y)` (on `float` or `f32`),
+`floor`, `ceil`, `round`, `clock()` (seconds),
 `args()` (the command-line arguments as `[str]`, without the program's name:
 `brine run app.br -- a b` gives `["a", "b"]`), `exit(code)`, `panic(msg)`,
 `eprint(...)` (print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`, `flush()`.
@@ -340,6 +375,21 @@ file it is buffered (and written at exit, or when `eprint`, `run` or `flush()`
 needs it out). `flush()` writes out what is buffered, such as a prompt printed
 with `end=""`.
 
+Standard input, from a terminal, a pipe or a file:
+
+```python
+while true:
+    match input("> "):                  # Option[str]: a line without its "\n"
+        case Some(line):                # (or "\r\n"), None at the end of input
+            print(line.upper())
+        case None:
+            break
+let all = read_stdin()                  # Result[str, str]: everything that is left
+```
+`input(prompt)` writes the prompt first. Text that isn't UTF-8 becomes U+FFFD in
+`input()` and an `Err` from `read_stdin()`. On Windows a console's input is read
+as UTF-8 too. A web page has no stdin: `input()` gives `None` there.
+
 Files and processes (all failures are values, never crashes):
 
 ```python
@@ -349,12 +399,13 @@ match read_file("in.txt"):              # Result[str, str]; text must be UTF-8
     case Err(e):
         eprint(e)                       # "cannot read in.txt: No such file or directory"
 write_file("out.txt", "hi\n")          # Result[(), str]
+append_file("log.txt", "one more\n")   # Result[(), str]: creates the file if needed
 file_exists("out.txt")                  # bool
 getenv("HOME")                          # Option[str]
 run(["cc", "-O2", "-o", "app", "app.c"])  # Result[int, str]: Ok(exit code), Err if it can't start
 ```
-`write_file` and `run` can't be used inside `par` (their effects would happen in
-an unpredictable order).
+`write_file`, `append_file`, `run`, `input` and `read_stdin` can't be used inside
+`par` (their effects would happen in an unpredictable order).
 
 The `os` module (built in, no import; errors are `Err` values with the OS's
 message, e.g. `"The system cannot find the file specified. (os error 2)"`):
@@ -367,6 +418,8 @@ os.remove_file(path), os.rename(src, dst)    # Result[(), str]; rename replaces 
 os.cwd(), os.temp_dir() # str (temp_dir has no trailing separator)
 os.set_cwd(path)        # Result[(), str]: change the working directory
 os.write_bytes(path, b) # Result[(), str]: write a [u8] as a binary file
+os.append_bytes(path, b)                     # Result[(), str]: add to the end
+os.read_bytes(path)     # Result[[u8], str]: a file's bytes, whatever they are
 os.exe_path()           # str: the absolute path of the running program
 os.abs_path(path)       # Result[str, str]: canonical; on Windows `\\?\C:\...`
 os.name(), os.arch()    # "windows"/"macos"/"linux"..., "x86_64"/"aarch64"...
@@ -531,5 +584,11 @@ than 300 seconds is stopped and fails (`brine test --timeout <seconds>`; 0: no l
 ## C interop
 
 ```python
-extern fn rand() -> i32     # declare a C standard library function (ints, floats, bools only)
+extern fn rand() -> i32     # declare a C standard library function
+extern fn puts(s: str) -> i32
 ```
+Extern functions take integers, floats, bools and strings, and return integers,
+floats, bools or nothing; the types must match the C declaration (`int` is
+`i32`, `size_t` is `u64` on 64-bit targets and `u32` in WebAssembly). A `str`
+reaches C as a NUL-terminated `const char *` copy that lives until the call
+returns (a string containing a NUL byte panics). Strings can't be returned.

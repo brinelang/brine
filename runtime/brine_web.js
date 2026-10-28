@@ -85,11 +85,8 @@ export async function run(wasm, options = {}) {
       v.setUint32(written, total, true);
       return 0;
     },
-    fd_read: (fd, iovs, n, read) => {
-      if (fd !== 0) return ERRNO_BADF;
-      view().setUint32(read, 0, true);
-      return 0;
-    },
+    // a page has no stdin: `input()` gives None, `read_stdin()` an Err
+    fd_read: () => ERRNO_BADF,
     fd_fdstat_get: (fd, ptr) => {
       if (fd > 2) return ERRNO_BADF;
       const v = view();

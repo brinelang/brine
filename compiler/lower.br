@@ -15,7 +15,7 @@
 # tuples and structs are C structs, enums with payload are boxes
 # `{rc, tag, union of variant structs}`, other enums are int32.
 from diag import Span, SourceMap
-from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, LocalKind, int_ty
+from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, LocalKind, int_ty, NumM
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import FmtSpec, parse_fmt_spec, children, stmt_exprs, stmt_blocks, local_of
 from info import ProgramInfo, ConstVal, TryKind, try_kind, mangle_module, PRELUDE
@@ -3704,7 +3704,7 @@ struct Lower:
         let ty = target.ty
         # `s = s + a + b`: append in place, as `s += a` then `s += b`, when
         # the parts don't read `s` (else rebuilding the string is quadratic)
-        if op.is_none() and ty == Ty.Str:
+        if op.is_none() and (ty == Ty.Str or ty.elem() != Ty.Error):
             match self_append(target, value):
                 case Some(parts):
                     for p in parts:
@@ -3793,7 +3793,7 @@ struct Lower:
                     self.cx.fb.store(lp, 0, v)
                     self.release(old, ty)
             case Some(o2):
-                if ty == Ty.Str:
+                if ty == Ty.Str and o2 == BinOp.Add:
                     let c = self.str_byte(value)
                     if c >= 0:
                         let lp = self.lvalue(target)
@@ -3805,8 +3805,19 @@ struct Lower:
                         return
                 let v = self.expr(value)
                 let lp = self.lvalue(target)
-                if ty == Ty.Str:
+                if ty == Ty.Str and o2 == BinOp.Mul:
+                    # `s *= n`
+                    let n = self.cx.fb.conv(K.I64, v)
+                    let loc = self.loc(span)
+                    let old = self.cx.fb.load(K.Ptr, lp, 0)
+                    let c = self.cx.fb.call(K.Ptr, "brine_s_repeat", [old, n, loc])
+                    self.cx.fb.store(lp, 0, c)
+                    self.release(old, Ty.Str)
+                elif ty == Ty.Str:
                     self.cx.fb.rt_void("brine_str_add", [lp, v])
+                elif ty.elem() != Ty.Error:
+                    # `xs += ys` extends `xs` in place
+                    self.cx.fb.call_void("brine_arr_extend", [lp, v])
                 else:
                     let cur = self.cx.fb.load(self.kind(ty), lp, 0)
                     let c = self.arith(o2, cur, v, ty, checked, span)
@@ -4212,6 +4223,19 @@ struct Lower:
                     let b = self.expr(r)
                     let c = self.cx.fb.call(K.Ptr, "brine_str_concat", [a, b])
                     return self.temp(c, Ty.Str)
+                if op == BinOp.Mul and e.ty == Ty.Str:
+                    let a = self.expr(l)
+                    let n0 = self.expr(r)
+                    let n = self.cx.fb.conv(K.I64, n0)
+                    let loc = self.loc(e.span)
+                    let c = self.cx.fb.call(K.Ptr, "brine_s_repeat", [a, n, loc])
+                    return self.temp(c, Ty.Str)
+                if op == BinOp.Add and e.ty.elem() != Ty.Error:
+                    let a = self.expr(l)
+                    let b = self.expr(r)
+                    let loc = self.loc(e.span)
+                    let c = self.cx.fb.call(K.Ptr, "brine_arr_concat", [a, b, loc])
+                    return self.temp(c, e.ty)
                 let a = self.expr(l)
                 let chk = self.op_checked(Some(op), e.ty, e.checked)
                 let sh = -1 if chk else pow2_shift(op, r, e.ty)
@@ -4407,7 +4431,8 @@ struct Lower:
                     case Ty.Str:
                         tst = self.cx.fb.call(K.Bool, "brine_str_contains", [c, x])
                     case _:
-                        let ix = self.find_elem(c, x, coll.ty.elem())
+                        let z0 = self.cx.fb.konst(K.I64, 0)
+                        let ix = self.find_elem(c, x, coll.ty.elem(), z0)
                         let zero = self.cx.fb.konst(K.I64, 0)
                         tst = self.cx.fb.cmp(Op.Ge, ix, zero)
                 if neg:
@@ -4507,9 +4532,9 @@ struct Lower:
         return self.temp(r, Ty.Str)
 
     # I64: the index of the first element of array `a` equal to `x`, or -1.
-    fn find_elem(ref self, a: int, x: int, el: Ty) -> int:
+    fn find_elem(ref self, a: int, x: int, el: Ty, start: int) -> int:
         let r = self.cx.fb.konst(K.I64, -1)
-        let i = self.cx.fb.konst(K.I64, 0)
+        let i = self.cx.fb.copy_of(start)
         let one = self.cx.fb.konst(K.I64, 1)
         let n = self.cx.fb.load(K.I64, a, 8)
         let data = self.cx.fb.load(K.Ptr, a, 48)
@@ -4533,10 +4558,10 @@ struct Lower:
 
     fn fmt_spec(ref self, sb: int, v: int, t: Ty, fs: FmtSpec):
         var start = -1
-        if fs.width > 0:
+        if fs.width > 0 or fs.group:
             start = self.cx.fb.load(K.I64, sb, 8)
         let k = fs.kind.unwrap_or("")
-        if k == "f" or k == "e":
+        if k == "f" or k == "e" or k == "g":
             let p = self.cx.fb.konst(K.I32, fs.prec.unwrap_or(-1))
             let kc = self.cx.fb.konst(K.I32, ord(k))
             let x = self.cx.fb.conv(K.F64, v)
@@ -4560,6 +4585,8 @@ struct Lower:
                     self.cx.fb.call_void("brine_sb_fmt_u64", [sb, x, kc])
         else:
             self.fmt_code(sb, v, t, false)
+        if fs.group:
+            self.cx.fb.call_void("brine_sb_group", [sb, start])
         if fs.width > 0:
             let w = self.cx.fb.konst(K.I64, fs.width)
             let left = self.cx.fb.konst(K.Bool, 1 if fs.left else 0)
@@ -4706,13 +4733,26 @@ struct Lower:
                 cargs[base + i] = self.lvalue(it.0)
         if self.tracks_caller(id):
             cargs.push(self.loc(span))
+        # a string reaches C as a NUL-terminated copy, freed after the call
+        var cstrs: [int] = []
+        if sig.is_extern:
+            for i, it in enumerate(items):
+                if it.0.ty == Ty.Str:
+                    let loc = self.loc(it.0.span)
+                    let c = self.cx.fb.call(K.Ptr, "brine_cstr", [cargs[base + i], loc])
+                    cargs[base + i] = c
+                    cstrs.push(c)
         if sret >= 0:
             self.cx.fb.call_void(sig.c_name, cargs)
             return self.temp(sret, sig.ret)
         if not self.ret_has(sig.ret):
             self.cx.fb.call_void(sig.c_name, cargs)
+            for c in cstrs:
+                self.cx.fb.call_void("brine_cstr_free", [c])
             return self.unit()
         let r = self.cx.fb.call(self.kind(sig.ret), sig.c_name, cargs)
+        for c in cstrs:
+            self.cx.fb.call_void("brine_cstr_free", [c])
         return self.temp(r, sig.ret)
 
     # `x?`: return `None`/`Err` from the function, or continue with the value inside.
@@ -5070,10 +5110,83 @@ struct Lower:
                         n = "round"
                 let suf = "f" if e.ty == Ty.Float(FloatTy.F32) else ""
                 return self.cx.fb.rt(self.kind(e.ty), f"brine_f_{n}{suf}", [v])
-            case Builtin.Pow:
+            case Builtin.Pow | Builtin.Math2(_):
                 let a = self.expr(args[0].expr)
                 let c = self.expr(args[1].expr)
-                return self.cx.fb.rt(K.F64, "brine_f_pow", [a, c])
+                var n = "pow"
+                match b:
+                    case Builtin.Math2(m):
+                        n = m
+                    case _:
+                        pass
+                let suf = "f" if e.ty == Ty.Float(FloatTy.F32) else ""
+                return self.cx.fb.rt(self.kind(e.ty), f"brine_f_{n}{suf}", [a, c])
+            case Builtin.Math1(n):
+                let v = self.expr(args[0].expr)
+                let suf = "f" if e.ty == Ty.Float(FloatTy.F32) else ""
+                return self.cx.fb.rt(self.kind(e.ty), f"brine_f_{n}{suf}", [v])
+            case Builtin.Num(m):
+                return self.num_method(m, recv.unwrap(), args, e)
+            case Builtin.FromBits:
+                let u = self.expr(args[0].expr)
+                let k = self.kind(e.ty)
+                let p = self.cx.fb.temp_mem(k.size(), k.size())
+                self.cx.fb.store(p, 0, u)
+                return self.cx.fb.load(k, p, 0)
+            case Builtin.FromUtf8:
+                let a = self.expr(args[0].expr)
+                let outp = self.null_slot()
+                let ok = self.cx.fb.call(K.Bool, "brine_str_from_utf8", [a, outp])
+                let o = self.cx.fb.load(K.Ptr, outp, 0)
+                return self.make_result(e.ty, ok, o, Ty.Str, o)
+            case Builtin.ToInt | Builtin.ToFloat:
+                let s = self.expr(recv.unwrap())
+                var vt = int_ty()
+                match try_kind(self.info, e.ty):
+                    case Some(TryKind.Opt(_, _, inner)):
+                        vt = inner
+                    case _:
+                        pass
+                let lay = self.lay(vt)
+                let p = self.cx.fb.temp_mem(lay.size, lay.align)
+                var ok = -1
+                match vt:
+                    case Ty.Int(k):
+                        let bits = self.cx.fb.konst(K.I64, k.bits())
+                        let sg = self.cx.fb.konst(K.Bool, 1 if k.signed() else 0)
+                        ok = self.cx.fb.call(K.Bool, "brine_try_parse_int", [s, bits, sg, p])
+                    case _:
+                        let small = 1 if vt == Ty.Float(FloatTy.F32) else 0
+                        let f32 = self.cx.fb.konst(K.Bool, small)
+                        ok = self.cx.fb.call(K.Bool, "brine_try_parse_float", [s, f32, p])
+                return self.make_option(e.ty, ok, p, vt)
+            case Builtin.Input:
+                var pr = self.cx.fb.konst(K.Ptr, 0)
+                if len(args) == 1:
+                    pr = self.expr(args[0].expr)
+                let g = self.cx.fb.call(K.Ptr, "brine_input", [pr])
+                let null = self.cx.fb.konst(K.Ptr, 0)
+                let present = self.cx.fb.cmp(Op.Ne, g, null)
+                let gp = self.addr_of(g, Ty.Str)
+                let o = self.make_option(e.ty, present, gp, Ty.Str)
+                let skip = self.cx.fb.label()
+                self.cx.fb.brnot(present, skip)
+                self.release(g, Ty.Str)
+                self.cx.fb.place(skip)
+                return o
+            case Builtin.ReadStdin:
+                let outp = self.null_slot()
+                let ok = self.cx.fb.call(K.Bool, "brine_read_stdin", [outp])
+                let o = self.cx.fb.load(K.Ptr, outp, 0)
+                return self.make_result(e.ty, ok, o, Ty.Str, o)
+            case Builtin.AppendFile:
+                let p = self.expr(args[0].expr)
+                let t = self.expr(args[1].expr)
+                let errp = self.null_slot()
+                let ok = self.cx.fb.call(K.Bool, "brine_append_file", [p, t, errp])
+                let err = self.cx.fb.load(K.Ptr, errp, 0)
+                let u = self.unit()
+                return self.make_result(e.ty, ok, u, Ty.Unit, err)
             case Builtin.Clock:
                 return self.cx.fb.call(K.F64, "brine_clock", [])
             case Builtin.Flush:
@@ -5146,11 +5259,18 @@ struct Lower:
                     let fp = self.cx.fb.global(c)
                     self.cx.fb.call_void("brine_arr_sort", [lp, fp])
                 return self.unit()
-            case Builtin.IndexOf:
+            case Builtin.IndexOf | Builtin.IndexFrom:
                 let r = recv.unwrap()
                 let a = self.expr(r)
                 let x = self.expr(args[0].expr)
-                let ix = self.find_elem(a, x, r.ty.elem())
+                var start = self.cx.fb.konst(K.I64, 0)
+                if b == Builtin.IndexFrom:
+                    let s0 = self.expr(args[1].expr)
+                    let s = self.cx.fb.conv(K.I64, s0)
+                    let n = self.cx.fb.load(K.I64, a, 8)
+                    let loc = self.loc(e.span)
+                    start = self.cx.fb.call(K.I64, "brine_start_chk", [s, n, loc])
+                let ix = self.find_elem(a, x, r.ty.elem(), start)
                 let zero = self.cx.fb.konst(K.I64, 0)
                 let present = self.cx.fb.cmp(Op.Ge, ix, zero)
                 let ip = self.addr_of(ix, int_ty())
@@ -5161,7 +5281,7 @@ struct Lower:
                 for a in args:
                     vals.push(self.expr(a.expr))
                 vals.push(self.loc(e.span))
-                if m == StrM.Find:
+                if m == StrM.Find or m == StrM.FindFrom:
                     let ix = self.cx.fb.call(K.I64, m.c_name(), vals)
                     let zero = self.cx.fb.konst(K.I64, 0)
                     let present = self.cx.fb.cmp(Op.Ge, ix, zero)
@@ -5251,6 +5371,87 @@ struct Lower:
                 let loc = self.loc(e.span)
                 let r = self.cx.fb.call(K.Ptr, "brine_chr", [v, loc])
                 return self.temp(r, Ty.Str)
+
+    # Methods of numbers: plain IR, nothing to check. Wrapping arithmetic is the
+    # IR's own (it wraps); rotations and bit counts work on the unsigned bits.
+    fn num_method(ref self, m: NumM, r: Expr, args: [Arg], e: Expr) -> int:
+        let x = self.expr(r)
+        if r.ty.is_float():
+            # `to_bits`: the same bytes, read as an unsigned integer
+            let k = self.kind(e.ty)
+            let p = self.cx.fb.temp_mem(k.size(), k.size())
+            self.cx.fb.store(p, 0, x)
+            return self.cx.fb.load(k, p, 0)
+        var ik = IntTy.I64
+        match r.ty:
+            case Ty.Int(k):
+                ik = k
+            case _:
+                pass
+        let kk = int_kind(ik)
+        let w = ik.bits()
+        var uk = K.U64
+        match w:
+            case 8:
+                uk = K.U8
+            case 16:
+                uk = K.U16
+            case 32:
+                uk = K.U32
+            case 128:
+                uk = K.U128
+            case _:
+                pass
+        match m:
+            case NumM.WrappingAdd | NumM.WrappingSub | NumM.WrappingMul:
+                let y = self.expr(args[0].expr)
+                var o = Op.Add
+                if m == NumM.WrappingSub:
+                    o = Op.Sub
+                elif m == NumM.WrappingMul:
+                    o = Op.Mul
+                return self.cx.fb.bin(o, kk, x, y)
+            case NumM.WrappingNeg:
+                return self.cx.fb.un(Op.Neg, kk, x)
+            case NumM.RotateLeft | NumM.RotateRight:
+                let n0 = self.expr(args[0].expr)
+                let u = self.cx.fb.conv(uk, x) if kk != uk else x
+                # the amount modulo the width (a power of two), so a negative
+                # amount turns the other way: `rotate_left(-1)` is `rotate_right(1)`
+                let n = self.cx.fb.conv(uk, n0)
+                let mask = self.cx.fb.konst(uk, w - 1)
+                let s = self.cx.fb.bin(Op.And, uk, n, mask)
+                let wk = self.cx.fb.konst(uk, w)
+                let t0 = self.cx.fb.bin(Op.Sub, uk, wk, s)
+                # w - s, or 0 when s is 0 (a shift by the width is not allowed)
+                let t = self.cx.fb.bin(Op.And, uk, t0, mask)
+                let left = m == NumM.RotateLeft
+                let a = self.cx.fb.bin(Op.Shl if left else Op.Shr, uk, u, s)
+                let c = self.cx.fb.bin(Op.Shr if left else Op.Shl, uk, u, t)
+                let res = self.cx.fb.bin(Op.Or, uk, a, c)
+                return self.cx.fb.conv(kk, res) if kk != uk else res
+            case _:
+                # count_ones, leading_zeros, trailing_zeros; all `w` for 0
+                var nm = "popcnt"
+                if m == NumM.LeadingZeros:
+                    nm = "clz"
+                elif m == NumM.TrailingZeros:
+                    nm = "ctz"
+                let u = self.cx.fb.conv(uk, x) if kk != uk else x
+                if w == 128:
+                    return self.cx.fb.rt(K.I64, f"brine_{nm}_u128", [u])
+                var z = u
+                if w < 64:
+                    z = self.cx.fb.conv(K.U64, u)
+                    if m == NumM.TrailingZeros:
+                        # a bit just above the value stops the count at `w`
+                        let top = self.cx.fb.konst(K.U64, 1 << w)
+                        z = self.cx.fb.bin(Op.Or, K.U64, z, top)
+                let c = self.cx.fb.rt(K.I64, f"brine_{nm}_u64", [z])
+                if m == NumM.LeadingZeros and w < 64:
+                    let d = self.cx.fb.konst(K.I64, 64 - w)
+                    return self.cx.fb.bin(Op.Sub, K.I64, c, d)
+                return c
 
     # The address of a new 8-byte stack slot holding 0 (an out-parameter).
     fn null_slot(ref self) -> int:
@@ -5376,6 +5577,10 @@ struct Lower:
                 return self.os_with_err("set_cwd", None, a, e)
             case OsOp.WriteBytes:
                 return self.os_with_err("write_bytes", None, a, e)
+            case OsOp.AppendBytes:
+                return self.os_with_err("append_bytes", None, a, e)
+            case OsOp.ReadBytes:
+                return self.os_with_err("read_bytes", Some(K.Ptr), a, e)
             case OsOp.ExePath:
                 let r = self.cx.fb.call(K.Ptr, "brine_os_exe_path", [])
                 return self.temp(r, Ty.Str)
