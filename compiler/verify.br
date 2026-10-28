@@ -2020,6 +2020,7 @@ struct Vf:
                     case _:
                         for a in args:
                             self.eval(a.expr)
+                        self.ref_args(args)
                         return self.fresh_val(e.ty, "?")
             case ExprKind.MethodCall(recv, _, _, args):
                 match e.cres:
@@ -2052,8 +2053,10 @@ struct Vf:
                         let nm = self.name_of(e)
                         return self.fresh_val(e.ty, nm)
                     case _:
+                        self.eval(recv)
                         for a in args:
                             self.eval(a.expr)
+                        self.ref_args(args)
                         return self.fresh_val(e.ty, "?")
             case ExprKind.Field(b, _, _):
                 match e.res:
@@ -2406,6 +2409,7 @@ struct Vf:
                 self.eval(args[0].expr)
             match self.lvalue_path(r):
                 case None:
+                    self.eval(r)
                     return self.fresh_val(e.ty, "?")
                 case Some((root, steps)):
                     let cur = self.read_path(root, steps)
@@ -2430,9 +2434,17 @@ struct Vf:
                             let nv = self.fresh_val(self.local_ty(root), self.local_name(root))
                             self.bind(root, nv)
                             return self.fresh_val(e.ty, "?")
+        if b.mutates_recv() and recv.is_some():
+            return self.mutate(b, recv.unwrap(), args, e)
+        match recv:
+            case Some(r):
+                self.eval(r)
+            case None:
+                pass
         var vals: [V] = []
         for a in args:
             vals.push(self.eval(a.expr))
+        self.ref_args(args)
         match b:
             case Builtin.Len:
                 if len(vals) > 0:
@@ -2491,6 +2503,88 @@ struct Vf:
                 return V.Int(r)
             case _:
                 return self.fresh_val(e.ty, "?")
+
+    # A method that changes its receiver in place (`clear`, `sort`, `pop(i)`, ...).
+    fn mutate(ref self, b: Builtin, r: Expr, args: [Arg], e: Expr) -> V:
+        var vals: [V] = []
+        for a in args:
+            vals.push(self.eval(a.expr))
+        self.ref_args(args)
+        var out = self.fresh_val(e.ty, "?")
+        match self.lvalue_path(r):
+            case None:
+                # a temporary: nothing else sees the change
+                self.eval(r)
+                return out
+            case Some((root, steps)):
+                let cur = self.read_path(root, steps)
+                var nv = V.Opaque
+                match cur:
+                    case V.Arr(c, l):
+                        let name = self.content_names[c]
+                        var nlen: Option[Lin] = Some(l)
+                        match b:
+                            case Builtin.Clear:
+                                nlen = Some(Lin.konst(0))
+                            case Builtin.PopAt:
+                                let i = self.as_int(vals[0], args[0].expr.ty)
+                                self.kept(
+                                    e.span,
+                                    F.and_([F.ge(i), F.lt(i, l)]),
+                                    "index bounds check"
+                                )
+                                out = self.sel(c, i, e.ty)
+                                nlen = l.add_c(-1)
+                            case Builtin.Insert:
+                                let i = self.as_int(vals[0], args[0].expr.ty)
+                                self.kept(
+                                    e.span,
+                                    F.and_([F.ge(i), F.le(i, l)]),
+                                    "insert index check"
+                                )
+                                nlen = l.add_c(1)
+                            case Builtin.Extend:
+                                match vals[0]:
+                                    case V.Arr(_, m):
+                                        nlen = l.add(m)
+                                    case _:
+                                        nlen = None
+                            case _:
+                                # sort, reverse: same length, other order
+                                pass
+                        var n = Lin.konst(0)
+                        match nlen:
+                            case Some(x):
+                                n = x
+                            case None:
+                                n = self.fresh_nonneg("len(" + name + ")")
+                        nv = V.Arr(self.fresh_content(name), n)
+                    case _:
+                        nv = self.fresh_val(r.ty, self.name_of(r))
+                let old = self.lookup(root, self.local_ty(root))
+                let w = self.write_path(old, steps, nv)
+                self.bind(root, w)
+                return out
+
+    # `ref` arguments of a call the prover doesn't follow may change arbitrarily.
+    fn ref_args(ref self, args: [Arg]):
+        for a in args:
+            if a.by_ref:
+                match lvalue_root(a.expr):
+                    case Some(root):
+                        let nv = self.fresh_val(self.local_ty(root), self.local_name(root))
+                        self.bind(root, nv)
+                    case None:
+                        pass
+
+    # A runtime check that stays whether or not it's proven: listed in
+    # `--report` unless proven; either way it holds afterwards.
+    fn kept(ref self, span: Span, goal: F, what: str):
+        if self.spec or not self.live:
+            return
+        if not self.holds(goal):
+            self.remaining.push((span, what))
+        self.assume(goal)
 
     fn call_user(ref self, id: int, recv: Option[Expr], args: [Arg], e: Expr) -> V:
         let sig = self.info.fns[id]
