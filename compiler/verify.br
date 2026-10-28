@@ -699,6 +699,7 @@ fn new_vf(info: ProgramInfo, specs: [Option[FnSpec]], sm: SourceMap, f: FnDecl) 
         ranges=[],
         terms={},
         content_names=[],
+        content_ranges=[],
         defs=[],
         st=St(env={}, facts=[]),
         live=false,
@@ -724,6 +725,8 @@ struct Vf:
     ranges: [Option[(i128, i128)]]
     terms: {str: int}
     content_names: [str]
+    # the range of every element of a content, when known (from a literal)
+    content_ranges: [Option[(i128, i128)]]
     defs: [F]
     # the current state; `live` is false where execution can't reach
     st: St
@@ -801,7 +804,28 @@ struct Vf:
 
     fn fresh_content(ref self, name: str) -> int:
         self.content_names.push(name)
+        self.content_ranges.push(None)
         return len(self.content_names) - 1
+
+    # A content whose elements are all constants between `lo` and `hi`.
+    fn ranged_content(ref self, name: str, vals: [V]) -> int:
+        let c = self.fresh_content(name)
+        var lo: Option[i128] = None
+        var hi: Option[i128] = None
+        for v in vals:
+            match v:
+                case V.Int(l):
+                    match l.is_const():
+                        case Some(x):
+                            lo = Some(x if lo.is_none() else min(lo.unwrap(), x))
+                            hi = Some(x if hi.is_none() else max(hi.unwrap(), x))
+                        case None:
+                            return c
+                case _:
+                    return c
+        if lo.is_some():
+            self.content_ranges[c] = Some((lo.unwrap(), hi.unwrap()))
+        return c
 
     fn term(ref self, t: Term, range: Option[(i128, i128)]) -> int:
         let tk = term_key(t)
@@ -909,7 +933,13 @@ struct Vf:
     fn sel(ref self, c: int, i: Lin, ety: Ty) -> V:
         match ety:
             case Ty.Int(k):
-                return V.Int(Lin.atom(self.term(Term.Sel(c, i), int_range(k))))
+                var r = int_range(k)
+                match self.content_ranges[c]:
+                    case Some(cr):
+                        r = Some((max(cr.0, k.min()), min(cr.1, k.max())))
+                    case None:
+                        pass
+                return V.Int(Lin.atom(self.term(Term.Sel(c, i), r)))
             case Ty.Bool:
                 return V.Bool(F.B(self.term(Term.SelB(c, i), None), true))
             case _:
@@ -1631,6 +1661,28 @@ struct Vf:
             case _:
                 pass
 
+    # The entry values of the loop's monotone locals (see `monotone`).
+    fn mono_starts(self, body: Block, cond: Option[Expr]) -> [(int, int, Lin)]:
+        var out: [(int, int, Lin)] = []
+        if not self.live:
+            return out
+        for id, d in monotone(body, cond, self.info):
+            match self.st.env.get(id):
+                case Some(V.Int(x0)):
+                    out.push((id, d, x0))
+                case _:
+                    pass
+        return out
+
+    # After the havoc: each monotone local moved one way only.
+    fn mono_facts(ref self, starts: [(int, int, Lin)]):
+        for id, d, x0 in starts:
+            match self.st.env.get(id):
+                case Some(V.Int(x)):
+                    self.assume(F.le(x0, x) if d > 0 else F.le(x, x0))
+                case _:
+                    pass
+
     fn while_loop(ref self, cond: Expr, invs: [Expr], body: Block):
         self.check_entry_invs(invs, F.True)
         if not self.live:
@@ -1640,7 +1692,9 @@ struct Vf:
         var mods: {int: int} = {}
         mods_block(body, self.info, ref mods)
         mods_expr(cond, self.info, ref mods)
+        let starts = self.mono_starts(body, Some(cond))
         self.havoc_mods(mods)
+        self.mono_facts(starts)
         for inv in invs:
             let f = self.spec_cond(inv)
             self.assume(f)
@@ -1758,7 +1812,9 @@ struct Vf:
                         self.st.env[var_id] = v
                     case None:
                         pass
+        let mono = self.mono_starts(body, None)
         self.havoc(body)
+        self.mono_facts(mono)
         let head = self.cur()
         # bind the loop variable
         var v = V.Opaque
@@ -2463,18 +2519,18 @@ struct Vf:
                 var vals: [V] = []
                 for x in es:
                     vals.push(self.eval(x))
-                let c = self.fresh_content("[...]")
+                let c = self.ranged_content("[...]", vals)
                 let et = e.ty.elem()
                 for i, v in enumerate(vals):
                     self.define_sel(c, Lin.konst(i128(i)), et, v)
                 return V.Arr(c, Lin.konst(i128(len(es))))
             case ExprKind.Repeat(elem, count):
-                self.eval(elem)
+                let ev = self.eval(elem)
                 let nv = self.eval(count)
                 let n = self.as_int(nv, count.ty)
                 self.kept(e.span, F.ge(n), "array length check")
                 self.cap_len(n)
-                return V.Arr(self.fresh_content("[...]"), n)
+                return V.Arr(self.ranged_content("[...]", [ev]), n)
             case ExprKind.Tuple(es):
                 return self.agg(es)
             case ExprKind.ParTuple(es):
@@ -3279,3 +3335,52 @@ fn tighten_by(
             case None:
                 pass
     return (lo, hi)
+
+# Monotone locals: those a loop changes only by `x += c` (or only by `x -= c`)
+# with constants c >= 0, anywhere in its body. An overflow panics, so at the
+# start of every iteration and after the loop `x >= x0` (`x <= x0`).
+fn monotone(b: Block, cond: Option[Expr], info: ProgramInfo) -> [(int, int)]:
+    var dirs: {int: int} = {}
+    var other: {int: int} = {}
+    match cond:
+        case Some(c):
+            mods_expr(c, info, ref other)
+        case None:
+            pass
+    count_steps(b, info, ref dirs, ref other)
+    var ids: [int] = []
+    for id in dirs:
+        if dirs[id] != 0 and id not in other:
+            ids.push(id)
+    ids.sort()
+    return [(id, dirs[id]) for id in ids]
+
+fn count_steps(b: Block, info: ProgramInfo, ref dirs: {int: int}, ref other: {int: int}):
+    for s in b.stmts:
+        match s.kind:
+            case StmtKind.Assign(target, op, value):
+                match lvalue_root(target):
+                    case Some(r):
+                        var d = 0
+                        match (target.kind, op, value.kind):
+                            case (ExprKind.Ident(_), Some(BinOp.Add), ExprKind.Int(v)):
+                                if v >= 0:
+                                    d = 1
+                            case (ExprKind.Ident(_), Some(BinOp.Sub), ExprKind.Int(v)):
+                                if v >= 0:
+                                    d = -1
+                            case _:
+                                pass
+                        let was = dirs.get(r).unwrap_or(d)
+                        if d == 0 or was != d:
+                            note_mod(ref other, r, MOD_WHOLE)
+                        else:
+                            dirs[r] = d
+                    case None:
+                        pass
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            mods_expr(e, info, ref other)
+        for blk in stmt_blocks(s):
+            count_steps(blk, info, ref dirs, ref other)
