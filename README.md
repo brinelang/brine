@@ -10,7 +10,7 @@ parallelism built into the language: every core, the GPU, and many machines.**
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
 
-[Install](#installation) · [Tour](#a-quick-tour) · [Language reference](docs/QUICKREF.md) · [Design](docs/DESIGN.md) · [Examples](examples/)
+[Website](https://brinelang.org) · [Docs](https://docs.brinelang.org) · [Install](#installation) · [Tour](#a-quick-tour) · [Language reference](docs/QUICKREF.md) · [Design](docs/DESIGN.md) · [Examples](examples/)
 
 </div>
 
@@ -449,6 +449,8 @@ them from the start.
 
 ## Documentation
 
+* [brinelang.org](https://brinelang.org): the brine website
+* [docs.brinelang.org](https://docs.brinelang.org): the documentation online
 * [docs/QUICKREF.md](docs/QUICKREF.md): the whole language on one page (also `brine guide`)
 * [docs/DESIGN.md](docs/DESIGN.md): philosophy, architecture, roadmap and open decisions
 * [CHANGELOG.md](CHANGELOG.md): what changed in each release
