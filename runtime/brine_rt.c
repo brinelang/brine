@@ -1485,7 +1485,73 @@ brine_u128 brine_parse_u128(brine_str *s, const char *loc) {
     if (!br_parse_128(s, &neg, &u) || (neg && u != 0)) br_panicf(loc, "invalid integer: \"%.*s\"", (int)s->len, s->data);
     return u;
 }
+/* Exact powers of ten: a double holds 10^k exactly up to 10^22. */
+static const double br_pow10[23] = {1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
+                                    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+/* m * 10^e when both m and 10^e are exact doubles, so one multiply or divide
+ * rounds once and the result is correctly rounded (Clinger's fast path).
+ * False when that doesn't hold. */
+static bool br_dec_fast(uint64_t m, int e, double *out) {
+    if (m > ((uint64_t)1 << 53)) return false;
+    double d = (double)m;
+    if (e > 22 && e <= 22 + 15) {
+        /* 1234e25 is 1234000e22: move zeros into m while it stays exact */
+        for (; e > 22; e--) {
+            if (m > ((uint64_t)1 << 53) / 10) return false;
+            m *= 10;
+        }
+        d = (double)m;
+    }
+    if (e < -22 || e > 22) return false;
+    *out = e < 0 ? d / br_pow10[-e] : d * br_pow10[e];
+    return true;
+}
+/* Plain decimals (`-12.5`, `3e-7`) with at most 19 significant digits that
+ * the fast path takes, else false: strtod handles the rest. */
+static bool br_parse_f64_fast(const char *p, const char *end, double *out) {
+    bool neg = false;
+    if (p < end && (*p == '-' || *p == '+')) neg = *p++ == '-';
+    uint64_t m = 0;
+    int nd = 0, e = 0;
+    bool any = false;
+    for (; p < end && *p >= '0' && *p <= '9'; p++) {
+        any = true;
+        if (m == 0 && *p == '0') continue;
+        if (++nd > 19) return false;
+        m = m * 10 + (uint64_t)(*p - '0');
+    }
+    if (p < end && *p == '.') {
+        for (p++; p < end && *p >= '0' && *p <= '9'; p++) {
+            any = true;
+            e--;
+            if (m == 0 && *p == '0') continue;
+            if (++nd > 19) return false;
+            m = m * 10 + (uint64_t)(*p - '0');
+        }
+    }
+    if (!any) return false;
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        p++;
+        bool eneg = false;
+        if (p < end && (*p == '-' || *p == '+')) eneg = *p++ == '-';
+        if (p == end || *p < '0' || *p > '9') return false;
+        int x = 0;
+        for (; p < end && *p >= '0' && *p <= '9'; p++) {
+            if (x > 10000) return false;
+            x = x * 10 + (*p - '0');
+        }
+        e += eneg ? -x : x;
+    }
+    while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++;
+    if (p != end) return false;
+    double v = 0;
+    if (m != 0 && !br_dec_fast(m, e, &v)) return false;
+    *out = neg ? -v : v;
+    return true;
+}
 double brine_parse_f64(brine_str *s, const char *loc) {
+    double fast;
+    if (br_parse_f64_fast(s->data, s->data + s->len, &fast)) return fast;
     char *end;
     errno = 0;
     double v = strtod(s->data, &end);
