@@ -1895,6 +1895,19 @@ struct Checker:
             case StmtKind.Contract(_, _):
                 pass
 
+    fn not_orderable(ref self, t: Ty, span: Span, msg: str):
+        var d = diag.error("E0305", msg).label(
+            span,
+            "only numbers, strings, enums without data, and tuples and structs of these support `<`"
+        )
+        match unordered_part(self.info, t):
+            case Some((what, pt)):
+                if pt != t:
+                    d = d.note(f"{what} has type " + self.tn(pt))
+            case None:
+                pass
+        self.err(d)
+
     fn error_count(self) -> int:
         var n = 0
         for d in self.diags:
@@ -3348,12 +3361,11 @@ struct Checker:
                         self.err(d)
                         continue
                     let ord = op == CmpOp.Lt or op == CmpOp.Le or op == CmpOp.Gt or op == CmpOp.Ge
-                    if ord and not (a.is_numeric() or a == Ty.Str):
-                        self.err(
-                            diag.error(
-                                "E0305",
-                                "values of type " + self.tn(a) + " can't be ordered"
-                            ).label(both, "only numbers and strings support `<`")
+                    if ord and not orderable(self.info, a):
+                        self.not_orderable(
+                            a,
+                            both,
+                            "values of type " + self.tn(a) + " can't be ordered"
                         )
                     elif not ord and not equatable(a):
                         self.err(
@@ -4376,6 +4388,29 @@ struct Checker:
                                     ).label(args[0].expr.span, "not a bool")
                                 )
                             return Ty.Bool
+                        case Reducer.Min | Reducer.Max:
+                            var in_par = false
+                            match args[0].expr.kind:
+                                case ExprKind.Comp(c):
+                                    in_par = c.par
+                                case _:
+                                    pass
+                            if bt.is_numeric():
+                                return bt
+                            if in_par:
+                                self.err(
+                                    diag.error(
+                                        "E0301",
+                                        f"a parallel `{name}` needs numbers, found " + self.tn(bt)
+                                    ).label(args[0].expr.span, "not numeric")
+                                )
+                            elif not orderable(self.info, bt):
+                                self.not_orderable(
+                                    bt,
+                                    args[0].expr.span,
+                                    f"`{name}` needs values that can be ordered"
+                                )
+                            return bt
                         case _:
                             if not bt.is_numeric():
                                 self.err(
@@ -4776,16 +4811,19 @@ struct Checker:
                     t0 = self.check_expr(ref args[0].expr, Some(t1))
                 if t0.is_error() or t1.is_error():
                     return Ty.Error
-                if not t0.is_numeric() or t0 != t1:
+                if t0 != t1:
                     self.err(
                         diag.error(
                             "E0301",
-                            f"`{name}` needs two numbers of the same type, found "
+                            f"`{name}` needs two values of the same type, found "
                             + self.tn(t0)
                             + " and "
                             + self.tn(t1)
                         ).label(span, "mismatched arguments")
                     )
+                    return Ty.Error
+                if not orderable(self.info, t0):
+                    self.not_orderable(t0, span, f"`{name}` needs values that can be ordered")
                     return Ty.Error
                 return t0
             case Builtin.Sqrt | Builtin.Sin | Builtin.Cos | Builtin.Tan | Builtin.Exp | Builtin.Log | Builtin.Floor | Builtin.Ceil | Builtin.Round:
@@ -5879,13 +5917,8 @@ struct Checker:
         if verb != "":
             self.check_mutation_target(recv, verb)
         self.typed_args(name, ref args, params, span)
-        if b == Builtin.Sort and not el.is_error() and not (el.is_numeric() or el == Ty.Str):
-            self.err(
-                diag.error(
-                    "E0305",
-                    "arrays of " + self.tn(el) + " can't be sorted"
-                ).label(span, "only numbers and strings can be ordered")
-            )
+        if b == Builtin.Sort and not el.is_error() and not orderable(self.info, el):
+            self.not_orderable(el, span, "arrays of " + self.tn(el) + " can't be sorted")
         if b == Builtin.IndexOf and not equatable(el):
             self.err(
                 diag.error(
@@ -7081,6 +7114,43 @@ fn printable(t: Ty) -> bool:
             return all(printable(x) for x in ts)
         case _:
             return true
+
+# Values `<` can order: numbers, strings, enums without data (in declaration
+# order), and tuples and structs of these (compared part by part, first to last).
+fn orderable(info: ProgramInfo, t: Ty) -> bool:
+    return unordered_part(info, t).is_none()
+
+# The first part of `t` that can't be ordered, described, if any.
+fn unordered_part(info: ProgramInfo, t: Ty) -> Option[(str, Ty)]:
+    if t.is_numeric() or t == Ty.Str or t.is_error():
+        return None
+    match t:
+        case Ty.Enum(eid):
+            if not info.enums[eid].has_payload():
+                return None
+        case Ty.Tuple(ts):
+            for i, x in enumerate(ts):
+                match unordered_part(info, x):
+                    case Some(p):
+                        if p.1 == x:
+                            return Some((f"element {i}", x))
+                        return Some(p)
+                    case None:
+                        pass
+            return None
+        case Ty.Struct(sid):
+            for f in info.structs[sid].fields:
+                match unordered_part(info, f.1):
+                    case Some(p):
+                        if p.1 == f.1:
+                            return Some((f"field `{f.0}`", f.1))
+                        return Some(p)
+                    case None:
+                        pass
+            return None
+        case _:
+            pass
+    return Some(("it", t))
 
 fn equatable(t: Ty) -> bool:
     match t:

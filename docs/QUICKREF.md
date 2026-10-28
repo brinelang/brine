@@ -58,6 +58,13 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
   width are dropped (`u64(1) << 63` is 2^63, `3 << 63` is `-2^63`). `>>` keeps the
   sign of signed types (`-8 >> 1 == -4`) and fills unsigned ones with zeros. A shift
   by a negative amount or by the type's width or more panics.
+* `<`, `<=`, `>`, `>=` work on numbers, strings (byte order), enums without data
+  (declaration order) and tuples and structs whose parts all support them. Those
+  compare part by part, in field order, like Python: `(1, "b") < (2, "a")`. A NaN
+  makes `<` false, so in a tuple it's false whenever the NaN part decides. The same
+  types work with `sort()` (stable; NaN sorts after every number), `min`/`max` of
+  two (ties keep the first) and `min(... for ...)`/`max(...)`; `par min`/`par max`
+  need numbers.
 * Values are **values**: `let b = a` copies (cheaply, copy-on-write). Changing `b`
   never changes `a`. To share a variable on purpose, use `ref` (see Functions).
 
@@ -256,8 +263,8 @@ are always available. Methods: `is_some()`, `is_none()`, `is_ok()`, `is_err()`,
 Each use of a generic function or type with new type arguments makes a
 specialized copy, so generic code is as fast as hand-written code. A generic
 function's body is checked for each set of type arguments it's used with:
-`largest[T]` that compares with `>` works for `int` and `str`, and is an error
-for a struct. In the same way, `T(x)` converts to what `T` stands for, like
+`largest[T]` that compares with `>` works for `int`, `str` or a tuple, and is an
+error for a struct with an array field. In the same way, `T(x)` converts to what `T` stands for, like
 `int(x)` or `f32(x)`: `fn mean[E](xs: [E]) -> E` can return `total / E(len(xs))`.
 
 Methods can have type parameters of their own, next to their type's:
@@ -281,7 +288,7 @@ xs.push(5)              # append
 let last = xs.pop()     # remove and return the last element (xs.pop(i): at i)
 xs.insert(0, 9)         # put 9 at index 0, shifting the rest right
 xs.extend([7, 8])       # append every element
-xs.sort()               # numbers and strings; stable
+xs.sort()               # anything `<` works on; stable
 xs.reverse()
 xs.clear()
 print(len(xs), xs == [3, 1, 2], 3 in xs, xs.index(3))  # index: Option[int]
