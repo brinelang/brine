@@ -360,3 +360,88 @@ fn switches(f: Func) -> Func:
     g.code = out
     g.nlabels = nl
     return g
+
+# ================================================================ inlining
+# Small functions that call nothing are copied into their callers (native
+# code, not debug builds): the calls of float code made of little helpers
+# (`fmin`, a dot product) cost more than the helpers do.
+const INLINE_MAX = 40
+
+fn inlinable(f: Func) -> bool:
+    if len(f.code) > INLINE_MAX or f.public:
+        return false
+    for x in f.code:
+        if x.op == Op.Call or x.op == Op.CallInd or x.op == Op.Switch:
+            return false
+    return true
+
+fn inline_small(fs: [Func]) -> [Func]:
+    var small: {str: int} = {}
+    for i, f in enumerate(fs):
+        if inlinable(f):
+            small[f.name] = i
+    if len(small) == 0:
+        return fs
+    var out: [Func] = []
+    for f in fs:
+        if not any(x.op == Op.Call and x.b == 0 and x.s in small for x in f.code):
+            out.push(f)
+            continue
+        var g = f
+        var code: [Inst] = []
+        for x in f.code:
+            if x.op == Op.Call and x.b == 0 and x.s in small:
+                let c = fs[small[x.s]]
+                if len(x.args) == c.nparams and c.name != f.name:
+                    inline_call(ref g, ref code, x, c)
+                    continue
+            code.push(x)
+        g.code = code
+        out.push(g)
+    return out
+
+# Appends a copy of `c`'s body for `call` to `code`, with c's vregs, labels
+# and slots after g's.
+fn inline_call(ref g: Func, ref code: [Inst], call: Inst, c: Func):
+    let vb = len(g.vk)
+    g.vk.extend(c.vk)
+    let lb = g.nlabels
+    let end = lb + c.nlabels
+    g.nlabels = end + 1
+    let sb = len(g.slots)
+    g.slots.extend(c.slots)
+    for i in 0..c.nparams:
+        code.push(Inst(op=Op.Mov, d=vb + i, a=call.args[i], b=-1, c=-1, n=0, s="", args=[]))
+    for x in c.code:
+        var y = x
+        if y.d >= 0:
+            y.d += vb
+        match y.op:
+            case Op.Const | Op.FConst | Op.Global | Op.Unreachable:
+                pass
+            case Op.Line:
+                continue
+            case Op.SlotAddr:
+                y.a += sb
+            case Op.Label | Op.Jmp:
+                y.n += lb
+            case Op.Br | Op.BrNot:
+                y.a += vb
+                y.n += lb
+            case Op.Ret:
+                if y.a >= 0 and call.d >= 0:
+                    code.push(Inst(op=Op.Mov, d=call.d, a=y.a + vb, b=-1, c=-1, n=0, s="", args=[]))
+                code.push(Inst(op=Op.Jmp, d=-1, a=-1, b=-1, c=-1, n=end, s="", args=[]))
+                continue
+            case _:
+                if y.a >= 0:
+                    y.a += vb
+                if y.b >= 0:
+                    y.b += vb
+                if (
+                    (y.op == Op.AddO or y.op == Op.SubO or y.op == Op.MulO or y.op == Op.IdxChk)
+                    and y.c >= 0
+                ):
+                    y.c += vb
+        code.push(y)
+    code.push(Inst(op=Op.Label, d=-1, a=-1, b=-1, c=-1, n=end, s="", args=[]))
