@@ -69,12 +69,19 @@ var total = 0           # mutable
 total += x
 let (q, r) = (17 / 5, 17 % 5)   # tuple unpacking
 let (a, (b, c)) = (1, (2, 3))   # nests
+u, v = v, u % v         # assign several `var` places at once; parentheses optional
+xs[i], xs[j] = xs[j], xs[i]     # every value is computed first, then stored
+lo, _ = bounds          # `_` drops a value
 var names: [str] = []   # annotate when the type can't be inferred
 let n: i32 = 7          # ...or whenever you like
 for i: int in 0..3:     # loop variables too: `for k: str, v: int in m.items():`
     total += i
 const LIMIT = 100       # compile-time constant (top level)
 ```
+In `x, y = ...` the places can't overlap, and an index can't read a variable
+the same line assigns (`i, xs[i] = ...` is error E0405): the result would
+depend on the order of the stores.
+
 Types are optional, Python style. To require them, put `typed = true` under
 `[check]` in brine.toml (or pass `--typed`): then every `let`, `var` and `for`
 variable needs a written type (error E0337 tells you which one to add).

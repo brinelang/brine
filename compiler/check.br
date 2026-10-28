@@ -205,7 +205,8 @@ fn new_checker() -> Checker:
         key_checks=[],
         failed=false,
         src_dirs={},
-        embedded={}
+        embedded={},
+        expand=[]
     )
 
 struct Checker:
@@ -244,6 +245,8 @@ struct Checker:
     src_dirs: {int: str}
     # file contents already embedded, by the span of the path literal (calls can be checked twice)
     embedded: {Span: str}
+    # statements that replace the one just checked (`a, b = b, a`)
+    expand: [Stmt]
 
     fn err(ref self, d: Diag):
         self.diags.push(d)
@@ -1085,10 +1088,27 @@ struct Checker:
     # ============================================================ statements
     fn check_block(ref self, ref b: Block):
         self.scopes.push([])
+        # a statement may be replaced by several (`a, b = b, a`)
+        var out: [Stmt] = []
+        var expanded = false
         for i in 0..len(b.stmts):
             self.check_stmt(ref b.stmts[i])
+            if len(self.expand) > 0:
+                if not expanded:
+                    out = b.stmts[:i]
+                    expanded = true
+                for x in self.expand:
+                    for e in stmt_exprs(x):
+                        self.check_mut_conflicts(e)
+                    out.push(x)
+                self.expand = []
+                continue
             for e in stmt_exprs(b.stmts[i]):
                 self.check_mut_conflicts(e)
+            if expanded:
+                out.push(b.stmts[i])
+        if expanded:
+            b.stmts = out
         self.scopes.pop()
 
     # Value semantics inside one expression: a variable changed in place by a
@@ -1252,6 +1272,159 @@ struct Checker:
                 pass
         self.scopes[len(self.scopes) - 1].push((name, target))
 
+    # The place left of `=`: checks that it can be assigned and gives its type.
+    # None: an undefined name, already reported.
+    fn assign_target(ref self, ref target: Expr) -> Option[Ty]:
+        match target.kind:
+            case ExprKind.Ident(name):
+                if self.lookup_local(name).is_none() and not self.has_item(name):
+                    let d = diag.error(
+                        "E0201",
+                        f"cannot assign to undefined variable `{name}`"
+                    ).label(target.span, "not declared")
+                    self.err(
+                        d.with_help(f"declare it first: `var {name} = ...`").fix(
+                            Span(file=target.span.file, lo=target.span.lo, hi=target.span.lo),
+                            "var ",
+                            "declare with `var`"
+                        )
+                    )
+                    return None
+            case _:
+                pass
+        let tt = self.check_expr(ref target, None)
+        var is_const = false
+        match target.kind:
+            case ExprKind.Ident(n):
+                match target.res:
+                    case Res.Const(_):
+                        is_const = true
+                        self.err(
+                            diag.error(
+                                "E0401",
+                                f"cannot assign to constant `{n}`"
+                            ).label(target.span, "constants never change")
+                        )
+                    case _:
+                        pass
+            case _:
+                pass
+        if not is_const and not tt.is_error():
+            self.check_mutation_target(target, "assign to")
+        return Some(tt)
+
+    # `a, b = b, a`: every value is computed first, then stored left to right.
+    # It becomes `let t = (b, a)`, `a = t.0`, `b = t.1`.
+    fn tuple_assign(ref self, span: Span, target: Expr, op: Option[BinOp], value: Expr):
+        var value2 = value
+        match op:
+            case Some(_):
+                self.err(
+                    diag.error("E0404", "a compound assignment needs a single place")
+                    .label(target.span, "several places")
+                    .with_help("write one `+=` for each place")
+                )
+                self.check_expr(ref value2, None)
+                self.expand = [stmt(StmtKind.ExprStmt(value2), span)]
+                return
+            case None:
+                pass
+        var leaves: [(Expr, [int])] = []
+        place_leaves(target, [], ref leaves)
+        var tys: [Ty] = []
+        for i in 0..len(leaves):
+            if is_wild(leaves[i].0):
+                tys.push(Ty.Unknown)
+                continue
+            match self.assign_target(ref leaves[i].0):
+                case Some(t):
+                    tys.push(t)
+                case None:
+                    tys.push(Ty.Error)
+        var k = 0
+        let vt = self.check_expr(ref value2, Some(shape_ty(target, tys, ref k)))
+        let tmp = f"tup'{span.lo}"
+        let id = self.declare(tmp, value2.span, vt, LocalKind.Let)
+        var first = stmt(
+            StmtKind.Let(false, LetPat.Name(tmp, value2.span), None, value2, false),
+            span
+        )
+        first.locals = [id]
+        var out = [first]
+        if vt.is_error():
+            self.expand = out
+            return
+        if not fits_shape(target, vt):
+            let tn = self.tn(vt)
+            self.err(
+                diag.error("E0301", f"cannot assign {tn} to {len(leaves)} places")
+                .label(value2.span, f"has type {tn}")
+                .label(target.span, "the places")
+                .with_help("give one value for each place, e.g. `a, b = b, a`")
+            )
+            self.expand = out
+            return
+        self.place_conflicts(leaves)
+        for i, leaf in enumerate(leaves):
+            if is_wild(leaf.0):
+                continue
+            let vspan = elem_span(value2, leaf.1)
+            var src = mk(ExprKind.Ident(tmp), vspan)
+            for j in leaf.1:
+                src = mk(ExprKind.Field(src, str(j), vspan), vspan)
+            self.check_expr(ref src, Some(tys[i]))
+            if not tys[i].is_error():
+                self.expect_ty(tys[i], src)
+            out.push(stmt(StmtKind.Assign(leaf.0, None, src), span))
+        self.expand = out
+
+    # Places in one tuple assignment must not overlap, and an index in one
+    # must not read a variable another changes: the result would depend on
+    # the order of the stores.
+    fn place_conflicts(ref self, leaves: [(Expr, [int])]):
+        for i in 0..len(leaves):
+            let a = leaves[i].0
+            if is_wild(a):
+                continue
+            match lvalue_root(a):
+                case Some(root):
+                    for j in 0..len(leaves):
+                        let b = leaves[j].0
+                        if j == i or is_wild(b):
+                            continue
+                        match index_reading(b, root):
+                            case Some(sp):
+                                let n = self.locals[root].name
+                                self.err(
+                                    diag.error(
+                                        "E0405",
+                                        f"this index reads `{n}`, which the same assignment changes"
+                                    )
+                                    .label(sp, f"reads `{n}`")
+                                    .label(a.span, f"`{n}` changes here")
+                                    .with_help(
+                                        "assign in two steps, so the order is visible: first the index's variable, then the element"
+                                    )
+                                )
+                                return
+                            case None:
+                                pass
+                case None:
+                    pass
+            for j in i + 1..len(leaves):
+                match (place_key(a), place_key(leaves[j].0)):
+                    case (Some(x), Some(y)):
+                        if x == y or x.starts_with(y + ".") or y.starts_with(x + "."):
+                            self.err(
+                                diag.error("E0405", "the same place is assigned twice")
+                                .label(leaves[j].0.span, "assigned again here")
+                                .label(a.span, "first assigned here")
+                                .with_help("assign each place once")
+                            )
+                            return
+                    case _:
+                        pass
+
     fn check_stmt(ref self, ref s: Stmt):
         let span = s.span
         match s.kind:
@@ -1355,50 +1528,22 @@ struct Checker:
                 s.kind = StmtKind.Let(mutable, pat, ty, init2, is_ref)
                 s.locals = locals
             case StmtKind.Assign(target, op, value):
+                match target.kind:
+                    case ExprKind.Tuple(_):
+                        self.tuple_assign(s.span, target, op, value)
+                        return
+                    case _:
+                        pass
                 var target2 = target
                 var value2 = value
-                match target.kind:
-                    case ExprKind.Ident(name):
-                        if self.lookup_local(name).is_none() and not self.has_item(name):
-                            let d = diag.error(
-                                "E0201",
-                                f"cannot assign to undefined variable `{name}`"
-                            ).label(target.span, "not declared")
-                            self.err(
-                                d.with_help(f"declare it first: `var {name} = ...`").fix(
-                                    Span(
-                                        file=target.span.file,
-                                        lo=target.span.lo,
-                                        hi=target.span.lo
-                                    ),
-                                    "var ",
-                                    "declare with `var`"
-                                )
-                            )
-                            self.check_expr(ref value2, None)
-                            s.kind = StmtKind.Assign(target2, op, value2)
-                            return
-                    case _:
-                        pass
-                let tt = self.check_expr(ref target2, None)
-                var is_const = false
-                match target2.kind:
-                    case ExprKind.Ident(n):
-                        match target2.res:
-                            case Res.Const(_):
-                                is_const = true
-                                self.err(
-                                    diag.error(
-                                        "E0401",
-                                        f"cannot assign to constant `{n}`"
-                                    ).label(target2.span, "constants never change")
-                                )
-                            case _:
-                                pass
-                    case _:
-                        pass
-                if not is_const and not tt.is_error():
-                    self.check_mutation_target(target2, "assign to")
+                var tt = Ty.Error
+                match self.assign_target(ref target2):
+                    case Some(t):
+                        tt = t
+                    case None:
+                        self.check_expr(ref value2, None)
+                        s.kind = StmtKind.Assign(target2, op, value2)
+                        return
                 match op:
                     case None:
                         self.check_expr(ref value2, Some(tt))
@@ -6623,6 +6768,93 @@ fn equatable(t: Ty) -> bool:
             return all(equatable(x) for x in ts)
         case _:
             return true
+
+# The places of `a, (b, c) = ...`, each with its path into the value.
+fn place_leaves(e: Expr, path: [int], ref out: [(Expr, [int])]):
+    match e.kind:
+        case ExprKind.Tuple(xs):
+            for i, x in enumerate(xs):
+                var p = path
+                p.push(i)
+                place_leaves(x, p, ref out)
+        case _:
+            out.push((e, path))
+
+fn is_wild(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Ident(n):
+            return n == "_"
+        case _:
+            return false
+
+# The type a tuple of places expects, from the types of its places in order.
+fn shape_ty(e: Expr, tys: [Ty], ref k: int) -> Ty:
+    match e.kind:
+        case ExprKind.Tuple(xs):
+            var ts: [Ty] = []
+            for x in xs:
+                ts.push(shape_ty(x, tys, ref k))
+            return Ty.Tuple(ts)
+        case _:
+            k += 1
+            return tys[k - 1]
+
+fn fits_shape(e: Expr, t: Ty) -> bool:
+    match e.kind:
+        case ExprKind.Tuple(xs):
+            match t:
+                case Ty.Tuple(ts):
+                    if len(ts) != len(xs):
+                        return false
+                    for i, x in enumerate(xs):
+                        if not fits_shape(x, ts[i]):
+                            return false
+                    return true
+                case _:
+                    return false
+        case _:
+            return true
+
+# Where the value for a path comes from, for error labels.
+fn elem_span(v: Expr, path: [int]) -> Span:
+    var e = v
+    for i in path:
+        match e.kind:
+            case ExprKind.Tuple(xs):
+                e = xs[i]
+            case _:
+                return e.span
+    return e.span
+
+# The span of an index in place `e` that mentions local `id`.
+fn index_reading(e: Expr, id: int) -> Option[Span]:
+    match e.kind:
+        case ExprKind.Field(x, _, _):
+            return index_reading(x, id)
+        case ExprKind.Index(x, i):
+            if expr_mentions(i, id):
+                return Some(i.span)
+            return index_reading(x, id)
+        case _:
+            return None
+
+# `a.b.c` as text with the variable's id, or None when the place has an index.
+fn place_key(e: Expr) -> Option[str]:
+    match e.kind:
+        case ExprKind.Ident(_):
+            match local_of(e):
+                case Some(id):
+                    return Some(str(id))
+                case None:
+                    return None
+        case ExprKind.Field(x, name, _):
+            match place_key(x):
+                case Some(k):
+                    return Some(k + "." + name)
+                case None:
+                    return None
+        case _:
+            return None
 
 # The path step applied directly to the root variable.
 fn root_step(e: Expr) -> Option[Expr]:
