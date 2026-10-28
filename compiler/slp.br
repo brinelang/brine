@@ -1,0 +1,549 @@
+# Vector code for small straight-line float kernels (kernel.br finds them).
+#
+# A kernel is a DAG of IEEE double operations: loads from arrays, float
+# parameters, constants, + - * /, negation and sqrt, and the values it writes
+# back or returns. It runs on vectors of W doubles (2, 4 or 8: SSE2, AVX2 and
+# AVX-512 for the three x86-64 levels of a release build), written as GCC
+# vector extensions in the C a release build compiles.
+#
+# A node's class is its operation and its operands' classes (a load's: its
+# array and field), so `x[i] - x[j]` for every pair of bodies is one class.
+# `v + t` and `v - t` are one class too: the lanes that subtract multiply `t`
+# by -1 first, which is exact. A class is cut into packs of up to W nodes,
+# one vector each. Its lanes follow the packs that use it when those ask for
+# its nodes in separate groups (the velocities of the bodies, which every
+# step updates in turn, in body order); otherwise its nodes go in order and
+# the packs that use them shuffle them into place (the pairs of bodies, which
+# two bodies' updates read each). Either way each node is computed once.
+#
+# Every lane does what the scalar code does, the same operation on the same
+# operands, so the results are the same bits.
+
+const LOAD = 0
+const PARAM = 1
+const CONST = 2
+const ADD = 3
+const MUL = 4
+const DIV = 5
+const NEG = 6
+const SQRT = 7
+
+struct Node:
+    op: int
+    a: int
+    b: int
+    # LOAD: the array, the element and the field's byte offset in it;
+    # PARAM: the parameter's index in `arr`; CONST: the IEEE bits in `off`
+    arr: int
+    k: int
+    off: int
+    # ADD: a - b
+    sub: bool
+
+struct Dag:
+    nodes: [Node]
+    memo: {str: int}
+    # the element size of each array
+    sizes: [int]
+    # the values written back: (node, array, element, offset)
+    stores: [(int, int, int, int)]
+    # the returned value, or -1
+    ret: int
+
+    fn node(ref self, op: int, a: int, b: int, arr: int, k: int, off: int, sub: bool) -> int:
+        let key = f"{op},{a},{b},{arr},{k},{off},{sub}"
+        match self.memo.get(key):
+            case Some(i):
+                return i
+            case None:
+                pass
+        let i = len(self.nodes)
+        self.nodes.push(Node(op=op, a=a, b=b, arr=arr, k=k, off=off, sub=sub))
+        self.memo[key] = i
+        return i
+
+    fn load(ref self, arr: int, k: int, off: int) -> int:
+        return self.node(LOAD, -1, -1, arr, k, off, false)
+
+    fn param(ref self, i: int) -> int:
+        return self.node(PARAM, -1, -1, i, 0, 0, false)
+
+    fn konst(ref self, bits: int) -> int:
+        return self.node(CONST, -1, -1, 0, 0, bits, false)
+
+    fn bin(ref self, op: int, a: int, b: int, sub: bool) -> int:
+        return self.node(op, a, b, 0, 0, 0, sub)
+
+    fn un(ref self, op: int, a: int) -> int:
+        return self.node(op, a, -1, 0, 0, 0, false)
+
+fn new_dag(sizes: [int]) -> Dag:
+    return Dag(nodes=[], memo={}, sizes=sizes, stores=[], ret=-1)
+
+fn arity(op: int) -> int:
+    if op == ADD or op == MUL or op == DIV:
+        return 2
+    if op == NEG or op == SQRT:
+        return 1
+    return 0
+
+# What an operation costs, about: sqrt and division are slow, and as slow on
+# a vector as on one double.
+fn op_cost(op: int) -> int:
+    if op == SQRT:
+        return 8
+    if op == DIV:
+        return 4
+    if arity(op) > 0:
+        return 1
+    return 0
+
+# The nodes the stores and the result need.
+fn live(d: Dag) -> [bool]:
+    var out = [false] * len(d.nodes)
+    var work: [int] = []
+    for s in d.stores:
+        work.push(s.0)
+    if d.ret >= 0:
+        work.push(d.ret)
+    while len(work) > 0:
+        let n = work.pop()
+        if out[n]:
+            continue
+        out[n] = true
+        let x = d.nodes[n]
+        if arity(x.op) >= 1:
+            work.push(x.a)
+        if arity(x.op) == 2:
+            work.push(x.b)
+    return out
+
+# The cost of the code one double at a time.
+fn scalar_cost(d: Dag) -> int:
+    let lv = live(d)
+    var c = len(d.stores)
+    for i, x in enumerate(d.nodes):
+        if lv[i]:
+            c += op_cost(x.op)
+            if x.op == LOAD:
+                c += 1
+    return c
+
+struct Pack:
+    cls: int
+    lanes: [int]
+
+# Which pack and lane holds each node, for vectors of `w` lanes.
+struct Layout:
+    w: int
+    packs: [Pack]
+    # by node; -1: not in a pack (a constant, or not needed)
+    pack_of: [int]
+    lane_of: [int]
+    # the classes by height, lowest first, and the packs of each
+    order: [int]
+    cpacks: [[int]]
+
+fn list_key(l: [int]) -> str:
+    return ",".join([f"{x}" for x in l])
+
+fn layout(d: Dag, w: int) -> Layout:
+    let n = len(d.nodes)
+    let lv = live(d)
+    var cls = [0] * n
+    var height = [0] * n
+    var ids: {str: int} = {}
+    var members: [[int]] = []
+    var cheight: [int] = []
+    var const_cls = -1
+    for i in 0..n:
+        let x = d.nodes[i]
+        var key = ""
+        var h = 0
+        if x.op == LOAD:
+            key = f"L{x.arr}:{x.off}"
+        elif x.op == PARAM:
+            key = f"P{x.arr}"
+        elif x.op == CONST:
+            key = "C"
+        elif arity(x.op) == 2:
+            key = f"{x.op}:{cls[x.a]}:{cls[x.b]}"
+            h = 1 + max(height[x.a], height[x.b])
+        else:
+            key = f"{x.op}:{cls[x.a]}"
+            h = 1 + height[x.a]
+        height[i] = h
+        match ids.get(key):
+            case Some(c):
+                cls[i] = c
+            case None:
+                let c = len(members)
+                ids[key] = c
+                cls[i] = c
+                members.push([])
+                cheight.push(h)
+                if x.op == CONST:
+                    const_cls = c
+        if lv[i]:
+            members[cls[i]].push(i)
+    let nc = len(members)
+    # the groups of nodes the packs using a class ask for, in lane order
+    var dem: [[[int]]] = [[] for _ in 0..nc]
+    # stores, by array, field and class, in element order
+    var groups: {str: [int]} = {}
+    var gorder: [str] = []
+    var skeys: [int] = []
+    for s in d.stores:
+        skeys.push(s.2 * 1000000 + len(skeys))
+    var sorder = skeys
+    sorder.sort()
+    for sk in sorder:
+        let s = d.stores[sk % 1000000]
+        if cls[s.0] == const_cls:
+            continue
+        let g = f"{s.1}:{s.3}:{cls[s.0]}"
+        if g not in groups:
+            groups[g] = []
+            gorder.push(g)
+        groups[g].push(s.0)
+    for g in gorder:
+        let vs = groups[g]
+        var i = 0
+        while i < len(vs):
+            let end = min(i + w, len(vs))
+            dem[cls[vs[i]]].push(vs[i:end])
+            i = end
+    if d.ret >= 0 and cls[d.ret] != const_cls:
+        dem[cls[d.ret]].push([d.ret])
+    # classes from the highest down: a class's users are all higher
+    var corder: [int] = []
+    for c in 0..nc:
+        corder.push((1000000 - cheight[c]) * 100000 + c)
+    corder.sort()
+    var out = Layout(
+        w=w,
+        packs=[],
+        pack_of=[-1] * n,
+        lane_of=[-1] * n,
+        order=[],
+        cpacks=[[] for _ in 0..nc]
+    )
+    for ck in corder:
+        let c = ck % 100000
+        let m = members[c]
+        if c == const_cls or len(m) == 0:
+            continue
+        var lists: [[int]] = []
+        var lseen: {str: bool} = {}
+        for l in dem[c]:
+            let key = list_key(l)
+            if key not in lseen:
+                lseen[key] = true
+                lists.push(l)
+        var valid = true
+        var seen: {int: bool} = {}
+        for l in lists:
+            for x in l:
+                if x in seen:
+                    valid = false
+                seen[x] = true
+        if len(seen) != len(m):
+            valid = false
+        # users that each take one node (a serial sum) say nothing about
+        # which nodes go together
+        let dense_packs = (len(m) + w - 1) / w
+        if not valid or len(lists) > 2 * dense_packs or (len(m) > 1 and len(lists) == len(m)):
+            lists = dense(d, m, w)
+        for l in lists:
+            let p = len(out.packs)
+            out.packs.push(Pack(cls=c, lanes=l))
+            out.cpacks[c].push(p)
+            for li, x in enumerate(l):
+                out.pack_of[x] = p
+                out.lane_of[x] = li
+            let x0 = d.nodes[l[0]]
+            if arity(x0.op) >= 1:
+                let ops = [d.nodes[x].a for x in l]
+                if cls[ops[0]] != const_cls:
+                    dem[cls[ops[0]]].push(ops)
+            if arity(x0.op) == 2:
+                let ops = [d.nodes[x].b for x in l]
+                if cls[ops[0]] != const_cls:
+                    dem[cls[ops[0]]].push(ops)
+    var i = len(corder) - 1
+    while i >= 0:
+        let c = corder[i] % 100000
+        if len(out.cpacks[c]) > 0:
+            out.order.push(c)
+        i -= 1
+    return out
+
+# A class's nodes in order (loads by element), `w` at a time.
+fn dense(d: Dag, m: [int], w: int) -> [[int]]:
+    var keys: [int] = []
+    for x in m:
+        let nd = d.nodes[x]
+        let k = nd.k if nd.op == LOAD else 0
+        keys.push(k * 1000000 + x)
+    keys.sort()
+    var out: [[int]] = []
+    var i = 0
+    while i < len(keys):
+        let end = min(i + w, len(keys))
+        out.push([keys[j] % 1000000 for j in i..end])
+        i = end
+    return out
+
+# The 64 bits of `n` as an unsigned C literal.
+fn u64_lit(n: int) -> str:
+    if n < 0:
+        let u = i128(n) + 18446744073709551616
+        return f"{u}ULL"
+    return f"{n}ULL"
+
+# Writes one kernel's C, counting what it costs.
+struct Emit:
+    d: Dag
+    l: Layout
+    vt: str
+    out: str
+    temps: int
+    gathers: {str: str}
+    cost: int
+
+    fn tmp(ref self) -> str:
+        self.temps += 1
+        return f"t{self.temps}"
+
+    fn line(ref self, s: str):
+        self.out += "    " + s + "\n"
+
+    fn pname(self, p: int) -> str:
+        return f"p{p}"
+
+    fn is_vec(self, p: int) -> bool:
+        return len(self.l.packs[p].lanes) > 1
+
+    # Node `n` as a double.
+    fn scal(ref self, n: int) -> str:
+        let x = self.d.nodes[n]
+        if x.op == CONST:
+            return f"br_f64({u64_lit(x.off)})"
+        let p = self.l.pack_of[n]
+        if self.is_vec(p):
+            self.cost += 1
+            return f"{self.pname(p)}[{self.l.lane_of[n]}]"
+        return self.pname(p)
+
+    # The nodes `ns` as a vector, lane i holding ns[i]: a pack itself, or
+    # shuffled together from packs, scalars and constants.
+    fn gather(ref self, ns: [int]) -> str:
+        let w = self.l.w
+        var same = true
+        let p0 = self.l.pack_of[ns[0]]
+        for i, x in enumerate(ns):
+            if self.l.pack_of[x] != p0 or self.l.lane_of[x] != i:
+                same = false
+        if same and p0 >= 0 and self.is_vec(p0):
+            return self.pname(p0)
+        let key = list_key(ns)
+        match self.gathers.get(key):
+            case Some(t):
+                return t
+            case None:
+                pass
+        var srcs: [int] = []
+        var all_const = true
+        for x in ns:
+            let p = self.l.pack_of[x]
+            if p >= 0 and self.is_vec(p) and p not in srcs:
+                srcs.push(p)
+            if self.d.nodes[x].op != CONST:
+                all_const = false
+        let t = self.tmp()
+        var done = [false] * w
+        if len(srcs) == 0:
+            var es: [str] = []
+            for i in 0..w:
+                es.push(self.scal(ns[i] if i < len(ns) else ns[0]))
+            if not all_const:
+                self.cost += len(ns)
+            self.line(f"{self.vt} {t} = ({self.vt})\{" + ", ".join(es) + "\};")
+            self.gathers[key] = t
+            return t
+        # the first two vector sources, then one more at a time
+        var idx = [0] * w
+        let a = srcs[0]
+        let b = srcs[1] if len(srcs) > 1 else srcs[0]
+        for i, x in enumerate(ns):
+            let p = self.l.pack_of[x]
+            if p == a:
+                idx[i] = self.l.lane_of[x]
+                done[i] = true
+            elif p == b:
+                idx[i] = w + self.l.lane_of[x]
+                done[i] = true
+        self.cost += 1
+        self.line(f"{self.vt} {t} = BRK_SH{w}({self.pname(a)}, {self.pname(b)}, {list_key(idx)});")
+        for si in 2..len(srcs):
+            let s = srcs[si]
+            var ix = [i for i in 0..w]
+            for i, x in enumerate(ns):
+                if self.l.pack_of[x] == s:
+                    ix[i] = w + self.l.lane_of[x]
+                    done[i] = true
+            self.cost += 1
+            self.line(f"{t} = BRK_SH{w}({t}, {self.pname(s)}, {list_key(ix)});")
+        for i, x in enumerate(ns):
+            if not done[i]:
+                self.cost += 1
+                let v = self.scal(x)
+                self.line(f"{t}[{i}] = {v};")
+        self.gathers[key] = t
+        return t
+
+    fn operand(ref self, ns: [int], vec: bool) -> str:
+        if vec:
+            return self.gather(ns)
+        return self.scal(ns[0])
+
+    fn mem(self, n: int) -> str:
+        let x = self.d.nodes[n]
+        let off = x.k * self.d.sizes[x.arr] + x.off
+        return f"*(double *)(a{x.arr} + {off})"
+
+    fn pack(ref self, p: int):
+        let pk = self.l.packs[p]
+        let ls = pk.lanes
+        let vec = len(ls) > 1
+        let w = self.l.w
+        let ty = self.vt if vec else "double"
+        let name = self.pname(p)
+        let x0 = self.d.nodes[ls[0]]
+        let op = x0.op
+        self.cost += op_cost(op)
+        if op == LOAD:
+            self.cost += len(ls)
+            if not vec:
+                self.line(f"double {name} = {self.mem(ls[0])};")
+                return
+            var es: [str] = []
+            for i in 0..w:
+                es.push(self.mem(ls[i] if i < len(ls) else ls[0]))
+            self.line(f"{ty} {name} = ({ty})\{" + ", ".join(es) + "\};")
+            return
+        if op == PARAM:
+            self.line(f"double {name} = f{x0.arr};")
+            return
+        let a = self.operand([self.d.nodes[x].a for x in ls], vec)
+        if op == NEG:
+            self.line(f"{ty} {name} = -{a};")
+            return
+        if op == SQRT:
+            if vec:
+                self.line(f"{ty} {name} = brk_sqrt{w}({a});")
+            else:
+                self.line(f"double {name} = __builtin_sqrt({a});")
+            return
+        let b = self.operand([self.d.nodes[x].b for x in ls], vec)
+        if op == MUL:
+            self.line(f"{ty} {name} = {a} * {b};")
+            return
+        if op == DIV:
+            self.line(f"{ty} {name} = {a} / {b};")
+            return
+        var subs = 0
+        for x in ls:
+            if self.d.nodes[x].sub:
+                subs += 1
+        if subs == 0:
+            self.line(f"{ty} {name} = {a} + {b};")
+        elif subs == len(ls):
+            self.line(f"{ty} {name} = {a} - {b};")
+        else:
+            # some lanes subtract: b * -1 is exactly -b, and a + -b is a - b
+            var sg: [str] = []
+            for i in 0..w:
+                sg.push("-1.0" if i < len(ls) and self.d.nodes[ls[i]].sub else "1.0")
+            let t = self.tmp()
+            self.cost += 1
+            self.line(f"{ty} {t} = {b} * ({ty})\{" + ", ".join(sg) + "\};")
+            self.line(f"{ty} {name} = {a} + {t};")
+
+# The body of a kernel for vectors of `w` doubles (after its signature), and
+# what it costs.
+fn emit_body(d: Dag, w: int) -> (str, int):
+    let l = layout(d, w)
+    var e = Emit(d=d, l=l, vt=f"brk_v{w}", out="", temps=0, gathers={}, cost=0)
+    for c in l.order:
+        for p in l.cpacks[c]:
+            e.pack(p)
+    for s in d.stores:
+        let v = e.scal(s.0)
+        let off = s.2 * d.sizes[s.1] + s.3
+        e.cost += 1
+        e.line(f"*(double *)(a{s.1} + {off}) = {v};")
+    if d.ret >= 0:
+        let v = e.scal(d.ret)
+        e.line(f"return {v};")
+    return (e.out, e.cost)
+
+# The vector types and helpers kernels use, once per C file. BRK_W is the
+# widest vector of the level the file is compiled for.
+fn c_prelude() -> str:
+    var o = "\n/* vector kernels (slp.br) */\n"
+    o += "#if defined(__AVX512F__)\n#define BRK_W 8\n#elif defined(__AVX2__)\n#define BRK_W 4\n#else\n#define BRK_W 2\n#endif\n"
+    o += "#if defined(__SSE2__) || defined(__AVX__)\n#include <immintrin.h>\n#endif\n"
+    o += "#if defined(__clang__) || __GNUC__ >= 12\n#define BRK_SHUF(m, a, b, ...) __builtin_shufflevector(a, b, __VA_ARGS__)\n#else\n#define BRK_SHUF(m, a, b, ...) __builtin_shuffle(a, b, (m)\{__VA_ARGS__\})\n#endif\n"
+    for w in [2, 4, 8]:
+        if w > 2:
+            o += f"#if BRK_W >= {w}\n"
+        o += f"typedef double brk_v{w} __attribute__((vector_size({w * 8})));\n"
+        o += f"typedef long long brk_m{w} __attribute__((vector_size({w * 8})));\n"
+        o += f"#define BRK_SH{w}(a, b, ...) BRK_SHUF(brk_m{w}, a, b, __VA_ARGS__)\n"
+        o += f"static inline brk_v{w} brk_sqrt{w}(brk_v{w} a) \{\n"
+        if w == 2:
+            o += "#if defined(__SSE2__)\n    return (brk_v2)_mm_sqrt_pd((__m128d)a);\n#else\n"
+        elif w == 4:
+            o += "#if defined(__AVX__)\n    return (brk_v4)_mm256_sqrt_pd((__m256d)a);\n#else\n"
+        else:
+            o += "#if defined(__AVX512F__)\n    return (brk_v8)_mm512_sqrt_pd((__m512d)a);\n#else\n"
+        o += f"    brk_v{w} r;\n    for (int i = 0; i < {w}; i++) r[i] = __builtin_sqrt(a[i]);\n    return r;\n#endif\n\}\n"
+        if w > 2:
+            o += "#endif\n"
+    return o + "\n"
+
+# A kernel as C: `sig` is its signature (`static void brk_f(char *a0, double f0)`).
+# Each x86-64 level gets the cheapest of its widths that saves a tenth of the
+# work (below that the shuffles and the call cost more than the count says),
+# else the unrolled code one double at a time. None when no level gets
+# vectors.
+fn kernel_c(d: Dag, sig: str) -> Option[str]:
+    let base = scalar_cost(d)
+    var bodies: [str] = []
+    var costs: [int] = []
+    for w in [2, 4, 8]:
+        let (b, c) = emit_body(d, w)
+        bodies.push(b)
+        costs.push(c)
+    var picks: [int] = []
+    for lv in 0..3:
+        var best = -1
+        for i in 0..lv + 1:
+            if costs[i] * 10 <= base * 9 and (best < 0 or costs[i] < costs[best]):
+                best = i
+        picks.push(best)
+    if picks[2] < 0:
+        return None
+    var o = ""
+    for lv in [2, 1, 0]:
+        if lv == 2:
+            o += "#if BRK_W == 8\n"
+        elif lv == 1:
+            o += "#elif BRK_W == 4\n"
+        else:
+            o += "#else\n"
+        let body = bodies[picks[lv]] if picks[lv] >= 0 else emit_body(d, 1).0
+        o += sig + " {\n" + body + "}\n"
+    o += "#endif\n"
+    return Some(o)

@@ -19,6 +19,7 @@ from verify import Report
 const PRELUDE_SRC = embed("../runtime/prelude.br")
 const RT_H = embed("../runtime/brine_rt.h")
 const RT_C = embed("../runtime/brine_rt.c")
+const CPU_C = embed("../runtime/brine_cpu.c")
 # runs a WebAssembly build under Node.js (`brine run --target wasm`)
 const WASI_NODE = embed("../runtime/brine_wasi.mjs")
 # the browser side of `--target web`
@@ -533,9 +534,45 @@ fn runtime_object(cc: str, flags: [str], key: str, dir: str) -> Result[(str, str
             pass
     return Ok((rt_dir, rt_obj))
 
+# The x86-64 levels an optimized program is compiled for, as the extra C
+# compiler flags of each: plain x86-64, then x86-64-v3 (AVX2) and x86-64-v4
+# (AVX-512). runtime/brine_cpu.c picks one when the program starts, so the
+# executable runs anywhere and still uses the vector units of newer CPUs.
+# None (one plain build) for other profiles and targets.
+fn cpu_levels(profile: Profile, plat: Platform, units: int) -> [[str]]:
+    if profile != Profile.Release or plat != Platform.Host or os.arch() != "x86_64" or units != 1:
+        return []
+    return [
+        ["-DBRINE_MAIN=brine_main_base"],
+        ["-DBRINE_MAIN=brine_main_v3", "-march=x86-64-v3"],
+        ["-DBRINE_MAIN=brine_main_v4", "-march=x86-64-v4"]
+    ]
+
 # Compile generated code to an executable. `dir` is a cache directory for
 # intermediate files. Returns Ok(true) if the C compiler actually ran.
 fn compile(code: Code, dest: str, dir: str, profile: Profile, plat: Platform) -> Result[bool, Diag]:
+    match compile_levels(code, dest, dir, profile, plat, true):
+        case Ok(ran):
+            return Ok(ran)
+        case Err(d):
+            # a C compiler too old for x86-64-v3 and v4 (gcc < 11, clang < 12)
+            # still makes a plain build
+            if len(cpu_levels(profile, plat, 1)) == 0:
+                return Err(d)
+            match compile_levels(code, dest, dir, profile, plat, false):
+                case Ok(ran):
+                    return Ok(ran)
+                case Err(_):
+                    return Err(d)
+
+fn compile_levels(
+    code: Code,
+    dest: str,
+    dir: str,
+    profile: Profile,
+    plat: Platform,
+    levels: bool
+) -> Result[bool, Diag]:
     var cc = ""
     var flags = ["-std=c11", "-fno-strict-aliasing", "-w"]
     var libs = link_libs()
@@ -564,14 +601,29 @@ fn compile(code: Code, dest: str, dir: str, profile: Profile, plat: Platform) ->
     # objects are named by a hash of what they're made from, the runtime
     # header included: its inline functions end up in them
     let ukey = key + "|" + hex16(fnv(RT_H))
-    var units: [str] = []
+    # C files with the extra flags each is compiled with
+    var units: [(str, [str])] = []
     var native: [u8] = []
     var hashes: [str] = []
     match code:
         case Code.C(us):
-            units = us
-            for u in units:
-                hashes.push(hex16(fnv(u + ukey)))
+            let lv = cpu_levels(profile, plat, len(us)) if levels else []
+            # gcc on Windows can't align its stack to 32 bytes, so it spills
+            # AVX registers to unaligned slots with aligned moves (gcc bug
+            # 54412); the assembler can make every such move unaligned
+            let fix_align = os.name() == "windows" and "clang" not in cc
+            for u in us:
+                if len(lv) == 0:
+                    units.push((u, []))
+                for i, extra in enumerate(lv):
+                    var e = extra
+                    if i > 0 and fix_align:
+                        e.push("-Wa,-muse-unaligned-vector-move")
+                    units.push((u, e))
+            if len(lv) > 0:
+                units.push((CPU_C, []))
+            for u, extra in units:
+                hashes.push(hex16(fnv(u + ukey + " ".join(extra))))
         case Code.Obj(b):
             native = b
             hashes.push(hex16(fnv_bytes(b)))
@@ -594,7 +646,7 @@ fn compile(code: Code, dest: str, dir: str, profile: Profile, plat: Platform) ->
     make_dirs(obj_dir)?
     var objs: [str] = []
     var jobs: [(int, str, str, str)] = []
-    for i, u in enumerate(units):
+    for i, (u, extra) in enumerate(units):
         let obj = project.join(obj_dir, hashes[i] + ".o")
         # identical units (empty ones) are one object
         if obj in objs:
@@ -607,6 +659,7 @@ fn compile(code: Code, dest: str, dir: str, profile: Profile, plat: Platform) ->
         let tmp = project.join(obj_dir, f"{hashes[i]}.{os.pid()}.o")
         var cmd = [cc]
         cmd.extend(flags)
+        cmd.extend(extra)
         cmd.extend(["-I", rt_dir, "-c", c_path, "-o", tmp])
         match os.spawn(cmd, {}, true, false):
             case Ok(h):
@@ -700,12 +753,12 @@ fn unit_count(profile: Profile) -> int:
         return 1
     return min(max(os.cpu_count(), 1), 16)
 
-fn lowered(fe: Frontend, tests: bool, debug: bool, plat: Platform) -> lower.Lowered:
+fn lowered(fe: Frontend, tests: bool, profile: Profile, plat: Platform) -> lower.Lowered:
     return lower.lower(
         fe.prog.unwrap(),
         fe.info.unwrap(),
         fe.sm,
-        lower.Options(tests=tests, debug=debug, gpu=not plat.is_wasm())
+        lower.Options(tests=tests, debug=profile == Profile.Debug, gpu=not plat.is_wasm(), fast=profile == Profile.Release, vec=profile == Profile.Release and not plat.is_wasm() and not use_native(profile))
     )
 
 # Native code for dev and debug builds where x64.br or a64.br knows the
@@ -742,7 +795,7 @@ fn out_name(profile: Profile, plat: Platform) -> str:
 
 fn gen_code(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> Code:
     var t = clock()
-    let l = lowered(fe, tests, profile == Profile.Debug, plat)
+    let l = lowered(fe, tests, profile, plat)
     t = phase_time(t, "lower")
     if use_native(profile) and not plat.is_wasm():
         let win = os.name() == "windows"
@@ -767,7 +820,7 @@ fn gen_code(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> Code
 
 # The program as one C file (`brine emit-c`).
 fn gen_c(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> str:
-    return ir_c.emit_c(lowered(fe, tests, profile == Profile.Debug, plat))
+    return ir_c.emit_c(lowered(fe, tests, profile, plat))
 
 # The command that runs a WebAssembly build: BRINE_WASM_RUNNER (say
 # `wasmtime run --dir=.`) or Node.js with the runner script, which is written

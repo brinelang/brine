@@ -1,0 +1,155 @@
+# Byte arrays. A local integer array that a function makes with `[c] * n` or
+# `[i for i in lo..hi]`, then only indexes, sets elements of with `=` and
+# measures, and whose elements only ever get small constants or elements of
+# such arrays, holds values in 0..=255 alone. Release builds keep it as one
+# byte per element: eight times less memory, and loops idiom.br recognizes
+# work on it a register at a time. Nothing else can tell.
+#
+# `[i for i in lo..hi]` needs hi <= 256: when hi is a parameter, the function
+# tests that on entry and runs a copy with plain arrays if it fails.
+from types import Ty, IntTy, Res, CallRes, Builtin, LocalInfo, LocalKind
+from ast import Expr, ExprKind, Stmt, StmtKind, Block, LetPat, Arg, CompKind, children, stmt_exprs, stmt_blocks
+import pack
+
+struct Narrow:
+    # the arrays to keep as bytes
+    arrs: {int: bool}
+    # parameters that must be <= 256 for them
+    guards: [int]
+
+fn local_id(e: Expr) -> int:
+    return pack.local_id(e)
+
+fn small_lit(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Int(v):
+            return v >= 0 and v <= 255
+        case _:
+            return false
+
+fn find(body: Block, locals: [LocalInfo]) -> Narrow:
+    var out = Narrow(arrs={}, guards=[])
+    let usable = pack.find_with(body, locals, true)
+    var f = Find(locals=locals, usable=usable, cand={}, guard={}, lets={}, stores=[], bad={})
+    f.block(body)
+    # drop arrays that get a value not known to be small, until none do
+    var changed = true
+    while changed:
+        changed = false
+        for st in f.stores:
+            if st.0 in f.cand and not f.small(st.1):
+                f.cand.remove(st.0)
+                changed = true
+    for a in f.cand:
+        out.arrs[a] = true
+        match f.guard.get(a):
+            case Some(p):
+                if p >= 0 and not (p in out.guards):
+                    out.guards.push(p)
+            case None:
+                pass
+    out.guards.sort()
+    return out
+
+struct Find:
+    locals: [LocalInfo]
+    # arrays only indexed, set with `=` and measured (pack.br's rules)
+    usable: {int: bool}
+    # arrays made the right way
+    cand: {int: bool}
+    # the parameter `[i for i in lo..p]` needs <= 256, or -1
+    guard: {int: int}
+    # `let`s (never changed), by local: their value
+    lets: {int: Expr}
+    # element stores: (array, value)
+    stores: [(int, Expr)]
+    bad: {int: bool}
+
+    fn block(ref self, b: Block):
+        for s in b.stmts:
+            self.stmt(s)
+
+    fn stmt(ref self, s: Stmt):
+        match s.kind:
+            case StmtKind.Let(mutable, pat, _, init, is_ref):
+                match pat:
+                    case LetPat.Name(_, _):
+                        let l = s.locals[0]
+                        if not is_ref and not mutable:
+                            self.lets[l] = init
+                        if not is_ref and l in self.usable and self.int_arr(l):
+                            self.made(l, init)
+                    case _:
+                        pass
+            case StmtKind.Assign(t, op, v):
+                match t.kind:
+                    case ExprKind.Index(b, _):
+                        let a = local_id(b)
+                        if a >= 0 and op.is_none():
+                            self.stores.push((a, v))
+                    case _:
+                        pass
+            case _:
+                pass
+        for blk in stmt_blocks(s):
+            self.block(blk)
+
+    fn int_arr(self, l: int) -> bool:
+        match self.locals[l].ty:
+            case Ty.Array(Ty.Int(k)):
+                return k != IntTy.U8 and k != IntTy.I8 and k.bits() <= 64
+            case _:
+                return false
+
+    fn made(ref self, l: int, init: Expr):
+        match init.kind:
+            case ExprKind.Repeat(elem, _):
+                if small_lit(elem):
+                    self.cand[l] = true
+                    self.guard[l] = -1
+            case ExprKind.Comp(c):
+                if c.par or c.filter.is_some() or c.kind != CompKind.List or len(c.unpack) > 0:
+                    return
+                # [i for i in lo..hi], 0 <= lo
+                if local_id(c.body) != init.local:
+                    return
+                match c.iter.kind:
+                    case ExprKind.Range(lo, hi, inclusive):
+                        if not small_lit(lo):
+                            return
+                        let top = 255 if inclusive else 256
+                        match hi.kind:
+                            case ExprKind.Int(v):
+                                if v <= i128(top):
+                                    self.cand[l] = true
+                                    self.guard[l] = -1
+                                return
+                            case _:
+                                pass
+                        let p = local_id(hi)
+                        if p >= 0 and self.locals[
+                            p
+                        ].kind == LocalKind.Param and self.locals[p].ty == Ty.Int(IntTy.I64) and not inclusive:
+                            self.cand[l] = true
+                            self.guard[l] = p
+                    case _:
+                        pass
+            case _:
+                pass
+
+    # is `e` in 0..=255 when the candidates hold only such values
+    fn small(self, e: Expr) -> bool:
+        if small_lit(e):
+            return true
+        match e.kind:
+            case ExprKind.Index(b, _):
+                return local_id(b) in self.cand
+            case ExprKind.Ident(_):
+                let l = local_id(e)
+                match self.lets.get(l):
+                    case Some(v):
+                        return self.small(v)
+                    case None:
+                        return false
+            case _:
+                return false

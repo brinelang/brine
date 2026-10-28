@@ -1,0 +1,507 @@
+# Range versioning. A loop whose integer arithmetic the prover couldn't show
+# never overflows often can't overflow while the integers it starts from are
+# small: `s * (s + 1)` with `s = i + j` and `i, j < n` is safe for n up to
+# 2^30. For such a loop, release builds test the bound once before it and run
+# a copy with no overflow checks when it holds (else the loop as written), so
+# the C compiler can vectorize it. The copy calls check-free clones of the
+# functions whose arithmetic is safe for the arguments it passes them.
+#
+# Interval arithmetic over the loop: the integers it reads but doesn't change
+# are in [-T, T], loop variables in their ranges, `let`s their initial value,
+# anything the loop changes unknown. Every operation that has a check must
+# then stay in its type's range (a division's divisor away from 0 and -1),
+# for the largest power of two T for which that holds.
+from types import Ty, IntTy, Res, CallRes, Builtin, LocalInfo
+from ast import BinOp, UnOp, Arg, Expr, ExprKind, LetPat, Stmt, StmtKind, Block, FnDecl, Program
+from ast import children, stmt_exprs, stmt_blocks, lvalue_root
+from info import ProgramInfo
+from diag import Span
+from solver import add_i128, mul_i128
+import verify
+
+# The versioning of a loop: the integers to test against [-bound, bound]
+# (none: no test needed), and the calls (by span) to send to clones.
+struct Version:
+    bound: i128
+    params: [int]
+    calls: {str: int}
+
+struct Iv:
+    lo: i128
+    hi: i128
+
+# calls are told apart by their spans
+fn key(s: Span) -> str:
+    return f"{s.file}:{s.lo}:{s.hi}"
+
+# Integer types the analysis handles: their values and products fit i128.
+fn handled(t: Ty) -> Option[IntTy]:
+    match t:
+        case Ty.Int(k):
+            if k.bits() <= 64 and (k.signed() or k.bits() < 64):
+                return Some(k)
+            return None
+        case _:
+            return None
+
+fn full(k: IntTy) -> Iv:
+    return Iv(lo=k.min(), hi=k.max())
+
+fn fits(v: Iv, k: IntTy) -> bool:
+    return k.min() <= v.lo and v.hi <= k.max()
+
+# The versioning of `for <var> in <iter>: body` in a function with locals
+# `locals`, if it has checks to remove and a bound that removes them all.
+fn plan(
+    iter: Expr,
+    var_id: int,
+    body: Block,
+    locals: [LocalInfo],
+    info: ProgramInfo,
+    fns: {int: FnDecl}
+) -> Option[Version]:
+    # what the loop changes (it's unknown inside), and what it only reads
+    var mods: {int: int} = {}
+    verify.mods_block(body, info, ref mods)
+    var r = Ranges(
+        locals=locals,
+        info=info,
+        fns=fns,
+        mods=mods,
+        params={},
+        decl={},
+        bound=0,
+        env={},
+        calls={},
+        checks=0,
+        ok=true,
+        depth=0
+    )
+    r.decl[var_id] = true
+    r.declared(body)
+    r.collect_block(body)
+    r.collect(iter)
+    if len(r.params) == 0:
+        return None
+    # the bound that removes the most, the largest of those
+    var best: Option[Version] = None
+    var most = 0
+    var t: i128 = 1
+    t = t << 62
+    while t >= 256:
+        var x = r
+        x.bound = t
+        x.env = {}
+        x.calls = {}
+        x.checks = 0
+        x.ok = true
+        x.for_loop(iter, var_id, body)
+        let n = x.checks + len(x.calls)
+        if x.ok and n > most:
+            most = n
+            var ps: [int] = []
+            for p in x.params:
+                ps.push(p)
+            ps.sort()
+            best = Some(Version(bound=t, params=ps, calls=x.calls))
+        t = t >> 1
+    return best
+
+struct Ranges:
+    locals: [LocalInfo]
+    info: ProgramInfo
+    fns: {int: FnDecl}
+    # changed by the loop
+    mods: {int: int}
+    # integers read and not changed: in [-bound, bound]
+    params: {int: bool}
+    # declared inside the loop
+    decl: {int: bool}
+    bound: i128
+    env: {int: Iv}
+    # calls whose callee can be a clone without checks
+    calls: {str: int}
+    # checks that the bound removes
+    checks: int
+    ok: bool
+    # inside a callee being checked for a clone
+    depth: int
+
+    # ------------------------------------------------------------ parameters
+    fn declared(ref self, b: Block):
+        for s in b.stmts:
+            match s.kind:
+                case StmtKind.Let(_, _, _, _, _):
+                    for l in s.locals:
+                        self.decl[l] = true
+                case StmtKind.For(_, _, _, _, _, _, _):
+                    self.decl[s.local] = true
+                case _:
+                    pass
+            for blk in stmt_blocks(s):
+                self.declared(blk)
+
+    fn collect_block(ref self, b: Block):
+        for s in b.stmts:
+            for e in stmt_exprs(s):
+                self.collect(e)
+            for blk in stmt_blocks(s):
+                self.collect_block(blk)
+
+    fn collect(ref self, e: Expr):
+        match e.kind:
+            case ExprKind.Ident(_):
+                match e.res:
+                    case Res.Local(l):
+                        if l not in self.mods and l not in self.decl and handled(
+                            self.locals[l].ty
+                        ).is_some():
+                            self.params[l] = true
+                    case _:
+                        pass
+            case _:
+                pass
+        for c in children(e):
+            self.collect(c)
+
+    # ------------------------------------------------------------ statements
+    fn block(ref self, b: Block):
+        for s in b.stmts:
+            if not self.ok:
+                return
+            self.stmt(s)
+
+    # a variable the code changes anywhere may have any value
+    fn set(ref self, l: int, v: Iv):
+        match handled(self.locals[l].ty):
+            case Some(k):
+                if l in self.mods:
+                    self.env[l] = full(k)
+                else:
+                    self.env[l] = v
+            case None:
+                pass
+
+    fn stmt(ref self, s: Stmt):
+        match s.kind:
+            case StmtKind.Let(_, pat, _, init, is_ref):
+                let v = self.expr(init)
+                if is_ref:
+                    self.ok = false
+                    return
+                match pat:
+                    case LetPat.Name(_, _):
+                        self.set(s.locals[0], v)
+                    case LetPat.Tuple(_):
+                        for l in s.locals:
+                            match handled(self.locals[l].ty):
+                                case Some(k):
+                                    self.set(l, full(k))
+                                case None:
+                                    pass
+            case StmtKind.Assign(target, op, value):
+                let v = self.expr(value)
+                match target.kind:
+                    case ExprKind.Ident(_):
+                        pass
+                    case _:
+                        self.expr(target)
+                match op:
+                    case Some(o):
+                        if not s.proven:
+                            match handled(target.ty):
+                                case Some(k):
+                                    match target.kind:
+                                        case ExprKind.Ident(_):
+                                            let cur = self.expr(target)
+                                            self.arith(o, cur, v, k, true)
+                                        case _:
+                                            self.arith(o, full(k), v, k, true)
+                                case None:
+                                    if target.ty != Ty.Str:
+                                        match target.ty:
+                                            case Ty.Int(_):
+                                                self.ok = false
+                                            case _:
+                                                pass
+                    case None:
+                        pass
+            case StmtKind.For(_, _, _, iter, _, body, is_par):
+                if is_par:
+                    self.ok = false
+                    return
+                self.for_loop(iter, s.local, body)
+            case StmtKind.Match(_, _):
+                # patterns bind variables this doesn't follow
+                self.ok = false
+            case _:
+                for e in stmt_exprs(s):
+                    self.expr(e)
+                for b in stmt_blocks(s):
+                    self.block(b)
+
+    fn for_loop(ref self, iter: Expr, var_id: int, body: Block):
+        match iter.kind:
+            case ExprKind.Range(lo, hi, inclusive):
+                let a = self.expr(lo)
+                let b = self.expr(hi)
+                let top = b.hi if inclusive else b.hi - 1
+                self.set(var_id, Iv(lo=a.lo, hi=top if top >= a.lo else a.lo))
+            case _:
+                self.expr(iter)
+                match handled(self.locals[var_id].ty):
+                    case Some(k):
+                        self.set(var_id, full(k))
+                    case None:
+                        pass
+        self.block(body)
+
+    # ------------------------------------------------------------ expressions
+    fn local(ref self, l: int) -> Iv:
+        match handled(self.locals[l].ty):
+            case Some(k):
+                match self.env.get(l):
+                    case Some(v):
+                        return v
+                    case None:
+                        pass
+                if self.depth == 0 and l in self.params:
+                    return Iv(lo=-self.bound, hi=self.bound)
+                return full(k)
+            case None:
+                return Iv(lo=0, hi=0)
+
+    # the value range of `e` (when it's a handled integer)
+    fn expr(ref self, e: Expr) -> Iv:
+        if not self.ok:
+            return Iv(lo=0, hi=0)
+        let top = self.top(e.ty)
+        match e.kind:
+            case ExprKind.Int(v):
+                return Iv(lo=v, hi=v)
+            case ExprKind.Ident(_):
+                match e.res:
+                    case Res.Local(l):
+                        return self.local(l)
+                    case _:
+                        return top
+            case ExprKind.Binary(op, l, r):
+                let a = self.expr(l)
+                let b = self.expr(r)
+                match handled(e.ty):
+                    case Some(k):
+                        return self.arith(op, a, b, k, e.checked)
+                    case None:
+                        match e.ty:
+                            case Ty.Int(_):
+                                if e.checked:
+                                    self.ok = false
+                            case _:
+                                pass
+                        return top
+            case ExprKind.Unary(op, x):
+                let a = self.expr(x)
+                if op == UnOp.Neg:
+                    match handled(e.ty):
+                        case Some(k):
+                            if k.signed():
+                                # always checked
+                                if a.lo <= k.min():
+                                    self.ok = false
+                                    return top
+                                self.checks += 1
+                            return Iv(lo=-a.hi, hi=-a.lo)
+                        case None:
+                            match e.ty:
+                                case Ty.Int(_):
+                                    self.ok = false
+                                case _:
+                                    pass
+                return top
+            case ExprKind.IfElse(c, t, f):
+                self.expr(c)
+                let a = self.expr(t)
+                let b = self.expr(f)
+                return Iv(lo=a.lo if a.lo < b.lo else b.lo, hi=a.hi if a.hi > b.hi else b.hi)
+            case ExprKind.Call(_, args):
+                var vals: [Iv] = []
+                for a in args:
+                    vals.push(self.expr(a.expr))
+                match e.cres:
+                    case CallRes.Builtin(Builtin.Len):
+                        return Iv(lo=0, hi=top.hi)
+                    case CallRes.Builtin(Builtin.Min):
+                        if len(vals) == 2 and handled(e.ty).is_some():
+                            let a = vals[0]
+                            let b = vals[1]
+                            return Iv(
+                                lo=a.lo if a.lo < b.lo else b.lo,
+                                hi=a.hi if a.hi < b.hi else b.hi
+                            )
+                    case CallRes.Builtin(Builtin.Max):
+                        if len(vals) == 2 and handled(e.ty).is_some():
+                            let a = vals[0]
+                            let b = vals[1]
+                            return Iv(
+                                lo=a.lo if a.lo > b.lo else b.lo,
+                                hi=a.hi if a.hi > b.hi else b.hi
+                            )
+                    case CallRes.Convert(t):
+                        match (handled(t), handled(args[0].expr.ty)):
+                            case (Some(k), Some(_)):
+                                let v = vals[0]
+                                if fits(v, k):
+                                    return v
+                            case _:
+                                pass
+                    case CallRes.Fn(id):
+                        self.callee(e, id, args, vals)
+                    case _:
+                        pass
+                return top
+            case ExprKind.Comp(_):
+                # its variables are bound where this doesn't look
+                self.ok = false
+                return top
+            case ExprKind.ParTuple(_):
+                self.ok = false
+                return top
+            case _:
+                for c in children(e):
+                    self.expr(c)
+                return top
+
+    fn top(self, t: Ty) -> Iv:
+        match handled(t):
+            case Some(k):
+                return full(k)
+            case None:
+                return Iv(lo=0, hi=0)
+
+    # `a op b` in type `k`: its range; a check that could fail ends the plan
+    fn arith(ref self, op: BinOp, a: Iv, b: Iv, k: IntTy, checked: bool) -> Iv:
+        var r = full(k)
+        var known = false
+        match op:
+            case BinOp.Add:
+                match (add_i128(a.lo, b.lo), add_i128(a.hi, b.hi)):
+                    case (Some(x), Some(y)):
+                        r = Iv(lo=x, hi=y)
+                        known = true
+                    case _:
+                        pass
+            case BinOp.Sub:
+                match (add_i128(a.lo, -b.hi), add_i128(a.hi, -b.lo)):
+                    case (Some(x), Some(y)):
+                        r = Iv(lo=x, hi=y)
+                        known = true
+                    case _:
+                        pass
+            case BinOp.Mul:
+                match (
+                    mul_i128(a.lo, b.lo),
+                    mul_i128(a.lo, b.hi),
+                    mul_i128(a.hi, b.lo),
+                    mul_i128(a.hi, b.hi)
+                ):
+                    case (Some(p), Some(q), Some(u), Some(v)):
+                        var lo = p
+                        var hi = p
+                        for x in [q, u, v]:
+                            if x < lo:
+                                lo = x
+                            if x > hi:
+                                hi = x
+                        r = Iv(lo=lo, hi=hi)
+                        known = true
+                    case _:
+                        pass
+            case BinOp.Div | BinOp.Mod:
+                # the divisor away from 0, and not MIN / -1
+                let zero = b.lo <= 0 and 0 <= b.hi
+                let minus = k.signed() and a.lo <= k.min() and b.lo <= -1 and -1 <= b.hi
+                if checked and (zero or minus):
+                    self.ok = false
+                    return r
+                if checked:
+                    self.checks += 1
+                if b.lo > 0:
+                    if op == BinOp.Mod:
+                        return Iv(lo=0, hi=b.hi - 1)
+                    # floor division by a positive number
+                    let q1 = fdiv(a.lo, b.lo)
+                    let q2 = fdiv(a.lo, b.hi)
+                    let q3 = fdiv(a.hi, b.lo)
+                    let q4 = fdiv(a.hi, b.hi)
+                    var lo = q1
+                    var hi = q1
+                    for x in [q2, q3, q4]:
+                        if x < lo:
+                            lo = x
+                        if x > hi:
+                            hi = x
+                    return Iv(lo=lo, hi=hi)
+                return r
+            case BinOp.BitAnd:
+                if a.lo >= 0 and b.lo >= 0:
+                    return Iv(lo=0, hi=a.hi if a.hi < b.hi else b.hi)
+                if a.lo >= 0:
+                    return Iv(lo=0, hi=a.hi)
+                if b.lo >= 0:
+                    return Iv(lo=0, hi=b.hi)
+                return r
+            case _:
+                # shifts keep their checks
+                return r
+        if not checked:
+            # proven: the result is in range
+            if known:
+                return Iv(
+                    lo=r.lo if r.lo > k.min() else k.min(),
+                    hi=r.hi if r.hi < k.max() else k.max()
+                )
+            return full(k)
+        if not known or not fits(r, k):
+            self.ok = false
+            return full(k)
+        self.checks += 1
+        return r
+
+    # A call to a brine function: a clone without checks serves it if the
+    # callee's arithmetic is safe for these arguments.
+    fn callee(ref self, e: Expr, id: int, args: [Arg], vals: [Iv]):
+        if self.depth > 0:
+            return
+        match self.fns.get(id):
+            case Some(f):
+                if len(f.tparams) > 0 or len(f.param_locals) != len(args):
+                    return
+                for a in args:
+                    if a.by_ref:
+                        return
+                var c = Ranges(
+                    locals=f.locals,
+                    info=self.info,
+                    fns=self.fns,
+                    mods={},
+                    params={},
+                    decl={},
+                    bound=0,
+                    env={},
+                    calls={},
+                    checks=0,
+                    ok=true,
+                    depth=1
+                )
+                verify.mods_block(f.body, self.info, ref c.mods)
+                for i, l in enumerate(f.param_locals):
+                    c.set(l, vals[i])
+                c.block(f.body)
+                if c.ok and c.checks > 0:
+                    self.calls[key(e.span)] = id
+            case None:
+                pass
+
+# floor(a / b) (brine's `/` floors)
+fn fdiv(a: i128, b: i128) -> i128:
+    return a / b

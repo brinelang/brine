@@ -184,19 +184,157 @@ static inline size_t brine_str_size(int64_t n) {
     size_t g = (size_t)1 << (61 - __builtin_clzll(t));
     return (t + g - 1) & ~(g - 1);
 }
+/* The longest string the block of a string of length n holds. */
+static inline int64_t brine_str_room(int64_t n) {
+    if (n <= 47) return (int64_t)(((uint64_t)n + 32) & ~(uint64_t)15) - 17;
+    return (int64_t)brine_str_size(n) - 17;
+}
+/* A string's bytes start 8-byte aligned, and every string (heap blocks by
+   brine_str_size, literals by padding) can be read to the end of the 8-byte
+   word that holds its terminating NUL. So short strings are read, compared and
+   hashed a word at a time, with the bytes past the end masked off. All
+   targets are little-endian. */
+static inline uint64_t brine_ld8(const char *p) {
+    uint64_t v;
+    __builtin_memcpy(&v, p, 8);
+    return v;
+}
+static inline void brine_st8(char *p, uint64_t v) { __builtin_memcpy(p, &v, 8); }
+/* the low n bytes of a word, 0 <= n <= 8 */
+static inline uint64_t brine_lowmask(uint64_t n) { return n >= 8 ? ~0ULL : ~(~0ULL << (n * 8)); }
+/* small copies inline: a memcpy of a length known only at run time is a library call */
+static inline void brine_copy(char *d, const char *s, int64_t n) {
+    if (n > 16) {
+        __builtin_memcpy(d, s, (size_t)n);
+        return;
+    }
+    for (int64_t i = 0; i < n; i++) d[i] = s[i];
+}
 /* `s += t`: in place when s is unshared and its block has room */
 static inline void brine_str_add(brine_str **ps, brine_str *b) {
     brine_str *a = *ps;
-    int64_t n = a->len + b->len;
-    if (__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 && brine_str_size(n) == brine_str_size(a->len)) {
-        __builtin_memcpy(a->data + a->len, b->data, (size_t)b->len);
+    int64_t la = a->len, lb = b->len, n = la + lb;
+    if (BR_LIKELY(__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 && n <= brine_str_room(la))) {
+        brine_copy(a->data + la, b->data, lb);
         a->data[n] = 0;
         a->len = n;
         return;
     }
     brine_str_append(ps, b);
 }
-bool brine_str_eq(brine_str *a, brine_str *b);
+void brine_str_add_byte_slow(brine_str **ps, uint8_t c);
+/* `s += t[i]` and `s += "c"`: one byte, in place when s is unshared and has
+   room. Within the first word the whole word is rewritten: a later word load
+   (hashing, comparing) then forwards from one store instead of waiting for
+   several byte stores to retire. */
+static inline void brine_str_add_byte(brine_str **ps, uint8_t c) {
+    brine_str *a = *ps;
+    int64_t la = a->len;
+    if (BR_LIKELY(__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 && la < brine_str_room(la))) {
+        if (la < 8) {
+            uint64_t sh = (uint64_t)la * 8;
+            brine_st8(a->data, (brine_ld8(a->data) & ~(~0ULL << sh)) | ((uint64_t)c << sh));
+            if (la == 7) a->data[8] = 0;
+        } else {
+            a->data[la] = (char)c;
+            a->data[la + 1] = 0;
+        }
+        a->len = la + 1;
+        return;
+    }
+    brine_str_add_byte_slow(ps, c);
+}
+/* `var s = lit` run again (a loop body's variable): keeps s's block when
+   nothing else holds it, instead of freeing it here and allocating again at
+   the next `+=`. lit is a literal, so it needs no reference. */
+static inline void brine_str_reset(brine_str **ps, brine_str *lit) {
+    brine_str *a = *ps;
+    int64_t n = lit->len;
+    if (__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 && n <= brine_str_room(a->len)) {
+        /* a short literal goes in as one word store, so the next append's
+           word load forwards from it */
+        if (n < 8)
+            brine_st8(a->data, brine_ld8(lit->data) & brine_lowmask((uint64_t)n));
+        else {
+            brine_copy(a->data, lit->data, n);
+            a->data[n] = 0;
+        }
+        a->len = n;
+        return;
+    }
+    brine_str_release(a);
+    *ps = lit;
+}
+/* A loop whose only use of string variable s is `s += t[i]` (or a one-byte
+   literal) appends through an appender: the length and the first 8 bytes
+   stay in the appender, which the C compiler keeps in registers, instead of
+   going through s's block on every byte. Nothing reads s during the loop;
+   brine_app_close writes the length back when it ends. While s is unshared,
+   bytes go straight into its block (the first word, `w0`, at the end), up
+   to `room`, and `lim` is the end of the bytes `w0` takes; when s is shared,
+   room is -1 and the first byte makes it a block of its own. */
+typedef struct {
+    char *data;
+    int64_t len, room, lim;
+    uint64_t w0;
+} brine_app;
+typedef struct {
+    brine_str *s;
+    int64_t len, room, lim;
+    uint64_t w0;
+} brine_app_st;
+brine_app_st brine_app_more(brine_str *a, int64_t n, int64_t room, uint64_t w0, uint8_t c);
+static inline void brine_app_open(brine_str **ps, void *ap) {
+    brine_app *p = (brine_app *)ap;
+    brine_str *a = *ps;
+    int64_t n = a->len;
+    int64_t room = __atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 ? brine_str_room(n) : -1;
+    p->data = a->data;
+    p->len = n;
+    p->room = room;
+    p->lim = room < 8 ? room : 8;
+    p->w0 = brine_ld8(a->data) & brine_lowmask((uint64_t)n);
+}
+static inline void brine_app_byte(brine_str **ps, void *ap, uint8_t c) {
+    brine_app *p = (brine_app *)ap;
+    int64_t n = p->len;
+    if (BR_LIKELY(n < p->lim)) {
+        p->w0 |= (uint64_t)c << (8 * n);
+        p->len = n + 1;
+        return;
+    }
+    if (BR_LIKELY(n > 8 && n < p->room)) {
+        p->data[n] = (char)c;
+        p->len = n + 1;
+        return;
+    }
+    /* by value, so the appender's address doesn't escape */
+    brine_app_st x = brine_app_more(*ps, n, p->room, p->w0, c);
+    *ps = x.s;
+    p->data = x.s->data;
+    p->len = x.len;
+    p->room = x.room;
+    p->lim = x.lim;
+    p->w0 = x.w0;
+}
+static inline void brine_app_close(brine_str **ps, void *ap) {
+    brine_app *p = (brine_app *)ap;
+    brine_str *a = *ps;
+    int64_t n = p->len;
+    if (a->len == n) return; /* nothing appended */
+    a->len = n;
+    /* the bytes past n in w0 are 0: the NUL */
+    if (n <= 8) brine_st8(p->data, p->w0);
+    if (n >= 8) p->data[n] = 0;
+}
+bool brine_str_eq_long(brine_str *a, brine_str *b);
+static inline bool brine_str_eq(brine_str *a, brine_str *b) {
+    if (a == b) return true;
+    uint64_t n = (uint64_t)a->len;
+    if (n != (uint64_t)b->len) return false;
+    if (BR_LIKELY(n <= 8)) return ((brine_ld8(a->data) ^ brine_ld8(b->data)) & brine_lowmask(n)) == 0;
+    return brine_str_eq_long(a, b);
+}
 bool brine_str_contains(brine_str *s, brine_str *sub);
 /* `s[i]`: the byte at i as a one-character string, from a table of immortal
    ones so indexing never allocates */
@@ -243,7 +381,133 @@ double brine_parse_f64(brine_str *s, const char *loc);
 
 /* ------------------------------------------------------------ arrays */
 brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_fn rl, const char *loc);
+brine_arr *brine_bits_new(int64_t len, int64_t fill, const char *loc);
+brine_arr *brine_bytes_new(int64_t len, const char *loc);
 void brine_arr_unique(brine_arr **pa);
+
+/* Loops the compiler recognizes (idiom.br), done in one step when every
+   element they touch is in bounds. They return false, having changed
+   nothing, when the caller must run the loop as written instead (so a panic
+   happens where it would have). */
+static inline bool br_arr_mine(brine_arr **pa) {
+    if (BR_UNLIKELY(__atomic_load_n(&(*pa)->rc, __ATOMIC_ACQUIRE) != 1)) brine_arr_unique(pa);
+    return true;
+}
+/* for i in lo..hi: a[i] = a[i + 1] */
+static inline bool brine_arr_shl(brine_arr **pa, int64_t lo, int64_t hi) {
+    if (lo >= hi) return true;
+    if (lo < 0 || hi >= (*pa)->len || (*pa)->esz == 0) return false;
+    br_arr_mine(pa);
+    brine_arr *a = *pa;
+    int64_t e = a->esz;
+    __builtin_memmove(a->data + lo * e, a->data + (lo + 1) * e, (size_t)((hi - lo) * e));
+    return true;
+}
+/* for i in lo..hi: b[i] = a[i], b and a different variables (so different
+   arrays once b is unique) */
+static inline bool brine_arr_copy(brine_arr **pb, brine_arr *a, int64_t lo, int64_t hi) {
+    if (lo >= hi) return true;
+    if (lo < 0 || hi > a->len || hi > (*pb)->len || a->esz != (*pb)->esz || a->esz == 0) return false;
+    br_arr_mine(pb);
+    brine_arr *b = *pb;
+    int64_t e = a->esz;
+    __builtin_memcpy(b->data + lo * e, a->data + lo * e, (size_t)((hi - lo) * e));
+    return true;
+}
+/* x = a[lo]; for i in lo..hi: a[i] = a[i + 1]; a[hi] = x */
+static inline bool brine_arr_rotl(brine_arr **pa, int64_t lo, int64_t hi) {
+    if (lo > hi || lo < 0 || hi >= (*pa)->len || (*pa)->esz == 0 || (*pa)->esz > 64) return false;
+    br_arr_mine(pa);
+    brine_arr *a = *pa;
+    int64_t e = a->esz;
+    char x[64];
+    __builtin_memcpy(x, a->data + lo * e, (size_t)e);
+    __builtin_memmove(a->data + lo * e, a->data + (lo + 1) * e, (size_t)((hi - lo) * e));
+    __builtin_memcpy(a->data + hi * e, x, (size_t)e);
+    return true;
+}
+
+/* The same on byte arrays (narrow.br): never shared, with 16 bytes to spare
+   after the last element (brine_bytes_new), so these work on 16 bytes in a
+   pair of registers. Data `d`, length `n`. */
+typedef unsigned __int128 br_u128x;
+/* the low n bytes set, n in 0..=16: a table, as a variable 128-bit shift is
+   a chain of dependent instructions */
+static const uint64_t br_low_tab[17][2] = {
+    {0, 0}, {0xff, 0}, {0xffff, 0}, {0xffffff, 0}, {0xffffffffULL, 0}, {0xffffffffffULL, 0},
+    {0xffffffffffffULL, 0}, {0xffffffffffffffULL, 0}, {~0ULL, 0}, {~0ULL, 0xff}, {~0ULL, 0xffff},
+    {~0ULL, 0xffffff}, {~0ULL, 0xffffffffULL}, {~0ULL, 0xffffffffffULL}, {~0ULL, 0xffffffffffffULL},
+    {~0ULL, 0xffffffffffffffULL}, {~0ULL, ~0ULL}};
+static inline br_u128x br_low_bytes(int64_t n) { return ((br_u128x)br_low_tab[n][1] << 64) | br_low_tab[n][0]; }
+static inline br_u128x br_bswap128(br_u128x x) {
+    return ((br_u128x)__builtin_bswap64((uint64_t)x) << 64) | __builtin_bswap64((uint64_t)(x >> 64));
+}
+/* as two 8-byte halves, so a load that follows a store gets it forwarded */
+static inline br_u128x br_ld128(const char *p) {
+    uint64_t a, b;
+    __builtin_memcpy(&a, p, 8);
+    __builtin_memcpy(&b, p + 8, 8);
+    return ((br_u128x)b << 64) | a;
+}
+static inline void br_st128(char *p, br_u128x x) {
+    uint64_t a = (uint64_t)x, b = (uint64_t)(x >> 64);
+    __builtin_memcpy(p, &a, 8);
+    __builtin_memcpy(p + 8, &b, 8);
+}
+/* while i < j: a[i], a[j] = a[j], a[i]; i += 1; j -= 1. Only 16 bytes at
+   most: longer ones gain little over the loop, and a loop around this one
+   then holds nothing else, so the C compiler can keep the bytes in registers. */
+static inline bool brine_bytes_rev(char *d, int64_t n, int64_t *pi, int64_t *pj) {
+    int64_t i = *pi, j = *pj;
+    if (i >= j) return true;
+    if (i < 0 || j >= n || j - i >= 16) return false;
+    /* bytes i..j reversed in place, the rest of the 16 kept */
+    int64_t k = j - i;
+    br_u128x x = br_ld128(d + i);
+    br_u128x m = br_low_bytes(k + 1);
+    br_st128(d + i, ((br_bswap128(x) >> (8 * (15 - k))) & m) | (x & ~m));
+    *pi = i + (k + 1) / 2;
+    *pj = j - (k + 1) / 2;
+    return true;
+}
+/* x = a[lo]; for i in lo..hi: a[i] = a[i + 1]; a[hi] = x */
+static inline bool brine_bytes_rotl(char *d, int64_t n, int64_t lo, int64_t hi) {
+    if (lo > hi || lo < 0 || hi >= n) return false;
+    int64_t k = hi - lo;
+    if (k < 16) {
+        br_u128x x = br_ld128(d + lo);
+        br_u128x rot = ((x >> 8) & br_low_bytes(k)) | ((x & 0xff) << (8 * k));
+        br_u128x m = br_low_bytes(k + 1);
+        br_st128(d + lo, (rot & m) | (x & ~m));
+    } else {
+        char x = d[lo];
+        __builtin_memmove(d + lo, d + lo + 1, (size_t)k);
+        d[hi] = x;
+    }
+    return true;
+}
+static inline bool brine_bytes_shl(char *d, int64_t n, int64_t lo, int64_t hi) {
+    if (lo >= hi) return true;
+    if (lo < 0 || hi >= n) return false;
+    if (hi - lo < 16) {
+        br_u128x x = br_ld128(d + lo);
+        br_u128x m = br_low_bytes(hi - lo);
+        br_st128(d + lo, ((x >> 8) & m) | (x & ~m));
+    } else
+        __builtin_memmove(d + lo, d + lo + 1, (size_t)(hi - lo));
+    return true;
+}
+static inline bool brine_bytes_copy(char *db, int64_t nb, const char *da, int64_t na, int64_t lo, int64_t hi) {
+    if (lo >= hi) return true;
+    if (lo < 0 || hi > na || hi > nb) return false;
+    if (hi == nb && hi - lo <= 16)
+        /* whole 16 bytes (past the end of b is spare), so reads of b right
+           after get the stores forwarded */
+        br_st128(db + lo, br_ld128(da + lo));
+    else
+        __builtin_memcpy(db + lo, da + lo, (size_t)(hi - lo));
+    return true;
+}
 void brine_arr_push(brine_arr **pa, const void *elem);
 void brine_arr_pop(brine_arr **pa, void *out, const char *loc);
 void brine_arr_pop_at(brine_arr **pa, int64_t i, void *out, const char *loc);
@@ -283,7 +547,51 @@ static inline uint64_t brine_hash_u64(uint64_t x) {
 }
 static inline uint64_t brine_hash_mix(uint64_t h, uint64_t x) { return brine_hash_u64(h ^ (x + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2))); }
 static inline uint64_t brine_hash_u128(brine_u128 x) { return brine_hash_mix(brine_hash_u64((uint64_t)x), (uint64_t)(x >> 64)); }
-uint64_t brine_hash_str(brine_str *s);
+/* A one-to-one mix for string hashes: an odd multiply carries every bit
+   upwards, and the byte swap brings the top bits, which depend on all of
+   the word, down to the bits a map's index uses. Cheaper than
+   brine_hash_u64, which matters for short keys. */
+static inline uint64_t brine_hash_word(uint64_t x) { return __builtin_bswap64(x * 0x9e3779b97f4a7c15ULL); }
+uint64_t brine_hash_long(const char *p, uint64_t n);
+/* A string of up to 7 bytes is its bytes and its length in one word, mixed by
+   brine_hash_word, a bijection: two such strings hash equally only if they
+   are equal. Longer strings hash to words with the top bit set before the
+   same mixing, so they never hash like a short one. A map can then take
+   equal hashes of short keys as equal keys (brine_map_probe). */
+static inline uint64_t brine_hash_str(brine_str *s) {
+    uint64_t n = (uint64_t)s->len;
+    if (BR_LIKELY(n < 8)) return brine_hash_word((brine_ld8(s->data) & brine_lowmask(n)) | n << 56);
+    return brine_hash_long(s->data, n);
+}
+/* Entry number of key k (hash h) in m, or -1. keq compares two keys of ksz
+   bytes; `exact` says h was made by a hash that is one-to-one for k (see
+   brine_hash_str), so an equal hash is an equal key. The C backend inlines
+   this with keq known. */
+static inline __attribute__((always_inline)) int64_t brine_map_probe(const brine_map *m, const void *k, uint64_t h, void *keqp,
+                                                                     int64_t ksz, bool exact) {
+    brine_eq_fn keq = (brine_eq_fn)keqp;
+    if (m->len == 0) return -1;
+    uint64_t mask = (uint64_t)(m->nidx - 1);
+    const int64_t *ix = m->index;
+    const uint64_t *hs = m->hashes;
+    for (uint64_t i = h & mask;; i = (i + 1) & mask) {
+        int64_t e = ix[i];
+        if (e == -1) return -1;
+        if (e >= 0 && hs[e] == h && (exact || keq(m->keys + e * ksz, k))) return e;
+    }
+}
+/* the value of entry e (from brine_map_probe; -1 panics for the missing key k) */
+static inline void *brine_map_val(brine_map *m, int64_t e, const void *k, int64_t vsz, const char *loc) {
+    if (BR_UNLIKELY(e < 0)) return brine_map_at(m, k, loc);
+    return m->vals + e * vsz;
+}
+void *brine_map_val_mut_slow(brine_map **pm, int64_t e, const void *k, const char *loc);
+/* same, after making the map unique so the value can be changed */
+static inline void *brine_map_val_mut(brine_map **pm, int64_t e, const void *k, int64_t vsz, const char *loc) {
+    brine_map *m = *pm;
+    if (BR_LIKELY(e >= 0 && __atomic_load_n(&m->rc, __ATOMIC_ACQUIRE) == 1)) return m->vals + e * vsz;
+    return brine_map_val_mut_slow(pm, e, k, loc);
+}
 
 static inline int64_t brine_idx(int64_t i, int64_t len, const char *loc) {
     if (BR_UNLIKELY((uint64_t)i >= (uint64_t)len)) brine_panic_idx(i, len, loc);

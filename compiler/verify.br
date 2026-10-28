@@ -65,6 +65,8 @@ const TAG_ARITH = 0
 const MERGE_MAX = 256
 const TAG_INDEX = 1
 const TAG_ASSERT = 2
+# the overflow check of a compound assignment (`x += 1`), keyed by the statement
+const TAG_COMPOUND = 3
 
 fn key(span: Span, tag: int) -> (int, int, int, int):
     return (span.file, span.lo, span.hi, tag)
@@ -207,6 +209,8 @@ fn apply_stmt(ref s: Stmt, p: {(int, int, int, int): bool}):
             apply_expr(ref t, p)
             apply_expr(ref v, p)
             s.kind = StmtKind.Assign(t, op, v)
+            if key(s.span, TAG_COMPOUND) in p:
+                s.proven = true
         case StmtKind.ExprStmt(e):
             var x = e
             apply_expr(ref x, p)
@@ -489,6 +493,48 @@ fn mods_block(b: Block, info: ProgramInfo, ref out: {int: int}):
             mods_expr(e, info, ref out)
         for blk in stmt_blocks(s):
             mods_block(blk, info, ref out)
+
+# Counters: the locals a loop body changes only by one `x += 1` outside its
+# inner loops. Each iteration adds at most 1 to them, so at the start of the
+# iteration `k` of `for k in lo..hi`, `x0 <= x <= x0 + (k - lo)`.
+fn counters(b: Block, info: ProgramInfo) -> [int]:
+    var incs: {int: int} = {}
+    var other: {int: int} = {}
+    count_incs(b, info, 0, ref incs, ref other)
+    var out: [int] = []
+    for id in incs:
+        if incs[id] == 1 and id not in other:
+            out.push(id)
+    out.sort()
+    return out
+
+fn count_incs(b: Block, info: ProgramInfo, depth: int, ref incs: {int: int}, ref other: {int: int}):
+    for s in b.stmts:
+        var inner = depth
+        match s.kind:
+            case StmtKind.Assign(target, op, value):
+                match lvalue_root(target):
+                    case Some(r):
+                        var inc = false
+                        match (target.kind, op, value.kind):
+                            case (ExprKind.Ident(_), Some(BinOp.Add), ExprKind.Int(v)):
+                                inc = v == 1 and depth == 0
+                            case _:
+                                pass
+                        if inc:
+                            incs[r] = incs.get(r).unwrap_or(0) + 1
+                        else:
+                            note_mod(ref other, r, MOD_WHOLE)
+                    case None:
+                        pass
+            case StmtKind.While(_, _, _) | StmtKind.For(_, _, _, _, _, _, _):
+                inner = depth + 1
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            mods_expr(e, info, ref other)
+        for blk in stmt_blocks(s):
+            count_incs(blk, info, inner, ref incs, ref other)
 
 # Does evaluating `e` have no observable effects (so a proven `assert` can be removed)?
 fn pure_expr(e: Expr) -> bool:
@@ -882,6 +928,17 @@ struct Vf:
             self.remaining.push((span, what))
         self.assume(goal)
 
+    # A check that is proven or not, without being listed in `--report`:
+    # compound assignments (`x += 1`) were never listed there.
+    fn implicit_quiet(ref self, span: Span, tag: int, goal: F):
+        if self.spec or not self.live:
+            return
+        if self.holds(goal):
+            self.proven[key(span, tag)] = true
+        else:
+            self.failed[key(span, tag)] = true
+        self.assume(goal)
+
     # Start running with an extra temporary assumption; `end_assume` drops the facts added since.
     fn begin_assume(ref self, extra: F) -> (Option[St], int):
         let saved = self.cur()
@@ -1117,9 +1174,11 @@ struct Vf:
                                         let r = self.arith_val(o, a, b, k)
                                         match r:
                                             case V.Int(l):
-                                                # compound assignment is always checked at runtime
-                                                if not self.spec:
-                                                    self.assume(in_range(l, k))
+                                                let f = in_range(l, k)
+                                                if o == BinOp.Add or o == BinOp.Sub or o == BinOp.Mul:
+                                                    self.implicit_quiet(s.span, TAG_COMPOUND, f)
+                                                elif not self.spec:
+                                                    self.assume(f)
                                             case _:
                                                 pass
                                         new = r
@@ -1514,6 +1573,18 @@ struct Vf:
             return
         let entry = self.st
         let k = len(entry.facts)
+        # the counters' values before the loop
+        var starts: [(int, Lin)] = []
+        match dom:
+            case D.Range(_, _, _):
+                for c in counters(body, self.info):
+                    match entry.env.get(c):
+                        case Some(V.Int(c0)):
+                            starts.push((c, c0))
+                        case _:
+                            pass
+            case _:
+                pass
         # invariants: entry, using the first value of the loop variable
         var nonempty = F.True
         var first: Option[V] = None
@@ -1580,6 +1651,18 @@ struct Vf:
                     case None:
                         pass
                 v = V.Int(i)
+                # x0 <= x and x + lo <= k + x0 (see `counters`)
+                for c, c0 in starts:
+                    match self.st.env.get(c):
+                        case Some(V.Int(x)):
+                            self.assume(F.le(c0, x))
+                            match (x.add(lo), i.add(c0)):
+                                case (Some(l), Some(r)):
+                                    self.assume(F.le(l, r))
+                                case _:
+                                    pass
+                        case _:
+                            pass
             case D.Stepped(lo, hi, step):
                 var ik = IntTy.I64
                 match vty:

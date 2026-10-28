@@ -1,0 +1,284 @@
+# Loops that are one array operation: reversing a part of an array, moving
+# a part down by one, and copying a part of one array into another. Release
+# builds run them as one call to the runtime (`brine_arr_rev`, `_shl`,
+# `_copy`) when everything they touch is in bounds, and as written when not,
+# so a panic still happens where it would have.
+from types import Ty, IntTy, Res, LocalInfo
+from ast import BinOp, CmpOp, Expr, ExprKind, LetPat, Stmt, StmtKind, Block, stmt_blocks
+
+enum Idiom:
+    # while i < j: t = a[i]; a[i] = a[j]; a[j] = t; i += 1; j -= 1
+    Rev(a: int, i: int, j: int)
+    # for i in lo..hi: a[i] = a[i + 1]
+    Shl(a: int)
+    # for i in lo..hi: b[i] = a[i]
+    Copy(b: int, a: int)
+
+fn local_id(e: Expr) -> int:
+    match e.kind:
+        case ExprKind.Ident(_):
+            match e.res:
+                case Res.Local(x):
+                    return x
+                case _:
+                    return -1
+        case _:
+            return -1
+
+# `a[x]` with `a` and `x` locals: (a, x), else (-1, -1)
+fn index_of(e: Expr) -> (int, int):
+    match e.kind:
+        case ExprKind.Index(b, i):
+            let a = local_id(b)
+            let x = local_id(i)
+            if a >= 0 and x >= 0:
+                return (a, x)
+            return (-1, -1)
+        case _:
+            return (-1, -1)
+
+fn is_int(e: Expr, v: i128) -> bool:
+    match e.kind:
+        case ExprKind.Int(x):
+            return x == v
+        case _:
+            return false
+
+fn is_i64(locals: [LocalInfo], l: int) -> bool:
+    return locals[l].ty == Ty.Int(IntTy.I64)
+
+fn is_arr(locals: [LocalInfo], l: int) -> bool:
+    match locals[l].ty:
+        case Ty.Array(_):
+            return true
+        case _:
+            return false
+
+# `x += 1` (step 1) or `x -= 1` (step -1) on a local: the local, else -1
+fn step_of(s: Stmt, step: int) -> int:
+    match s.kind:
+        case StmtKind.Assign(t, op, v):
+            let want = BinOp.Add if step > 0 else BinOp.Sub
+            if op == Some(want) and is_int(v, 1):
+                return local_id(t)
+            return -1
+        case _:
+            return -1
+
+# `a[x] = v` on locals: (a, x, v)
+fn store_of(s: Stmt) -> Option[(int, int, Expr)]:
+    match s.kind:
+        case StmtKind.Assign(t, op, v):
+            if op.is_some():
+                return None
+            let (a, x) = index_of(t)
+            if a < 0:
+                return None
+            return Some((a, x, v))
+        case _:
+            return None
+
+fn while_idiom(cond: Expr, body: Block, locals: [LocalInfo]) -> Option[Idiom]:
+    var i = -1
+    var j = -1
+    match cond.kind:
+        case ExprKind.Compare(l, rest):
+            if len(rest) != 1 or rest[0].0 != CmpOp.Lt:
+                return None
+            i = local_id(l)
+            j = local_id(rest[0].1)
+        case _:
+            return None
+    if i < 0 or j < 0 or i == j or not is_i64(locals, i) or not is_i64(locals, j):
+        return None
+    let ss = body.stmts
+    if len(ss) != 5:
+        return None
+    # let t = a[i]
+    var t = -1
+    var a = -1
+    match ss[0].kind:
+        case StmtKind.Let(_, pat, _, init, is_ref):
+            match pat:
+                case LetPat.Name(_, _):
+                    let (aa, x) = index_of(init)
+                    if is_ref or x != i:
+                        return None
+                    a = aa
+                    t = ss[0].locals[0]
+                case _:
+                    return None
+        case _:
+            return None
+    if a < 0 or a == i or a == j or not is_arr(locals, a):
+        return None
+    # a[i] = a[j]; a[j] = t
+    match (store_of(ss[1]), store_of(ss[2])):
+        case (Some((a1, x1, v1)), Some((a2, x2, v2))):
+            let (a3, x3) = index_of(v1)
+            if a1 != a or x1 != i or a3 != a or x3 != j:
+                return None
+            if a2 != a or x2 != j or local_id(v2) != t:
+                return None
+        case _:
+            return None
+    # i += 1; j -= 1, in either order
+    let ok = (
+        step_of(ss[3], 1) == i and step_of(ss[4], -1) == j
+    ) or (step_of(ss[3], -1) == j and step_of(ss[4], 1) == i)
+    if not ok:
+        return None
+    return Some(Idiom.Rev(a=a, i=i, j=j))
+
+# a bound evaluated again by the loop as written: nothing it does can differ
+fn simple(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Int(_):
+            return true
+        case _:
+            return local_id(e) >= 0
+
+fn for_idiom(iter: Expr, var_id: int, body: Block, locals: [LocalInfo]) -> Option[Idiom]:
+    match iter.kind:
+        case ExprKind.Range(lo, hi, inclusive):
+            if inclusive or not simple(lo) or not simple(hi) or lo.ty != Ty.Int(IntTy.I64):
+                return None
+        case _:
+            return None
+    if len(body.stmts) != 1:
+        return None
+    match store_of(body.stmts[0]):
+        case Some((b, x, v)):
+            if x != var_id or not is_arr(locals, b):
+                return None
+            # a[i] = a[i + 1]
+            match v.kind:
+                case ExprKind.Index(vb, vi):
+                    if local_id(vb) == b:
+                        match vi.kind:
+                            case ExprKind.Binary(op, l, r):
+                                if op == BinOp.Add and local_id(l) == var_id and is_int(r, 1):
+                                    return Some(Idiom.Shl(a=b))
+                            case _:
+                                pass
+                        return None
+                case _:
+                    pass
+            # b[i] = a[i]
+            let (a, y) = index_of(v)
+            if a >= 0 and y == var_id and a != b and a != var_id and locals[a].ty == locals[b].ty:
+                return Some(Idiom.Copy(b=b, a=a))
+            return None
+        case None:
+            return None
+
+fn same(a: Expr, b: Expr) -> bool:
+    match (a.kind, b.kind):
+        case (ExprKind.Int(x), ExprKind.Int(y)):
+            return x == y
+        case _:
+            let l = local_id(a)
+            return l >= 0 and l == local_id(b)
+
+# `let x = a[lo]`, `for i in lo..hi: a[i] = a[i + 1]`, `a[hi] = x` at
+# stmts[k..k + 3]: moving a part of `a` left by one, its first element to the
+# end. Returns `a`, else -1.
+fn rot_idiom(stmts: [Stmt], k: int, locals: [LocalInfo]) -> int:
+    if k + 2 >= len(stmts):
+        return -1
+    var a = -1
+    var x = -1
+    match stmts[k].kind:
+        case StmtKind.Let(_, pat, _, init, is_ref):
+            match pat:
+                case LetPat.Name(_, _):
+                    if is_ref:
+                        return -1
+                    match init.kind:
+                        case ExprKind.Index(b, i):
+                            a = local_id(b)
+                            if a < 0 or not simple(i):
+                                return -1
+                            x = stmts[k].locals[0]
+                            match stmts[k + 1].kind:
+                                case StmtKind.For(_, _, _, iter, _, body, is_par):
+                                    if is_par:
+                                        return -1
+                                    match for_idiom(iter, stmts[k + 1].local, body, locals):
+                                        case Some(Idiom.Shl(a2)):
+                                            if a2 != a:
+                                                return -1
+                                        case _:
+                                            return -1
+                                    match iter.kind:
+                                        case ExprKind.Range(l, h, _):
+                                            if not same(l, i):
+                                                return -1
+                                            match store_of(stmts[k + 2]):
+                                                case Some((a3, y, v)):
+                                                    let hl = local_id(h)
+                                                    var ok = a3 == a and local_id(v) == x
+                                                    if hl >= 0:
+                                                        ok = ok and y == hl
+                                                    else:
+                                                        ok = false
+                                                    if ok:
+                                                        return a
+                                                    return -1
+                                                case None:
+                                                    return -1
+                                        case _:
+                                            return -1
+                                case _:
+                                    return -1
+                        case _:
+                            return -1
+                case _:
+                    return -1
+        case _:
+            return -1
+    return -1
+
+# A loop whose only loops are idioms: release builds lower it twice, the
+# idioms in the first copy failing over to the second, which has the loops as
+# written. So the first holds no slow path, and the C compiler can keep what
+# the idioms touch in registers. Only statements whose locals live in their
+# stack slots, so the second copy can pick up where the first left off.
+fn twin_body(b: Block, locals: [LocalInfo]) -> bool:
+    return twin_scan(b, locals) > 0
+
+# the idiom loops in `b`, or -1 when it has something else twin_body rules out
+fn twin_scan(b: Block, locals: [LocalInfo]) -> int:
+    var n = 0
+    for s in b.stmts:
+        match s.kind:
+            case StmtKind.Let(_, _, _, _, is_ref):
+                if is_ref:
+                    return -1
+            case StmtKind.Assign(
+                _,
+                _,
+                _
+            ) | StmtKind.ExprStmt(_) | StmtKind.Pass | StmtKind.Break | StmtKind.Continue:
+                pass
+            case StmtKind.Return(
+                _
+            ) | StmtKind.Assert(_, _) | StmtKind.Prove(_) | StmtKind.Contract(_, _):
+                pass
+            case StmtKind.If(_, _):
+                for blk in stmt_blocks(s):
+                    let m = twin_scan(blk, locals)
+                    if m < 0:
+                        return -1
+                    n += m
+            case StmtKind.While(cond, _, body):
+                if while_idiom(cond, body, locals).is_none():
+                    return -1
+                n += 1
+            case StmtKind.For(_, _, _, iter, _, body, is_par):
+                if is_par or for_idiom(iter, s.local, body, locals).is_none():
+                    return -1
+                n += 1
+            case _:
+                return -1
+    return n

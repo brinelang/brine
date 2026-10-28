@@ -1,0 +1,148 @@
+# Bit arrays. A local `[bool]` that a function makes with `[b] * n` and then
+# only indexes, assigns elements of and measures never leaves the function, so
+# release builds can keep it as one bit per element instead of one byte: an
+# array the cache holds eight times more of. Nothing else can tell; the
+# array's length and bounds checks are the same.
+#
+# Functions with `par` keep bytes: two threads may write neighbouring
+# elements, which would be the same word.
+from types import Res, CallRes, Builtin, LocalInfo, Ty
+from ast import Expr, ExprKind, Stmt, StmtKind, Block, LetPat, Arg, children, stmt_exprs, stmt_blocks
+
+# The locals of the function with body `body` to keep as bits.
+fn find(body: Block, locals: [LocalInfo]) -> {int: bool}:
+    return find_with(body, locals, false)
+
+# With `any`, the arrays of any type made by a `let`/`var` and used only
+# these ways (narrow.br's starting point).
+fn find_with(body: Block, locals: [LocalInfo], any: bool) -> {int: bool}:
+    var p = Pack(locals=locals, any=any, made={}, bad={}, par=false)
+    p.block(body)
+    var out: {int: bool} = {}
+    if p.par:
+        return out
+    for l in p.made:
+        if not (l in p.bad):
+            out[l] = true
+    return out
+
+fn local_id(e: Expr) -> int:
+    match e.kind:
+        case ExprKind.Ident(_):
+            match e.res:
+                case Res.Local(x):
+                    return x
+                case _:
+                    return -1
+        case _:
+            return -1
+
+fn is_repeat(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Repeat(_, _):
+            return true
+        case _:
+            return false
+
+struct Pack:
+    locals: [LocalInfo]
+    any: bool
+    # made by a `let`/`var` with `[b] * n`
+    made: {int: bool}
+    # used some other way
+    bad: {int: bool}
+    par: bool
+
+    fn block(ref self, b: Block):
+        for s in b.stmts:
+            self.stmt(s)
+
+    fn stmt(ref self, s: Stmt):
+        match s.kind:
+            case StmtKind.Let(_, pat, _, init, is_ref):
+                match pat:
+                    case LetPat.Name(_, _):
+                        let l = s.locals[0]
+                        if not is_ref and self.any:
+                            match self.locals[l].ty:
+                                case Ty.Array(_):
+                                    self.made[l] = true
+                                case _:
+                                    pass
+                        elif not is_ref and is_repeat(
+                            init
+                        ) and self.locals[l].ty == Ty.Array(Ty.Bool):
+                            self.made[l] = true
+                    case _:
+                        pass
+                if is_ref:
+                    self.root_bad(init)
+            case StmtKind.Assign(t, op, _):
+                match t.kind:
+                    case ExprKind.Index(base, _):
+                        let l = local_id(base)
+                        if l >= 0 and op.is_some():
+                            self.bad[l] = true
+                    case _:
+                        pass
+            case StmtKind.For(_, _, _, _, _, _, is_par):
+                if is_par:
+                    self.par = true
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            self.expr(e)
+        for b in stmt_blocks(s):
+            self.block(b)
+
+    # `ref x[i]` and the like: an element's address is taken
+    fn root_bad(ref self, e: Expr):
+        match e.kind:
+            case ExprKind.Index(base, _):
+                self.root_bad(base)
+            case ExprKind.Field(base, _, _):
+                self.root_bad(base)
+            case _:
+                let l = local_id(e)
+                if l >= 0:
+                    self.bad[l] = true
+
+    fn expr(ref self, e: Expr):
+        match e.kind:
+            case ExprKind.Index(base, idx):
+                if local_id(base) >= 0:
+                    self.expr(idx)
+                    return
+            case ExprKind.Call(_, args):
+                self.ref_args(args)
+                match e.cres:
+                    case CallRes.Builtin(b):
+                        match b:
+                            case Builtin.Len:
+                                if len(
+                                    args
+                                ) == 1 and not args[0].by_ref and local_id(args[0].expr) >= 0:
+                                    return
+                            case _:
+                                pass
+                    case _:
+                        pass
+            case ExprKind.MethodCall(recv, _, _, args):
+                self.root_bad(recv)
+                self.ref_args(args)
+            case ExprKind.ParTuple(_):
+                self.par = true
+            case ExprKind.Ident(_):
+                let l = local_id(e)
+                if l >= 0:
+                    self.bad[l] = true
+                return
+            case _:
+                pass
+        for c in children(e):
+            self.expr(c)
+
+    fn ref_args(ref self, args: [Arg]):
+        for a in args:
+            if a.by_ref:
+                self.root_bad(a.expr)

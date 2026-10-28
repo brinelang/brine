@@ -26,6 +26,44 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <winternl.h>
+/* Winsock is loaded when a program first uses the network (br_ws_start):
+   importing it would load it, and the DLLs it needs, into every program. */
+#define BR_WS_FNS(X) \
+    X(WSAStartup) X(WSAGetLastError) X(accept) X(bind) X(closesocket) X(connect) X(freeaddrinfo) \
+    X(getaddrinfo) X(getsockname) X(listen) X(recv) X(send) X(setsockopt) X(socket)
+#define BR_WS_PTR(f) static __typeof__(f) *br_ws_##f;
+BR_WS_FNS(BR_WS_PTR)
+#define WSAStartup (*br_ws_WSAStartup)
+#define WSAGetLastError (*br_ws_WSAGetLastError)
+#define accept (*br_ws_accept)
+#define bind (*br_ws_bind)
+#define closesocket (*br_ws_closesocket)
+#define connect (*br_ws_connect)
+#define freeaddrinfo (*br_ws_freeaddrinfo)
+#define getaddrinfo (*br_ws_getaddrinfo)
+#define getsockname (*br_ws_getsockname)
+#define listen (*br_ws_listen)
+#define recv (*br_ws_recv)
+#define send (*br_ws_send)
+#define setsockopt (*br_ws_setsockopt)
+#define socket (*br_ws_socket)
+#define htons(x) __builtin_bswap16(x)
+#define ntohs(x) __builtin_bswap16(x)
+#define htonl(x) __builtin_bswap32(x)
+static void br_ws_start(void) {
+    static int ready;
+    if (__atomic_load_n(&ready, __ATOMIC_ACQUIRE)) return;
+    HMODULE h = LoadLibraryA("ws2_32.dll");
+    if (!h) {
+        fprintf(stderr, "brine: could not load ws2_32.dll\n");
+        exit(2);
+    }
+#define BR_WS_GET(f) br_ws_##f = (__typeof__(f) *)(void (*)(void))GetProcAddress(h, #f);
+    BR_WS_FNS(BR_WS_GET)
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    __atomic_store_n(&ready, 1, __ATOMIC_RELEASE);
+}
 #elif defined(__wasi__)
 /* WebAssembly (WASI preview 1): one thread, no processes, sockets or shared
  * libraries. `par` runs on the calling thread and `world` has one rank. */
@@ -250,6 +288,7 @@ typedef struct {
     void *head[BR_NCLASS];
     int64_t count[BR_NCLASS];
     char *bump[BR_NCLASS], *end[BR_NCLASS];
+    int in_par; /* running a parallel region (br_in_par_get) */
 } br_heap_th;
 #if defined(_WIN32) && !defined(__clang__)
 /* MinGW gcc emulates thread-locals with a library call per access, which
@@ -374,7 +413,16 @@ static void *br_alloc_slow(br_heap_th *h, int c, size_t n) {
     return ch;
 }
 
-static void *br_alloc(size_t n) {
+/* the common cases of br_alloc and br_free inline and without a stack frame;
+   the rest out of line */
+#if defined(__GNUC__) || defined(__clang__)
+#define BR_HOT inline __attribute__((always_inline))
+#define BR_COLD __attribute__((noinline))
+#else
+#define BR_HOT inline
+#define BR_COLD
+#endif
+static BR_COLD void *br_alloc_miss(size_t n) {
     if (n > BR_SMALL || !br_heap_base) return br_big(n);
     int c = br_class_of(n ? n : 1);
     br_heap_th *h = br_th_get();
@@ -386,8 +434,27 @@ static void *br_alloc(size_t n) {
     }
     return br_alloc_slow(h, c, n);
 }
+static BR_HOT void *br_alloc(size_t n) {
+    /* n - 1 < BR_SMALL: 1 <= n <= BR_SMALL */
+    if (BR_LIKELY(n - 1 < BR_SMALL && br_heap_base)) {
+        br_heap_th *h = br_th_peek();
+        if (BR_LIKELY(h != NULL)) {
+            int c = br_class_of(n);
+            void *p = h->head[c];
+            if (BR_LIKELY(p != NULL)) {
+                h->head[c] = *(void **)p;
+                h->count[c] -= h->count[c] > 0;
+                return p;
+            }
+        }
+    }
+    return br_alloc_miss(n);
+}
 
-static void br_free(void *p) {
+/* a thread keeps BR_SPARE bytes of free blocks per class */
+#define BR_TOO_MANY(h, c) (++(h)->count[c] * (int64_t)br_class_size(c) > BR_SPARE)
+static BR_COLD void br_give_cold(br_heap_th *h, int c) { br_give(h, c); }
+static BR_COLD void br_free_miss(void *p) {
     if (!br_in_heap(p)) {
         free(p);
         return;
@@ -396,7 +463,20 @@ static void br_free(void *p) {
     br_heap_th *h = br_th_get();
     *(void **)p = h->head[c];
     h->head[c] = p;
-    if (++h->count[c] * (int64_t)br_class_size(c) > BR_SPARE) br_give(h, c);
+    if (BR_TOO_MANY(h, c)) br_give(h, c);
+}
+static BR_HOT void br_free(void *p) {
+    if (BR_LIKELY(br_in_heap(p))) {
+        br_heap_th *h = br_th_peek();
+        if (BR_LIKELY(h != NULL)) {
+            int c = br_chunk_class[((uintptr_t)p - br_heap_base) / BR_CHUNK];
+            *(void **)p = h->head[c];
+            h->head[c] = p;
+            if (BR_UNLIKELY(BR_TOO_MANY(h, c))) br_give_cold(h, c);
+            return;
+        }
+    }
+    br_free_miss(p);
 }
 
 static void *br_realloc(void *p, size_t n) {
@@ -436,7 +516,9 @@ void *brine_alloc(int64_t n) { return br_alloc(n > 0 ? (size_t)n : 1); }
 void brine_free(void *p) { br_free(p); }
 /* live string/array count, reported at exit when BRINE_LEAKCHECK is set */
 static int64_t br_live;
-#define BR_LIVE(d) __atomic_fetch_add(&br_live, (d), __ATOMIC_RELAXED)
+/* counted only for BRINE_LEAKCHECK: a locked add on every allocation costs */
+static bool br_leakcheck;
+#define BR_LIVE(d) (BR_UNLIKELY(br_leakcheck) ? (void)__atomic_fetch_add(&br_live, (d), __ATOMIC_RELAXED) : (void)0)
 void brine_str_free(brine_str *s) {
     BR_LIVE(-1);
     free(s);
@@ -467,7 +549,7 @@ void brine_rl_arr(void *p) { brine_arr_release(*(brine_arr **)p); }
 /* ============================================================ strings */
 #define br_str_size brine_str_size
 static brine_str *br_str_alloc(int64_t n) {
-    brine_str *s = (brine_str *)brine_alloc((int64_t)br_str_size(n));
+    brine_str *s = (brine_str *)br_alloc(br_str_size(n));
     BR_LIVE(1);
     s->rc = 1;
     s->len = n;
@@ -481,8 +563,8 @@ brine_str *brine_str_new(const char *p, int64_t n) {
 }
 brine_str *brine_str_concat(brine_str *a, brine_str *b) {
     brine_str *s = br_str_alloc(a->len + b->len);
-    memcpy(s->data, a->data, (size_t)a->len);
-    memcpy(s->data + a->len, b->data, (size_t)b->len);
+    brine_copy(s->data, a->data, a->len);
+    brine_copy(s->data + a->len, b->data, b->len);
     return s;
 }
 /* `s += b`: grows s in place when nothing else holds it */
@@ -509,9 +591,56 @@ void brine_str_append(brine_str **ps, brine_str *b) {
     s->data[n] = 0;
     *ps = s;
 }
-bool brine_str_eq(brine_str *a, brine_str *b) {
-    return a == b || (a->len == b->len && memcmp(a->data, b->data, (size_t)a->len) == 0);
+/* brine_str_add_byte when s is shared or full: the usual case is the first
+   `+=` to a literal (`var w = ""`), which gets a block of its own */
+void brine_str_add_byte_slow(brine_str **ps, uint8_t c) {
+    brine_str *a = *ps;
+    int64_t la = a->len;
+    brine_str *s;
+    if (__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1) {
+        brine_str_append(ps, (brine_str *)&brine_bytes[c]); /* grows the block */
+        return;
+    }
+    s = br_str_alloc(la + 1);
+    if (la < 8) {
+        brine_st8(s->data, (brine_ld8(a->data) & brine_lowmask((uint64_t)la)) | ((uint64_t)c << (8 * la)));
+        s->data[8] = 0;
+    } else {
+        memcpy(s->data, a->data, (size_t)la);
+        s->data[la] = (char)c;
+    }
+    brine_str_release(a);
+    *ps = s;
 }
+/* brine_app_byte past the appender's fast paths: the 9th byte, a shared
+   string, or a full block */
+brine_app_st brine_app_more(brine_str *a, int64_t n, int64_t room, uint64_t w0, uint8_t c) {
+    brine_app_st x;
+    if (n == 8 && n < room) {
+        brine_st8(a->data, w0);
+        a->data[8] = (char)c;
+        x.s = a;
+        x.len = 9;
+        x.room = room;
+        x.lim = 0;
+        x.w0 = 0;
+        return x;
+    }
+    if (room >= 0) { /* unshared: write the appender back first */
+        if (n <= 8) brine_st8(a->data, w0);
+        a->len = n;
+        a->data[n] = 0;
+    }
+    brine_str_add_byte_slow(&a, c);
+    n++;
+    x.s = a;
+    x.len = n;
+    x.room = brine_str_room(n);
+    x.lim = n < 8 && x.room >= 8 ? 8 : 0;
+    x.w0 = brine_ld8(a->data) & brine_lowmask((uint64_t)n);
+    return x;
+}
+bool brine_str_eq_long(brine_str *a, brine_str *b) { return memcmp(a->data, b->data, (size_t)a->len) == 0; }
 bool brine_str_contains(brine_str *s, brine_str *sub) {
     if (sub->len == 0) return true;
     for (int64_t i = 0; i + sub->len <= s->len; i++)
@@ -1192,13 +1321,27 @@ brine_str *brine_s_repeat(brine_str *s, int64_t n, const char *loc) {
     for (int64_t i = 0; i < n; i++) brine_sb_str(&sb, s);
     return brine_sb_finish(&sb);
 }
-uint64_t brine_hash_str(brine_str *s) {
-    uint64_t h = 0xcbf29ce484222325ULL; /* FNV-1a, then mixed */
-    for (int64_t i = 0; i < s->len; i++) {
-        h ^= (unsigned char)s->data[i];
-        h *= 0x100000001b3ULL;
+/* strings of 8 bytes or more (brine_hash_str has the rest): 16 bytes per
+   folded 64x64->128 multiply (wyhash's scheme), then the last 1 to 16 bytes as
+   two masked words, mixed with the top bit set */
+static inline uint64_t br_mum(uint64_t a, uint64_t b) {
+    __extension__ unsigned __int128 r = (unsigned __int128)a * b;
+    return (uint64_t)r ^ (uint64_t)(r >> 64);
+}
+uint64_t brine_hash_long(const char *p, uint64_t n) {
+    const uint64_t k0 = 0xa0761d6478bd642fULL, k1 = 0xe7037ed1a0b428dbULL;
+    uint64_t seed = k0 ^ n, len = n;
+    while (n > 16) {
+        seed = br_mum(brine_ld8(p) ^ k1, brine_ld8(p + 8) ^ seed);
+        p += 16;
+        n -= 16;
     }
-    return brine_hash_u64(h ^ (uint64_t)s->len);
+    uint64_t a = brine_ld8(p), b = 0;
+    if (n < 8)
+        a &= brine_lowmask(n);
+    else if (n > 8)
+        b = brine_ld8(p + 8) & brine_lowmask(n - 8);
+    return brine_hash_word(br_mum(k1 ^ len, br_mum(a ^ k1, b ^ seed)) | 1ULL << 63);
 }
 int brine_str_cmp(brine_str *a, brine_str *b) {
     int64_t n = a->len < b->len ? a->len : b->len;
@@ -1273,6 +1416,47 @@ brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_
     }
     return a;
 }
+/* An integer array kept as bytes (narrow.br), zeroed, with 16 more bytes
+   than it needs for brine_bytes_rev and friends. It is never shared, so
+   never copied. */
+brine_arr *brine_bytes_new(int64_t len, const char *loc) {
+    if (len < 0) br_panicf(loc, "cannot create an array with negative length %lld", (long long)len);
+    brine_arr *a = (brine_arr *)brine_alloc(sizeof(brine_arr));
+    BR_LIVE(1);
+    a->rc = 1;
+    a->len = len;
+    a->cap = len + 16;
+    a->esz = 1;
+    a->retain = NULL;
+    a->release = NULL;
+    a->data = (char *)calloc((size_t)len + 16, 1);
+    if (!a->data) {
+        fprintf(stderr, "out of memory\n");
+        abort();
+    }
+    return a;
+}
+/* A `[bool]` kept as bits (the compiler's pack.br): `len` elements in 64-bit
+   words. `esz` 0 marks it; only indexing, `len` and freeing ever see one. */
+brine_arr *brine_bits_new(int64_t len, int64_t fill, const char *loc) {
+    if (len < 0) br_panicf(loc, "cannot create an array with negative length %lld", (long long)len);
+    brine_arr *a = (brine_arr *)brine_alloc(sizeof(brine_arr));
+    BR_LIVE(1);
+    a->rc = 1;
+    a->len = len;
+    a->cap = len;
+    a->esz = 0;
+    a->retain = NULL;
+    a->release = NULL;
+    size_t bytes = (size_t)(len / 64 + 1) * 8;
+    a->data = (char *)(fill ? malloc(bytes) : calloc(bytes, 1));
+    if (!a->data) {
+        fprintf(stderr, "out of memory\n");
+        abort();
+    }
+    if (fill) memset(a->data, 0xff, bytes);
+    return a;
+}
 void brine_arr_unique(brine_arr **pa) {
     brine_arr *a = *pa;
     if (__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1) return;
@@ -1281,8 +1465,9 @@ void brine_arr_unique(brine_arr **pa) {
     BR_LIVE(1);
     n->rc = 1;
     n->cap = a->len;
-    n->data = (char *)brine_alloc(a->len * a->esz);
-    memcpy(n->data, a->data, (size_t)(a->len * a->esz));
+    int64_t bytes = a->esz ? a->len * a->esz : (a->len / 64 + 1) * 8;
+    n->data = (char *)brine_alloc(bytes);
+    memcpy(n->data, a->data, (size_t)bytes);
     if (a->retain)
         for (int64_t i = 0; i < a->len; i++) a->retain(n->data + i * a->esz);
     brine_arr_release(a);
@@ -1435,7 +1620,8 @@ void brine_map_free(brine_map *m) {
 }
 static void br_map_reindex(brine_map *m) {
     int64_t n = 8;
-    while (n < 2 * m->cap) n *= 2;
+    /* a sparse index: fewer probes, and few maps are big enough for it to cost much */
+    while (n < 4 * m->cap) n *= 2;
     free(m->index);
     m->nidx = n;
     m->index = (int64_t *)brine_alloc(n * (int64_t)sizeof(int64_t));
@@ -1529,6 +1715,13 @@ void *brine_map_at(brine_map *m, const void *k, const char *loc) {
 void *brine_map_at_mut(brine_map **pm, const void *k, const char *loc) {
     int64_t e = brine_map_find(*pm, k);
     if (BR_UNLIKELY(e < 0)) br_map_missing(*pm, k, loc);
+    brine_map *before = *pm;
+    brine_map_unique(pm);
+    if (*pm != before) e = brine_map_find(*pm, k); /* copying compacts the entries */
+    return (*pm)->vals + e * (*pm)->ty->vsz;
+}
+void *brine_map_val_mut_slow(brine_map **pm, int64_t e, const void *k, const char *loc) {
+    if (e < 0) return brine_map_at_mut(pm, k, loc); /* panics */
     brine_map *before = *pm;
     brine_map_unique(pm);
     if (*pm != before) e = brine_map_find(*pm, k); /* copying compacts the entries */
@@ -1866,7 +2059,13 @@ static struct {
     int main_waits;
 } br_pool;
 
-static _Thread_local int br_in_par = 0;
+/* whether this thread runs a parallel region (a field of the per-thread heap
+   struct: MinGW gcc would emulate a _Thread_local with libwinpthread) */
+static int br_in_par_get(void) {
+    br_heap_th *h = br_th_peek();
+    return h ? h->in_par : 0;
+}
+static void br_in_par_set(int v) { br_th_get()->in_par = v; }
 static int64_t br_task_budget = 0;
 
 static int br_threads(void) {
@@ -1911,7 +2110,7 @@ static void br_run_chunks(br_job *j) {
 
 static void br_worker(void *arg) {
     (void)arg;
-    br_in_par = 1;
+    br_in_par_set(1);
     uint64_t seen = 0;
     for (;;) {
         br_spin_while_eq(&br_pool.ids, seen);
@@ -1942,7 +2141,7 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
     job.n = hi - lo;
     job.k = nchunks;
     job.next = 0;
-    if (nchunks == 1 || br_in_par || br_threads() <= 1 || !br_trylock(&br_pool.job_lock)) {
+    if (nchunks == 1 || br_in_par_get() || br_threads() <= 1 || !br_trylock(&br_pool.job_lock)) {
         br_run_chunks(&job);
         return;
     }
@@ -1959,9 +2158,9 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
     __atomic_store_n(&br_pool.ids, job.id, __ATOMIC_SEQ_CST);
     br_cond_broadcast(&br_pool.cv_work);
     br_unlock(&br_pool.mu);
-    br_in_par = 1;
+    br_in_par_set(1);
     br_run_chunks(&job);
-    br_in_par = 0;
+    br_in_par_set(0);
     __atomic_store_n(&br_pool.cur, (br_job *)NULL, __ATOMIC_SEQ_CST);
     for (int i = 0; i < BR_SPINS && __atomic_load_n(&br_pool.active, __ATOMIC_SEQ_CST) > 0; i++) BR_RELAX();
     if (__atomic_load_n(&br_pool.active, __ATOMIC_SEQ_CST) > 0) {
@@ -3183,8 +3382,8 @@ static br_gpu_choice br_gpu_choose(brine_kernel *k, br_kst *st, int64_t rest, ui
 static int64_t br_probe_for(brine_chunk_fn fn, void *ctx, int64_t lo, int64_t n, double secs, double *ns) {
     double t0 = brine_clock();
     int64_t i = lo, step = 16;
-    int saved = br_in_par;
-    br_in_par = 1;
+    int saved = br_in_par_get();
+    br_in_par_set(1);
     while (i < n) {
         int64_t j = i + step < n ? i + step : n;
         fn(ctx, 0, i, j);
@@ -3192,7 +3391,7 @@ static int64_t br_probe_for(brine_chunk_fn fn, void *ctx, int64_t lo, int64_t n,
         if (brine_clock() - t0 >= secs) break;
         step *= 2;
     }
-    br_in_par = saved;
+    br_in_par_set(saved);
     double dt = brine_clock() - t0;
     *ns = i > lo ? dt * 1e9 / (double)(i - lo) : 0;
     return i;
@@ -3255,7 +3454,7 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
         return 0;
     }
     *why = "nested in a parallel construct";
-    if (br_in_par) return 0;
+    if (br_in_par_get()) return 0;
     *why = "small";
     if (n < BR_GPU_MIN_N && br_gpu.mode != BR_GPU_ON) return 0;
     br_lock(&br_gpu.mu);
@@ -3351,16 +3550,16 @@ void brine_par_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn fn) {
     double t0 = brine_clock();
     brine_par_run(done, n, brine_par_plan(n - done), fn, ctx);
     double dt = brine_clock() - t0;
-    if (k->ptx && !br_in_par && n - done >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n - done, dt);
-    if (br_gpu.log && !br_in_par) br_gpu_log_cpu(k, n, why, dt);
+    if (k->ptx && !br_in_par_get() && n - done >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n - done, dt);
+    if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt);
 }
 
 /* ------------------------------------------------------------ reductions on the GPU */
 /* Folds leaves [l0, l1) on this thread, pushing each at height 0. */
 static void br_fold_leaves(br_fold *f, brine_leaf_fn fn, void *ctx, int64_t n, int64_t l0, int64_t l1) {
     _Alignas(16) char v[16];
-    int saved = br_in_par;
-    br_in_par = 1;
+    int saved = br_in_par_get();
+    br_in_par_set(1);
     for (int64_t l = l0; l < l1; l++) {
         int64_t a = l * BRINE_LEAF;
         int64_t b = a + BRINE_LEAF < n ? a + BRINE_LEAF : n;
@@ -3368,7 +3567,7 @@ static void br_fold_leaves(br_fold *f, brine_leaf_fn fn, void *ctx, int64_t n, i
         fn(ctx, l, a, b, v, &h);
         br_fold_push(f, 0, v, h);
     }
-    br_in_par = saved;
+    br_in_par_set(saved);
 }
 
 /* One aligned subtree of 2^h leaves starting at leaf l0 (fewer at the end) on
@@ -3407,7 +3606,7 @@ static int br_gpu_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx
         return 0;
     }
     *why = "nested in a parallel construct";
-    if (br_in_par) return 0;
+    if (br_in_par_get()) return 0;
     *why = "small";
     if (n < BR_GPU_MIN_N && br_gpu.mode != BR_GPU_ON) return 0;
     br_lock(&br_gpu.mu);
@@ -3530,8 +3729,8 @@ void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, v
     double t0 = brine_clock();
     br_reduce_cpu(n, fn, ctx, k->op, k->vk, val, has, loc);
     double dt = brine_clock() - t0;
-    if (k->ptx && !br_in_par && n >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n, dt);
-    if (br_gpu.log && !br_in_par) br_gpu_log_cpu(k, n, why, dt);
+    if (k->ptx && !br_in_par_get() && n >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n, dt);
+    if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt);
 }
 
 /* ============================================================ world: transport */
@@ -3750,8 +3949,7 @@ static void br_world_init(void) {
         return;
     }
 #ifdef _WIN32
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    br_ws_start();
 #else
     signal(SIGPIPE, SIG_IGN);
 #endif
@@ -4097,12 +4295,75 @@ double brine_world_reduce_f64(double v, int op, const char *loc) {
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
-#include <shellapi.h>
+/* Splits a command line the way CommandLineToArgvW does: the arguments go to
+   d (len + 2 wide chars), argv[i] points at each. Our own copy because
+   that function is in shell32.dll, which takes over a millisecond to load. */
+static int br_split_cmdline(const wchar_t *s, wchar_t **argv, wchar_t *d) {
+    int argc = 1;
+    argv[0] = d;
+    /* the program ends at the next quote if it starts with one, else at a
+       space or control character, which is skipped */
+    if (*s == L'"') {
+        for (s++; *s && *s != L'"';) *d++ = *s++;
+        if (*s) s++;
+    } else {
+        while (*s > L' ') *d++ = *s++;
+        if (*s) s++;
+    }
+    *d++ = 0;
+    while (*s == L' ' || *s == L'\t') s++;
+    if (!*s) return argc;
+    argv[argc] = d;
+    argc++;
+    /* 2n backslashes and a quote: n backslashes, and the quote opens or closes;
+       2n+1 and a quote: n backslashes and a quote. Of a run of quotes inside
+       quotes, every third is a literal one. */
+    int q = 0, bs = 0;
+    while (*s) {
+        if ((*s == L' ' || *s == L'\t') && q == 0) {
+            *d++ = 0;
+            bs = 0;
+            do s++;
+            while (*s == L' ' || *s == L'\t');
+            if (*s) {
+                argv[argc] = d;
+                argc++;
+            }
+        } else if (*s == L'\\') {
+            *d++ = *s++;
+            bs++;
+        } else if (*s == L'"') {
+            if ((bs & 1) == 0) {
+                d -= bs / 2;
+                q++;
+            } else {
+                d -= bs / 2 + 1;
+                *d++ = L'"';
+            }
+            s++;
+            bs = 0;
+            for (; *s == L'"'; s++)
+                if (++q == 3) {
+                    *d++ = L'"';
+                    q = 0;
+                }
+            if (q == 2) q = 0;
+        } else {
+            *d++ = *s++;
+            bs = 0;
+        }
+    }
+    *d = 0;
+    return argc;
+}
 /* Windows hands `main` arguments in the local code page; brine strings are UTF-8 */
 static void br_utf8_args(void) {
-    int n = 0;
-    wchar_t **w = CommandLineToArgvW(GetCommandLineW(), &n);
-    if (!w) return;
+    const wchar_t *line = GetCommandLineW();
+    if (!*line) return; /* the C runtime's argv[0] is then the program's path too */
+    size_t len = wcslen(line);
+    /* each argument after the first follows a separator: at most len / 2 + 2 of them */
+    wchar_t **w = (wchar_t **)brine_alloc((int64_t)(sizeof(wchar_t *) * (len / 2 + 2) + sizeof(wchar_t) * (len + 2)));
+    int n = br_split_cmdline(line, w, (wchar_t *)(w + len / 2 + 2));
     char **out = (char **)brine_alloc((int64_t)sizeof(char *) * (n + 1));
     for (int i = 0; i < n; i++) {
         int m = WideCharToMultiByte(CP_UTF8, 0, w[i], -1, NULL, 0, NULL, NULL);
@@ -4111,13 +4372,14 @@ static void br_utf8_args(void) {
         else out[i][0] = 0;
     }
     out[n] = NULL;
-    LocalFree(w);
+    brine_free(w);
     br_argc = n;
     br_argv = out;
 }
 #endif
 
 void brine_rt_init(int argc, char **argv) {
+    br_leakcheck = getenv("BRINE_LEAKCHECK") != NULL;
     br_heap_init();
     br_argc = argc;
     br_argv = argv;
@@ -4147,7 +4409,7 @@ void brine_rt_shutdown(void) {
     br_gpu_settle();
     if (br_size > 1) brine_world_barrier();
     br_flush();
-    if (getenv("BRINE_LEAKCHECK")) fprintf(stderr, "brine: %lld live objects at exit\n", (long long)__atomic_load_n(&br_live, __ATOMIC_RELAXED));
+    if (br_leakcheck) fprintf(stderr, "brine: %lld live objects at exit\n", (long long)__atomic_load_n(&br_live, __ATOMIC_RELAXED));
 }
 
 /* ============================================================ files and processes */
@@ -5060,12 +5322,7 @@ bool brine_os_free_ports(int64_t n, brine_arr **out, brine_str **err) {
     return false;
 #else
 #ifdef _WIN32
-    static int wsa_ready;
-    if (!wsa_ready) {
-        WSADATA wsa;
-        WSAStartup(MAKEWORD(2, 2), &wsa);
-        wsa_ready = 1;
-    }
+    br_ws_start();
 #define BR_SOCK_ERR ((int)WSAGetLastError())
 #else
 #define BR_SOCK_ERR errno
@@ -5714,7 +5971,32 @@ void brine_x_map_release(brine_map *m) { brine_map_release(m); }
 brine_str *brine_x_str_at(brine_str *s, int64_t i, const char *loc) { return brine_str_at(s, i, loc); }
 brine_str *brine_x_str_byte(brine_str *s, int64_t i) { return brine_str_byte(s, i); }
 void brine_x_str_add(brine_str **ps, brine_str *b) { brine_str_add(ps, b); }
+void brine_x_str_add_byte(brine_str **ps, uint8_t c) { brine_str_add_byte(ps, c); }
+void brine_x_str_reset(brine_str **ps, brine_str *lit) { brine_str_reset(ps, lit); }
+void brine_x_app_open(brine_str **ps, void *ap) { brine_app_open(ps, ap); }
+void brine_x_app_byte(brine_str **ps, void *ap, uint8_t c) { brine_app_byte(ps, ap, c); }
+void brine_x_app_close(brine_str **ps, void *ap) { brine_app_close(ps, ap); }
+bool brine_x_str_eq(brine_str *a, brine_str *b) { return brine_str_eq(a, b); }
+uint64_t brine_x_hash_str(brine_str *s) { return brine_hash_str(s); }
 bool brine_x_map_has(brine_map *m, const void *k) { return brine_map_has(m, k); }
+bool brine_x_arr_shl(brine_arr **pa, int64_t lo, int64_t hi) { return brine_arr_shl(pa, lo, hi); }
+bool brine_x_arr_copy(brine_arr **pb, brine_arr *a, int64_t lo, int64_t hi) { return brine_arr_copy(pb, a, lo, hi); }
+bool brine_x_bytes_rev(char *d, int64_t n, int64_t *pi, int64_t *pj) { return brine_bytes_rev(d, n, pi, pj); }
+bool brine_x_bytes_shl(char *d, int64_t n, int64_t lo, int64_t hi) { return brine_bytes_shl(d, n, lo, hi); }
+bool brine_x_bytes_rotl(char *d, int64_t n, int64_t lo, int64_t hi) { return brine_bytes_rotl(d, n, lo, hi); }
+bool brine_x_arr_rotl(brine_arr **pa, int64_t lo, int64_t hi) { return brine_arr_rotl(pa, lo, hi); }
+bool brine_x_bytes_copy(char *db, int64_t nb, const char *da, int64_t na, int64_t lo, int64_t hi) {
+    return brine_bytes_copy(db, nb, da, na, lo, hi);
+}
+int64_t brine_x_map_probe(const brine_map *m, const void *k, uint64_t h, void *keq, int64_t ksz, bool exact) {
+    return brine_map_probe(m, k, h, keq, ksz, exact);
+}
+void *brine_x_map_val(brine_map *m, int64_t e, const void *k, int64_t vsz, const char *loc) {
+    return brine_map_val(m, e, k, vsz, loc);
+}
+void *brine_x_map_val_mut(brine_map **pm, int64_t e, const void *k, int64_t vsz, const char *loc) {
+    return brine_map_val_mut(pm, e, k, vsz, loc);
+}
 uint64_t brine_x_hash_u64(uint64_t x) { return brine_hash_u64(x); }
 uint64_t brine_x_hash_mix(uint64_t h, uint64_t x) { return brine_hash_mix(h, x); }
 uint64_t brine_x_hash_u128(const brine_u128 *x) { return brine_hash_u128(*x); }

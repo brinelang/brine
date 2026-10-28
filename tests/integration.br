@@ -169,7 +169,13 @@ fn features() -> [str]:
         "tests/programs/unpacking.br",
         "tests/programs/loop_arrays.br",
         "tests/programs/reductions.br",
-        "tests/programs/gpu.br"
+        "tests/programs/interleave.br",
+        "tests/programs/bits.br",
+        "tests/programs/versioned.br",
+        "tests/programs/idioms.br",
+        "tests/programs/kernels.br",
+        "tests/programs/gpu.br",
+        "tests/programs/string_building.br"
     ]
 
 test "language features":
@@ -187,6 +193,15 @@ test "language features through C":
         [],
         {"BRINE_BACKEND": "c"}
     )
+
+# Release builds go through C with more optimizations, and on x86-64 carry
+# the program for three CPU levels: each must print the same.
+test "language features in release builds":
+    for f in features():
+        run_ok(f, expected(f), ["--release"])
+        if os.arch() == "x86_64":
+            for level in ["base", "v3"]:
+                run_with(f, expected(f), ["--release"], {"BRINE_CPU": level})
 
 # Debug builds compile without optimizations (each value in its stack slot,
 # for the debugger), so they get the programs too.
@@ -337,12 +352,21 @@ test "panics are clear":
         ("tests/programs/panic_index.br", "index 7 is out of bounds"),
         ("tests/programs/panic_overflow.br", "overflow"),
         ("tests/programs/panic_overflow128.br", "overflow in addition"),
-        ("tests/programs/panic_slice.br", "slice [1:8] is out of bounds")
+        ("tests/programs/panic_slice.br", "slice [1:8] is out of bounds"),
+        ("tests/programs/panic_str_byte.br", "index 3 is out of bounds")
     ]:
         let o = brine(["run", f, "-q"])
         assert o.code == 101, f"{f}: exit {o.code}\n{o.err}"
         assert msg in o.err, f"{f}: expected `{msg}` in:\n{o.err}"
         assert f"--> {f}:" in o.err, f"{f}: no location in:\n{o.err}"
+    # `s += t[i]` appends the byte without making a string of it (here through
+    # the loop's appender), but panics where `t[i]` would, in every kind of build
+    for extra in [["-q"], ["-q", "--release"], ["-q", "--debug"]]:
+        var args = ["run", "tests/programs/panic_str_byte.br"]
+        args.extend(extra)
+        let o = brine(args)
+        assert o.code == 101, f"{extra}: exit {o.code}\n{o.err}"
+        assert "--> tests/programs/panic_str_byte.br:5:14" in o.err, f"{extra}: wrong location in:\n{o.err}"
 
 # ------------------------------------------------------------ WebAssembly
 
@@ -541,6 +565,161 @@ test "proofs remove runtime checks":
         let o = brine(["check", f, "--report"])
         assert o.code == 0, o.all()
         assert "0 remain" in o.all(), o.all()
+
+test "proofs remove compound assignment checks":
+    let d = scratch("compound")
+    let f = d + "/count.br"
+    # `i += 1` can't overflow below `n`; `total += x` can
+    write(
+        f,
+        "fn main():\n    let n = int(\"10\")\n    var i = 0\n    var total = 0\n    while i < n:\n        total += int(\"7\")\n        i += 1\n    print(i, total)\n"
+    )
+    let c = d + "/count.c"
+    let o = brine(["emit-c", "--release", f, "-o", c])
+    assert o.code == 0, o.all()
+    assert text(c).count("brine_panic_ovf(\"addition\"") == 1, text(c)
+    run_ok(f, "10 70\n", [])
+    # a counter goes up by at most 1 per iteration: `hits` can't overflow,
+    # `big` (which starts near the top) can
+    let g = d + "/counter.br"
+    write(
+        g,
+        "fn main():\n    let n = int(\"5\")\n    var hits = 0\n    for i in 0..n:\n        if i % 3 == 0:\n            hits += 1\n    var big = int(\"9223372036854775800\")\n    for i in 0..n:\n        big += 1\n    print(hits, big)\n"
+    )
+    let gc = d + "/counter.c"
+    let o2 = brine(["emit-c", "--release", g, "-o", gc])
+    assert o2.code == 0, o2.all()
+    assert text(gc).count("brine_panic_ovf(\"addition\"") == 1, text(gc)
+    run_ok(g, "2 9223372036854775805\n", [])
+
+test "release builds interleave independent iterations":
+    let d = scratch("interleave")
+    let c = d + "/interleave.c"
+    let o = brine(["emit-c", "--release", "tests/programs/interleave.br", "-o", c])
+    assert o.code == 0, o.all()
+    # each lane has its own copy of the loop's variables
+    assert text(c).count("    double zr_") == 5, text(c)
+    # a sum that overflows panics where it would one iteration at a time
+    let f = "tests/programs/panic_interleave.br"
+    for extra in [["-q"], ["-q", "--release"]]:
+        var args = ["run", f]
+        args.extend(extra)
+        let r = brine(args)
+        assert r.code == 101, f"{extra}: exit {r.code}\n{r.err}"
+        assert "overflow in addition" in r.err and f"--> {f}:11:13" in r.err, r.err
+
+test "release builds keep local bool arrays as bits":
+    let d = scratch("bits")
+    let c = d + "/bits.c"
+    let o = brine(["emit-c", "--release", "tests/programs/bits.br", "-o", c])
+    assert o.code == 0, o.all()
+    # `primes` and `pattern`, not `main`'s array, which is passed on
+    assert text(c).count("brine_bits_new(") == 2, text(c)
+    let f = "tests/programs/panic_bits.br"
+    for extra in [["-q"], ["-q", "--release"]]:
+        var args = ["run", f]
+        args.extend(extra)
+        let r = brine(args)
+        assert r.code == 101, f"{extra}: exit {r.code}\n{r.err}"
+        assert "index 70 is out of bounds" in r.err and f"--> {f}:5:11" in r.err, r.err
+
+test "release builds build strings and count them in place":
+    let d = scratch("strings")
+    let c = d + "/string_building.c"
+    let o = brine(["emit-c", "--release", "tests/programs/string_building.br", "-o", c])
+    assert o.code == 0, o.all()
+    let t = text(c)
+    # `w += t[i]` appends the byte without a one-byte string
+    # (the one left is `text[i] == " "` in `appenders`, a one-byte string)
+    assert t.count("brine_str_at(") == 1, t
+    # the `var w = ""` in each loop keeps its block from one iteration to the next
+    assert t.count("brine_str_reset(") == 4, t
+    # `if w in m: m[w] += 1` looks the key up once
+    let body = t[t.find("static void * main__counts(void * v0) {").unwrap():]
+    let f = body[:body.find("\n}\n").unwrap()]
+    assert f.count("br_mf_map_str_i64(") == 1, f
+    # a loop that only appends bytes to a string goes through an appender: all
+    # but the loop that reads `r` and the `s += "|"` outside the inner loop
+    let body2 = t[t.find("static void main__appenders(void) {").unwrap():]
+    let g = body2[:body2.find("\n}\n").unwrap()]
+    assert g.count("brine_app_open(") == 5 and g.count("brine_app_byte(") == 6, g
+    assert g.count("brine_app_close(") == 5 and g.count("brine_str_add_byte(") == 3, g
+
+test "release builds drop overflow checks a bound rules out":
+    let d = scratch("versioned")
+    let c = d + "/versioned.c"
+    let o = brine(["emit-c", "--release", "tests/programs/versioned.br", "-o", c])
+    assert o.code == 0, o.all()
+    # `total`'s loop calls a clone of `tri` without checks
+    assert text(c).count("main__tri__nc(") == 3, text(c)
+    # the bound fails here: the loop as written panics where it would have
+    let f = "tests/programs/panic_versioned.br"
+    for extra in [["-q"], ["-q", "--release"]]:
+        var args = ["run", f]
+        args.extend(extra)
+        let r = brine(args)
+        assert r.code == 101, f"{extra}: exit {r.code}\n{r.err}"
+        assert "overflow in multiplication" in r.err and f"--> {f}:3:12" in r.err, r.err
+
+test "release builds run loop idioms as one operation":
+    let d = scratch("idioms")
+    let c = d + "/idioms.c"
+    let o = brine(["emit-c", "--release", "tests/programs/idioms.br", "-o", c])
+    assert o.code == 0, o.all()
+    let t = text(c)
+    for f in [
+        "brine_bytes_new(",
+        "brine_bytes_rev(",
+        "brine_bytes_rotl(",
+        "brine_bytes_copy(",
+        "brine_arr_rotl(",
+        "brine_arr_copy("
+    ]:
+        assert f in t, f
+    # out of bounds: the loop as written panics where it would have
+    for p in [
+        ("tests/programs/panic_reverse.br", "11:20", "index 13"),
+        ("tests/programs/panic_rotate.br", "7:20", "index 12")
+    ]:
+        let (f, at, what) = p
+        for extra in [["-q"], ["-q", "--release"]]:
+            var args = ["run", f]
+            args.extend(extra)
+            let r = brine(args)
+            assert r.code == 101, f"{extra}: exit {r.code}\n{r.err}"
+            assert f"{what} is out of bounds" in r.err and f"--> {f}:{at}" in r.err, r.err
+
+test "release builds run small fixed-size loops as vector kernels":
+    let d = scratch("kernels")
+    let c = d + "/kernels.c"
+    let o = brine(["emit-c", "--release", "tests/programs/kernels.br", "-o", c])
+    assert o.code == 0, o.all()
+    # one kernel per CPU level, for `step` and for `spread`
+    let src = text(c)
+    assert src.count("static void brk_main__step(char *a0, double f0, double f1) {") == 3, src
+    assert src.count("static double brk_main__spread(char *a0) {") == 3, src
+    # each CPU level prints what the code as written does
+    for level in ["base", "v3", "v4"]:
+        run_with(
+            "tests/programs/kernels.br",
+            expected("tests/programs/kernels.br"),
+            ["--release"],
+            {"BRINE_CPU": level}
+        )
+    # the array's length isn't what the callers showed: the function runs as
+    # written and panics where it would have
+    let f = "tests/programs/panic_kernels.br"
+    let pc = d + "/panic.c"
+    let o2 = brine(["emit-c", "--release", f, "-o", pc])
+    assert o2.code == 0, o2.all()
+    assert "brk_main__relax(" in text(pc), text(pc)
+    for extra in [["-q"], ["-q", "--release"]]:
+        var args = ["run", f]
+        args.extend(extra)
+        let r = brine(args)
+        assert r.code == 101, f"{extra}: exit {r.code}\n{r.err}"
+        assert "division by zero" in r.err and f"--> {f}:3:19" in r.err, r.err
+        assert "-0.10206207261596574" in r.out, r.out
 
 test "every error code is explained":
     for code in [
