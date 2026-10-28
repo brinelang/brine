@@ -1089,6 +1089,17 @@ struct Lower:
         self.retain(v, ty)
         return v
 
+    # A plain aggregate (no counted parts) in memory of its own. Owning it
+    # takes nothing, so `v` may still point into a temp the frame is about to
+    # release (`match mk()[0]`), or into a variable that changes meanwhile.
+    fn detach(ref self, v: int, ty: Ty) -> int:
+        if not self.agg(ty) or self.managed(ty):
+            return v
+        let lay = self.lay(ty)
+        let t = self.cx.fb.temp_mem(lay.size, lay.align)
+        self.cx.fb.copy(t, v, lay.size)
+        return t
+
     # Owned values of several expressions. All are evaluated before any is
     # claimed, so a `?` in a later one can't leak an earlier one.
     fn owned_all(ref self, es: [Expr]) -> [int]:
@@ -1953,7 +1964,8 @@ struct Lower:
         let el = ty.elem()
         let sz = self.lay(el).size
         self.push_frame()
-        let v = self.expr(elem)
+        let v0 = self.expr(elem)
+        let v = self.detach(v0, el)
         self.pop_frame()
         # (elements 16-byte aligned, as malloc's: i128 needs it)
         let a = self.cx.fb.temp_mem(64 + n * sz, 16)
@@ -4569,7 +4581,8 @@ struct Lower:
                     let xv = self.ld(v, self.field_off(ty, i), x)
                     self.add_owned(xv, x)
         else:
-            v = self.owned(scrut)
+            let o = self.owned(scrut)
+            v = self.detach(o, ty)
             self.pop_frame()
             self.add_owned(v, ty)
         let end = self.cx.fb.label()
@@ -4929,14 +4942,18 @@ struct Lower:
                 let end = self.cx.fb.label()
                 self.cx.fb.brnot(c, lels)
                 self.push_frame()
-                let v1 = self.owned(then) if m else self.expr(then)
+                var v1 = self.owned(then) if m else self.expr(then)
+                if not m:
+                    v1 = self.detach(v1, e.ty)
                 if then.ty != Ty.Never:
                     self.cx.fb.mov(t, v1)
                 self.pop_frame()
                 self.cx.fb.jmp(end)
                 self.cx.fb.place(lels)
                 self.push_frame()
-                let v2 = self.owned(els) if m else self.expr(els)
+                var v2 = self.owned(els) if m else self.expr(els)
+                if not m:
+                    v2 = self.detach(v2, e.ty)
                 if els.ty != Ty.Never:
                     self.cx.fb.mov(t, v2)
                 self.pop_frame()
@@ -7018,7 +7035,8 @@ struct Lower:
             case None:
                 pass
         self.push_frame()
-        let v = self.owned(c.body)
+        let v0 = self.owned(c.body)
+        let v = self.detach(v0, ty)
         self.pop_frame()
         let is = self.is_some(v, ty)
         let miss = self.cx.fb.label()
