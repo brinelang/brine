@@ -130,7 +130,7 @@ fn main():
 ```
 Arguments are passed by value (cheaply: arrays and strings are copy-on-write).
 References can't be stored in structs or arrays or returned, so they never dangle.
-`main` may return `int` (the exit code). Parameter types are required;
+`main` may return `int` (the exit code) or a `Result` (see below). Parameter types are required;
 local types are inferred.
 
 ## Structs and methods
@@ -233,6 +233,7 @@ fn main() -> Result[(), str]:           # an Err prints "error: ..." and exits w
     print(load("bit.txt")?)
     return Ok(())
 ```
+`main` may also return `Result[int, E]`: `Ok(n)` exits with code `n`.
 
 `Option[T]` (`Some(value)`, `None`) and `Result[T, E]` (`Ok(value)`, `Err(error)`)
 are always available. Methods: `is_some()`, `is_none()`, `is_ok()`, `is_err()`,

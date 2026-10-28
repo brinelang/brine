@@ -76,7 +76,7 @@ fn main():
 | Enums | Tagged unions with named fields per variant; values are immutable and may be recursive. `match` must be exhaustive (checked at compile time, with an example of a missed value). |
 | Memory | Deterministic: reference counting (atomic), freed at scope exit. No GC pauses. |
 | Generics | `fn f[T](x: T)`, `struct Pair[A, B]`, `enum Option[T]`. Monomorphized: every use with new type arguments is a specialized copy, checked and proven like ordinary code. Type arguments are inferred from arguments and the expected type. |
-| Errors | `Result[T, E]` and `Option[T]` from the prelude for expected failures; runtime traps with a source location (`panic`) for bugs. `x?` returns a `None`/`Err` to the caller (no implicit error conversions). `main` may return `Result[(), E]`. |
+| Errors | `Result[T, E]` and `Option[T]` from the prelude for expected failures; runtime traps with a source location (`panic`) for bugs. `x?` returns a `None`/`Err` to the caller (no implicit error conversions). `main` may return `Result[(), E]` or `Result[int, E]` (`Ok(n)`: exit code `n`). |
 
 ### 2.2 Proofs ("rules cannot be broken")
 
