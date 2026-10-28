@@ -93,6 +93,11 @@ _Static_assert(sizeof(brine_map_ty) == 80 && sizeof(brine_sb) == 24, "brine_map_
 
 /* ============================================================ platform layer */
 static void br_heap_exit(void);
+/* Every thread brine code runs on, `main` included, has a stack this big
+ * (reserved, not committed). */
+#define BR_STACK ((size_t)64 << 20)
+static void br_stack_enter(void);
+static void br_stack_leave(void);
 #ifdef _WIN32
 typedef CRITICAL_SECTION br_mutex;
 typedef CONDITION_VARIABLE br_cond;
@@ -108,15 +113,17 @@ typedef struct { void (*fn)(void *); void *arg; } br_tramp;
 static DWORD WINAPI br_thread_main(LPVOID p) {
     br_tramp t = *(br_tramp *)p;
     free(p);
+    br_stack_enter();
     t.fn(t.arg);
     br_heap_exit();
+    br_stack_leave();
     return 0;
 }
 static int br_thread_start(br_thread *th, void (*fn)(void *), void *arg) {
     br_tramp *t = (br_tramp *)malloc(sizeof(br_tramp));
     t->fn = fn;
     t->arg = arg;
-    *th = CreateThread(NULL, 64u << 20, br_thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    *th = CreateThread(NULL, BR_STACK, br_thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     return *th != NULL;
 }
 static void br_thread_join(br_thread th) {
@@ -173,8 +180,10 @@ typedef struct { void (*fn)(void *); void *arg; } br_tramp;
 static void *br_thread_main(void *p) {
     br_tramp t = *(br_tramp *)p;
     free(p);
+    br_stack_enter();
     t.fn(t.arg);
     br_heap_exit();
+    br_stack_leave();
     return NULL;
 }
 static int br_thread_start(br_thread *th, void (*fn)(void *), void *arg) {
@@ -183,7 +192,7 @@ static int br_thread_start(br_thread *th, void (*fn)(void *), void *arg) {
     t->arg = arg;
     pthread_attr_t at;
     pthread_attr_init(&at);
-    pthread_attr_setstacksize(&at, (size_t)64 << 20);
+    pthread_attr_setstacksize(&at, BR_STACK);
     int ok = pthread_create(th, &at, br_thread_main, t) == 0;
     pthread_attr_destroy(&at);
     return ok;
@@ -258,6 +267,81 @@ void brine_assert_fail(const char *loc, const char *src, brine_str *msg) {
         br_panicf(loc, "assertion failed: %s\n  message: %.*s", src, (int)msg->len, msg->data);
     br_panicf(loc, "assertion failed: %s", src);
 }
+/* ------------------------------------------------------------ stack overflow */
+/* Deep recursion runs into the guard page under the stack. Instead of dying
+ * silently (and losing what is still buffered for stdout), report it like a
+ * panic. The handler runs on a reserve: on Windows the stack guarantee, on
+ * POSIX an alternate signal stack, both set up for each thread. */
+static BR_NORETURN void br_stack_overflow(void) {
+    br_panic_claim();
+    fflush(stdout);
+    char m[128];
+    if (br_size > 1)
+        snprintf(m, sizeof m, "\npanic (rank %lld): stack overflow (recursion too deep)\n", (long long)br_rank);
+    else
+        snprintf(m, sizeof m, "\npanic: stack overflow (recursion too deep)\n");
+    fputs(m, stderr);
+    fflush(stderr);
+    _exit(101);
+}
+#ifdef _WIN32
+static LONG CALLBACK br_on_exception(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) br_stack_overflow();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static void br_stack_setup(void) { AddVectoredExceptionHandler(1, br_on_exception); }
+static void br_stack_enter(void) {
+    ULONG reserve = 64 << 10;
+    SetThreadStackGuarantee(&reserve);
+}
+static void br_stack_leave(void) {}
+#elif defined(BR_WASM)
+/* The engine traps when its call stack runs out; the runner (brine_wasi.mjs,
+ * brine_web.js) then calls this so the output before it isn't lost. */
+__attribute__((export_name("brine_flush"))) void brine_wasm_flush(void) { fflush(stdout); }
+#else
+#define BR_ALT_STACK ((size_t)64 << 10)
+/* the top of this thread's stack, when it is one of ours */
+static __thread char *br_stack_top;
+static void br_on_segv(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    char *a = (char *)si->si_addr, *top = br_stack_top;
+    /* the stack's own pages are mapped: a fault in its range (or just under
+     * it, from a big frame that skipped the guard page) is an overflow */
+    if (top && a < top && a >= top - BR_STACK - ((size_t)1 << 20)) br_stack_overflow();
+    /* anything else crashes as it would without the handler */
+    signal(sig, SIG_DFL);
+}
+static void br_stack_setup(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = br_on_segv;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+static void br_stack_enter(void) {
+    char here;
+    br_stack_top = &here;
+    stack_t ss;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_size = BR_ALT_STACK > (size_t)SIGSTKSZ ? BR_ALT_STACK : (size_t)SIGSTKSZ;
+    ss.ss_sp = malloc(ss.ss_size);
+    if (ss.ss_sp && sigaltstack(&ss, NULL) != 0) {
+        free(ss.ss_sp);
+        br_stack_top = NULL;
+    }
+}
+static void br_stack_leave(void) {
+    stack_t ss, old;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_flags = SS_DISABLE;
+    br_stack_top = NULL;
+    if (sigaltstack(&ss, &old) == 0 && old.ss_sp) free(old.ss_sp);
+}
+#endif
+
 void brine_exit(int64_t code) {
     br_flush();
     br_gpu_settle();
@@ -4392,7 +4476,34 @@ static void br_utf8_args(void) {
 }
 #endif
 
+#ifndef BR_WASM
+/* The OS gives the first thread a small stack (1 MB on Windows, 8 MB on
+ * Linux) while `par` threads get BR_STACK: so that code that works in `par`
+ * works outside it too, `main` runs again on a thread of ours. */
+extern int main(int argc, char **argv);
+static int br_main_argc;
+static char **br_main_argv;
+static void br_main_thread(void *p) {
+    (void)p;
+    exit(main(br_main_argc, br_main_argv));
+}
+#endif
+
 void brine_rt_init(int argc, char **argv) {
+#ifndef BR_WASM
+    static int on_our_thread;
+    if (!on_our_thread) {
+        on_our_thread = 1;
+        br_stack_setup();
+        br_main_argc = argc;
+        br_main_argv = argv;
+        br_thread th;
+        if (br_thread_start(&th, br_main_thread, NULL)) {
+            br_thread_join(th);
+            exit(0); /* not reached: the thread exits the process */
+        }
+    }
+#endif
     br_leakcheck = getenv("BRINE_LEAKCHECK") != NULL;
     br_heap_init();
     br_argc = argc;

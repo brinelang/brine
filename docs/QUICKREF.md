@@ -45,6 +45,10 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
 * Integer overflow, out-of-range conversions, division by zero and
   out-of-bounds indexing stop the program with a clear message (a *panic*),
   unless the compiler proved they can't happen, in which case the check is removed.
+  Only the first panic is reported, even when many `par` threads fail at once.
+* Every thread, `main` included, has a 64 MB stack; recursion deeper than that
+  panics with "stack overflow (recursion too deep)". WebAssembly engines allow
+  less (about 10,000 to 100,000 calls, depending on the frames).
 * Integer `/` rounds down like Python's `//` (`-7 / 2 == -4`), and `%` takes the sign of
   the right side (`-7 % 2 == 1`). Use `float(a) / float(b)` for a fractional result.
 * Values are **values**: `let b = a` copies (cheaply, copy-on-write). Changing `b`
