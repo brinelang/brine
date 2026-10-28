@@ -326,6 +326,12 @@ match line.to_int():                      # Option[int]; blanks around it are fi
 ```
 Both accept `_` between digits (`"1_000"`), as `int()` and `float()` do.
 
+Format specs in f-strings, as in Python: `{x:.2f}` (fixed), `{x:.3e}`
+(scientific), `{x:g}` / `{x:.10g}` (general: the shorter of the two, trailing
+zeros dropped), `{n:,}` / `{x:,.2f}` (thousands separators: `1,234,567.89`),
+`{n:x}` / `{n:b}` (hex, binary), a width `{n:8}` (`<8` to left-align, `08` to pad
+with zeros) and combinations like `{x:>12,.2f}`.
+
 ## Maps
 
 ```python

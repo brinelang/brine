@@ -2203,7 +2203,7 @@ void brine_sb_i128(brine_sb *sb, brine_i128 v) {
 void brine_sb_fmt_u128(brine_sb *sb, brine_u128 v, int kind) {
     if (kind == 'x' || kind == 'b')
         br_sb_u128_base(sb, v, kind == 'x' ? 16 : 2);
-    else if (kind == 'f' || kind == 'e')
+    else if (kind == 'f' || kind == 'e' || kind == 'g')
         brine_sb_fmt_f64(sb, (double)v, -1, kind);
     else
         brine_sb_u128(sb, v);
@@ -2212,7 +2212,7 @@ void brine_sb_fmt_i128(brine_sb *sb, brine_i128 v, int kind) {
     if (kind == 'x' || kind == 'b') {
         if (v < 0) brine_sb_cat(sb, "-", 1);
         br_sb_u128_base(sb, v < 0 ? (brine_u128)(-(v + 1)) + 1 : (brine_u128)v, kind == 'x' ? 16 : 2);
-    } else if (kind == 'f' || kind == 'e')
+    } else if (kind == 'f' || kind == 'e' || kind == 'g')
         brine_sb_fmt_f64(sb, (double)v, -1, kind);
     else
         brine_sb_i128(sb, v);
@@ -2316,7 +2316,7 @@ void brine_sb_fmt_i64(brine_sb *sb, int64_t v, int kind) {
             br_sb_bin(sb, u);
         return;
     }
-    if (kind == 'f' || kind == 'e') {
+    if (kind == 'f' || kind == 'e' || kind == 'g') {
         brine_sb_fmt_f64(sb, (double)v, -1, kind);
         return;
     }
@@ -2329,7 +2329,7 @@ void brine_sb_fmt_u64(brine_sb *sb, uint64_t v, int kind) {
         br_sb_cstr(sb, b);
     } else if (kind == 'b')
         br_sb_bin(sb, v);
-    else if (kind == 'f' || kind == 'e')
+    else if (kind == 'f' || kind == 'e' || kind == 'g')
         brine_sb_fmt_f64(sb, (double)v, -1, kind);
     else
         brine_sb_u64(sb, v);
@@ -2345,8 +2345,30 @@ void brine_sb_fmt_f64(brine_sb *sb, double v, int prec, int kind) {
     } else if (kind == 'e') {
         snprintf(b, sizeof b, "%.*e", prec < 0 ? 6 : prec, v);
         br_sb_cstr(sb, b);
+    } else if (kind == 'g') {
+        snprintf(b, sizeof b, "%.*g", prec < 0 ? 6 : prec, v);
+        br_sb_cstr(sb, b);
     } else
         brine_sb_f64(sb, v);
+}
+/* `{x:,}`: commas between groups of three digits in the integer part of the
+ * number written from `start` on */
+void brine_sb_group(brine_sb *sb, int64_t start) {
+    int64_t a = start;
+    if (a < sb->len && (sb->p[a] == '-' || sb->p[a] == '+')) a++;
+    int64_t b = a;
+    while (b < sb->len && sb->p[b] >= '0' && sb->p[b] <= '9') b++;
+    int64_t n = b - a, k = (n - 1) / 3;
+    if (n <= 3) return;
+    br_sb_reserve(sb, k);
+    memmove(sb->p + b + k, sb->p + b, (size_t)(sb->len - b));
+    sb->len += k;
+    /* from the right: copy digits, a comma after every third */
+    int64_t from = b - 1, to = b + k - 1;
+    for (int64_t i = 0; from >= a; i++) {
+        if (i > 0 && i % 3 == 0) sb->p[to--] = ',';
+        sb->p[to--] = sb->p[from--];
+    }
 }
 void brine_sb_pad(brine_sb *sb, int64_t start, int64_t width, bool left, bool zero) {
     int64_t n = sb->len - start;
