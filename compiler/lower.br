@@ -153,6 +153,9 @@ struct FnCx:
     pre_idx: {str: int}
     # the keys in `arrc` (negative) of the array fields loops cache, by path
     fkeys: {str: int}
+    # `var`s that only ever borrow (see `borrow_let`): assigning one
+    # neither retains the new value nor releases the old
+    borrowed: {int: bool}
     # parameters this body owns (an `__own` clone, see `own_call`) and the
     # depth of the scope of the body's own statements
     own_params: {int: bool}
@@ -213,6 +216,7 @@ fn new_cx(f: Func) -> FnCx:
         apps={},
         pre_idx={},
         fkeys={},
+        borrowed={},
         own_params={},
         body_depth=-1,
         own_arg=-1,
@@ -2652,42 +2656,35 @@ struct Lower:
 
     # `let d = r.f` or `let d = r[i].g`, where nothing in the rest of the
     # block can change `r` or move it: `d` borrows the value, which `r` keeps
-    # alive, instead of retaining it and releasing it at the end.
+    # alive, instead of retaining it and releasing it at the end. A `var d`
+    # too, when all it is ever given is such places (`d = q.f`) and nothing
+    # else changes it.
     fn borrow_let(ref self, stmts: [Stmt], k: int) -> bool:
         if not self.moves_ok():
             return false
         let s = stmts[k]
         match s.kind:
             case StmtKind.Let(mutable, pat, _, init, is_ref):
-                if mutable or is_ref or len(
-                    s.locals
-                ) != 1 or not is_name(pat) or not borrow_place(init):
+                if is_ref or len(s.locals) != 1 or not is_name(pat) or not borrow_place(init):
                     return false
                 let d = s.locals[0]
                 let ty = self.flocals[d].ty
                 if not self.managed(ty) or init.ty != ty or not self.plain_local(d):
                     return false
-                var r = -1
-                match place_path(init):
-                    case Some((l, _)):
-                        r = l
-                    case None:
-                        return false
-                let rk = self.flocals[r].kind
-                if rk == LocalKind.Var or rk == LocalKind.Let:
-                    if r in self.cx.lptr or r in self.cx.packed or r in self.cx.narrow:
-                        return false
-                elif rk != LocalKind.Param and rk != LocalKind.RefParam:
-                    return false
-                for i in k + 1..len(stmts):
-                    if not self.keeps_root(stmts[i], r):
-                        return false
-                match self.fnd:
-                    case Some(f):
-                        for t in f.body.stmts:
-                            if ref_alias(t, r):
-                                return false
-                    case None:
+                var roots = [place_path(init).unwrap().0]
+                if mutable:
+                    for i in k + 1..len(stmts):
+                        if not self.only_borrows(stmts[i], d, ref roots):
+                            return false
+                    match self.fnd:
+                        case Some(f):
+                            for t in f.body.stmts:
+                                if ref_alias(t, d):
+                                    return false
+                        case None:
+                            return false
+                for r in roots:
+                    if r == d or not self.keeps_alive(stmts, k, r):
                         return false
                 self.push_frame()
                 let v = self.expr(init)
@@ -2696,15 +2693,68 @@ struct Lower:
                 self.st(home, 0, ty, v)
                 if own:
                     self.add_local_home(home, ty, d)
+                elif mutable:
+                    self.cx.borrowed[d] = true
                 self.pop_frame()
                 return true
             case _:
                 return false
 
+    # Does variable `r` keep what is borrowed from it alive through the
+    # statements after `stmts[k]`?
+    fn keeps_alive(self, stmts: [Stmt], k: int, r: int) -> bool:
+        let rk = self.flocals[r].kind
+        if rk == LocalKind.Var or rk == LocalKind.Let:
+            if r in self.cx.lptr or r in self.cx.packed or r in self.cx.narrow or r in self.cx.borrowed:
+                return false
+        elif rk != LocalKind.Param and rk != LocalKind.RefParam:
+            return false
+        for i in k + 1..len(stmts):
+            if not self.keeps_root(stmts[i], r):
+                return false
+        match self.fnd:
+            case Some(f):
+                for t in f.body.stmts:
+                    if ref_alias(t, r):
+                        return false
+                return true
+            case None:
+                return false
+
+    # Is `var d` in statement `s` only read, or given a place to borrow
+    # (`d = q.f`, whose root is added to `roots`)?
+    fn only_borrows(self, s: Stmt, d: int, ref roots: [int]) -> bool:
+        match s.kind:
+            case StmtKind.Assign(t, op, v):
+                if local_of(t) == Some(d):
+                    if op.is_some() or not borrow_place(v) or mentions_local(v, d):
+                        return false
+                    roots.push(place_path(v).unwrap().0)
+                    return self.keeps_root_in(v, d)
+            case _:
+                pass
+        if not self.keeps_root_flat(s, d):
+            return false
+        for b in stmt_blocks(s):
+            for t in b.stmts:
+                if not self.only_borrows(t, d, ref roots):
+                    return false
+        return true
+
     # Does statement `s` leave the value of variable `r` (and all it holds)
     # alone: no write, `ref` or changing method through it, and no read of
     # the whole variable a move could take (`var t = r`, `p = r`)?
     fn keeps_root(self, s: Stmt, r: int) -> bool:
+        if not self.keeps_root_flat(s, r):
+            return false
+        for b in stmt_blocks(s):
+            for t in b.stmts:
+                if not self.keeps_root(t, r):
+                    return false
+        return true
+
+    # `keeps_root` for `s` itself, not the blocks in it
+    fn keeps_root_flat(self, s: Stmt, r: int) -> bool:
         match s.kind:
             case StmtKind.Let(_, _, _, init, is_ref):
                 if local_of(init) == Some(r) or is_ref and mentions_local(init, r):
@@ -2717,10 +2767,6 @@ struct Lower:
         for e in stmt_exprs(s):
             if not self.keeps_root_in(e, r):
                 return false
-        for b in stmt_blocks(s):
-            for t in b.stmts:
-                if not self.keeps_root(t, r):
-                    return false
         return true
 
     fn keeps_root_in(self, e: Expr, r: int) -> bool:
@@ -3629,6 +3675,19 @@ struct Lower:
                     for p in parts:
                         self.assign(target, Some(BinOp.Add), p, checked, span)
                     return
+                case None:
+                    pass
+        if op.is_none() and len(self.cx.borrowed) > 0:
+            match local_of(target):
+                case Some(l):
+                    if l in self.cx.borrowed:
+                        # see `borrow_let`: `value` is a place, never a temp
+                        let v = self.expr(value)
+                        if self.claim(v):
+                            panic("lowering: a borrowing variable was given an owned value")
+                        let home = self.local_ptr(l)
+                        self.st(home, 0, ty, v)
+                        return
                 case None:
                     pass
         if op.is_none() and self.own_call(target, value):
