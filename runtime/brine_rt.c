@@ -26,6 +26,44 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <winternl.h>
+/* Winsock is loaded when a program first uses the network (br_ws_start):
+   importing it would load it, and the DLLs it needs, into every program. */
+#define BR_WS_FNS(X) \
+    X(WSAStartup) X(WSAGetLastError) X(accept) X(bind) X(closesocket) X(connect) X(freeaddrinfo) \
+    X(getaddrinfo) X(getsockname) X(listen) X(recv) X(send) X(setsockopt) X(socket)
+#define BR_WS_PTR(f) static __typeof__(f) *br_ws_##f;
+BR_WS_FNS(BR_WS_PTR)
+#define WSAStartup (*br_ws_WSAStartup)
+#define WSAGetLastError (*br_ws_WSAGetLastError)
+#define accept (*br_ws_accept)
+#define bind (*br_ws_bind)
+#define closesocket (*br_ws_closesocket)
+#define connect (*br_ws_connect)
+#define freeaddrinfo (*br_ws_freeaddrinfo)
+#define getaddrinfo (*br_ws_getaddrinfo)
+#define getsockname (*br_ws_getsockname)
+#define listen (*br_ws_listen)
+#define recv (*br_ws_recv)
+#define send (*br_ws_send)
+#define setsockopt (*br_ws_setsockopt)
+#define socket (*br_ws_socket)
+#define htons(x) __builtin_bswap16(x)
+#define ntohs(x) __builtin_bswap16(x)
+#define htonl(x) __builtin_bswap32(x)
+static void br_ws_start(void) {
+    static int ready;
+    if (__atomic_load_n(&ready, __ATOMIC_ACQUIRE)) return;
+    HMODULE h = LoadLibraryA("ws2_32.dll");
+    if (!h) {
+        fprintf(stderr, "brine: could not load ws2_32.dll\n");
+        exit(2);
+    }
+#define BR_WS_GET(f) br_ws_##f = (__typeof__(f) *)(void (*)(void))GetProcAddress(h, #f);
+    BR_WS_FNS(BR_WS_GET)
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    __atomic_store_n(&ready, 1, __ATOMIC_RELEASE);
+}
 #elif defined(__wasi__)
 /* WebAssembly (WASI preview 1): one thread, no processes, sockets or shared
  * libraries. `par` runs on the calling thread and `world` has one rank. */
@@ -250,6 +288,7 @@ typedef struct {
     void *head[BR_NCLASS];
     int64_t count[BR_NCLASS];
     char *bump[BR_NCLASS], *end[BR_NCLASS];
+    int in_par; /* running a parallel region (br_in_par_get) */
 } br_heap_th;
 #if defined(_WIN32) && !defined(__clang__)
 /* MinGW gcc emulates thread-locals with a library call per access, which
@@ -1908,7 +1947,13 @@ static struct {
     int main_waits;
 } br_pool;
 
-static _Thread_local int br_in_par = 0;
+/* whether this thread runs a parallel region (a field of the per-thread heap
+   struct: MinGW gcc would emulate a _Thread_local with libwinpthread) */
+static int br_in_par_get(void) {
+    br_heap_th *h = br_th_peek();
+    return h ? h->in_par : 0;
+}
+static void br_in_par_set(int v) { br_th_get()->in_par = v; }
 static int64_t br_task_budget = 0;
 
 static int br_threads(void) {
@@ -1953,7 +1998,7 @@ static void br_run_chunks(br_job *j) {
 
 static void br_worker(void *arg) {
     (void)arg;
-    br_in_par = 1;
+    br_in_par_set(1);
     uint64_t seen = 0;
     for (;;) {
         br_spin_while_eq(&br_pool.ids, seen);
@@ -1984,7 +2029,7 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
     job.n = hi - lo;
     job.k = nchunks;
     job.next = 0;
-    if (nchunks == 1 || br_in_par || br_threads() <= 1 || !br_trylock(&br_pool.job_lock)) {
+    if (nchunks == 1 || br_in_par_get() || br_threads() <= 1 || !br_trylock(&br_pool.job_lock)) {
         br_run_chunks(&job);
         return;
     }
@@ -2001,9 +2046,9 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
     __atomic_store_n(&br_pool.ids, job.id, __ATOMIC_SEQ_CST);
     br_cond_broadcast(&br_pool.cv_work);
     br_unlock(&br_pool.mu);
-    br_in_par = 1;
+    br_in_par_set(1);
     br_run_chunks(&job);
-    br_in_par = 0;
+    br_in_par_set(0);
     __atomic_store_n(&br_pool.cur, (br_job *)NULL, __ATOMIC_SEQ_CST);
     for (int i = 0; i < BR_SPINS && __atomic_load_n(&br_pool.active, __ATOMIC_SEQ_CST) > 0; i++) BR_RELAX();
     if (__atomic_load_n(&br_pool.active, __ATOMIC_SEQ_CST) > 0) {
@@ -3225,8 +3270,8 @@ static br_gpu_choice br_gpu_choose(brine_kernel *k, br_kst *st, int64_t rest, ui
 static int64_t br_probe_for(brine_chunk_fn fn, void *ctx, int64_t lo, int64_t n, double secs, double *ns) {
     double t0 = brine_clock();
     int64_t i = lo, step = 16;
-    int saved = br_in_par;
-    br_in_par = 1;
+    int saved = br_in_par_get();
+    br_in_par_set(1);
     while (i < n) {
         int64_t j = i + step < n ? i + step : n;
         fn(ctx, 0, i, j);
@@ -3234,7 +3279,7 @@ static int64_t br_probe_for(brine_chunk_fn fn, void *ctx, int64_t lo, int64_t n,
         if (brine_clock() - t0 >= secs) break;
         step *= 2;
     }
-    br_in_par = saved;
+    br_in_par_set(saved);
     double dt = brine_clock() - t0;
     *ns = i > lo ? dt * 1e9 / (double)(i - lo) : 0;
     return i;
@@ -3297,7 +3342,7 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
         return 0;
     }
     *why = "nested in a parallel construct";
-    if (br_in_par) return 0;
+    if (br_in_par_get()) return 0;
     *why = "small";
     if (n < BR_GPU_MIN_N && br_gpu.mode != BR_GPU_ON) return 0;
     br_lock(&br_gpu.mu);
@@ -3393,16 +3438,16 @@ void brine_par_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn fn) {
     double t0 = brine_clock();
     brine_par_run(done, n, brine_par_plan(n - done), fn, ctx);
     double dt = brine_clock() - t0;
-    if (k->ptx && !br_in_par && n - done >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n - done, dt);
-    if (br_gpu.log && !br_in_par) br_gpu_log_cpu(k, n, why, dt);
+    if (k->ptx && !br_in_par_get() && n - done >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n - done, dt);
+    if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt);
 }
 
 /* ------------------------------------------------------------ reductions on the GPU */
 /* Folds leaves [l0, l1) on this thread, pushing each at height 0. */
 static void br_fold_leaves(br_fold *f, brine_leaf_fn fn, void *ctx, int64_t n, int64_t l0, int64_t l1) {
     _Alignas(16) char v[16];
-    int saved = br_in_par;
-    br_in_par = 1;
+    int saved = br_in_par_get();
+    br_in_par_set(1);
     for (int64_t l = l0; l < l1; l++) {
         int64_t a = l * BRINE_LEAF;
         int64_t b = a + BRINE_LEAF < n ? a + BRINE_LEAF : n;
@@ -3410,7 +3455,7 @@ static void br_fold_leaves(br_fold *f, brine_leaf_fn fn, void *ctx, int64_t n, i
         fn(ctx, l, a, b, v, &h);
         br_fold_push(f, 0, v, h);
     }
-    br_in_par = saved;
+    br_in_par_set(saved);
 }
 
 /* One aligned subtree of 2^h leaves starting at leaf l0 (fewer at the end) on
@@ -3449,7 +3494,7 @@ static int br_gpu_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx
         return 0;
     }
     *why = "nested in a parallel construct";
-    if (br_in_par) return 0;
+    if (br_in_par_get()) return 0;
     *why = "small";
     if (n < BR_GPU_MIN_N && br_gpu.mode != BR_GPU_ON) return 0;
     br_lock(&br_gpu.mu);
@@ -3572,8 +3617,8 @@ void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, v
     double t0 = brine_clock();
     br_reduce_cpu(n, fn, ctx, k->op, k->vk, val, has, loc);
     double dt = brine_clock() - t0;
-    if (k->ptx && !br_in_par && n >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n, dt);
-    if (br_gpu.log && !br_in_par) br_gpu_log_cpu(k, n, why, dt);
+    if (k->ptx && !br_in_par_get() && n >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n, dt);
+    if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt);
 }
 
 /* ============================================================ world: transport */
@@ -3792,8 +3837,7 @@ static void br_world_init(void) {
         return;
     }
 #ifdef _WIN32
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    br_ws_start();
 #else
     signal(SIGPIPE, SIG_IGN);
 #endif
@@ -4139,12 +4183,75 @@ double brine_world_reduce_f64(double v, int op, const char *loc) {
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
-#include <shellapi.h>
+/* Splits a command line the way CommandLineToArgvW does: the arguments go to
+   d (len + 2 wide chars), argv[i] points at each. Our own copy because
+   that function is in shell32.dll, which takes over a millisecond to load. */
+static int br_split_cmdline(const wchar_t *s, wchar_t **argv, wchar_t *d) {
+    int argc = 1;
+    argv[0] = d;
+    /* the program ends at the next quote if it starts with one, else at a
+       space or control character, which is skipped */
+    if (*s == L'"') {
+        for (s++; *s && *s != L'"';) *d++ = *s++;
+        if (*s) s++;
+    } else {
+        while (*s > L' ') *d++ = *s++;
+        if (*s) s++;
+    }
+    *d++ = 0;
+    while (*s == L' ' || *s == L'\t') s++;
+    if (!*s) return argc;
+    argv[argc] = d;
+    argc++;
+    /* 2n backslashes and a quote: n backslashes, and the quote opens or closes;
+       2n+1 and a quote: n backslashes and a quote. Of a run of quotes inside
+       quotes, every third is a literal one. */
+    int q = 0, bs = 0;
+    while (*s) {
+        if ((*s == L' ' || *s == L'\t') && q == 0) {
+            *d++ = 0;
+            bs = 0;
+            do s++;
+            while (*s == L' ' || *s == L'\t');
+            if (*s) {
+                argv[argc] = d;
+                argc++;
+            }
+        } else if (*s == L'\\') {
+            *d++ = *s++;
+            bs++;
+        } else if (*s == L'"') {
+            if ((bs & 1) == 0) {
+                d -= bs / 2;
+                q++;
+            } else {
+                d -= bs / 2 + 1;
+                *d++ = L'"';
+            }
+            s++;
+            bs = 0;
+            for (; *s == L'"'; s++)
+                if (++q == 3) {
+                    *d++ = L'"';
+                    q = 0;
+                }
+            if (q == 2) q = 0;
+        } else {
+            *d++ = *s++;
+            bs = 0;
+        }
+    }
+    *d = 0;
+    return argc;
+}
 /* Windows hands `main` arguments in the local code page; brine strings are UTF-8 */
 static void br_utf8_args(void) {
-    int n = 0;
-    wchar_t **w = CommandLineToArgvW(GetCommandLineW(), &n);
-    if (!w) return;
+    const wchar_t *line = GetCommandLineW();
+    if (!*line) return; /* the C runtime's argv[0] is then the program's path too */
+    size_t len = wcslen(line);
+    /* each argument after the first follows a separator: at most len / 2 + 2 of them */
+    wchar_t **w = (wchar_t **)brine_alloc((int64_t)(sizeof(wchar_t *) * (len / 2 + 2) + sizeof(wchar_t) * (len + 2)));
+    int n = br_split_cmdline(line, w, (wchar_t *)(w + len / 2 + 2));
     char **out = (char **)brine_alloc((int64_t)sizeof(char *) * (n + 1));
     for (int i = 0; i < n; i++) {
         int m = WideCharToMultiByte(CP_UTF8, 0, w[i], -1, NULL, 0, NULL, NULL);
@@ -4153,7 +4260,7 @@ static void br_utf8_args(void) {
         else out[i][0] = 0;
     }
     out[n] = NULL;
-    LocalFree(w);
+    brine_free(w);
     br_argc = n;
     br_argv = out;
 }
@@ -5102,12 +5209,7 @@ bool brine_os_free_ports(int64_t n, brine_arr **out, brine_str **err) {
     return false;
 #else
 #ifdef _WIN32
-    static int wsa_ready;
-    if (!wsa_ready) {
-        WSADATA wsa;
-        WSAStartup(MAKEWORD(2, 2), &wsa);
-        wsa_ready = 1;
-    }
+    br_ws_start();
 #define BR_SOCK_ERR ((int)WSAGetLastError())
 #else
 #define BR_SOCK_ERR errno
