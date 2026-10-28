@@ -2158,6 +2158,12 @@ struct Lower:
         self.push_scope()
         var k = 0
         while k < len(b.stmts):
+            if self.take_at(b.stmts, k):
+                k += 2
+                continue
+            if self.put_back(b.stmts, k):
+                k += 1
+                continue
             self.stmt(b.stmts[k])
             if self.rot_after(b.stmts, k):
                 k += 3
@@ -2471,6 +2477,91 @@ struct Lower:
             self.stmt(stmts[k + 2])
             self.cx.fb.place(end)
         return true
+
+    # Moving an array between a variable and a place instead of retaining it
+    # and releasing what it replaces: only in plain straight-line lowering.
+    fn moves_ok(self) -> bool:
+        return not self.opts.debug and not self.cx.lifted and len(
+            self.cx.jx.act
+        ) == 0 and self.cx.twin == 0 and not self.cx.fb.ends()
+
+    fn movable(self, id: int) -> bool:
+        let lc = self.flocals[id]
+        if lc.kind != LocalKind.Var and lc.kind != LocalKind.Let:
+            return false
+        if id in self.cx.packed or id in self.cx.narrow or id in self.cx.reset or id in self.cx.apps:
+            return false
+        match lc.ty:
+            case Ty.Array(_):
+                return true
+            case _:
+                return false
+
+    # `var w = p` then `p = []`, for an array place `p` (the "take" idiom):
+    # move the array out of `p` into `w`. Nothing runs between the two, so
+    # `w` holds the reference `p` held, as a retain then a release would leave it.
+    fn take_at(ref self, stmts: [Stmt], k: int) -> bool:
+        if k + 1 >= len(stmts) or not self.moves_ok():
+            return false
+        match take_pair(stmts[k], stmts[k + 1]):
+            case Some((id, place, empty)):
+                if not self.movable(id):
+                    return false
+                match place_path(place):
+                    case Some((root, _)):
+                        if root in self.cx.packed or root in self.cx.narrow:
+                            return false
+                    case None:
+                        return false
+                let ty = self.flocals[id].ty
+                self.push_frame()
+                let lp = self.lvalue(place)
+                let w = self.cx.fb.load(K.Ptr, lp, 0)
+                let e = self.owned(empty)
+                self.cx.fb.store(lp, 0, e)
+                self.pop_frame()
+                let home = self.new_local(id, ty)
+                self.st(home, 0, ty, w)
+                self.add_home(home, ty)
+                self.cx.hit_e = -1
+                return true
+            case None:
+                return false
+
+    # `p = w` with `w` an array variable this block declared and never uses
+    # again: swap the two, so `p` takes w's reference and the scope frees
+    # what `p` held, instead of a retain and a release.
+    fn put_back(ref self, stmts: [Stmt], j: int) -> bool:
+        if not self.moves_ok():
+            return false
+        match stmts[j].kind:
+            case StmtKind.Assign(t, op, v):
+                if op.is_some() or t.ty != v.ty or not array_place(t):
+                    return false
+                match local_of(v):
+                    case Some(w):
+                        if not self.movable(w) or mentions_local(t, w) or not last_use(stmts, j, w):
+                            return false
+                        match place_path(t):
+                            case Some((root, _)):
+                                if root in self.cx.packed or root in self.cx.narrow:
+                                    return false
+                            case None:
+                                return false
+                        self.push_frame()
+                        let lp = self.lvalue(t)
+                        let home = self.local_ptr(w)
+                        let nv = self.cx.fb.load(K.Ptr, home, 0)
+                        let old = self.cx.fb.load(K.Ptr, lp, 0)
+                        self.cx.fb.store(lp, 0, nv)
+                        self.cx.fb.store(home, 0, old)
+                        self.pop_frame()
+                        self.cx.hit_e = -1
+                        return true
+                    case None:
+                        return false
+            case _:
+                return false
 
     # A loop idiom.twin_body allows, in two copies. Returns false having
     # emitted nothing when it doesn't qualify.
@@ -6287,4 +6378,139 @@ fn has_try(e: Expr) -> bool:
     for c in children(e):
         if has_try(c):
             return true
+    return false
+
+# `var w = p` then `p = []` (see `take_at`): w's local, `p`, and the `[]`.
+fn take_pair(s: Stmt, t: Stmt) -> Option[(int, Expr, Expr)]:
+    match s.kind:
+        case StmtKind.Let(_, pat, _, init, is_ref):
+            if is_ref or len(s.locals) != 1 or not is_name(pat) or not array_place(init):
+                return None
+            match t.kind:
+                case StmtKind.Assign(target, op, v):
+                    if op.is_some() or not same_place(target, init):
+                        return None
+                    match v.kind:
+                        case ExprKind.Array(es):
+                            if len(es) == 0 and v.ty == init.ty:
+                                return Some((s.locals[0], init, v))
+                        case _:
+                            pass
+                    return None
+                case _:
+                    return None
+        case _:
+            return None
+
+fn is_name(p: LetPat) -> bool:
+    match p:
+        case LetPat.Name(_, _):
+            return true
+        case _:
+            return false
+
+# A variable, or fields and array elements of one at indexes that can be
+# computed again with the same result.
+fn array_place(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Ident(_):
+            return local_of(e).is_some()
+        case ExprKind.Field(b, _, _):
+            return array_place(b)
+        case ExprKind.Index(b, i):
+            match b.ty:
+                case Ty.Array(_):
+                    return pure_index(i) and array_place(b)
+                case _:
+                    return false
+        case _:
+            return false
+
+fn pure_index(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Ident(_):
+            return local_of(e).is_some()
+        case ExprKind.Int(_):
+            return true
+        case ExprKind.Field(b, _, _):
+            return pure_index(b)
+        case ExprKind.Binary(_, l, r):
+            return pure_index(l) and pure_index(r)
+        case _:
+            return false
+
+# The same place, written the same way (see `array_place`).
+fn same_place(a: Expr, b: Expr) -> bool:
+    match a.kind:
+        case ExprKind.Ident(_):
+            return local_of(a).is_some() and local_of(a) == local_of(b)
+        case ExprKind.Int(x):
+            match b.kind:
+                case ExprKind.Int(y):
+                    return x == y and a.ty == b.ty
+                case _:
+                    return false
+        case ExprKind.Field(x, _, _):
+            match b.kind:
+                case ExprKind.Field(y, _, _):
+                    return a.idx == b.idx and same_place(x, y)
+                case _:
+                    return false
+        case ExprKind.Index(x, i):
+            match b.kind:
+                case ExprKind.Index(y, j):
+                    return same_place(x, y) and same_place(i, j)
+                case _:
+                    return false
+        case ExprKind.Binary(o, x, i):
+            match b.kind:
+                case ExprKind.Binary(p, y, j):
+                    return o == p and a.ty == b.ty and same_place(x, y) and same_place(i, j)
+                case _:
+                    return false
+        case _:
+            return false
+
+# Is `stmts[j]` the last use of `w`, a variable an earlier `let`/`var` of
+# this block declared, with no `ref` name for it?
+fn last_use(stmts: [Stmt], j: int, w: int) -> bool:
+    var declared = false
+    for i in 0..j:
+        match stmts[i].kind:
+            case StmtKind.Let(_, pat, _, _, is_ref):
+                if not is_ref and is_name(pat) and stmts[i].locals == [w]:
+                    declared = true
+            case _:
+                pass
+    if not declared:
+        return false
+    for i in 0..len(stmts):
+        if ref_alias(stmts[i], w):
+            return false
+        if i > j and stmt_mentions(stmts[i], w):
+            return false
+    return true
+
+fn stmt_mentions(s: Stmt, w: int) -> bool:
+    for e in stmt_exprs(s):
+        if mentions_local(e, w):
+            return true
+    for b in stmt_blocks(s):
+        for t in b.stmts:
+            if stmt_mentions(t, w):
+                return true
+    return false
+
+# `let r = ref ...w...`, here or in a nested block
+fn ref_alias(s: Stmt, w: int) -> bool:
+    match s.kind:
+        case StmtKind.Let(_, _, _, init, is_ref):
+            if is_ref and mentions_local(init, w):
+                return true
+        case _:
+            pass
+    for b in stmt_blocks(s):
+        for t in b.stmts:
+            if ref_alias(t, w):
+                return true
     return false
