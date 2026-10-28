@@ -494,6 +494,48 @@ fn mods_block(b: Block, info: ProgramInfo, ref out: {int: int}):
         for blk in stmt_blocks(s):
             mods_block(blk, info, ref out)
 
+# Counters: the locals a loop body changes only by one `x += 1` outside its
+# inner loops. Each iteration adds at most 1 to them, so at the start of the
+# iteration `k` of `for k in lo..hi`, `x0 <= x <= x0 + (k - lo)`.
+fn counters(b: Block, info: ProgramInfo) -> [int]:
+    var incs: {int: int} = {}
+    var other: {int: int} = {}
+    count_incs(b, info, 0, ref incs, ref other)
+    var out: [int] = []
+    for id in incs:
+        if incs[id] == 1 and id not in other:
+            out.push(id)
+    out.sort()
+    return out
+
+fn count_incs(b: Block, info: ProgramInfo, depth: int, ref incs: {int: int}, ref other: {int: int}):
+    for s in b.stmts:
+        var inner = depth
+        match s.kind:
+            case StmtKind.Assign(target, op, value):
+                match lvalue_root(target):
+                    case Some(r):
+                        var inc = false
+                        match (target.kind, op, value.kind):
+                            case (ExprKind.Ident(_), Some(BinOp.Add), ExprKind.Int(v)):
+                                inc = v == 1 and depth == 0
+                            case _:
+                                pass
+                        if inc:
+                            incs[r] = incs.get(r).unwrap_or(0) + 1
+                        else:
+                            note_mod(ref other, r, MOD_WHOLE)
+                    case None:
+                        pass
+            case StmtKind.While(_, _, _) | StmtKind.For(_, _, _, _, _, _, _):
+                inner = depth + 1
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            mods_expr(e, info, ref other)
+        for blk in stmt_blocks(s):
+            count_incs(blk, info, inner, ref incs, ref other)
+
 # Does evaluating `e` have no observable effects (so a proven `assert` can be removed)?
 fn pure_expr(e: Expr) -> bool:
     var ok = true
@@ -1531,6 +1573,18 @@ struct Vf:
             return
         let entry = self.st
         let k = len(entry.facts)
+        # the counters' values before the loop
+        var starts: [(int, Lin)] = []
+        match dom:
+            case D.Range(_, _, _):
+                for c in counters(body, self.info):
+                    match entry.env.get(c):
+                        case Some(V.Int(c0)):
+                            starts.push((c, c0))
+                        case _:
+                            pass
+            case _:
+                pass
         # invariants: entry, using the first value of the loop variable
         var nonempty = F.True
         var first: Option[V] = None
@@ -1597,6 +1651,18 @@ struct Vf:
                     case None:
                         pass
                 v = V.Int(i)
+                # x0 <= x and x + lo <= k + x0 (see `counters`)
+                for c, c0 in starts:
+                    match self.st.env.get(c):
+                        case Some(V.Int(x)):
+                            self.assume(F.le(c0, x))
+                            match (x.add(lo), i.add(c0)):
+                                case (Some(l), Some(r)):
+                                    self.assume(F.le(l, r))
+                                case _:
+                                    pass
+                        case _:
+                            pass
             case D.Stepped(lo, hi, step):
                 var ik = IntTy.I64
                 match vty:
