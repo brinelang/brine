@@ -28,4 +28,20 @@
 68 70 punct %=
 71 72 ident o
 72 72 newline
-73 73 eof
+73 74 ident p
+75 77 punct &=
+78 79 ident q
+80 82 punct |=
+83 84 ident r
+85 87 punct ^=
+88 89 ident s
+90 93 punct <<=
+94 95 ident t
+96 99 punct >>=
+100 101 ident u
+102 104 punct <<
+104 105 ident v
+106 108 punct >>
+108 109 ident w
+109 109 newline
+110 110 eof

@@ -57,7 +57,8 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
   Unlike `+` and `*`, `<<` doesn't check for overflow: bits shifted past the type's
   width are dropped (`u64(1) << 63` is 2^63, `3 << 63` is `-2^63`). `>>` keeps the
   sign of signed types (`-8 >> 1 == -4`) and fills unsigned ones with zeros. A shift
-  by a negative amount or by the type's width or more panics.
+  by a negative amount or by the type's width or more panics. Each has a compound
+  assignment: `x &= m`, `x |= m`, `x ^= m`, `x <<= 2`, `x >>= 2`.
 * Values are **values**: `let b = a` copies (cheaply, copy-on-write). Changing `b`
   never changes `a`. To share a variable on purpose, use `ref` (see Functions).
 
