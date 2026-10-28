@@ -184,6 +184,11 @@ static inline size_t brine_str_size(int64_t n) {
     size_t g = (size_t)1 << (61 - __builtin_clzll(t));
     return (t + g - 1) & ~(g - 1);
 }
+/* The longest string the block of a string of length n holds. */
+static inline int64_t brine_str_room(int64_t n) {
+    if (n <= 47) return (int64_t)(((uint64_t)n + 32) & ~(uint64_t)15) - 17;
+    return (int64_t)brine_str_size(n) - 17;
+}
 /* A string's bytes start 8-byte aligned, and every string (heap blocks by
    brine_str_size, literals by padding) can be read to the end of the 8-byte
    word that holds its terminating NUL. So short strings are read, compared and
@@ -197,17 +202,47 @@ static inline uint64_t brine_ld8(const char *p) {
 static inline void brine_st8(char *p, uint64_t v) { __builtin_memcpy(p, &v, 8); }
 /* the low n bytes of a word, 0 <= n <= 8 */
 static inline uint64_t brine_lowmask(uint64_t n) { return n >= 8 ? ~0ULL : ~(~0ULL << (n * 8)); }
+/* small copies inline: a memcpy of a length known only at run time is a library call */
+static inline void brine_copy(char *d, const char *s, int64_t n) {
+    if (n > 16) {
+        __builtin_memcpy(d, s, (size_t)n);
+        return;
+    }
+    for (int64_t i = 0; i < n; i++) d[i] = s[i];
+}
 /* `s += t`: in place when s is unshared and its block has room */
 static inline void brine_str_add(brine_str **ps, brine_str *b) {
     brine_str *a = *ps;
-    int64_t n = a->len + b->len;
-    if (__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 && brine_str_size(n) == brine_str_size(a->len)) {
-        __builtin_memcpy(a->data + a->len, b->data, (size_t)b->len);
+    int64_t la = a->len, lb = b->len, n = la + lb;
+    if (BR_LIKELY(__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 && n <= brine_str_room(la))) {
+        brine_copy(a->data + la, b->data, lb);
         a->data[n] = 0;
         a->len = n;
         return;
     }
     brine_str_append(ps, b);
+}
+void brine_str_add_byte_slow(brine_str **ps, uint8_t c);
+/* `s += t[i]` and `s += "c"`: one byte, in place when s is unshared and has
+   room. Within the first word the whole word is rewritten: a later word load
+   (hashing, comparing) then forwards from one store instead of waiting for
+   several byte stores to retire. */
+static inline void brine_str_add_byte(brine_str **ps, uint8_t c) {
+    brine_str *a = *ps;
+    int64_t la = a->len;
+    if (BR_LIKELY(__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 && la < brine_str_room(la))) {
+        if (la < 8) {
+            uint64_t sh = (uint64_t)la * 8;
+            brine_st8(a->data, (brine_ld8(a->data) & ~(~0ULL << sh)) | ((uint64_t)c << sh));
+            if (la == 7) a->data[8] = 0;
+        } else {
+            a->data[la] = (char)c;
+            a->data[la + 1] = 0;
+        }
+        a->len = la + 1;
+        return;
+    }
+    brine_str_add_byte_slow(ps, c);
 }
 bool brine_str_eq_long(brine_str *a, brine_str *b);
 static inline bool brine_str_eq(brine_str *a, brine_str *b) {

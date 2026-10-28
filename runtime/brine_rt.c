@@ -563,8 +563,8 @@ brine_str *brine_str_new(const char *p, int64_t n) {
 }
 brine_str *brine_str_concat(brine_str *a, brine_str *b) {
     brine_str *s = br_str_alloc(a->len + b->len);
-    memcpy(s->data, a->data, (size_t)a->len);
-    memcpy(s->data + a->len, b->data, (size_t)b->len);
+    brine_copy(s->data, a->data, a->len);
+    brine_copy(s->data + a->len, b->data, b->len);
     return s;
 }
 /* `s += b`: grows s in place when nothing else holds it */
@@ -589,6 +589,27 @@ void brine_str_append(brine_str **ps, brine_str *b) {
     memcpy(s->data + s->len, self ? s->data : b->data, (size_t)blen);
     s->len = n;
     s->data[n] = 0;
+    *ps = s;
+}
+/* brine_str_add_byte when s is shared or full: the usual case is the first
+   `+=` to a literal (`var w = ""`), which gets a block of its own */
+void brine_str_add_byte_slow(brine_str **ps, uint8_t c) {
+    brine_str *a = *ps;
+    int64_t la = a->len;
+    brine_str *s;
+    if (__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1) {
+        brine_str_append(ps, (brine_str *)&brine_bytes[c]); /* grows the block */
+        return;
+    }
+    s = br_str_alloc(la + 1);
+    if (la < 8) {
+        brine_st8(s->data, (brine_ld8(a->data) & brine_lowmask((uint64_t)la)) | ((uint64_t)c << (8 * la)));
+        s->data[8] = 0;
+    } else {
+        memcpy(s->data, a->data, (size_t)la);
+        s->data[la] = (char)c;
+    }
+    brine_str_release(a);
     *ps = s;
 }
 bool brine_str_eq_long(brine_str *a, brine_str *b) { return memcmp(a->data, b->data, (size_t)a->len) == 0; }
@@ -5922,6 +5943,7 @@ void brine_x_map_release(brine_map *m) { brine_map_release(m); }
 brine_str *brine_x_str_at(brine_str *s, int64_t i, const char *loc) { return brine_str_at(s, i, loc); }
 brine_str *brine_x_str_byte(brine_str *s, int64_t i) { return brine_str_byte(s, i); }
 void brine_x_str_add(brine_str **ps, brine_str *b) { brine_str_add(ps, b); }
+void brine_x_str_add_byte(brine_str **ps, uint8_t c) { brine_str_add_byte(ps, c); }
 bool brine_x_str_eq(brine_str *a, brine_str *b) { return brine_str_eq(a, b); }
 uint64_t brine_x_hash_str(brine_str *s) { return brine_hash_str(s); }
 bool brine_x_map_has(brine_map *m, const void *k) { return brine_map_has(m, k); }
