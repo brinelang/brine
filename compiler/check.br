@@ -208,7 +208,8 @@ fn new_checker() -> Checker:
         embedded={},
         expand=[],
         or_names=None,
-        or_seen=[]
+        or_seen=[],
+        const_exprs={}
     )
 
 struct Checker:
@@ -253,6 +254,8 @@ struct Checker:
     or_names: Option[{str: int}]
     # ... and the ones this alternative has bound so far
     or_seen: [str]
+    # array constants: the literal each use stands for, every element folded
+    const_exprs: {int: Expr}
 
     fn err(ref self, d: Diag):
         self.diags.push(d)
@@ -485,16 +488,22 @@ struct Checker:
                                 self.info.consts[id].value = v
                                 self.info.consts[id].ty = ty
                             case None:
-                                self.err(
-                                    diag.error(
-                                        "E0317",
-                                        "constant value must be computable at compile time"
-                                    )
-                                    .label(c.value.span, "not a constant expression")
-                                    .with_help(
-                                        "constants can use literals, arithmetic, and other constants"
-                                    )
-                                )
+                                match self.const_array(c.value):
+                                    case Some(lit):
+                                        self.const_exprs[id] = lit
+                                        self.info.consts[id].ty = ty
+                                    case None:
+                                        if not t.is_error():
+                                            self.err(
+                                                diag.error(
+                                                    "E0317",
+                                                    "constant value must be computable at compile time"
+                                                )
+                                                .label(c.value.span, "not a constant expression")
+                                                .with_help(
+                                                    "constants can use literals, arithmetic, other constants, and arrays of these"
+                                                )
+                                            )
                         prog.modules[mi].consts[ci] = c
                     case _:
                         pass
@@ -816,6 +825,50 @@ struct Checker:
                 self.err(d)
                 return Ty.Error
 
+    # `[3, 4, 5]`, `[0] * 256` or `[[1, 2], [3, 4]]` with every element known
+    # now: the same literal with each element folded to a literal.
+    fn const_array(self, e: Expr) -> Option[Expr]:
+        var out: [Expr] = []
+        match e.kind:
+            case ExprKind.Array(xs):
+                for x in xs:
+                    out.push(self.const_elem(x)?)
+            case ExprKind.Repeat(x, n):
+                let v = self.const_elem(x)?
+                match self.eval_const(n)?:
+                    case ConstVal.Int(k):
+                        if k < 0 or k > 1 << 20:
+                            return None
+                        for _ in 0..int(k):
+                            out.push(v)
+                    case _:
+                        return None
+            case _:
+                return None
+        var r = e
+        r.kind = ExprKind.Array(out)
+        return Some(r)
+
+    fn const_elem(self, x: Expr) -> Option[Expr]:
+        match self.eval_const(x):
+            case Some(v):
+                var lit = x
+                match v:
+                    case ConstVal.Int(n):
+                        lit.kind = ExprKind.Int(n)
+                    case ConstVal.UInt(n):
+                        lit.kind = ExprKind.UInt(n)
+                    case ConstVal.Float(f):
+                        lit.kind = ExprKind.Float(f)
+                    case ConstVal.Bool(b):
+                        lit.kind = ExprKind.Bool(b)
+                    case ConstVal.Str(t):
+                        lit.kind = ExprKind.Str(t)
+                lit.res = Res.Unresolved
+                return Some(lit)
+            case None:
+                return self.const_array(x)
+
     fn eval_const(self, e: Expr) -> Option[ConstVal]:
         match e.kind:
             case ExprKind.Int(v):
@@ -842,6 +895,19 @@ struct Checker:
                         if len(args) == 0:
                             return None
                         return self.eval_const(args[0].expr)
+                    # `len(TABLE)` of an array constant
+                    case CallRes.Builtin(Builtin.Len):
+                        if len(args) != 1:
+                            return None
+                        match args[0].expr.res:
+                            case Res.Const(_):
+                                match args[0].expr.kind:
+                                    case ExprKind.Array(xs):
+                                        return Some(ConstVal.Int(i128(len(xs))))
+                                    case _:
+                                        return None
+                            case _:
+                                return None
                     case _:
                         return None
             case ExprKind.Unary(op, x):
@@ -2568,6 +2634,17 @@ struct Checker:
             case Some(r):
                 root = r
             case None:
+                match const_root(e):
+                    case Some(id):
+                        let n = self.info.consts[id].name
+                        self.err(
+                            diag.error("E0401", f"cannot {what} constant `{n}`")
+                            .label(e.span, "constants never change")
+                            .with_help(f"copy it into a variable first: `var t = {n}`")
+                        )
+                        return None
+                    case None:
+                        pass
                 if not e.ty.is_error():
                     self.err(
                         diag.error(
@@ -3605,6 +3682,17 @@ struct Checker:
                     )
                 return Some(x2)
 
+    # An array constant becomes its literal at each use; `res` still names the
+    # constant, so changing it is reported as changing a constant.
+    fn use_const(ref self, ref e: Expr, id: int):
+        match self.const_exprs.get(id):
+            case Some(lit):
+                e.kind = lit.kind
+                e.ty = lit.ty
+            case None:
+                pass
+        e.res = Res.Const(id)
+
     fn check_ident(ref self, ref e: Expr, name: str, exp: Option[Ty]) -> Ty:
         let span = e.span
         match self.lookup_local(name):
@@ -3616,7 +3704,7 @@ struct Checker:
                 pass
         match self.item(name):
             case Some(Item.Const(id)):
-                e.res = Res.Const(id)
+                self.use_const(ref e, id)
                 return self.info.consts[id].ty
             case Some(Item.Fn(_)) | Some(Item.GenFn(_)):
                 self.err(
@@ -3732,7 +3820,7 @@ struct Checker:
                         case Some(Item.Module(m)):
                             match self.items[m].get(name):
                                 case Some(Item.Const(id)):
-                                    e.res = Res.Const(id)
+                                    self.use_const(ref e, id)
                                     return self.info.consts[id].ty
                                 case Some(_):
                                     self.err(
@@ -6909,6 +6997,19 @@ fn equatable(t: Ty) -> bool:
             return all(equatable(x) for x in ts)
         case _:
             return true
+
+# The array constant `e` (`TABLE[i]`) is part of, if any.
+fn const_root(e: Expr) -> Option[int]:
+    match e.res:
+        case Res.Const(id):
+            return Some(id)
+        case _:
+            pass
+    match e.kind:
+        case ExprKind.Index(x, _) | ExprKind.Field(x, _, _):
+            return const_root(x)
+        case _:
+            return None
 
 # The places of `a, (b, c) = ...`, each with its path into the value.
 fn place_leaves(e: Expr, path: [int], ref out: [(Expr, [int])]):

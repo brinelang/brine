@@ -77,6 +77,7 @@ let n: i32 = 7          # ...or whenever you like
 for i: int in 0..3:     # loop variables too: `for k: str, v: int in m.items():`
     total += i
 const LIMIT = 100       # compile-time constant (top level)
+const BASE = [3, 4, 5, 6]       # read-only arrays too; `len(BASE)` is a constant
 ```
 In `x, y = ...` the places can't overlap, and an index can't read a variable
 the same line assigns (`i, xs[i] = ...` is error E0405): the result would

@@ -291,6 +291,7 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         blays=[],
         done={},
         strs={},
+        carrs={},
         cstrs={},
         nlifts={},
         dnames={},
@@ -329,6 +330,8 @@ struct Lower:
     done: {str: bool}
     # string literal objects and plain C strings, by text
     strs: {str: str}
+    # array constants in the data section, by constant
+    carrs: {int: str}
     cstrs: {str: str}
     nlifts: {str: int}
     dnames: {str: bool}
@@ -835,6 +838,67 @@ struct Lower:
                     b.push(u8(0))
                 self.data.push(Data(name=sym, align=8, bytes=b, relocs=[], readonly=false))
         return self.cx.fb.global(sym)
+
+    # An array constant of numbers or bools: one array in the data section,
+    # never freed (its count starts too high to reach 0) and copied before
+    # any change like any shared array. Each use borrows it.
+    fn const_arr(ref self, e: Expr) -> Option[int]:
+        var id = 0
+        match e.res:
+            case Res.Const(c):
+                id = c
+            case _:
+                return None
+        match self.carrs.get(id):
+            case Some(sym):
+                return Some(self.cx.fb.global(sym))
+            case None:
+                pass
+        let el = e.ty.elem()
+        let esz = self.lay(el).size
+        var es: [Expr] = []
+        match e.kind:
+            case ExprKind.Array(xs):
+                es = xs
+            case _:
+                return None
+        var body: [u8] = []
+        for x in es:
+            match (el, x.kind):
+                case (Ty.Int(k), ExprKind.Int(n)):
+                    if k.bits() > 64:
+                        return None
+                    le_bytes(ref body, int(n), esz)
+                case (Ty.Float(FloatTy.F32), ExprKind.Float(f)):
+                    le_bytes(ref body, f32_bits(f), esz)
+                case (Ty.Float(_), ExprKind.Float(f)):
+                    le_bytes(ref body, f64_bits(f), esz)
+                case (Ty.Bool, ExprKind.Bool(b)):
+                    le_bytes(ref body, 1 if b else 0, esz)
+                case _:
+                    return None
+        var b: [u8] = []
+        # the layout of `brine_arr`: rc, len, cap, esz, retain, release, data
+        le_bytes(ref b, 1 << 62, 8)
+        le_bytes(ref b, len(es), 8)
+        le_bytes(ref b, len(es), 8)
+        le_bytes(ref b, esz, 8)
+        le_bytes(ref b, 0, 24)
+        b.extend(body)
+        while len(b) % 8 != 0 or len(b) == 56:
+            b.push(u8(0))
+        let sym = self.data_name("br_ca", self.info.consts[id].name)
+        self.data.push(
+            Data(
+                name=sym,
+                align=8,
+                bytes=b,
+                relocs=[Reloc(off=48, sym=sym, add=56)],
+                readonly=false
+            )
+        )
+        self.carrs[id] = sym
+        return Some(self.cx.fb.global(sym))
 
     fn push_frame(ref self):
         self.cx.frames.push([])
@@ -4422,6 +4486,11 @@ struct Lower:
                     return self.cx.fb.un(Op.Not, K.Bool, tst)
                 return tst
             case ExprKind.Array(es):
+                match self.const_arr(e):
+                    case Some(t):
+                        return t
+                    case None:
+                        pass
                 let el = e.ty.elem()
                 let vals = self.owned_all(es)
                 let loc = self.loc(e.span)
