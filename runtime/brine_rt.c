@@ -1859,6 +1859,18 @@ void brine_arr_extend(brine_arr **pa, brine_arr *b) {
     a->len += n;
     brine_arr_release(b);
 }
+/* a `str` argument of an `extern fn`: a NUL-terminated copy for the call */
+char *brine_cstr(brine_str *s, const char *loc) {
+    const char *z = (const char *)memchr(s->data, 0, (size_t)s->len);
+    if (BR_UNLIKELY(z != NULL))
+        br_panicf(loc, "a string passed to an extern function contains a NUL byte (at %lld)",
+                  (long long)(z - s->data));
+    char *p = (char *)brine_alloc(s->len + 1);
+    memcpy(p, s->data, (size_t)s->len);
+    p[s->len] = 0;
+    return p;
+}
+void brine_cstr_free(char *p) { free(p); }
 /* `a + b`: a new array (or a shared one when a side is empty) */
 brine_arr *brine_arr_concat(brine_arr *a, brine_arr *b, const char *loc) {
     if (a->len == 0 || b->len == 0) {

@@ -531,6 +531,8 @@ void brine_arr_pop_at(brine_arr **pa, int64_t i, void *out, const char *loc);
 void brine_arr_insert(brine_arr **pa, int64_t i, const void *elem, const char *loc);
 void brine_arr_extend(brine_arr **pa, brine_arr *b);
 brine_arr *brine_arr_concat(brine_arr *a, brine_arr *b, const char *loc);
+char *brine_cstr(brine_str *s, const char *loc);
+void brine_cstr_free(char *p);
 void brine_arr_reverse(brine_arr **pa);
 void brine_arr_clear(brine_arr **pa);
 /* push, pop and clear with their common case inline: the array is this

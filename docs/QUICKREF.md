@@ -562,5 +562,11 @@ than 300 seconds is stopped and fails (`brine test --timeout <seconds>`; 0: no l
 ## C interop
 
 ```python
-extern fn rand() -> i32     # declare a C standard library function (ints, floats, bools only)
+extern fn rand() -> i32     # declare a C standard library function
+extern fn puts(s: str) -> i32
 ```
+Extern functions take integers, floats, bools and strings, and return integers,
+floats, bools or nothing; the types must match the C declaration (`int` is
+`i32`, `size_t` is `u64` on 64-bit targets and `u32` in WebAssembly). A `str`
+reaches C as a NUL-terminated `const char *` copy that lives until the call
+returns (a string containing a NUL byte panics). Strings can't be returned.
