@@ -47,6 +47,11 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
   unless the compiler proved they can't happen, in which case the check is removed.
 * Integer `/` rounds down like Python's `//` (`-7 / 2 == -4`), and `%` takes the sign of
   the right side (`-7 % 2 == 1`). Use `float(a) / float(b)` for a fractional result.
+* Bit operators on integers: `&` (and), `|` (or), `^` (xor), `~` (not), `<<`, `>>`.
+  Unlike `+` and `*`, `<<` doesn't check for overflow: bits shifted past the type's
+  width are dropped (`u64(1) << 63` is 2^63, `3 << 63` is `-2^63`). `>>` keeps the
+  sign of signed types (`-8 >> 1 == -4`) and fills unsigned ones with zeros. A shift
+  by a negative amount or by the type's width or more panics.
 * Values are **values**: `let b = a` copies (cheaply, copy-on-write). Changing `b`
   never changes `a`. To share a variable on purpose, use `ref` (see Functions).
 
@@ -278,7 +283,7 @@ print(s.split(", "), "a b  c".split())    # ["hello", "brine"], ["a", "b", "c"]
 print("-".join(["a", "b"]), "ab".repeat(3), s.replace("l", "L"))
 print(s.starts_with("he"), s.ends_with("!"), s.count("l"))
 print("  x ".strip(), "  x".lstrip(), "x  ".rstrip(), s.upper(), s.lower())
-print("a\nb".lines(), s.chars(), s.bytes())  # [str], [str], [int]
+print("a\nb".lines(), s.chars(), s.bytes())  # [str], [str], [u8]
 print("42".is_digit(), "ab".is_alpha(), " ".is_space(), "a1".is_alnum())
 print(ord("a"), chr(97))                   # 97 "a"
 ```
@@ -312,8 +317,9 @@ Keys can be integers, `bool`, `str`, enums, or arrays/tuples/structs of those
 `print(a, b, ...)` (`sep=" "` goes between the values and `end="\n"` after
 them: `print(x, end="")`), `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`, `cos`,
 `tan`, `exp`, `log`, `pow(x, y)`, `floor`, `ceil`, `round`, `clock()` (seconds),
-`args()` (command-line arguments), `exit(code)`, `panic(msg)`, `eprint(...)`
-(print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`.
+`args()` (the command-line arguments as `[str]`, without the program's name:
+`brine run app.br -- a b` gives `["a", "b"]`), `exit(code)`, `panic(msg)`,
+`eprint(...)` (print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`.
 
 Files and processes (all failures are values, never crashes):
 
