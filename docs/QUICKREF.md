@@ -459,6 +459,9 @@ fn index_of(xs: [int], target: int) -> int:
   `max`, fields, indexing, constants and `result`.
 * In `for i in a..b` loops, invariants may mention `i`: they must hold at the start
   of each iteration (and with `i = b` after the loop).
+* Of what a loop changes (down to the fields and array elements it writes), the
+  prover knows only what the invariants say; everything else it still knows. A
+  call forgets only what the function may change in its `ref` arguments.
 * The prover handles linear integer arithmetic (`+ - ` and multiplication or
   division by constants). It never accepts a false claim.
 * `brine check --report` lists the runtime checks that remain.
