@@ -12,7 +12,7 @@
 # when it has been proven or is enforced by a runtime check.
 from diag import Span, Diag, SourceMap
 import diag
-from types import Ty, IntTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, LocalInfo, int_ty
+from types import Ty, IntTy, Res, CallRes, Builtin, NumM, StrM, Reducer, WorldOp, LocalInfo, int_ty
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import children, stmt_exprs, stmt_blocks, lvalue_root
 from info import ProgramInfo, ConstVal
@@ -2950,10 +2950,40 @@ struct Vf:
                         let n = self.lin(x.add(y), "len(?)")
                         self.cap_len(n)
                         return V.Str(n)
+                    # `s * n`: the length is a product
+                    case (V.Str(x), V.Int(c)):
+                        self.kept(e.span, F.ge(c), "repeat count check")
+                        return V.Str(self.repeat_len(x, c))
                     case _:
                         return V.Str(self.fresh_len("len(?)"))
+            # `xs + ys`: new contents, the two lengths added
+            case Ty.Array(_):
+                match (av, bv):
+                    case (V.Arr(_, x), V.Arr(_, y)):
+                        let n = self.lin(x.add(y), "len(?)")
+                        self.cap_len(n)
+                        return V.Arr(self.fresh_content("?"), n)
+                    case _:
+                        return self.fresh_val(e.ty, "?")
             case _:
                 return V.Opaque
+
+    # The length of `n` copies of something `x` long (none when `n` < 0).
+    fn repeat_len(ref self, x: Lin, n: Lin) -> Lin:
+        let r = self.fresh_len("len(?)")
+        match n.is_const():
+            case Some(c):
+                if c <= 0:
+                    self.assume(F.equal(r, Lin.konst(0)))
+                    return r
+                match x.scale(c):
+                    case Some(p):
+                        self.assume(F.equal(r, p))
+                    case None:
+                        pass
+            case None:
+                pass
+        return r
 
     fn slice(ref self, e: Expr, b: Expr, lo0: Option[Expr], hi0: Option[Expr]) -> V:
         let bv = self.eval(b)
@@ -3334,6 +3364,22 @@ struct Vf:
                 let top: i128 = 1114111
                 self.assume(F.le(r, Lin.konst(top)))
                 return V.Int(r)
+            # a count of bits: between 0 and the receiver's width
+            case Builtin.Num(
+                NumM.CountOnes
+            ) | Builtin.Num(NumM.LeadingZeros) | Builtin.Num(NumM.TrailingZeros):
+                var w: i128 = 128
+                match recv:
+                    case Some(r):
+                        match r.ty:
+                            case Ty.Int(k):
+                                w = i128(k.bits())
+                            case _:
+                                pass
+                    case None:
+                        pass
+                let z: i128 = 0
+                return V.Int(Lin.atom(self.new_atom(self.name_of(e), Some((z, w)))))
             case _:
                 return self.fresh_val(e.ty, "?")
 
