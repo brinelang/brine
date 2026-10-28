@@ -562,7 +562,9 @@ Every module path starts at the main file's directory, in whichever module the
 `from ..common import Thing`, `import ....shared.util` (two up), and the module
 is named after its last part (`common`, `util`).
 
-`from m import x` only imports items defined in `m` itself. A name can't be both
+`from m import x` takes an item `m` defines or itself imports with `from`, so
+a module can gather names for others (`m.x` finds the same item). Modules `m`
+loads with `import` aren't passed on. A name can't be both
 imported and defined in the same module.
 
 ## Tests

@@ -7,7 +7,7 @@ from types import int_ty, float_ty, builtins, world_ops, os_ops
 from ast import TypeExpr, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Expr, ExprKind, mk
 from ast import LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, stmt, pattern
 from ast import children, stmt_exprs, stmt_blocks, local_of, lvalue_root, parse_fmt_spec
-from ast import Param, FnDecl, FieldDecl, StructDecl, EnumDecl, Module, Program, module_name
+from ast import Param, FnDecl, FieldDecl, StructDecl, EnumDecl, Module, Program, Import, module_name
 from info import StructInfo, VariantInfo, EnumInfo, ParamSig, FnSig, ConstVal, ConstInfo, ProgramInfo
 from info import TryKind, try_kind, new_info, mangle_module, PRELUDE
 import num
@@ -210,7 +210,8 @@ fn new_checker() -> Checker:
         or_names=None,
         or_seen=[],
         const_exprs={},
-        ref_paths=[]
+        ref_paths=[],
+        failed_imports={}
     )
 
 struct Checker:
@@ -260,6 +261,9 @@ struct Checker:
     # `let t = ref self.t`: the variable and the fields each alias stands for.
     # Its scope entry has id `-2 - k` for alias k.
     ref_paths: [(str, [str], Span)]
+    # `"<module> <name>"` for each `from m import name` that failed, already
+    # reported: its uses aren't reported again
+    failed_imports: {str: bool}
 
     fn err(ref self, d: Diag):
         self.diags.push(d)
@@ -661,55 +665,80 @@ struct Checker:
                     return None
         return None
 
-    # `from a import x, y`: bind each name to the item defined in `a`.
-    # Only items defined in `a` itself can be imported (not `a`'s own imports).
+    # `from a import x, y`: bind each name to the item `a` defines, or itself
+    # imports with `from` (a re-export), so `from a import x` finds what `a.x` does.
     fn from_imports(ref self, prog: Program, ref spans: [{str: Span}]):
-        var own: [{str: Item}] = []
-        for its in self.items:
-            var o: {str: Item} = {}
-            for k, v in its.items():
+        # (module, import, name) left to bind. A re-exported name is only there
+        # once its own import is bound, so go round until nothing changes.
+        var todo: [(int, int, int)] = []
+        for mi, m in enumerate(prog.modules):
+            for ii, imp in enumerate(m.imports):
+                for ni in 0..len(imp.names):
+                    todo.push((mi, ii, ni))
+        var progress = true
+        while progress:
+            progress = false
+            var left: [(int, int, int)] = []
+            for mi, ii, ni in todo:
+                let imp = prog.modules[mi].imports[ii]
+                let target = prog.import_targets[mi][ii]
+                let (name, sp) = imp.names[ni]
+                match self.items[target].get(name):
+                    case Some(Item.Module(_)) | None:
+                        left.push((mi, ii, ni))
+                    case Some(it):
+                        progress = true
+                        self.bind_from(mi, imp, name, sp, it, ref spans)
+            todo = left
+        for mi, ii, ni in todo:
+            let imp = prog.modules[mi].imports[ii]
+            let target = prog.import_targets[mi][ii]
+            let (name, sp) = imp.names[ni]
+            self.failed_imports[f"{mi} {name}"] = true
+            var names: [str] = []
+            for k, v in self.items[target].items():
                 match v:
                     case Item.Module(_):
                         pass
                     case _:
-                        o[k] = v
-            own.push(o)
-        for mi, m in enumerate(prog.modules):
-            for ii, imp in enumerate(m.imports):
-                let target = prog.import_targets[mi][ii]
-                for name, sp in imp.names:
-                    match own[target].get(name):
-                        case None:
-                            let mname = module_name(imp.path)
-                            var d = diag.error(
-                                "E0201",
-                                f"module `{mname}` has no item `{name}`"
-                            ).label(sp, "not found")
-                            match best_match(name, own[target].keys()):
-                                case Some(b):
-                                    d = d.with_help(f"did you mean `{b}`?").fix(sp, b, "replace")
-                                case None:
-                                    pass
-                            self.err(d)
-                        case Some(it):
-                            match spans[mi].get(name):
-                                case Some(prev):
-                                    let p = module_name(imp.path)
-                                    let last = imp.path[len(imp.path) - 1]
-                                    self.err(
-                                        diag.error(
-                                            "E0202",
-                                            f"`{name}` is imported but this module already has that name"
-                                        )
-                                        .label(sp, "imported here")
-                                        .label(prev, "also defined here")
-                                        .with_help(
-                                            f"rename one of them, or use `import {p}` and write `{last}.{name}`"
-                                        )
-                                    )
-                                case None:
-                                    spans[mi][name] = sp
-                                    self.items[mi][name] = it
+                        names.push(k)
+            let mname = module_name(imp.path)
+            var d = diag.error(
+                "E0201",
+                f"module `{mname}` has no item `{name}`"
+            ).label(sp, "not found")
+            match best_match(name, names):
+                case Some(b):
+                    d = d.with_help(f"did you mean `{b}`?").fix(sp, b, "replace")
+                case None:
+                    pass
+            self.err(d)
+
+    fn bind_from(
+        ref self,
+        mi: int,
+        imp: Import,
+        name: str,
+        sp: Span,
+        it: Item,
+        ref spans: [{str: Span}]
+    ):
+        match spans[mi].get(name):
+            case Some(prev):
+                let p = module_name(imp.path)
+                let last = imp.path[len(imp.path) - 1]
+                self.err(
+                    diag.error(
+                        "E0202",
+                        f"`{name}` is imported but this module already has that name"
+                    )
+                    .label(sp, "imported here")
+                    .label(prev, "also defined here")
+                    .with_help(f"rename one of them, or use `import {p}` and write `{last}.{name}`")
+                )
+            case None:
+                spans[mi][name] = sp
+                self.items[mi][name] = it
 
     fn dup(ref self, name: str, span: Span, prev: Span):
         self.err(
@@ -795,6 +824,8 @@ struct Checker:
                         return t
                     case None:
                         pass
+                if f"{self.cur_mod} {name}" in self.failed_imports:
+                    return Ty.Error
                 var d = diag.error(
                     "E0203",
                     f"unknown type `{name}`"
@@ -1165,6 +1196,8 @@ struct Checker:
         return v
 
     fn undefined(ref self, name: str, span: Span, what: str):
+        if f"{self.cur_mod} {name}" in self.failed_imports:
+            return
         var d = diag.error(
             "E0201",
             f"cannot find {what} `{name}`"
