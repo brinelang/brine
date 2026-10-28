@@ -289,6 +289,11 @@ typedef struct {
     int64_t count[BR_NCLASS];
     char *bump[BR_NCLASS], *end[BR_NCLASS];
     int in_par; /* running a parallel region (br_in_par_get) */
+    /* brine_drop: how deep the frees nest, and the dead objects left for the
+       outermost one (pairs: object, function) */
+    int drop_depth;
+    void **drops;
+    int64_t ndrops, capdrops;
 } br_heap_th;
 #if defined(_WIN32) && !defined(__clang__)
 /* MinGW gcc emulates thread-locals with a library call per access, which
@@ -523,10 +528,55 @@ void brine_str_free(brine_str *s) {
     BR_LIVE(-1);
     free(s);
 }
+/* Freeing an object frees what it holds first, so a deep structure (a long
+   enum list, a tree 100k levels deep) would recurse once per level and
+   overflow the stack. `fn(p)` finishes freeing a dead object; past
+   BR_DROP_DEPTH nested calls the object waits on a list instead, which the
+   outermost call works through. */
+#define BR_DROP_DEPTH 200
+void brine_drop(void *p, void (*fn)(void *)) {
+    br_heap_th *h = br_th_get();
+    if (h->drop_depth >= BR_DROP_DEPTH) {
+        if (h->ndrops + 2 > h->capdrops) {
+            int64_t nc = h->capdrops ? h->capdrops * 2 : 256;
+            void **d = (void **)realloc(h->drops, (size_t)nc * sizeof(void *));
+            if (!d) {
+                fprintf(stderr, "out of memory\n");
+                abort();
+            }
+            h->drops = d;
+            h->capdrops = nc;
+        }
+        h->drops[h->ndrops++] = p;
+        h->drops[h->ndrops++] = (void *)fn;
+        return;
+    }
+    h->drop_depth++;
+    fn(p);
+    if (h->drop_depth == 1 && h->drops) {
+        while (h->ndrops > 0) {
+            h->ndrops -= 2;
+            void (*f)(void *) = (void (*)(void *))h->drops[h->ndrops + 1];
+            f(h->drops[h->ndrops]);
+        }
+        free(h->drops);
+        h->drops = NULL;
+        h->capdrops = 0;
+    }
+    h->drop_depth--;
+}
+static void br_arr_drop(void *p) {
+    brine_arr *a = (brine_arr *)p;
+    for (int64_t i = 0; i < a->len; i++) a->release(a->data + i * a->esz);
+    free(a->data);
+    free(a);
+}
 void brine_arr_free(brine_arr *a) {
     BR_LIVE(-1);
-    if (a->release)
-        for (int64_t i = 0; i < a->len; i++) a->release(a->data + i * a->esz);
+    if (a->release) {
+        brine_drop(a, br_arr_drop);
+        return;
+    }
     free(a->data);
     free(a);
 }
@@ -1603,8 +1653,8 @@ brine_map *brine_map_new(const brine_map_ty *ty) {
     m->ty = ty;
     return m;
 }
-void brine_map_free(brine_map *m) {
-    BR_LIVE(-1);
+static void br_map_drop(void *p) {
+    brine_map *m = (brine_map *)p;
     const brine_map_ty *t = m->ty;
     for (int64_t i = 0; i < m->used; i++) {
         if (!m->live[i]) continue;
@@ -1617,6 +1667,14 @@ void brine_map_free(brine_map *m) {
     free(m->live);
     free(m->index);
     free(m);
+}
+void brine_map_free(brine_map *m) {
+    BR_LIVE(-1);
+    if (m->ty->krelease || m->ty->vrelease) {
+        brine_drop(m, br_map_drop);
+        return;
+    }
+    br_map_drop(m);
 }
 static void br_map_reindex(brine_map *m) {
     int64_t n = 8;

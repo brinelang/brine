@@ -148,6 +148,8 @@ static inline void brine_arr_release(brine_arr *a) {
 }
 void *brine_box_new(int64_t size, int64_t tag);
 void brine_box_free(void *p);
+/* fn(p) finishes freeing the dead object p; deep structures go iteratively */
+void brine_drop(void *p, void (*fn)(void *));
 static inline void brine_box_retain(void *p) {
     brine_box *b = (brine_box *)p;
     if (__atomic_load_n(&b->rc, __ATOMIC_RELAXED) >= 0) __atomic_fetch_add(&b->rc, 1, __ATOMIC_RELAXED);

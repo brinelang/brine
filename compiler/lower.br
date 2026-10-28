@@ -1406,24 +1406,71 @@ struct Lower:
                 let s1 = self.start_helper("br_retain_" + m, [K.Ptr], false, K.I64)
                 self.cx.fb.rt_void("brine_box_retain", [0])
                 self.finish_helper(s1)
-                let s2 = self.start_helper("br_release_" + m, [K.Ptr], false, K.I64)
-                let dead = self.cx.fb.rt(K.Bool, "brine_box_dec", [0])
+                # an enum that can hold itself (a list, a tree) may be deep:
+                # its dead boxes are freed through `brine_drop`, which doesn't
+                # recurse without bound
+                var seen: {str: bool} = {}
+                let deep = self.self_holding(t, eid, ref seen)
+                if deep:
+                    let s0 = self.start_helper("br_release_" + m, [K.Ptr], false, K.I64)
+                    let dead0 = self.cx.fb.rt(K.Bool, "brine_box_dec", [0])
+                    let out0 = self.cx.fb.label()
+                    self.cx.fb.brnot(dead0, out0)
+                    let f = self.fn_ptr("br_drop_" + m)
+                    self.cx.fb.call_void("brine_drop", [0, f])
+                    self.cx.fb.place(out0)
+                    self.finish_helper(s0)
+                let s2 = self.start_helper(
+                    ("br_drop_" if deep else "br_release_") + m,
+                    [K.Ptr],
+                    false,
+                    K.I64
+                )
                 let out = self.cx.fb.label()
-                self.cx.fb.brnot(dead, out)
-                let tag = self.cx.fb.load(K.I64, 0, 8)
+                if not deep:
+                    let dead = self.cx.fb.rt(K.Bool, "brine_box_dec", [0])
+                    self.cx.fb.brnot(dead, out)
+                # a variant's last field of this enum (a list's tail) is freed
+                # by looping, so a chain needs one `brine_drop`, not one a box
+                let cur = self.cx.fb.copy_of(0)
+                let f0 = self.cx.fb.konst(K.Bool, 0)
+                let more = self.cx.fb.copy_of(f0)
+                let nx = self.cx.fb.copy_of(0)
+                let head = self.cx.fb.label()
+                var looped = false
+                self.cx.fb.place(head)
+                let tag = self.cx.fb.load(K.I64, cur, 8)
                 for vi, v in enumerate(variants):
                     if not any(self.managed(fd.1) for fd in v.fields):
                         continue
+                    var tail = -1
+                    if deep:
+                        for fi, fd in enumerate(v.fields):
+                            if fd.1 == t:
+                                tail = fi
                     let next = self.cx.fb.label()
                     let vv = self.cx.fb.konst(K.I64, vi)
                     let hit = self.cx.fb.cmp(Op.Eq, tag, vv)
                     self.cx.fb.brnot(hit, next)
                     for fi, fd in enumerate(v.fields):
-                        if self.managed(fd.1):
-                            let x = self.ld(0, self.vfield_off(eid, vi, fi), fd.1)
+                        if fi == tail:
+                            let x = self.ld(cur, self.vfield_off(eid, vi, fi), fd.1)
+                            self.cx.fb.mov(nx, x)
+                            let f1 = self.cx.fb.konst(K.Bool, 1)
+                            self.cx.fb.mov(more, f1)
+                            looped = true
+                        elif self.managed(fd.1):
+                            let x = self.ld(cur, self.vfield_off(eid, vi, fi), fd.1)
                             self.release(x, fd.1)
                     self.cx.fb.place(next)
-                self.cx.fb.call_void("brine_box_free", [0])
+                self.cx.fb.call_void("brine_box_free", [cur])
+                if looped:
+                    self.cx.fb.brnot(more, out)
+                    self.cx.fb.mov(more, f0)
+                    let dead1 = self.cx.fb.rt(K.Bool, "brine_box_dec", [nx])
+                    self.cx.fb.brnot(dead1, out)
+                    self.cx.fb.mov(cur, nx)
+                    self.cx.fb.jmp(head)
                 self.cx.fb.place(out)
                 self.finish_helper(s2)
                 let s3 = self.start_helper("br_rtp_" + m, [K.Ptr], false, K.I64)
@@ -1458,6 +1505,31 @@ struct Lower:
         self.cx.fb.call_void("br_release_" + m, [0])
         self.finish_helper(s8)
         return m
+
+    # Can a value of type `t` hold a value of enum `eid` (in a field, an
+    # element or a payload)? `seen`: the types already looked into.
+    fn self_holding(self, t: Ty, eid: int, ref seen: {str: bool}) -> bool:
+        var inner: [Ty] = []
+        match t:
+            case Ty.Enum(e):
+                for v in self.info.enums[e].variants:
+                    for fd in v.fields:
+                        inner.push(fd.1)
+            case Ty.Struct(_) | Ty.Tuple(_):
+                inner = self.field_tys(t)
+            case Ty.Array(x):
+                inner = [x]
+            case Ty.Map(k, v):
+                inner = [k, v]
+            case _:
+                return false
+        seen[self.mangle(t)] = true
+        for x in inner:
+            if x == Ty.Enum(eid):
+                return true
+            if self.mangle(x) not in seen and self.self_holding(x, eid, ref seen):
+                return true
+        return false
 
     # The element retain/release functions arrays of `t` use (or "" for none).
     fn elem_fns(ref self, t: Ty) -> (str, str):
