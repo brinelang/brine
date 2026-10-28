@@ -182,10 +182,14 @@ panics exactly as it would on the CPU.
   the construct reruns on the CPU, which panics with the usual message. Apple GPUs
   flush subnormal f32 values to zero, so on Metal a subnormal operand or result
   sets the flag too, and the construct reruns on the CPU. Results are
-  only copied back after a launch succeeded, and a body may only write its own elements (`out[i]`), so
-  rerunning is safe.
+  only copied back after a launch succeeded, and a body may only write its own
+  elements (`out[i]`), so rerunning is safe.
 * *Copies:* every launch copies the arrays the body reads to the device and the ones
-  it writes back (arrays are values, so nothing else can see them in between).
+  it writes back (arrays are values, so nothing else can see them in between). The
+  results of a `par [...]`, and an array that a `par for i in lo..hi` body writes as
+  `out[i] = ...` in every iteration (a top-level statement, no `continue` before it)
+  and never reads, aren't copied to the device, and only the elements the device
+  wrote come back.
   Keeping arrays on the device between constructs is future work, so constructs
   that do little work per byte (a plain sum of an array) stay on the CPU.
 

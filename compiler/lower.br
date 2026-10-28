@@ -6025,7 +6025,10 @@ struct Lower:
 
     # The descriptor `br_gk_<id>` of a parallel construct, for the runtime to
     # run it on a GPU (`gpu_emit` fills it in). `real` overrides context field
-    # types, with flags: 1 written by the body, 2 only written (not read).
+    # types, with flags (BRINE_GA_* in brine_rt.h): 1 written by the body,
+    # 2 iteration k writes exactly element `first + k` and nothing reads the
+    # array (`first` is 0, or the u64 at offset (flags >> 8) - 1 in the
+    # context).
     fn gpu_site(
         ref self,
         pc: ParCtx,
@@ -6299,7 +6302,16 @@ struct Lower:
         let pc = self.par_ctx(captures, extra)
         var real = self.dom_tys(dom)
         for w in par_writes:
-            real.push((f"c{w}", self.flocals[w].ty, 1))
+            var flags = 1
+            match dom:
+                case Dom.Range(IntTy.I64, _, _, _, step):
+                    # iteration k writes element lo + k, and nothing reads it:
+                    # the device needn't get the array's old elements
+                    if step < 0 and write_only(body, w, local):
+                        flags = 3 | ((pc.off("dlo") + 1) << 8)
+                case _:
+                    pass
+            real.push((f"c{w}", self.flocals[w].ty, flags))
         self.par_launch(pc, 0, n, real, span)
         self.pop_scope()
 
@@ -6415,6 +6427,64 @@ struct Lower:
             self.cx.fb.place(next)
         self.lift_exit(saved)
         return res
+
+# Does a `par for` body (loop variable `lv`) write `w[lv]` in every iteration
+# and never read `w`?
+fn write_only(body: Block, w: int, lv: int) -> bool:
+    var found = false
+    for s in body.stmts:
+        if not found:
+            match s.kind:
+                case StmtKind.Assign(t, op, _):
+                    found = op.is_none() and whole_elem(t, w, lv)
+                case _:
+                    pass
+            # an earlier `continue` may skip the write
+            if not found and stmt_continues(s):
+                return false
+        if not only_writes(s, w, lv):
+            return false
+    return found
+
+fn whole_elem(t: Expr, w: int, lv: int) -> bool:
+    match t.kind:
+        case ExprKind.Index(base, idx):
+            return local_of(base) == Some(w) and local_of(idx) == Some(lv)
+        case _:
+            return false
+
+# Is `w` used in `s` only as the target of `w[lv] = ...`?
+fn only_writes(s: Stmt, w: int, lv: int) -> bool:
+    match s.kind:
+        case StmtKind.Assign(t, op, v):
+            if op.is_none() and whole_elem(t, w, lv):
+                return not mentions(v, w)
+        case _:
+            pass
+    for e in stmt_exprs(s):
+        if mentions(e, w):
+            return false
+    for b in stmt_blocks(s):
+        for x in b.stmts:
+            if not only_writes(x, w, lv):
+                return false
+    return true
+
+fn mentions(e: Expr, w: int) -> bool:
+    if local_of(e) == Some(w):
+        return true
+    return any(mentions(c, w) for c in children(e))
+
+fn stmt_continues(s: Stmt) -> bool:
+    match s.kind:
+        case StmtKind.Continue:
+            return true
+        case _:
+            pass
+    for b in stmt_blocks(s):
+        if any(stmt_continues(x) for x in b.stmts):
+            return true
+    return false
 
 struct LoopCtl:
     head: int

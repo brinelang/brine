@@ -3432,6 +3432,9 @@ typedef struct {
     int64_t node;
     uint64_t hoff, doff, bytes;
     int written, read, staged;
+    /* BRINE_GA_DENSE: iteration k writes element first + k only */
+    int dense;
+    int64_t first;
 } br_garr;
 
 typedef struct {
@@ -3442,6 +3445,8 @@ typedef struct {
     int64_t *tab; /* open addressing, index + 1 */
     int64_t tcap;
     uint64_t stage, direct;
+    /* the iterations the device runs */
+    int64_t lo, hi;
     int ok;
 } br_gplan;
 
@@ -3478,7 +3483,7 @@ static void br_gplan_grow(br_gplan *p) {
     }
 }
 
-static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int written, int read, int depth) {
+static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int written, int read, int dense, int64_t first, int depth) {
     if (!p->ok || !a) return;
     if (depth > 16) {
         p->ok = 0;
@@ -3493,6 +3498,10 @@ static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int writ
     if (i >= 0) {
         p->a[i].written |= written;
         p->a[i].read |= read;
+        if (p->a[i].dense != dense || p->a[i].first != first) {
+            p->a[i].dense = 0;
+            p->a[i].read = 1;
+        }
         return;
     }
     if (p->na == p->acap) {
@@ -3516,6 +3525,8 @@ static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int writ
     g->bytes = (uint64_t)a->len * (uint64_t)esz;
     g->written = written;
     g->read = read;
+    g->dense = dense;
+    g->first = first;
     g->hoff = p->stage;
     p->stage += 64;
     g->staged = nsub > 0 || g->bytes <= BR_GPU_SMALL;
@@ -3530,7 +3541,7 @@ static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int writ
     for (int64_t e = 0; e < a->len && nsub > 0; e++)
         for (int64_t s = 0; s < nsub; s++) {
             const brine_arr *c = *(brine_arr *const *)(a->data + e * esz + nd[2 + 2 * s]);
-            br_gplan_add(p, c, nd[3 + 2 * s], 0, 1, depth + 1);
+            br_gplan_add(p, c, nd[3 + 2 * s], 0, 1, 0, 0, depth + 1);
         }
 }
 
@@ -3545,7 +3556,10 @@ static int br_gplan_make(br_gplan *p, const brine_kernel *k, const void *ctx) {
     for (int64_t f = 0; f < nf; f++) {
         const int64_t *fd = k->ptrs + 1 + 3 * f;
         const brine_arr *a = *(brine_arr *const *)((const char *)ctx + fd[0]);
-        br_gplan_add(p, a, fd[2], (fd[1] & 1) != 0, (fd[1] & 2) == 0, 0);
+        int64_t fl = fd[1], first = 0;
+        if (fl >> 8) memcpy(&first, (const char *)ctx + (fl >> 8) - 1, 8);
+        int dense = (fl & BRINE_GA_DENSE) != 0;
+        br_gplan_add(p, a, fd[2], (fl & BRINE_GA_WRITTEN) != 0, !dense, dense, first, 0);
     }
     for (int64_t i = 0; i < p->na; i++)
         if (!p->a[i].staged) p->a[i].doff += BR_ALIGN(p->stage, 256);
@@ -3559,10 +3573,30 @@ static void br_gplan_free(br_gplan *p) {
 
 static uint64_t br_gplan_size(const br_gplan *p) { return BR_ALIGN(p->stage, 256) + p->direct; }
 
+/* The bytes of g that go back: all of them, or the elements the device's
+ * iterations write. */
+static void br_garr_out(const br_gplan *p, const br_garr *g, uint64_t *off, uint64_t *bytes) {
+    *off = 0;
+    *bytes = g->bytes;
+    if (!g->dense) return;
+    int64_t esz = p->nodes[g->node], len = g->host->len;
+    int64_t a = g->first + p->lo, b = g->first + p->hi;
+    if (a < 0) a = 0;
+    if (b > len) b = len;
+    if (b < a) b = a;
+    *off = (uint64_t)(a * esz);
+    *bytes = (uint64_t)((b - a) * esz);
+}
+
 static uint64_t br_gplan_bytes(const br_gplan *p) {
     uint64_t b = p->stage;
-    for (int64_t i = 0; i < p->na; i++)
-        if (!p->a[i].staged) b += (p->a[i].read ? p->a[i].bytes : 0) + (p->a[i].written ? p->a[i].bytes : 0);
+    for (int64_t i = 0; i < p->na; i++) {
+        const br_garr *g = &p->a[i];
+        uint64_t off = 0, out = 0;
+        br_garr_out(p, g, &off, &out);
+        if (!g->staged && g->read) b += g->bytes;
+        if (g->written) b += out;
+    }
     return b;
 }
 
@@ -3653,7 +3687,9 @@ static br_gpu_res br_gpu_copy_out(br_gplan *p) {
     br_gpu_res r = 0;
     for (int64_t i = 0; i < p->na && r == 0; i++) {
         br_garr *g = &p->a[i];
-        if (g->written && g->bytes > 0) r = br_dev_dtoh(g->host->data, br_gpu.buf + g->doff, (size_t)g->bytes);
+        uint64_t off = 0, n = 0;
+        br_garr_out(p, g, &off, &n);
+        if (g->written && n > 0) r = br_dev_dtoh(g->host->data + off, br_gpu.buf + g->doff + off, (size_t)n);
     }
     return r;
 }
@@ -3819,11 +3855,13 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
         *why = "out of memory";
         return done;
     }
-    /* the arrays go back whole, so the elements the probe wrote must be on
-     * the device too */
+    /* arrays that go back whole need the elements the probe wrote on the
+     * device too */
+    p.lo = done;
+    p.hi = n;
     if (done > 0)
         for (int64_t i = 0; i < p.na; i++)
-            if (p.a[i].written) p.a[i].read = 1;
+            if (p.a[i].written && !p.a[i].dense) p.a[i].read = 1;
     br_lock(&br_gpu.mu);
     br_gpu_choice c = br_gpu_choose(k, st, n - done, br_gplan_bytes(&p), 1 + (int64_t)((n - done) / ((int64_t)1 << 22)));
     br_unlock(&br_gpu.mu);
