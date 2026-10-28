@@ -471,8 +471,10 @@ fn io_diag(e: str) -> Diag:
 
 # Generated code, ready for the system toolchain.
 enum Code:
-    # C translation units, compiled in parallel and cached one by one
-    C(units: [str])
+    # C translation units, compiled in parallel and cached one by one;
+    # `once` are compiled a single time even when `units` are compiled for
+    # several CPU levels (the big data blocks)
+    C(units: [str], once: [str])
     # a native object file (x64.br)
     Obj(bytes: [u8])
 
@@ -633,7 +635,7 @@ fn compile_levels(
     var native: [u8] = []
     var hashes: [str] = []
     match code:
-        case Code.C(us):
+        case Code.C(us, once):
             let lv = cpu_levels(profile, plat, len(us)) if levels else []
             # gcc on Windows can't align its stack to 32 bytes, so it spills
             # AVX registers to unaligned slots with aligned moves (gcc bug
@@ -653,6 +655,8 @@ fn compile_levels(
                     if i == 2 and no_bmi2:
                         e.push("-mno-bmi2")
                     units.push((u, e))
+            for u in once:
+                units.push((u, []))
             if len(lv) > 0:
                 units.push((CPU_C, []))
             for u, extra in units:
@@ -847,9 +851,14 @@ fn gen_code(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> Code
         phase_time(t, "aarch64" if arm else "x86-64")
         return Code.Obj(b)
     let n = unit_count(profile)
-    var units = [ir_c.emit_c(l)] if n == 1 else ir_c.emit_units(l, n)
+    if n > 1:
+        let units = ir_c.emit_units(l, n)
+        phase_time(t, "emit C")
+        return Code.C(units, [])
+    # one unit, maybe compiled once per CPU level: big data goes in its own
+    let (unit, data) = ir_c.emit_c_shared(l, 4096 if len(cpu_levels(profile, plat, 1)) > 0 else -1)
     phase_time(t, "emit C")
-    return Code.C(units)
+    return Code.C([unit], [data] if data != "" else [])
 
 # The program as one C file (`brine emit-c`).
 fn gen_c(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> str:
