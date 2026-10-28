@@ -25,6 +25,7 @@ from ir import DType, DField, DVar, DT_BASE, DT_STRUCT, DT_UNION, DT_ENUM, DT_PT
 import ptx
 import msl
 import jam
+import pack
 
 struct Options:
     # generate a test-runner `main` instead of the program's `main`
@@ -104,6 +105,10 @@ struct FnCx:
     lifted: bool
     # the lanes of the interleaved loop being lowered
     jx: JamCx
+    # the local `[bool]` arrays kept as bits (pack.br)
+    packed: {int: bool}
+    # the `[b] * n` being lowered makes one
+    bits_init: bool
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -136,7 +141,9 @@ fn new_cx(f: Func) -> FnCx:
         sret=-1,
         dmark=[],
         lifted=false,
-        jx=no_jam()
+        jx=no_jam(),
+        packed={},
+        bits_init=false
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -305,6 +312,8 @@ struct Lower:
         self.cx = new_cx(new_func(name, ks, has, rk))
         if self.opts.debug:
             self.dbg_func(f, is_test)
+        elif self.opts.fast:
+            self.cx.packed = pack.find(f.body, f.locals)
         if not is_test:
             let sig = self.info.fns[f.id]
             var pi = 0
@@ -1866,6 +1875,7 @@ struct Lower:
         match s.kind:
             case StmtKind.Let(_, pat, _, init, _):
                 self.push_frame()
+                self.cx.bits_init = len(s.locals) > 0 and s.locals[0] in self.cx.packed
                 let v = self.owned(init)
                 match pat:
                     case LetPat.Name(_, _):
@@ -2406,6 +2416,38 @@ struct Lower:
             case None:
                 return None
 
+    fn is_bits(self, e: Expr) -> bool:
+        match local_of(e):
+            case Some(l):
+                return l in self.cx.packed
+            case None:
+                return false
+
+    # Element `idx` of bit array `base`: the address of its 64-bit word and
+    # its place in the word.
+    fn bit_at(ref self, base: Expr, idx: Expr, checked: bool, span: Span) -> (int, int):
+        var data = -1
+        var n = -1
+        match self.cached_arr(base):
+            case Some(c):
+                data = c.data
+                n = c.len
+            case None:
+                let a = self.expr(base)
+                n = self.cx.fb.load(K.I64, a, 8)
+                data = self.cx.fb.load(K.Ptr, a, 48)
+        let i0 = self.expr(idx)
+        var ix = self.cx.fb.conv(K.I64, i0)
+        if checked:
+            let loc = self.loc(span)
+            ix = self.cx.fb.chk(Op.IdxChk, K.I64, ix, n, loc)
+        let six = self.cx.fb.konst(K.I64, 6)
+        let wi = self.cx.fb.bin(Op.Shr, K.I64, ix, six)
+        let p = self.cx.fb.elem(data, wi, 8)
+        let m63 = self.cx.fb.konst(K.I64, 63)
+        let sh = self.cx.fb.bin(Op.And, K.I64, ix, m63)
+        return (p, sh)
+
     # The address of element `i` of a cached array.
     fn cached_elem_ptr(ref self, c: ArrCache, i: int, et: Ty, checked: bool, span: Span) -> int:
         var ix = self.cx.fb.conv(K.I64, i)
@@ -2418,6 +2460,20 @@ struct Lower:
         let ty = target.ty
         match target.kind:
             case ExprKind.Index(b0, i0):
+                if self.is_bits(b0):
+                    # pack.br only keeps arrays whose elements are set with `=`
+                    let v = self.expr(value)
+                    let (p, sh) = self.bit_at(b0, i0, target.checked, target.span)
+                    let w = self.cx.fb.load(K.U64, p, 0)
+                    let one = self.cx.fb.konst(K.U64, 1)
+                    let m = self.cx.fb.bin(Op.Shl, K.U64, one, sh)
+                    let nm = self.cx.fb.un(Op.Not, K.U64, m)
+                    let keep = self.cx.fb.bin(Op.And, K.U64, w, nm)
+                    let vb = self.cx.fb.conv(K.U64, v)
+                    let set = self.cx.fb.bin(Op.Shl, K.U64, vb, sh)
+                    let w2 = self.cx.fb.bin(Op.Or, K.U64, keep, set)
+                    self.cx.fb.store(p, 0, w2)
+                    return
                 match b0.ty:
                     case Ty.Map(_, _):
                         if op.is_none():
@@ -2901,6 +2957,14 @@ struct Lower:
                         return self.ld(p, 0, e.ty)
                     case _:
                         pass
+                if self.is_bits(base):
+                    let (p, sh) = self.bit_at(base, idx, e.checked, e.span)
+                    let w = self.cx.fb.load(K.U64, p, 0)
+                    let x = self.cx.fb.bin(Op.Shr, K.U64, w, sh)
+                    let one = self.cx.fb.konst(K.U64, 1)
+                    let bit = self.cx.fb.bin(Op.And, K.U64, x, one)
+                    let z = self.cx.fb.konst(K.U64, 0)
+                    return self.cx.fb.cmp(Op.Ne, bit, z)
                 match self.cached_arr(base):
                     case Some(c):
                         let i = self.expr(idx)
@@ -2955,11 +3019,18 @@ struct Lower:
                         self.st(data, i * esz, el, v)
                 return t
             case ExprKind.Repeat(elem, count):
+                let bits = self.cx.bits_init
+                self.cx.bits_init = false
                 let el = e.ty.elem()
                 let v = self.expr(elem)
                 let n0 = self.expr(count)
                 let n = self.cx.fb.conv(K.I64, n0)
                 let loc = self.loc(e.span)
+                if bits:
+                    let fill = self.cx.fb.conv(K.I64, v)
+                    let b = self.cx.fb.call(K.Ptr, "brine_bits_new", [n, fill, loc])
+                    self.register(b, e.ty)
+                    return b
                 let t = self.new_arr(el, n, loc)
                 self.register(t, e.ty)
                 var zero = false

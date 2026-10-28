@@ -1273,6 +1273,27 @@ brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_
     }
     return a;
 }
+/* A `[bool]` kept as bits (the compiler's pack.br): `len` elements in 64-bit
+   words. `esz` 0 marks it; only indexing, `len` and freeing ever see one. */
+brine_arr *brine_bits_new(int64_t len, int64_t fill, const char *loc) {
+    if (len < 0) br_panicf(loc, "cannot create an array with negative length %lld", (long long)len);
+    brine_arr *a = (brine_arr *)brine_alloc(sizeof(brine_arr));
+    BR_LIVE(1);
+    a->rc = 1;
+    a->len = len;
+    a->cap = len;
+    a->esz = 0;
+    a->retain = NULL;
+    a->release = NULL;
+    size_t bytes = (size_t)(len / 64 + 1) * 8;
+    a->data = (char *)(fill ? malloc(bytes) : calloc(bytes, 1));
+    if (!a->data) {
+        fprintf(stderr, "out of memory\n");
+        abort();
+    }
+    if (fill) memset(a->data, 0xff, bytes);
+    return a;
+}
 void brine_arr_unique(brine_arr **pa) {
     brine_arr *a = *pa;
     if (__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1) return;
@@ -1281,8 +1302,9 @@ void brine_arr_unique(brine_arr **pa) {
     BR_LIVE(1);
     n->rc = 1;
     n->cap = a->len;
-    n->data = (char *)brine_alloc(a->len * a->esz);
-    memcpy(n->data, a->data, (size_t)(a->len * a->esz));
+    int64_t bytes = a->esz ? a->len * a->esz : (a->len / 64 + 1) * 8;
+    n->data = (char *)brine_alloc(bytes);
+    memcpy(n->data, a->data, (size_t)bytes);
     if (a->retain)
         for (int64_t i = 0; i < a->len; i++) a->retain(n->data + i * a->esz);
     brine_arr_release(a);

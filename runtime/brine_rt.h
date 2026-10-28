@@ -243,6 +243,7 @@ double brine_parse_f64(brine_str *s, const char *loc);
 
 /* ------------------------------------------------------------ arrays */
 brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_fn rl, const char *loc);
+brine_arr *brine_bits_new(int64_t len, int64_t fill, const char *loc);
 void brine_arr_unique(brine_arr **pa);
 void brine_arr_push(brine_arr **pa, const void *elem);
 void brine_arr_pop(brine_arr **pa, void *out, const char *loc);
