@@ -300,7 +300,9 @@ print(xs[1:3], xs[:2], xs[2:])   # slices are copies; out of range panics
 ```
 There are no negative indexes: write `xs[len(xs) - 1]`. A statement can't both
 change a variable and read it elsewhere (`print(xs.pop(), xs)` is an error), so
-evaluation order never matters.
+evaluation order never matters. A call in another call's arguments runs first
+(`t.add(t.leaf(1), 2)` is fine), and different fields are different places
+(`both(ref self.a, ref self.b)`, `self.items[self.rng.below(n)]`).
 
 ## Strings
 

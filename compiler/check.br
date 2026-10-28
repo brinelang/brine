@@ -1222,13 +1222,15 @@ struct Checker:
     # depend on the order of evaluation. Reads in the call's own receiver and
     # arguments are fine (they happen before the change, as in Rust and Swift),
     # and so are uses on different sides of `and`/`or`/`if-else`, which run in order.
+    # A call in another call's arguments runs first, so `t.f(t.g(x))` is fine
+    # when `t` is a variable or a field path; and different fields of a variable
+    # (`self.a`, `self.b`) are separate places.
     fn check_mut_conflicts(ref self, e: Expr):
-        var sites: [(int, Span)] = []
-        var reads: [(int, Span)] = []
-        var seq: [(Span, Span)] = []
-        mut_sites(e, self.info, ref sites, ref reads, ref seq)
+        var m = MutScan(sites=[], reads=[], seq=[], places=[])
+        mut_sites(e, self.info, ref m)
         var done: [int] = []
-        for root, _ in sites:
+        for st in m.sites:
+            let root = st.root
             if root in done:
                 continue
             done.push(root)
@@ -1242,18 +1244,24 @@ struct Checker:
             if reported:
                 continue
             let n = self.locals[root].name
-            var mine: [Span] = []
-            for r, s in sites:
-                if r == root:
+            var mine: [MutSite] = []
+            for s in m.sites:
+                if s.root == root:
                     mine.push(s)
-            # a second change: `xs.push(xs.pop())`, `f(xs.pop(), xs.pop())`
+            # a second change: `xs.push(xs.pop()[0])`, `f(xs.pop(), xs.pop())`
             var twice: Option[(Span, Span)] = None
             for i in 0..len(mine):
                 let a = mine[i]
                 for j in i + 1..len(mine):
                     let b = mine[j]
-                    if b != a and not ordered(seq, a, b):
-                        twice = Some((a, b))
+                    if (
+                        b.span != a.span
+                        and paths_overlap(a.path, b.path)
+                        and not ordered(m.seq, a.span, b.span)
+                        and not runs_first(a, b)
+                        and not runs_first(b, a)
+                    ):
+                        twice = Some((a.span, b.span))
                         break
                 if twice.is_some():
                     break
@@ -1263,6 +1271,7 @@ struct Checker:
                         diag.error("E0405", f"`{n}` is changed twice in the same expression")
                         .label(again, "changed here")
                         .label(first, "and changed here")
+                        .note("brine doesn't define which of the two runs first")
                         .with_help(
                             "make one change in its own statement first, e.g. `let v = ...`, then use `v`"
                         )
@@ -1273,9 +1282,15 @@ struct Checker:
             # a read outside the changing call
             var conflict: Option[(Span, Span)] = None
             for s in mine:
-                for r, x in reads:
-                    if r == root and not within(x, s) and not ordered(seq, x, s):
-                        conflict = Some((s, x))
+                for r in m.reads:
+                    if (
+                        r.root == root
+                        and paths_overlap(r.path, s.path)
+                        and not within(r.span, s.span)
+                        and not ordered(m.seq, r.span, s.span)
+                        and not read_later(m.places, r.span, s.span)
+                    ):
+                        conflict = Some((s.span, r.span))
                         break
                 if conflict.is_some():
                     break
@@ -4526,7 +4541,7 @@ struct Checker:
             )
             self.check_all(ref args)
             return sig.ret
-        var mut_roots: [(int, Span)] = []
+        var mut_roots: [(int, [str], Span)] = []
         for i in 0..len(args):
             let p = params[i]
             match args[i].name:
@@ -4559,7 +4574,13 @@ struct Checker:
                     )
                 match self.check_mutation_target(args[i].expr, "pass as `ref`"):
                     case Some(r):
-                        mut_roots.push((r, args[i].expr.span))
+                        var path: [str] = []
+                        match place_of(args[i].expr):
+                            case Some((_, fp, _)):
+                                path = fp
+                            case None:
+                                pass
+                        mut_roots.push((r, path, args[i].expr.span))
                     case None:
                         pass
             elif args[i].by_ref:
@@ -4572,12 +4593,12 @@ struct Checker:
                 )
         # by-value arguments are evaluated (and kept) before the call, so only a
         # second `ref` to the same variable is a problem
-        for r, rsp in mut_roots:
+        for r, path, rsp in mut_roots:
             for a in args:
                 # each pair once, at the later argument
                 if a.expr.span.lo <= rsp.lo or not a.by_ref:
                     continue
-                if expr_mentions(a.expr, r):
+                if touches(a.expr, r, path):
                     let n = self.locals[r].name
                     self.err(
                         diag.error("E0405", f"`{n}` is passed as `ref` twice")
@@ -4586,7 +4607,9 @@ struct Checker:
                         .note(
                             "a `ref` argument must be the only access to that variable during the call"
                         )
-                        .with_help(f"copy the value first: `let {n}_copy = ...`")
+                        .with_help(
+                            f"pass `{n}` once and reach both parts through it, or pass separate fields (`ref {n}.a, ref {n}.b`)"
+                        )
                     )
         return sig.ret
 
@@ -5308,10 +5331,10 @@ struct Checker:
                         # by-value arguments are evaluated (and kept) before the call, so they may
                         # read the receiver; another `ref` to it would be a second live alias
                         if sig.params[0].by_ref:
-                            match lvalue_root(recv):
-                                case Some(root):
+                            match place_of(recv):
+                                case Some((root, rpath, _)):
                                     for a in args:
-                                        if a.by_ref and expr_mentions(a.expr, root):
+                                        if a.by_ref and touches(a.expr, root, rpath):
                                             let n = self.locals[root].name
                                             self.err(
                                                 diag.error(
@@ -5323,7 +5346,7 @@ struct Checker:
                                                     "a `ref` must be the only access to that variable during the call"
                                                 )
                                                 .with_help(
-                                                    "copy the value into a new variable first"
+                                                    "pass separate fields of it (`s.a.f(ref s.b)`), or make the change in two steps"
                                                 )
                                             )
                                 case None:
@@ -7362,39 +7385,124 @@ fn ordered(seq: [(Span, Span)], a: Span, b: Span) -> bool:
             return true
     return false
 
-# Locals changed in place by calls in `e` (`sites`), every mention of a local
-# (`reads`), and pairs of parts that run one after the other (`seq`).
-fn mut_sites(
-    e: Expr,
-    info: ProgramInfo,
-    ref sites: [(int, Span)],
-    ref reads: [(int, Span)],
-    ref seq: [(Span, Span)]
-):
+# A call that changes a variable in place: the variable, the fields of it the
+# call can reach (all of it when empty), whether the place is only fields
+# (`t`, `self.a`, not `xs[i]`), and the call.
+struct MutSite:
+    root: int
+    path: [str]
+    exact: bool
+    span: Span
+
+# A mention of a variable: the fields read (all of it when empty).
+struct MutRead:
+    root: int
+    path: [str]
+    span: Span
+
+struct MutScan:
+    sites: [MutSite]
+    reads: [MutRead]
+    # pairs of parts that run one after the other
+    seq: [(Span, Span)]
+    # the receiver or `ref` argument of a changing call, made only of fields,
+    # and that call: the place is used when the call runs, after its arguments
+    places: [(Span, Span)]
+
+# Does change `a` run before change `b`? It does when `a` is in `b`'s arguments
+# and `b` changes a place that no index leads to (`t.f(t.g(x))`): that place's
+# address stays the same while the arguments run.
+fn runs_first(a: MutSite, b: MutSite) -> bool:
+    return b.exact and within(a.span, b.span) and a.span != b.span
+
+# Is read `r` part of the place a changing call uses, with change `s` in that
+# call's arguments (so the place is used after `s`)?
+fn read_later(places: [(Span, Span)], r: Span, s: Span) -> bool:
+    for p, call in places:
+        if within(r, p) and within(s, call) and s != call:
+            return true
+    return false
+
+# The variable a place starts at, the fields it goes through before any index,
+# and whether it is only fields: `self.a.b` is (self, [a, b], true), `xs[i].b`
+# is (xs, [], false).
+fn place_of(e: Expr) -> Option[(int, [str], bool)]:
     match e.kind:
         case ExprKind.Ident(_):
-            match e.res:
-                case Res.Local(l):
-                    reads.push((l, e.span))
+            match local_of(e):
+                case Some(l):
+                    return Some((l, [], true))
+                case None:
+                    return None
+        case ExprKind.Field(x, f, _):
+            match place_of(x):
+                case Some((l, p, exact)):
+                    if not exact:
+                        return Some((l, p, false))
+                    var q = p
+                    q.push(f)
+                    return Some((l, q, true))
+                case None:
+                    return None
+        case ExprKind.Index(x, _):
+            match place_of(x):
+                case Some((l, p, _)):
+                    return Some((l, p, false))
+                case None:
+                    return None
+        case _:
+            return None
+
+# Do two field paths of one variable share memory (is one a prefix of the other)?
+fn paths_overlap(a: [str], b: [str]) -> bool:
+    for i in 0..min(len(a), len(b)):
+        if a[i] != b[i]:
+            return false
+    return true
+
+# Does `e` use variable `r` in a part that overlaps its fields `path`?
+fn touches(e: Expr, r: int, path: [str]) -> bool:
+    match e.kind:
+        case ExprKind.Ident(_) | ExprKind.Field(_, _, _):
+            match place_of(e):
+                case Some((l, p, true)):
+                    return l == r and paths_overlap(p, path)
                 case _:
                     pass
-            return
+        case _:
+            pass
+    for c in children(e):
+        if touches(c, r, path):
+            return true
+    return false
+
+# Records in `m` the variables changed in place by calls in `e`, every mention
+# of a variable, and the parts that run one after the other.
+fn mut_sites(e: Expr, info: ProgramInfo, ref m: MutScan):
+    match e.kind:
+        case ExprKind.Ident(_) | ExprKind.Field(_, _, _):
+            match place_of(e):
+                case Some((l, p, true)):
+                    m.reads.push(MutRead(root=l, path=p, span=e.span))
+                    return
+                case _:
+                    pass
         # a nested comprehension or `par` body runs as its own code
         case ExprKind.Comp(_) | ExprKind.ParTuple(_):
             return
         case ExprKind.Binary(op, l, r):
             if op == BinOp.And or op == BinOp.Or:
-                seq.push((l.span, r.span))
-                mut_sites(l, info, ref sites, ref reads, ref seq)
-                mut_sites(r, info, ref sites, ref reads, ref seq)
+                m.seq.push((l.span, r.span))
+                mut_sites(l, info, ref m)
+                mut_sites(r, info, ref m)
                 return
         case ExprKind.IfElse(c, t, f):
-            seq.push((c.span, t.span))
-            seq.push((c.span, f.span))
-            seq.push((t.span, f.span))
-            mut_sites(c, info, ref sites, ref reads, ref seq)
-            mut_sites(t, info, ref sites, ref reads, ref seq)
-            mut_sites(f, info, ref sites, ref reads, ref seq)
+            m.seq.push((c.span, t.span))
+            m.seq.push((c.span, f.span))
+            m.seq.push((t.span, f.span))
+            mut_sites(c, info, ref m)
+            mut_sites(t, info, ref m)
+            mut_sites(f, info, ref m)
             return
         case _:
             pass
@@ -7421,26 +7529,27 @@ fn mut_sites(
                     recv_mut = info.fns[id].params[0].by_ref
             case _:
                 pass
+    # the change happens when the call runs, after all its arguments are read
+    var changed: [Expr] = []
     if recv_mut:
         match recv:
             case Some(r):
-                match lvalue_root(r):
-                    case Some(root):
-                        sites.push((root, e.span))
-                    case None:
-                        pass
+                changed.push(r)
             case None:
                 pass
-    # the change happens when the call runs, after all its arguments are read
     for a in args:
         if a.by_ref:
-            match lvalue_root(a.expr):
-                case Some(root):
-                    sites.push((root, e.span))
-                case None:
-                    pass
+            changed.push(a.expr)
+    for x in changed:
+        match place_of(x):
+            case Some((root, p, exact)):
+                m.sites.push(MutSite(root=root, path=p, exact=exact, span=e.span))
+                if exact:
+                    m.places.push((x.span, e.span))
+            case None:
+                pass
     for c in children(e):
-        mut_sites(c, info, ref sites, ref reads, ref seq)
+        mut_sites(c, info, ref m)
 
 fn expr_mentions(e: Expr, id: int) -> bool:
     match e.kind:
