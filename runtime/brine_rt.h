@@ -793,41 +793,11 @@ static inline double brine_f_fmod(double a, double b) { double r = fmod(a, b); r
 static inline float brine_f_fmodf(float a, float b) { float r = fmodf(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
 /* float min and max: a NaN loses to a number, and -0.0 is less than 0.0 (C's
  * fmin may return either zero), so the result is the same on every platform
- * and on a GPU (ptx.br). With AVX (the x86-64-v3 and v4 builds of a release)
- * they are two selects and no branch, so loops that use them vectorize; equal
- * values are merged bitwise, which only matters for the sign of a zero.
- * Without vector blends the selects become slower than the branches. */
-#if defined(__AVX__)
-#define BR_MINMAX(T, U, S)                                                      \
-static inline T brine_f_fmin##S(T a, T b) {                                     \
-    U x, y; T e;                                                                \
-    __builtin_memcpy(&x, &a, sizeof x); __builtin_memcpy(&y, &b, sizeof y);     \
-    x |= y; __builtin_memcpy(&e, &x, sizeof e);                                 \
-    T r = ((a < b) | (b != b)) ? a : b;                                         \
-    return a == b ? e : r;                                                      \
-}                                                                               \
-static inline T brine_f_fmax##S(T a, T b) {                                     \
-    U x, y; T e;                                                                \
-    __builtin_memcpy(&x, &a, sizeof x); __builtin_memcpy(&y, &b, sizeof y);     \
-    x &= y; __builtin_memcpy(&e, &x, sizeof e);                                 \
-    T r = ((a > b) | (b != b)) ? a : b;                                         \
-    return a == b ? e : r;                                                      \
-}
-#else
-#define BR_MINMAX(T, U, S)                                                      \
-static inline T brine_f_fmin##S(T a, T b) {                                     \
-    if (a < b || b != b) return a;                                              \
-    if (b < a || a != a) return b;                                              \
-    return signbit(a) ? a : b;                                                  \
-}                                                                               \
-static inline T brine_f_fmax##S(T a, T b) {                                     \
-    if (a > b || b != b) return a;                                              \
-    if (b > a || a != a) return b;                                              \
-    return signbit(a) ? b : a;                                                  \
-}
-#endif
-BR_MINMAX(double, uint64_t, )
-BR_MINMAX(float, uint32_t, f)
+ * and on a GPU (ptx.br). Branches, not selects: in `lo = min(lo, x)` a select
+ * waits for the last result, a predicted branch doesn't (3.5x faster). */
+#define BR_MINMAX(T, S)                                                         static inline T brine_f_fmin##S(T a, T b) {                                         if (a < b || b != b) return a;                                                  if (b < a || a != a) return b;                                                  return signbit(a) ? a : b;                                                  }                                                                               static inline T brine_f_fmax##S(T a, T b) {                                         if (a > b || b != b) return a;                                                  if (b > a || a != a) return b;                                                  return signbit(a) ? b : a;                                                  }
+BR_MINMAX(double, )
+BR_MINMAX(float, f)
 
 /* ------------------------------------------------------------ bit counts */
 /* `x.count_ones()`, `leading_zeros()`, `trailing_zeros()` of the bits
