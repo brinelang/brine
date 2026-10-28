@@ -294,7 +294,10 @@ the same element it always would.
 
 Cost: an empty array allocates nothing for its elements until the first push, so
 taking an inner array out to change it (`var w = xss[i]; xss[i] = []`, then
-`xss[i] = w`) costs one small allocation.
+`xss[i] = w`) costs one small allocation. A local `var a = [x] * n` with `n` a
+literal (at most 1 KB of numbers or `bool`s; 4 KB per function), in a function
+without `par`, that is only indexed, assigned at an index and measured with `len`
+lives in the stack frame: no allocation at all (a traversal stack, a histogram).
 
 ## Strings
 
@@ -445,8 +448,9 @@ the CPU (they have no f64).
 Nothing to write or install beyond the driver: the compiler makes a kernel of every
 body that only uses int/float arithmetic, comparisons, branches, loops, structs,
 tuples, reads of outer arrays and scalars, `out[i]` writes, `sqrt`, `abs`, `floor`,
-`ceil`, `round`, `min`, `max`, and calls to functions that do the same. Strings,
-maps, new arrays, printing, `sin`/`exp`/`log`/`pow` and the like keep a body on the
+`ceil`, `round`, `min`, `max`, and calls to functions that do the same (which may
+use local arrays kept in the stack frame, see Arrays). Strings,
+maps, other new arrays, printing, `sin`/`exp`/`log`/`pow` and the like keep a body on the
 CPU. `BRINE_GPU=off|on|auto` (default `auto`; `on` uses the GPU whenever it can),
 `BRINE_GPU_LOG=1` prints where each construct ran and why.
 

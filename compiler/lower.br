@@ -99,6 +99,8 @@ struct FnCx:
     scopes: [[Owned]]
     loops: [Loop]
     par_writes: {int: bool}
+    # local arrays kept in the stack frame (see `stack_arrays`)
+    stack_arrs: {int: bool}
     # the loop variable of the `par for` this body was lifted from (else -1)
     par_var: int
     # arrays no enclosing loop can share, grow or replace: their pointers
@@ -200,6 +202,7 @@ fn new_cx(f: Func) -> FnCx:
         scopes=[],
         loops=[],
         par_writes={},
+        stack_arrs={},
         par_var=-1,
         arrc={},
         lslot={},
@@ -487,6 +490,8 @@ struct Lower:
             self.dbg_func(f, is_test)
         elif self.opts.fast:
             self.cx.packed = pack.find(f.body, f.locals)
+        if not self.opts.debug:
+            self.cx.stack_arrs = self.stack_arrays(f.body)
         var owned: [(int, int, Ty)] = []
         if not is_test:
             let sig = self.info.fns[f.id]
@@ -523,6 +528,13 @@ struct Lower:
         var nw = narrow.Narrow(arrs={}, guards=[])
         if self.opts.fast and not self.opts.debug and self.own_body == 0:
             nw = narrow.find(f.body, f.locals)
+        # (an array kept as bits or bytes isn't a stack array)
+        for l in nw.arrs:
+            if l in self.cx.stack_arrs:
+                self.cx.stack_arrs.remove(l)
+        for l in self.cx.packed:
+            if l in self.cx.stack_arrs:
+                self.cx.stack_arrs.remove(l)
         if len(owned) > 0:
             self.push_scope()
             for a, id, t in owned:
@@ -1813,6 +1825,100 @@ struct Lower:
             return self.cx.fb.konst(K.Ptr, 0)
         return self.cx.fb.global(sym)
 
+    # The locals of a function body (without `par`) made by `[x] * n`, with n a
+    # literal and x a scalar, of at most STACK_ARR bytes, and then only
+    # indexed, assigned at an index and measured: nothing can hold such an
+    # array but its variable, so it can live in the stack frame, header and
+    # all, and is never retained, released or reallocated.
+    fn stack_arrays(self, body: Block) -> {int: bool}:
+        var su = StackUse(made={}, bad={}, par=false)
+        su.block(body)
+        var out: {int: bool} = {}
+        if su.par:
+            return out
+        # (in declaration order, up to STACK_FN bytes in all: recursion
+        # keeps most of its depth)
+        var ls: [int] = []
+        for l in su.made:
+            ls.push(l)
+        ls.sort()
+        var total = 0
+        for l in ls:
+            if l in su.bad:
+                continue
+            let n = su.made[l]
+            match self.flocals[l].ty:
+                case Ty.Array(el):
+                    let bytes = n * self.lay(el).size
+                    if (
+                        not self.managed(el)
+                        and not self.agg(el)
+                        and bytes <= STACK_ARR
+                        and total + bytes <= STACK_FN
+                    ):
+                        out[l] = true
+                        total += bytes
+                case _:
+                    pass
+        return out
+
+    # `var a = [x] * n` for a `stack_arrays` local: the header and elements in
+    # a slot (the layout of brine_arr), filled with x.
+    fn stack_let(ref self, id: int, init: Expr):
+        var n = 0
+        var elem = init
+        match init.kind:
+            case ExprKind.Repeat(x, count):
+                elem = x
+                match count.kind:
+                    case ExprKind.Int(v):
+                        n = int(v)
+                    case _:
+                        panic("stack_let: not a literal length")
+            case _:
+                panic("stack_let: not `[x] * n`")
+        let ty = self.flocals[id].ty
+        let el = ty.elem()
+        let sz = self.lay(el).size
+        self.push_frame()
+        let v = self.expr(elem)
+        self.pop_frame()
+        # (elements 16-byte aligned, as malloc's: i128 needs it)
+        let a = self.cx.fb.temp_mem(64 + n * sz, 16)
+        let one = self.cx.fb.konst(K.I64, 1)
+        let nv = self.cx.fb.konst(K.I64, n)
+        let szv = self.cx.fb.konst(K.I64, sz)
+        let z = self.cx.fb.konst(K.I64, 0)
+        self.cx.fb.store(a, 0, one)
+        self.cx.fb.store(a, 8, nv)
+        self.cx.fb.store(a, 16, nv)
+        self.cx.fb.store(a, 24, szv)
+        self.cx.fb.store(a, 32, z)
+        self.cx.fb.store(a, 40, z)
+        let data = self.cx.fb.offset(a, 64)
+        self.cx.fb.store(a, 48, data)
+        if zero_lit(elem):
+            self.cx.fb.zero(data, n * sz)
+            let home0 = self.new_local(id, ty)
+            self.cx.fb.store(home0, 0, a)
+            return
+        let k = self.cx.fb.konst(K.I64, 0)
+        let step = self.cx.fb.konst(K.I64, 1)
+        let head = self.cx.fb.label()
+        let out = self.cx.fb.label()
+        self.cx.fb.place(head)
+        let more = self.cx.fb.cmp(Op.Lt, k, nv)
+        self.cx.fb.brnot(more, out)
+        let p = self.cx.fb.elem(data, k, sz)
+        self.st(p, 0, el, v)
+        let k2 = self.cx.fb.bin(Op.Add, K.I64, k, step)
+        self.cx.fb.mov(k, k2)
+        self.cx.fb.jmp(head)
+        self.cx.fb.place(out)
+        # (no home in a scope: nothing to release)
+        let home = self.new_local(id, ty)
+        self.cx.fb.store(home, 0, a)
+
     # brine_arr_new(n, sizeof(elem), retain, release, loc)
     fn new_arr(ref self, elem: Ty, n: int, loc: int) -> int:
         let (rt, rl) = self.elem_fns(elem)
@@ -2493,6 +2599,9 @@ struct Lower:
                             return
                         case _:
                             pass
+                if len(s.locals) == 1 and s.locals[0] in self.cx.stack_arrs:
+                    self.stack_let(s.locals[0], init)
+                    return
                 self.push_frame()
                 self.cx.bits_init = len(s.locals) > 0 and s.locals[0] in self.cx.packed
                 self.cx.narrow_init = len(s.locals) > 0 and s.locals[0] in self.cx.narrow
@@ -3847,7 +3956,7 @@ struct Lower:
             match info.ty:
                 case Ty.Array(_):
                     let p = self.local_ptr(l)
-                    if l in u.written:
+                    if l in u.written and l not in self.cx.stack_arrs:
                         self.cx.fb.call_void("brine_arr_unique", [p])
                     let a = self.cx.fb.load(K.Ptr, p, 0)
                     let n = self.cx.fb.load(K.I64, a, 8)
@@ -4499,7 +4608,8 @@ struct Lower:
                     case ExprKind.Ident(_):
                         match base.res:
                             case Res.Local(l):
-                                skip = l in self.cx.par_writes
+                                # (a stack array is only ever its variable's)
+                                skip = l in self.cx.par_writes or l in self.cx.stack_arrs
                             case _:
                                 pass
                     case _:
@@ -4849,18 +4959,7 @@ struct Lower:
                 else:
                     t = self.new_arr(el, n, loc)
                 self.register(t, e.ty)
-                var zero = false
-                match elem.kind:
-                    case ExprKind.Int(z):
-                        zero = z == 0
-                    case ExprKind.Bool(z):
-                        zero = not z
-                    case ExprKind.Float(z):
-                        let zs = f"{z}"
-                        zero = z == 0.0 and not zs.starts_with("-")
-                    case _:
-                        pass
-                if not zero:
+                if not zero_lit(elem):
                     let data = self.cx.fb.load(K.Ptr, t, 48)
                     let k = self.cx.fb.konst(K.I64, 0)
                     let one = self.cx.fb.konst(K.I64, 1)
@@ -7048,6 +7147,109 @@ fn world_desc(t: Ty) -> str:
             return "a" + world_desc(e)
         case _:
             return "?"
+
+# A literal whose bytes are all zero (`0`, `false`, `0.0` but not `-0.0`).
+fn zero_lit(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Int(z):
+            return z == 0
+        case ExprKind.Bool(z):
+            return not z
+        case ExprKind.Float(z):
+            let zs = f"{z}"
+            return z == 0.0 and not zs.starts_with("-")
+        case _:
+            return false
+
+# The largest array `stack_arrays` keeps in the stack frame, and the most it
+# keeps for one function, in bytes
+const STACK_ARR = 1024
+const STACK_FN = 4096
+
+# What `stack_arrays` needs from a function body: the locals made by
+# `[x] * n` (n a literal, with n), those used any way but `a[i]`, `a[i] = v`,
+# `a[i] op= v` and `len(a)`, and whether there is any `par`.
+struct StackUse:
+    made: {int: int}
+    bad: {int: bool}
+    par: bool
+
+    fn block(ref self, b: Block):
+        for s in b.stmts:
+            self.stmt(s)
+
+    fn stmt(ref self, s: Stmt):
+        match s.kind:
+            case StmtKind.Let(_, pat, _, init, is_ref):
+                match pat:
+                    case LetPat.Name(_, _):
+                        if not is_ref:
+                            match init.kind:
+                                case ExprKind.Repeat(_, count):
+                                    match count.kind:
+                                        case ExprKind.Int(v):
+                                            if 0 < v < (1 << 20):
+                                                self.made[s.locals[0]] = int(v)
+                                        case _:
+                                            pass
+                                case _:
+                                    pass
+                    case _:
+                        pass
+                if is_ref:
+                    self.root_bad(init)
+            case StmtKind.For(_, _, _, _, _, _, is_par):
+                if is_par:
+                    self.par = true
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            self.expr(e)
+        for b in stmt_blocks(s):
+            self.block(b)
+
+    # an element's address is taken (`ref a[i]`)
+    fn root_bad(ref self, e: Expr):
+        match lvalue_root(e):
+            case Some(r):
+                self.bad[r] = true
+            case None:
+                pass
+
+    fn expr(ref self, e: Expr):
+        match e.kind:
+            case ExprKind.Index(b, i):
+                if local_of(b).is_some():
+                    self.expr(i)
+                    return
+            case ExprKind.Call(_, args):
+                for a in args:
+                    if a.by_ref:
+                        self.root_bad(a.expr)
+                if e.cres == CallRes.Builtin(Builtin.Len) and len(args) == 1 and not args[0].by_ref:
+                    if local_of(args[0].expr).is_some():
+                        return
+            case ExprKind.MethodCall(recv, _, _, args):
+                self.root_bad(recv)
+                for a in args:
+                    if a.by_ref:
+                        self.root_bad(a.expr)
+            case ExprKind.ParTuple(_):
+                self.par = true
+            case ExprKind.Comp(c):
+                if c.par:
+                    self.par = true
+            case ExprKind.Ident(_):
+                match local_of(e):
+                    case Some(l):
+                        self.bad[l] = true
+                    case None:
+                        pass
+                return
+            case _:
+                pass
+        for c in children(e):
+            self.expr(c)
 
 # An index `arr[j + x]` (`x + j`, `j - x` with `neg`, `j`) in a loop over j:
 # its span and the span of the addition ("" for `arr[j]`); x is a variable
