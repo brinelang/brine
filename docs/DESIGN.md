@@ -171,7 +171,9 @@ panics exactly as it would on the CPU.
   at least 25% faster. Getting the device ready takes 0.1-0.7 s, so a construct that
   would gain only later starts it in the background and stays on the CPU until it
   is ready. `BRINE_GPU=off` never uses a GPU, `BRINE_GPU=on` uses one whenever it
-  can.
+  can. Ranks of a `world` take one GPU each: the k-th rank on a machine uses its
+  k-th GPU, and the ranks beyond the machine's GPUs stay on the CPU, since ranks
+  sharing a device queue for it (with `on`, they share the GPUs round-robin).
 * *How:* the compiler turns the lifted body of each eligible construct into a
   kernel, and the program carries the module: PTX (`compiler/ptx.br`), or Metal
   Shading Language source on macOS (`compiler/msl.br`). The runtime loads the CUDA

@@ -222,6 +222,8 @@ static br_mutex br_io_mu;
 static int br_argc;
 static char **br_argv;
 static int64_t br_rank = 0, br_size = 1;
+/* how many lower ranks run on this rank's machine (GPUs go one per rank) */
+static int64_t br_local_rank = 0;
 
 /* ============================================================ panics */
 static void br_flush(void) { fflush(stdout); }
@@ -2918,6 +2920,7 @@ static void br_gpu_logf(const char *fmt, ...) {
     va_start(ap, fmt);
     br_lock(&br_io_mu);
     fputs("brine gpu: ", stderr);
+    if (br_size > 1) fprintf(stderr, "rank %lld: ", (long long)br_rank);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     fflush(stderr);
@@ -2939,6 +2942,19 @@ static const char *br_gpu_cpu_est(char *buf, double cpu_s) {
  * as they are. */
 static int br_dev_open(const char *code, char *why, size_t nwhy);
 static const char *br_dev_err(br_gpu_res r);
+
+/* Which of the machine's n GPUs this rank uses, or -1. Ranks sharing a GPU
+ * would queue for it and each run slower than the CPU it gave up, so in
+ * auto mode the k-th rank on a machine gets GPU k, and the ranks beyond the
+ * GPUs stay on the CPU; BRINE_GPU=on shares them out round-robin. */
+static int br_gpu_ordinal(int n, char *why, size_t nwhy) {
+    if (n <= 0) return -1;
+    if (br_local_rank < n) return (int)br_local_rank;
+    if (br_gpu.mode == BR_GPU_ON) return (int)(br_local_rank % n);
+    snprintf(why, nwhy, "%d lower rank%s on this machine use%s its %d GPU%s (one rank per GPU; BRINE_GPU=on shares them)",
+             (int)br_local_rank, br_local_rank == 1 ? "" : "s", br_local_rank == 1 ? "s" : "", n, n == 1 ? "" : "s");
+    return -1;
+}
 /* makes the device current on this thread */
 static br_gpu_res br_dev_bind(void);
 static br_gpu_res br_dev_alloc(br_gpu_ptr *p, size_t n);
@@ -3026,6 +3042,7 @@ static int br_dev_open(const char *code, char *why, size_t nwhy) {
         return 0;
     }
     br_mtl.stack = strtoull(code + 24, NULL, 10);
+    if (br_gpu_ordinal(1, why, nwhy) < 0) return 0;
     void *objc = dlopen("/usr/lib/libobjc.A.dylib", RTLD_NOW | RTLD_LOCAL);
     void *fnd = dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_NOW | RTLD_LOCAL);
     void *mtl = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_NOW | RTLD_LOCAL);
@@ -3375,8 +3392,14 @@ static int br_dev_open(const char *ptx, char *why, size_t nwhy) {
         snprintf(why, nwhy, "cuInit: %s", br_dev_err(r));
         return 0;
     }
-    if (n <= 0 || c->DeviceGet(&dev, 0) != 0) {
+    if (n <= 0) {
         snprintf(why, nwhy, "no CUDA device");
+        return 0;
+    }
+    int ord = br_gpu_ordinal(n, why, nwhy);
+    if (ord < 0) return 0;
+    if (c->DeviceGet(&dev, ord) != 0) {
+        snprintf(why, nwhy, "no CUDA device %d", ord);
         return 0;
     }
     int major = 0, minor = 0;
@@ -4534,6 +4557,10 @@ static void br_abort_flush(int sig) {
     fflush(stderr);
 }
 
+static bool br_loopback(const char *h) { return strncmp(h, "127.", 4) == 0 || strcmp(h, "localhost") == 0; }
+
+static bool br_same_host(const char *a, const char *b) { return strcmp(a, b) == 0 || (br_loopback(a) && br_loopback(b)); }
+
 /* Processes this rank starts (`run`, `os.spawn`) are not part of its world. */
 static void br_unsetenv(const char *name) {
 #ifdef _WIN32
@@ -4587,6 +4614,8 @@ static void br_world_init(void) {
         ports[i] = colon + 1;
         p = comma ? comma + 1 : p + strlen(p);
     }
+    for (int64_t i = 0; i < br_rank; i++)
+        if (br_same_host(hosts[i], hosts[br_rank])) br_local_rank++;
     for (int64_t i = 0; i < br_size; i++) {
         br_mutex_init(&br_peers[i].mu);
         br_mutex_init(&br_peers[i].send_mu);
@@ -4602,7 +4631,7 @@ static void br_world_init(void) {
        outside can reach it, and firewalls don't ask about it */
     bool local = true;
     for (int64_t i = 0; i < br_size; i++)
-        if (strncmp(hosts[i], "127.", 4) != 0 && strcmp(hosts[i], "localhost") != 0) local = false;
+        if (!br_loopback(hosts[i])) local = false;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;

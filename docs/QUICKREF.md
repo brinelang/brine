@@ -441,7 +441,9 @@ tuples, reads of outer arrays and scalars, `out[i]` writes, `sqrt`, `abs`, `floo
 `ceil`, `round`, `min`, `max`, and calls to functions that do the same. Strings,
 maps, new arrays, printing, `sin`/`exp`/`log`/`pow` and the like keep a body on the
 CPU. `BRINE_GPU=off|on|auto` (default `auto`; `on` uses the GPU whenever it can),
-`BRINE_GPU_LOG=1` prints where each construct ran and why.
+`BRINE_GPU_LOG=1` prints where each construct ran and why. With `--ranks`, the
+k-th rank on a machine uses its k-th GPU and the ranks beyond its GPUs stay on the
+CPU (ranks sharing a GPU queue for it); `on` shares the GPUs out instead.
 
 ## Multiple processes and machines: `world`
 
