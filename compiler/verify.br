@@ -12,7 +12,7 @@
 # when it has been proven or is enforced by a runtime check.
 from diag import Span, Diag, SourceMap
 import diag
-from types import Ty, IntTy, Res, CallRes, Builtin, Reducer, WorldOp, LocalInfo, int_ty
+from types import Ty, IntTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, LocalInfo, int_ty
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import children, stmt_exprs, stmt_blocks, lvalue_root
 from info import ProgramInfo, ConstVal
@@ -945,16 +945,25 @@ struct Vf:
             self.remaining.push((span, what))
         self.assume(goal)
 
-    # A check that is proven or not, without being listed in `--report`:
-    # compound assignments (`x += 1`) were never listed there.
-    fn implicit_quiet(ref self, span: Span, tag: int, goal: F):
-        if self.spec or not self.live:
-            return
-        if self.holds(goal):
-            self.proven[key(span, tag)] = true
-        else:
-            self.failed[key(span, tag)] = true
-        self.assume(goal)
+    # `x op= y`: the new value of `x`; the statement's check is proven or listed.
+    fn compound(ref self, span: Span, op: BinOp, a: Lin, b: Lin, k: IntTy) -> V:
+        let r = self.arith_val(op, a, b, k)
+        let l = self.as_int(r, Ty.Int(k))
+        let fits = in_range(l, k)
+        match op:
+            case BinOp.Add | BinOp.Sub | BinOp.Mul:
+                self.implicit(span, TAG_COMPOUND, fits, "overflow check")
+            case BinOp.Div:
+                self.implicit(span, TAG_COMPOUND, div_goal(op, a, b, k), "division check")
+            case BinOp.Mod:
+                self.implicit(span, TAG_COMPOUND, div_goal(op, a, b, k), "remainder check")
+            case BinOp.Shl | BinOp.Shr:
+                self.implicit(span, TAG_COMPOUND, shift_goal(b, k), "shift check")
+            case _:
+                pass
+        if not self.spec:
+            self.assume(fits)
+        return V.Int(l)
 
     # Start running with an extra temporary assumption; `end_assume` drops the facts added since.
     fn begin_assume(ref self, extra: F) -> (Option[St], int):
@@ -1180,25 +1189,17 @@ struct Vf:
                             self.bind(id, x)
             case StmtKind.Assign(target, op, value):
                 let rhs = self.eval(value)
-                match self.lvalue_path(target):
+                match self.lvalue_path(target, op.is_none()):
                     case Some((root, steps)):
                         var new = rhs
                         match op:
                             case Some(o):
                                 let cur = self.read_path(root, steps)
                                 match (target.ty, cur, rhs):
-                                    case (Ty.Int(k), V.Int(a), V.Int(b)):
-                                        let r = self.arith_val(o, a, b, k)
-                                        match r:
-                                            case V.Int(l):
-                                                let f = in_range(l, k)
-                                                if o == BinOp.Add or o == BinOp.Sub or o == BinOp.Mul:
-                                                    self.implicit_quiet(s.span, TAG_COMPOUND, f)
-                                                elif not self.spec:
-                                                    self.assume(f)
-                                            case _:
-                                                pass
-                                        new = r
+                                    case (Ty.Int(k), _, _):
+                                        let a = self.as_int(cur, target.ty)
+                                        let b = self.as_int(rhs, value.ty)
+                                        new = self.compound(s.span, o, a, b, k)
                                     case (Ty.Str, V.Str(a), V.Str(b)):
                                         new = V.Str(self.lin(a.add(b), "len(?)"))
                                     case _:
@@ -1855,7 +1856,8 @@ struct Vf:
         self.put(out)
 
     # ------------------------------------------------------------ lvalues
-    fn lvalue_path(ref self, e: Expr) -> Option[(int, [(Step, Ty)])]:
+    # `insert`: `e` is assigned with `=`, so if it's `m[k]` the key needn't exist.
+    fn lvalue_path(ref self, e: Expr, insert: bool) -> Option[(int, [(Step, Ty)])]:
         match e.kind:
             case ExprKind.Ident(_):
                 match e.res:
@@ -1864,14 +1866,14 @@ struct Vf:
                     case _:
                         return None
             case ExprKind.Field(b, _, _):
-                let (r, p0) = self.lvalue_path(b)?
+                let (r, p0) = self.lvalue_path(b, false)?
                 var p = p0
                 p.push((Step.Field(e.idx), e.ty))
                 return Some((r, p))
             case ExprKind.Index(b, idx):
                 let iv = self.eval(idx)
                 let i = self.as_int(iv, idx.ty)
-                let (r, p0) = self.lvalue_path(b)?
+                let (r, p0) = self.lvalue_path(b, false)?
                 var p = p0
                 let base = self.read_path(r, p)
                 match base:
@@ -1879,7 +1881,8 @@ struct Vf:
                         let g = F.and_([F.ge(i), F.lt(i, l)])
                         self.implicit(e.span, TAG_INDEX, g, "index bounds check")
                     case _:
-                        pass
+                        if not insert:
+                            self.map_key_check(b, e.span)
                 p.push((Step.Index(i), e.ty))
                 return Some((r, p))
             case _:
@@ -2035,8 +2038,7 @@ struct Vf:
                     case (UnOp.Neg, Ty.Int(k)):
                         let l = self.as_int(v, x.ty)
                         let n = self.lin(l.neg(), "?")
-                        if not self.spec:
-                            self.assume(in_range(n, k))
+                        self.kept(e.span, in_range(n, k), "overflow check")
                         return V.Int(n)
                     case (UnOp.Not, _):
                         let f = self.as_bool(v)
@@ -2232,6 +2234,7 @@ struct Vf:
                             self.implicit(e.span, TAG_INDEX, g, "index bounds check")
                         return V.Str(Lin.konst(1))
                     case _:
+                        self.map_key_check(b, e.span)
                         return self.fresh_val(e.ty, "?")
             case ExprKind.Slice(b, lo, hi):
                 return self.slice(e, b, lo, hi)
@@ -2257,8 +2260,7 @@ struct Vf:
                 self.eval(elem)
                 let nv = self.eval(count)
                 let n = self.as_int(nv, count.ty)
-                if not self.spec:
-                    self.assume(F.ge(n))
+                self.kept(e.span, F.ge(n), "array length check")
                 return V.Arr(self.fresh_content("[...]"), n)
             case ExprKind.Tuple(es):
                 return self.agg(es)
@@ -2291,15 +2293,10 @@ struct Vf:
                 let a = self.as_int(av, l.ty)
                 let b = self.as_int(bv, r.ty)
                 if (op == BinOp.Div or op == BinOp.Mod) and e.checked:
-                    var g = [F.ne(b)]
-                    if op == BinOp.Div and k.signed():
-                        let am = a.sub(Lin.konst(k.min()))
-                        let b1 = b.add_c(1)
-                        g.push(F.or_([F.ne(am.unwrap_or(a)), F.ne(b1.unwrap_or(b))]))
-                        if am.is_none() or b1.is_none():
-                            g.push(F.B(ATOM_UNKNOWN, true))
                     let what = "division check" if op == BinOp.Div else "remainder check"
-                    self.implicit(e.span, TAG_ARITH, F.and_(g), what)
+                    self.implicit(e.span, TAG_ARITH, div_goal(op, a, b, k), what)
+                if (op == BinOp.Shl or op == BinOp.Shr) and e.checked:
+                    self.implicit(e.span, TAG_ARITH, shift_goal(b, k), "shift check")
                 let v = self.arith_val(op, a, b, k)
                 match v:
                     case V.Int(res):
@@ -2526,10 +2523,18 @@ struct Vf:
     fn convert(ref self, target: Ty, a: Expr, whole: Expr) -> V:
         let v = self.eval(a)
         match (target, a.ty, v):
-            case (Ty.Int(k), Ty.Int(_), V.Int(l)):
-                if not self.spec:
-                    self.assume(in_range(l, k))
+            case (Ty.Int(k), Ty.Int(src), V.Int(l)):
+                # a narrowing conversion is checked
+                let widens = k.signed() == src.signed() and k.bits() >= src.bits()
+                if widens or (k.signed() and not src.signed() and k.bits() > src.bits()):
+                    return V.Int(l)
+                self.kept(whole.span, in_range(l, k), "conversion check")
                 return V.Int(l)
+            case (Ty.Int(_), Ty.Float(_), _):
+                # in range and not NaN: checked
+                if not self.spec and self.live:
+                    self.remaining.push((whole.span, "conversion check"))
+                return self.fresh_val(target, self.name_of(whole))
             case (Ty.Int(_), Ty.Bool, V.Bool(b)):
                 let r = self.fresh_int("int(bool)", IntTy.I64)
                 self.defs.push(
@@ -2549,7 +2554,7 @@ struct Vf:
             let r = recv.unwrap()
             if b == Builtin.Push:
                 self.eval(args[0].expr)
-            match self.lvalue_path(r):
+            match self.lvalue_path(r, false):
                 case None:
                     self.eval(r)
                     return self.fresh_val(e.ty, "?")
@@ -2563,8 +2568,11 @@ struct Vf:
                             if b == Builtin.Push:
                                 nlen = self.lin(l.add_c(1), "len(?)")
                             else:
-                                if not self.spec:
-                                    self.assume(F.ge(l.add_c(-1).unwrap_or(l)))
+                                self.kept(
+                                    e.span,
+                                    F.ge(l.add_c(-1).unwrap_or(l)),
+                                    "empty array check"
+                                )
                                 nlen = self.lin(l.add_c(-1), "len(?)")
                                 out = self.sel(c, nlen, e.ty)
                             let nv = V.Arr(self.fresh_content(name), nlen)
@@ -2611,7 +2619,9 @@ struct Vf:
                                 )
                             case None:
                                 pass
-                        if not self.spec:
+                        if k.signed():
+                            self.kept(e.span, in_range(r, k), "overflow check")
+                        elif not self.spec:
                             self.assume(in_range(r, k))
                         return V.Int(r)
                     case _:
@@ -2637,8 +2647,30 @@ struct Vf:
             case Builtin.Args:
                 let c = self.fresh_content("args()")
                 return V.Arr(c, self.fresh_nonneg("len(args())"))
+            case Builtin.Chr:
+                if len(vals) > 0:
+                    let n = self.as_int(vals[0], args[0].expr.ty)
+                    let lo: i128 = 55295
+                    let hi: i128 = 57344
+                    let top: i128 = 1114111
+                    let ok = F.or_(
+                        [F.and_([F.ge(n), F.le(n, Lin.konst(lo))]), F.and_([F.le(Lin.konst(hi), n), F.le(n, Lin.konst(top))])]
+                    )
+                    self.kept(e.span, ok, "character check")
+                return self.fresh_val(e.ty, self.name_of(e))
+            case Builtin.Str(StrM.Repeat):
+                if len(vals) > 0:
+                    let n = self.as_int(vals[0], args[0].expr.ty)
+                    self.kept(e.span, F.ge(n), "repeat count check")
+                return self.fresh_val(e.ty, self.name_of(e))
             # a code point
             case Builtin.Ord:
+                if len(vals) > 0:
+                    match vals[0]:
+                        case V.Str(l):
+                            self.kept(e.span, F.equal(l, Lin.konst(1)), "character check")
+                        case _:
+                            pass
                 let r = self.fresh_nonneg("ord(...)")
                 let top: i128 = 1114111
                 self.assume(F.le(r, Lin.konst(top)))
@@ -2653,7 +2685,7 @@ struct Vf:
             vals.push(self.eval(a.expr))
         self.ref_args(args)
         var out = self.fresh_val(e.ty, "?")
-        match self.lvalue_path(r):
+        match self.lvalue_path(r, false):
             case None:
                 # a temporary: nothing else sees the change
                 self.eval(r)
@@ -2718,6 +2750,16 @@ struct Vf:
                         self.bind(root, nv)
                     case None:
                         pass
+
+    # `m[k]` on a map panics when the key is missing (the prover doesn't
+    # follow maps' keys).
+    fn map_key_check(ref self, m: Expr, span: Span):
+        match m.ty:
+            case Ty.Map(_, _):
+                if not self.spec and self.live:
+                    self.remaining.push((span, "map key check"))
+            case _:
+                pass
 
     # A runtime check that stays whether or not it's proven: listed in
     # `--report` unless proven; either way it holds afterwards.
@@ -2798,6 +2840,21 @@ struct Vf:
             case None:
                 pass
         return result
+
+# `a / b` and `a % b` don't fail: no division by zero, nor `MIN / -1`.
+fn div_goal(op: BinOp, a: Lin, b: Lin, k: IntTy) -> F:
+    var g = [F.ne(b)]
+    if op == BinOp.Div and k.signed():
+        let am = a.sub(Lin.konst(k.min()))
+        let b1 = b.add_c(1)
+        g.push(F.or_([F.ne(am.unwrap_or(a)), F.ne(b1.unwrap_or(b))]))
+        if am.is_none() or b1.is_none():
+            g.push(F.B(ATOM_UNKNOWN, true))
+    return F.and_(g)
+
+# A shift by `b` of a `k` is in range: 0 <= b < bits.
+fn shift_goal(b: Lin, k: IntTy) -> F:
+    return F.and_([F.ge(b), F.lt(b, Lin.konst(i128(k.bits())))])
 
 # Formula stating `a == b` (when expressible).
 fn val_eq(a: V, b: V) -> Option[F]:
