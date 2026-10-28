@@ -26,6 +26,7 @@ import ptx
 import msl
 import jam
 import pack
+import ranges
 
 struct Options:
     # generate a test-runner `main` instead of the program's `main`
@@ -109,6 +110,12 @@ struct FnCx:
     packed: {int: bool}
     # the `[b] * n` being lowered makes one
     bits_init: bool
+    # in a range-versioned copy (ranges.br): integer arithmetic needs no
+    # overflow checks, and these calls (by span) go to clones without them
+    nc: bool
+    nc_calls: {str: int}
+    # in the fallback copy of a versioned loop: don't version again
+    nv: bool
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -143,7 +150,10 @@ fn new_cx(f: Func) -> FnCx:
         lifted=false,
         jx=no_jam(),
         packed={},
-        bits_init=false
+        bits_init=false,
+        nc=false,
+        nc_calls={},
+        nv=false
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -220,7 +230,11 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         fsyms={},
         dtypes=[],
         dtys={},
-        gsites=[]
+        gsites=[],
+        fdecls={},
+        clones=[],
+        cloned={},
+        nc_body=false
     )
     return g.run()
 
@@ -252,11 +266,23 @@ struct Lower:
     dtys: {str: int}
     # `par` constructs that may run on a GPU (see `gpu_emit`)
     gsites: [GpuSite]
+    # brine functions by id, and those that need a clone without overflow
+    # checks (ranges.br)
+    fdecls: {int: FnDecl}
+    clones: [int]
+    cloned: {int: bool}
+    # the body being lowered is such a clone
+    nc_body: bool
 
     # ============================================================ driver
     fn run(ref self) -> Lowered:
         self.prep_layouts()
         let prog = self.prog
+        if self.opts.fast:
+            for m in prog.modules:
+                for f in m.fns:
+                    if not f.is_extern:
+                        self.fdecls[f.id] = f
         for m in prog.modules:
             for f in m.fns:
                 if not f.is_extern:
@@ -265,6 +291,13 @@ struct Lower:
             self.gen_tests()
         else:
             self.gen_main()
+        var ci = 0
+        while ci < len(self.clones):
+            let f = self.fdecls[self.clones[ci]]
+            self.nc_body = true
+            self.gen_body(f, self.info.fns[f.id].c_name + "__nc", false)
+            self.nc_body = false
+            ci += 1
         var externs: [Func] = []
         var seen: {str: bool} = {}
         for sig in self.info.fns:
@@ -310,6 +343,7 @@ struct Lower:
         self.fnd = Some(f)
         self.flocals = f.locals
         self.cx = new_cx(new_func(name, ks, has, rk))
+        self.cx.nc = self.nc_body
         if self.opts.debug:
             self.dbg_func(f, is_test)
         elif self.opts.fast:
@@ -1894,7 +1928,7 @@ struct Lower:
                 self.pop_frame()
             case StmtKind.Assign(target, op, value):
                 self.push_frame()
-                self.assign(target, op, value, not s.proven, s.span)
+                self.assign(target, op, value, self.op_checked(op, target.ty, not s.proven), s.span)
                 self.pop_frame()
             case StmtKind.ExprStmt(e):
                 self.push_frame()
@@ -1939,6 +1973,8 @@ struct Lower:
             case StmtKind.For(_, _, _, iter, _, body, is_par):
                 if is_par:
                     self.par_for(iter, s.local, s.caps, s.writes, body, s.span)
+                elif self.opts.fast and not self.cx.lifted and self.version_for(s, iter, body):
+                    pass
                 elif self.opts.fast and not self.cx.lifted and self.jam_for(iter, s.local, body):
                     pass
                 else:
@@ -2002,6 +2038,70 @@ struct Lower:
                 self.pop_frame()
             case _:
                 pass
+
+    # ============================================================ range versioning
+    # A loop ranges.br found free of overflow while its inputs are within a
+    # bound: test them once, then run a copy without overflow checks, or the
+    # loop as written. Returns false, having emitted nothing, when it doesn't
+    # qualify.
+    fn version_for(ref self, s: Stmt, iter: Expr, body: Block) -> bool:
+        if self.cx.nc or self.cx.nv or len(self.cx.jx.act) > 0:
+            return false
+        match ranges.plan(iter, s.local, body, self.flocals, self.info, self.fdecls):
+            case Some(v):
+                let slow = self.cx.fb.label()
+                let end = self.cx.fb.label()
+                let t = int(v.bound)
+                for p in v.params:
+                    match self.flocals[p].ty:
+                        case Ty.Int(k):
+                            let kk = int_kind(k)
+                            let x = self.read_local(p)
+                            if v.bound < k.max():
+                                let hi = self.cx.fb.konst(kk, t)
+                                let ok = self.cx.fb.cmp(Op.Le, x, hi)
+                                self.cx.fb.brnot(ok, slow)
+                            if k.signed() and -v.bound > k.min():
+                                let lo = self.cx.fb.konst(kk, -t)
+                                let ok = self.cx.fb.cmp(Op.Ge, x, lo)
+                                self.cx.fb.brnot(ok, slow)
+                        case _:
+                            pass
+                for ck in v.calls:
+                    let id = v.calls[ck]
+                    if not (id in self.cloned):
+                        self.cloned[id] = true
+                        self.clones.push(id)
+                self.cx.nc = true
+                self.cx.nc_calls = v.calls
+                self.stmt(s)
+                self.cx.nc = false
+                self.cx.nc_calls = {}
+                if not self.cx.fb.ends():
+                    self.cx.fb.jmp(end)
+                self.cx.fb.place(slow)
+                self.cx.nv = true
+                self.stmt(s)
+                self.cx.nv = false
+                self.cx.fb.place(end)
+                return true
+            case None:
+                return false
+
+    # Is `op` on a `ty` checked, `checked` being what the source asks for? A
+    # range-versioned copy drops the checks ranges.br showed can't fail.
+    fn op_checked(self, op: Option[BinOp], ty: Ty, checked: bool) -> bool:
+        if not checked or not self.cx.nc or ranges.handled(ty).is_none():
+            return checked
+        match op:
+            case Some(o):
+                match o:
+                    case BinOp.Add | BinOp.Sub | BinOp.Mul | BinOp.Div | BinOp.Mod:
+                        return false
+                    case _:
+                        return true
+            case None:
+                return checked
 
     # ============================================================ interleaving
     # `for x in lo..hi:` whose iterations jam.br found independent: LANES
@@ -2114,12 +2214,13 @@ struct Lower:
                         let ty = self.flocals[r].ty
                         let lp = self.local_ptr(r)
                         let cur = self.ld(lp, 0, ty)
+                        let o = op.unwrap_or(BinOp.Add)
                         let c = self.arith(
-                            op.unwrap_or(BinOp.Add),
+                            o,
                             cur,
                             v,
                             ty,
-                            not s.proven,
+                            self.op_checked(Some(o), ty, not s.proven),
                             s.span
                         )
                         self.st(lp, 0, ty, c)
@@ -2780,7 +2881,7 @@ struct Lower:
                     case UnOp.Neg:
                         match e.ty:
                             case Ty.Int(k):
-                                if k.signed():
+                                if k.signed() and not (self.cx.nc and ranges.handled(e.ty).is_some()):
                                     let loc = self.loc(e.span)
                                     return self.cx.fb.rt(
                                         int_kind(k),
@@ -2815,7 +2916,8 @@ struct Lower:
                     let c = self.cx.fb.call(K.Ptr, "brine_str_concat", [a, b])
                     return self.temp(c, Ty.Str)
                 let a = self.expr(l)
-                let sh = -1 if e.checked else pow2_shift(op, r, e.ty)
+                let chk = self.op_checked(Some(op), e.ty, e.checked)
+                let sh = -1 if chk else pow2_shift(op, r, e.ty)
                 if sh > 0:
                     let kk = self.kind(e.ty)
                     if op == BinOp.Div:
@@ -2824,7 +2926,7 @@ struct Lower:
                     let m = self.cx.fb.konst(kk, (1 << sh) - 1)
                     return self.cx.fb.bin(Op.And, kk, a, m)
                 let b = self.expr(r)
-                return self.arith(op, a, b, e.ty, e.checked, e.span)
+                return self.arith(op, a, b, e.ty, chk, e.span)
             case ExprKind.Compare(first, rest):
                 let a = self.expr(first)
                 if len(rest) == 1:
@@ -3230,7 +3332,9 @@ struct Lower:
                 return self.cx.fb.cmp(cmp_op(op), a, b)
 
     fn call_fn(ref self, id: int, recv: Option[Expr], args: [Arg], span: Span) -> int:
-        let sig = self.info.fns[id]
+        var sig = self.info.fns[id]
+        if len(self.cx.nc_calls) > 0 and ranges.key(span) in self.cx.nc_calls:
+            sig.c_name = sig.c_name + "__nc"
         # With a `ref` parameter, by-value arguments may read the variable the call
         # changes; holding a reference of their own makes copy-on-write protect them.
         let has_ref = any(p.by_ref for p in sig.params)
