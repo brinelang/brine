@@ -101,6 +101,11 @@ your setup with:
 brine doctor
 ```
 
+WebAssembly builds (`--target wasm` or `web`) also need
+[wasi-sdk](https://github.com/WebAssembly/wasi-sdk/releases): unpack it and set
+`WASI_SDK_PATH` to its folder. `brine run --target wasm` runs the result with
+Node.js.
+
 GPU offload needs nothing extra at build time. If an NVIDIA driver or Apple
 silicon is present when the program runs, brine uses it; otherwise everything
 runs on the CPU.
@@ -118,6 +123,8 @@ runs on the CPU.
 "Native dev builds" means the compiler writes machine code itself (the whole
 compiler builds in under a second). Everywhere else, and for every `--release`
 build, it goes through C.
+
+Every platform can also build WebAssembly, for WASI runtimes and for browsers.
 
 ### Your first project
 
@@ -239,6 +246,31 @@ BRINE_GPU_LOG=1 brine run examples/find_signal.br --release # where each `par` r
 On an RTX 4090, an f32 n-body step runs about 8x faster than on all 32 threads
 of a Ryzen 9 9950X3D. See [bench/gpu](bench/gpu/README.md) for the numbers,
 including the cases where the CPU wins and `auto` keeps the work there.
+
+### WebAssembly and the web
+
+The same programs compile to WebAssembly, with the same checks and the same
+results:
+
+```sh
+brine run --target wasm examples/parallel.br           # a .wasm module, run with Node.js
+brine build --target wasm examples/parallel.br         # parallel.wasm, for any WASI runtime
+brine build --target web examples/parallel.br -o demo  # demo/: index.html, brine.js, program.wasm
+python3 -m http.server -d demo                         # then open http://localhost:8000
+```
+
+A web build is a folder you can put on any static host. `index.html` shows what
+the program prints; replace it with your own page (rebuilding keeps it) and call
+`run` from `brine.js`:
+
+```js
+import { run } from "./brine.js";
+const code = await run("program.wasm", { args: ["10"], stdout: (text) => show(text) });
+```
+
+WebAssembly runs on one thread, so `par` constructs run in order (with the same
+results) and `world` programs run as one rank. In the browser, a program has no
+files and can't start processes.
 
 ### Many processes, no deadlocks
 
@@ -390,8 +422,8 @@ test result: ok. 2 passed; 0 failed; finished in 0.03s
 | Command | What it does |
 |---|---|
 | `brine new <name>` / `brine init` | create a project |
-| `brine run [file] [-- args]` | build and run (`--release`, `--threads N`, `--ranks N`) |
-| `brine build` | build a binary (`--release`, `--debug`, `-o`, `--emit-c`) |
+| `brine run [file] [-- args]` | build and run (`--release`, `--threads N`, `--ranks N`, `--target wasm`) |
+| `brine build` | build a binary (`--release`, `--debug`, `-o`, `--emit-c`, `--target wasm\|web`) |
 | `brine check` | type-check and prove without building (`--report` lists remaining runtime checks) |
 | `brine test [filter]` | run `test "...":` blocks in parallel |
 | `brine fmt` | format sources (`--check`) |

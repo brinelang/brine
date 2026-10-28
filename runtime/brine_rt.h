@@ -20,6 +20,31 @@
 #endif
 
 /* ------------------------------------------------------------ core types */
+/* Generated code lays memory out as on a 64-bit machine: a pointer takes 8
+ * bytes, in a struct field or an array element. Where pointers are 4 bytes
+ * (wasm32), a pointer field is the low half of an 8-byte slot (BR_P), and
+ * the runtime keeps pointer elements in BR_PSLOT-byte slots. */
+#if UINTPTR_MAX == 0xffffffffu
+#define BR_P(T, name) union { T name; uint64_t name##_slot; }
+#else
+#define BR_P(T, name) T name
+#endif
+#define BR_PSLOT 8
+/* load and store a pointer slot, and a local variable that is one (generated code) */
+#if UINTPTR_MAX == 0xffffffffu
+#define BR_LDP(at) ((void *)(uintptr_t) * (uint64_t *)(at))
+#define BR_STP(at, v) (*(uint64_t *)(at) = (uint64_t)(uintptr_t)(v))
+typedef uint64_t brine_pslot;
+#else
+#define BR_LDP(at) (*(void **)(at))
+#define BR_STP(at, v) (*(void **)(at) = (v))
+typedef void *brine_pslot;
+#endif
+/* a word of a table that holds pointers (generated code) */
+typedef union {
+    void *p;
+    uint64_t u;
+} brine_word;
 typedef struct brine_str {
     int64_t rc; /* < 0 means immortal (string literal) */
     int64_t len;
@@ -33,9 +58,9 @@ typedef struct brine_arr {
     int64_t len;
     int64_t cap;
     int64_t esz;
-    brine_elem_fn retain;  /* NULL for plain-data elements */
-    brine_elem_fn release;
-    char *data;
+    BR_P(brine_elem_fn, retain); /* NULL for plain-data elements */
+    BR_P(brine_elem_fn, release);
+    BR_P(char *, data);
 } brine_arr;
 
 /* What a map needs to know about its key and value types (one per map type). */
@@ -48,13 +73,20 @@ __extension__ typedef unsigned __int128 brine_u128;
 #define BR_U128_MAX (~(brine_u128)0)
 #define BR_I128_MAX ((brine_i128)(BR_U128_MAX >> 1))
 #define BR_I128_MIN (-BR_I128_MAX - 1)
+typedef uint64_t (*brine_hash_fn)(const void *k);
+typedef bool (*brine_eq_fn)(const void *a, const void *b);
+typedef void (*brine_fmt_fn)(brine_sb *sb, const void *k);
 typedef struct brine_map_ty {
     int64_t ksz, vsz;
-    uint64_t (*hash)(const void *k);
-    bool (*keq)(const void *a, const void *b);
-    bool (*veq)(const void *a, const void *b); /* NULL: values can't be compared */
-    void (*kfmt)(brine_sb *sb, const void *k);
-    brine_elem_fn kretain, krelease, vretain, vrelease; /* NULL for plain data */
+    BR_P(brine_hash_fn, hash);
+    BR_P(brine_eq_fn, keq);
+    BR_P(brine_eq_fn, veq); /* NULL: values can't be compared */
+    BR_P(brine_fmt_fn, kfmt);
+    /* NULL for plain data */
+    BR_P(brine_elem_fn, kretain);
+    BR_P(brine_elem_fn, krelease);
+    BR_P(brine_elem_fn, vretain);
+    BR_P(brine_elem_fn, vrelease);
 } brine_map_ty;
 
 /* Hash map that remembers insertion order. Entries live in `keys`/`vals`
@@ -65,12 +97,12 @@ typedef struct brine_map {
     int64_t used; /* entry slots used, including removed ones */
     int64_t cap;  /* entry slots allocated */
     int64_t nidx; /* index slots: 0 or a power of two >= 2 * cap */
-    const brine_map_ty *ty;
-    char *keys;
-    char *vals;
-    uint64_t *hashes;
-    bool *live;
-    int64_t *index; /* -1 empty, -2 removed, else an entry number */
+    BR_P(const brine_map_ty *, ty);
+    BR_P(char *, keys);
+    BR_P(char *, vals);
+    BR_P(uint64_t *, hashes);
+    BR_P(bool *, live);
+    BR_P(int64_t *, index); /* -1 empty, -2 removed, else an entry number */
 } brine_map;
 
 /* header shared by every enum box (enums whose variants carry data) */
@@ -80,7 +112,7 @@ typedef struct brine_box {
 } brine_box;
 
 struct brine_sb {
-    char *p;
+    BR_P(char *, p);
     int64_t len, cap;
 };
 
@@ -286,6 +318,8 @@ void brine_eprint_sb(brine_sb *sb);
 /* ------------------------------------------------------------ misc */
 double brine_clock(void);
 brine_arr *brine_args(void);
+/* argv[i] of `main` (NULL past the end), for the test runner */
+const char *brine_arg(int64_t i);
 /* files and processes: false means failure, with the message in the out string */
 bool brine_read_file(brine_str *path, brine_str **out);
 bool brine_write_file(brine_str *path, brine_str *text, brine_str **err);
@@ -524,20 +558,20 @@ typedef void (*brine_leaf_fn)(void *ctx, int64_t leaf, int64_t lo, int64_t hi, v
 /* A parallel construct, as the compiler describes it for the GPU (lower.br,
  * `gpu_emit`). `ptx` is NULL when the body can't run on a GPU. */
 typedef struct brine_kernel {
-    const char *ptx;   /* the program's GPU module: PTX, or MSL on macOS */
-    const char *entry; /* the kernel */
-    const char *where; /* file:line:col, for BRINE_GPU_LOG */
+    BR_P(const char *, ptx);   /* the program's GPU module: PTX, or MSL on macOS */
+    BR_P(const char *, entry); /* the kernel */
+    BR_P(const char *, where); /* file:line:col, for BRINE_GPU_LOG */
     int64_t kind;      /* 0 `par for`, 1 map, 2 reduction */
     int64_t op, vk;    /* reductions: BRINE_RED_*, BRINE_VK_* */
     int64_t ctx_size;
     /* the arrays in the context: [nfields, (offset, flags, node)*, nodes...],
      * a node [element size, n, (offset in an element, node)*], nodes numbered
      * from the first; flags 1: written by the body, 2: not read */
-    const int64_t *ptrs;
-    int64_t cost, cost64; /* estimated instructions per element (f64 ones) */
-    const char *comb;     /* reductions: the combine kernel */
-    void *state;          /* the runtime's */
-    const char *why;      /* why it can't run on a GPU */
+    BR_P(const int64_t *, ptrs);
+    int64_t cost, cost64;       /* estimated instructions per element (f64 ones) */
+    BR_P(const char *, comb);   /* reductions: the combine kernel */
+    BR_P(void *, state);        /* the runtime's */
+    BR_P(const char *, why);    /* why it can't run on a GPU */
 } brine_kernel;
 
 /* Runs fn over [0, n) on the thread pool, or on a GPU when that pays. */

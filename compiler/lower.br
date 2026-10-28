@@ -30,6 +30,8 @@ struct Options:
     tests: bool
     # mark statements with their source lines (`Op.Line`) for debuggers
     debug: bool
+    # compile `par` bodies for a GPU (not on WebAssembly)
+    gpu: bool
 
 struct Temp:
     v: int
@@ -383,17 +385,20 @@ struct Lower:
         self.gen_streq()
         let saved = self.start_main()
         let fb0 = self.cx.fb
+        # the arguments come from the runtime (`brine_arg`), not C's argv, whose
+        # pointers aren't 8 bytes everywhere (WebAssembly)
         let argc = 0
-        let argv = 1
         let done = self.cx.fb.label()
         let not_list = self.cx.fb.label()
         let not_run = self.cx.fb.label()
         let two = self.cx.fb.konst(K.I32, 2)
         let three = self.cx.fb.konst(K.I32, 3)
+        let one64 = self.cx.fb.konst(K.I64, 1)
+        let two64 = self.cx.fb.konst(K.I64, 2)
         # --list
         let ge2 = self.cx.fb.cmp(Op.Ge, argc, two)
         self.cx.fb.brnot(ge2, not_list)
-        let a1 = self.cx.fb.load(K.Ptr, argv, 8)
+        let a1 = self.cx.fb.call(K.Ptr, "brine_arg", [one64])
         let ls = self.cstr("--list")
         let is_list = self.cx.fb.call(K.Bool, "br_streq", [a1, ls])
         self.cx.fb.brnot(is_list, not_list)
@@ -409,11 +414,11 @@ struct Lower:
         # --run k
         let ge3 = self.cx.fb.cmp(Op.Ge, argc, three)
         self.cx.fb.brnot(ge3, not_run)
-        let a1b = self.cx.fb.load(K.Ptr, argv, 8)
+        let a1b = self.cx.fb.call(K.Ptr, "brine_arg", [one64])
         let rs = self.cstr("--run")
         let is_run = self.cx.fb.call(K.Bool, "br_streq", [a1b, rs])
         self.cx.fb.brnot(is_run, not_run)
-        let a2 = self.cx.fb.load(K.Ptr, argv, 16)
+        let a2 = self.cx.fb.call(K.Ptr, "brine_arg", [two64])
         let k = self.cx.fb.call(K.I64, "br_atoi", [a2])
         for i, t in enumerate(tests):
             let iv = self.cx.fb.konst(K.I64, i)
@@ -4086,7 +4091,20 @@ struct Lower:
                 ptx.KReq(fname=f"br_par_{g.id}", entry=f"brk_{g.id}", kind=g.kind, op=g.op, vk=g.vk)
             )
         # Metal source on macOS, PTX elsewhere
-        let code = msl.build(self.funcs, ks) if os.name() == "macos" else ptx.build(self.funcs, ks)
+        var code = ptx.GpuCode(ptx="", ok=[], why=[], cost=[], cost64=[])
+        if not self.opts.gpu:
+            let n = len(ks)
+            code = ptx.GpuCode(
+                ptx="",
+                ok=[false] * n,
+                why=["WebAssembly has no GPU"] * n,
+                cost=[0] * n,
+                cost64=[0] * n
+            )
+        elif os.name() == "macos":
+            code = msl.build(self.funcs, ks)
+        else:
+            code = ptx.build(self.funcs, ks)
         if code.ptx != "":
             var b: [u8] = []
             str_bytes(ref b, code.ptx)

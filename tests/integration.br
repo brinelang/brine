@@ -344,6 +344,74 @@ test "panics are clear":
         assert msg in o.err, f"{f}: expected `{msg}` in:\n{o.err}"
         assert f"--> {f}:" in o.err, f"{f}: no location in:\n{o.err}"
 
+# ------------------------------------------------------------ WebAssembly
+
+# `--target wasm` needs wasi-sdk (and Node.js to run): without them these
+# tests pass without checking anything, unless $BRINE_TEST_WASM is set (CI).
+fn wasm_ready() -> bool:
+    let must = getenv("BRINE_TEST_WASM").is_some()
+    var node = false
+    match os.spawn(["node", "--version"], {}, true, false):
+        case Ok(p):
+            node = os.wait(p) == 0
+        case Err(_):
+            pass
+    assert node or not must, "BRINE_TEST_WASM is set but node doesn't run"
+    if not node:
+        return false
+    let d = scratch("wasm-probe")
+    let o = brine(["build", "--target", "wasm", "examples/hello.br", "-q", "-o", d + "/hello.wasm"])
+    if "E0702" in o.all() and not must:
+        return false
+    assert o.code == 0, o.all()
+    return true
+
+# The same programs, compiled to WebAssembly and run by Node.js's WASI. Not
+# strings.br and os.br: they use files and processes outside the sandbox.
+test "WebAssembly programs give the same results":
+    if not wasm_ready():
+        return
+    let wasm = ["--target", "wasm"]
+    for f in features():
+        if f != "tests/programs/strings.br" and f != "tests/programs/os.br":
+            run_ok(f, expected(f), wasm)
+    run_ok(
+        "examples/parallel.br",
+        "average steps: 131.43, longest: 524\n[0.0, 1.0, 1.4142135623730951, 1.7320508075688772, 2.0, 2.23606797749979, 2.449489742783178, 2.6457513110645907]\n111 118\n",
+        wasm
+    )
+    # one thread, and the same answer as any number of threads
+    let det = brine(["run", "tests/programs/parallel_det.br", "-q"])
+    run_ok("tests/programs/parallel_det.br", det.out, wasm)
+    run_ok(
+        "examples/shapes",
+        "Point(x=3.0, y=4.0) 5.0\n[6.0, 2.25] 8.25\nbig circle 3.14159\nShape.Square(side=2.0) 4.0\ndot\n",
+        wasm
+    )
+    let p = brine(["run", "--target", "wasm", "tests/programs/panic_index.br", "-q"])
+    assert p.code == 101 and "index 7 is out of bounds" in p.err, p.all()
+    let t = brine(["test", "--target", "wasm", "examples/contracts.br"])
+    assert t.code == 0 and "2 passed; 0 failed" in t.all(), t.all()
+    let r = brine(["run", "--target", "wasm", "examples/world.br", "-q", "--ranks", "2"])
+    assert r.code != 0 and "WebAssembly programs run as one rank" in r.err, r.all()
+
+# A web build is a folder a browser opens; its loader also runs in Node.js.
+test "web builds run through their loader":
+    if not wasm_ready():
+        return
+    let d = scratch("web")
+    let b = brine(["build", "--target", "web", "examples/hello.br", "-q", "-o", d + "/site"])
+    assert b.code == 0, b.all()
+    for f in ["index.html", "brine.js", "program.wasm"]:
+        assert file_exists(d + "/site/" + f), f"missing {f}"
+    assert len(os.list_dir(d + "/site").unwrap_or([])) == 3, "extra files in the web folder"
+    write(
+        d + "/load.mjs",
+        "import { readFileSync } from 'node:fs';\n" + "import { pathToFileURL } from 'node:url';\n" + "const dir = process.argv[2];\n" + "const { run } = await import(pathToFileURL(dir + '/brine.js').href);\n" + "let out = '';\n" + "const code = await run(readFileSync(dir + '/program.wasm'), { stdout: (t) => (out += t), stderr: (t) => (out += t) });\n" + "process.stdout.write(out + 'exit ' + code + '\\n');\n"
+    )
+    let o = exec(["node", d + "/load.mjs", d + "/site"], {})
+    assert o.code == 0 and o.out == "Hello, world!\nexit 0\n", o.all()
+
 test "main can return a Result":
     let d = scratch("main")
     write(

@@ -19,6 +19,11 @@ from verify import Report
 const PRELUDE_SRC = embed("../runtime/prelude.br")
 const RT_H = embed("../runtime/brine_rt.h")
 const RT_C = embed("../runtime/brine_rt.c")
+# runs a WebAssembly build under Node.js (`brine run --target wasm`)
+const WASI_NODE = embed("../runtime/brine_wasi.mjs")
+# the browser side of `--target web`
+const WEB_JS = embed("../runtime/brine_web.js")
+const WEB_HTML = embed("../runtime/brine_web.html")
 # The one place the version is set (semantic versioning; see AGENTS.md).
 const VERSION = "0.4.0"
 
@@ -294,6 +299,36 @@ enum Profile:
             case Profile.Debug:
                 return ["-O0", "-g"]
 
+# What a build makes.
+enum Platform:
+    # an executable for this machine
+    Host
+    # a WebAssembly module for WASI (Node.js, wasmtime, ...)
+    Wasm
+    # a folder with a web page that runs the program in a browser
+    Web
+
+    fn name(self) -> str:
+        match self:
+            case Platform.Host:
+                return "host"
+            case Platform.Wasm:
+                return "wasm"
+            case Platform.Web:
+                return "web"
+
+    fn is_wasm(self) -> bool:
+        return self != Platform.Host
+
+fn parse_platform(s: str) -> Option[Platform]:
+    if s == "host" or s == "native":
+        return Some(Platform.Host)
+    if s == "wasm" or s == "wasm32" or s == "wasi":
+        return Some(Platform.Wasm)
+    if s == "web":
+        return Some(Platform.Web)
+    return None
+
 # Does `cmd` start and exit successfully?
 fn runs_ok(cmd: [str]) -> bool:
     match os.spawn(cmd, {}, true, false):
@@ -314,6 +349,30 @@ fn find_cc() -> Option[str]:
         if runs_ok([cand, "--version"]):
             return Some(cand)
     return None
+
+# The clang of a wasi-sdk (https://github.com/WebAssembly/wasi-sdk): it
+# brings the C library for WebAssembly. Found through WASI_SDK_PATH, or in
+# /opt/wasi-sdk.
+fn find_wasi_cc() -> Option[str]:
+    var dirs: [str] = []
+    match getenv("WASI_SDK_PATH"):
+        case Some(v):
+            if v.strip() != "":
+                dirs.push(v.strip())
+        case None:
+            pass
+    dirs.push("/opt/wasi-sdk")
+    for d in dirs:
+        let cc = project.join(project.join(d, "bin"), exe_name("clang"))
+        if file_exists(cc):
+            return Some(cc)
+    return None
+
+fn no_wasi_cc_diag() -> Diag:
+    return diag.error(
+        "E0702",
+        "no WebAssembly C toolchain found"
+    ).note("brine builds WebAssembly with the clang and C library of wasi-sdk").with_help("download wasi-sdk from https://github.com/WebAssembly/wasi-sdk/releases and set WASI_SDK_PATH to its folder")
 
 fn cc_version(cc: str) -> Option[str]:
     match os.spawn([cc, "--version"], {}, true, false):
@@ -361,6 +420,16 @@ fn exe_name(stem: str) -> str:
     if project.is_windows():
         return stem + ".exe"
     return stem
+
+# The file (or, for the web, folder) a build writes.
+fn out_file(stem: str, plat: Platform) -> str:
+    match plat:
+        case Platform.Host:
+            return exe_name(stem)
+        case Platform.Wasm:
+            return stem + ".wasm"
+        case Platform.Web:
+            return stem + "-web"
 
 fn link_libs() -> [str]:
     if project.is_windows():
@@ -466,16 +535,29 @@ fn runtime_object(cc: str, flags: [str], key: str, dir: str) -> Result[(str, str
 
 # Compile generated code to an executable. `dir` is a cache directory for
 # intermediate files. Returns Ok(true) if the C compiler actually ran.
-fn compile(code: Code, out_exe: str, dir: str, profile: Profile) -> Result[bool, Diag]:
+fn compile(code: Code, dest: str, dir: str, profile: Profile, plat: Platform) -> Result[bool, Diag]:
     var cc = ""
-    match find_cc():
-        case Some(x):
-            cc = x
-        case None:
-            return Err(no_cc_diag())
-    make_dirs(dir)?
     var flags = ["-std=c11", "-fno-strict-aliasing", "-w"]
+    var libs = link_libs()
+    if plat.is_wasm():
+        match find_wasi_cc():
+            case Some(x):
+                cc = x
+            case None:
+                return Err(no_wasi_cc_diag())
+        flags.insert(0, "--target=wasm32-wasip1")
+        # brine code recurses like native code does: give it a main thread's stack
+        libs = ["-Wl,-z,stack-size=8388608"]
+    else:
+        match find_cc():
+            case Some(x):
+                cc = x
+            case None:
+                return Err(no_cc_diag())
+    make_dirs(dir)?
     flags.extend(profile.cflags())
+    # the web build is a folder; the module in it is the linker's output
+    let out_exe = project.join(dest, "program.wasm") if plat == Platform.Web else dest
     let key = cc + "|" + " ".join(flags) + "|" + VERSION
     let (rt_dir, rt_obj) = runtime_object(cc, flags, key, dir)?
 
@@ -494,11 +576,16 @@ fn compile(code: Code, out_exe: str, dir: str, profile: Profile) -> Result[bool,
             native = b
             hashes.push(hex16(fnv_bytes(b)))
     let prog_hash = fnv(" ".join(hashes) + rt_obj)
-    let stamp = with_extension(out_exe, "brine-hash")
+    # a web folder is what gets deployed: keep the stamp out of it
+    var stamp = with_extension(out_exe, "brine-hash")
+    if plat == Platform.Web:
+        stamp = project.join(dir, f"web-{hex16(fnv(out_exe))}.brine-hash")
     if file_exists(out_exe):
         match read_file(stamp):
             case Ok(st):
                 if st.strip() == hex16(prog_hash):
+                    if plat == Platform.Web:
+                        web_files(dest)?
                     return Ok(false)
             case Err(_):
                 pass
@@ -566,19 +653,32 @@ fn compile(code: Code, out_exe: str, dir: str, profile: Profile) -> Result[bool,
         case None:
             pass
     var link = [cc]
+    if plat.is_wasm():
+        link.push(flags[0])
     link.extend(objs)
     link.extend([rt_obj, "-o", out_exe])
-    link.extend(link_libs())
+    link.extend(libs)
     match run_cc(link):
         case Ok(_):
             pass
         case Err(e):
             return Err(cc_failed("linking the program failed", e))
     phase_time(t, "link")
+    if plat == Platform.Web:
+        web_files(dest)?
     match write_file(stamp, hex16(prog_hash)):
         case _:
             pass
     return Ok(true)
+
+# The loader is ours and always current; the page is a starting point that
+# a demo replaces, so it's only written when missing.
+fn web_files(dest: str) -> Result[(), Diag]:
+    write_or_diag(project.join(dest, "brine.js"), WEB_JS)?
+    let page = project.join(dest, "index.html")
+    if not file_exists(page):
+        write_or_diag(page, WEB_HTML)?
+    return Ok(())
 
 # Every edit leaves an object behind: past a limit, keep only this build's.
 fn prune(obj_dir: str, keep: [str]):
@@ -600,12 +700,12 @@ fn unit_count(profile: Profile) -> int:
         return 1
     return min(max(os.cpu_count(), 1), 16)
 
-fn lowered(fe: Frontend, tests: bool, debug: bool) -> lower.Lowered:
+fn lowered(fe: Frontend, tests: bool, debug: bool, plat: Platform) -> lower.Lowered:
     return lower.lower(
         fe.prog.unwrap(),
         fe.info.unwrap(),
         fe.sm,
-        lower.Options(tests=tests, debug=debug)
+        lower.Options(tests=tests, debug=debug, gpu=not plat.is_wasm())
     )
 
 # Native code for dev and debug builds where x64.br or a64.br knows the
@@ -633,16 +733,18 @@ fn native_host() -> bool:
 # The folder a profile's executables go in. A build with `BRINE_BACKEND` set
 # gets its own, even when it picks the default backend, so it can't replace a
 # default build's executable while that one runs.
-fn out_name(profile: Profile) -> str:
+fn out_name(profile: Profile, plat: Platform) -> str:
+    if plat.is_wasm():
+        return profile.name() + "-" + plat.name()
     if getenv("BRINE_BACKEND").is_none():
         return profile.name()
     return profile.name() + ("-native" if use_native(profile) else "-c")
 
-fn gen_code(fe: Frontend, profile: Profile, tests: bool) -> Code:
+fn gen_code(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> Code:
     var t = clock()
-    let l = lowered(fe, tests, profile == Profile.Debug)
+    let l = lowered(fe, tests, profile == Profile.Debug, plat)
     t = phase_time(t, "lower")
-    if use_native(profile):
+    if use_native(profile) and not plat.is_wasm():
         let win = os.name() == "windows"
         let arm = os.arch() == "aarch64"
         let src = fe.sm.file(0).path
@@ -664,5 +766,29 @@ fn gen_code(fe: Frontend, profile: Profile, tests: bool) -> Code:
     return Code.C(units)
 
 # The program as one C file (`brine emit-c`).
-fn gen_c(fe: Frontend, profile: Profile, tests: bool) -> str:
-    return ir_c.emit_c(lowered(fe, tests, profile == Profile.Debug))
+fn gen_c(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> str:
+    return ir_c.emit_c(lowered(fe, tests, profile == Profile.Debug, plat))
+
+# The command that runs a WebAssembly build: BRINE_WASM_RUNNER (say
+# `wasmtime run --dir=.`) or Node.js with the runner script, which is written
+# to `dir`.
+fn wasm_command(wasm: str, dir: str) -> Result[[str], str]:
+    match getenv("BRINE_WASM_RUNNER"):
+        case Some(r):
+            if r.strip() != "":
+                var cmd = r.split()
+                cmd.push(wasm)
+                return Ok(cmd)
+        case None:
+            pass
+    if not runs_ok(["node", "--version"]):
+        return Err(
+            "running WebAssembly needs Node.js (https://nodejs.org) or a WASI runtime in BRINE_WASM_RUNNER (say `wasmtime run --dir=.`)"
+        )
+    match os.make_dir(dir):
+        case _:
+            pass
+    let js = project.join(dir, "brine-wasi-" + hex16(fnv(WASI_NODE)) + ".mjs")
+    if not file_exists(js):
+        write_file(js, WASI_NODE)?
+    return Ok(["node", "--no-warnings", js, wasm])

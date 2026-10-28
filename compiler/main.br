@@ -10,7 +10,7 @@ import lexer
 import parser
 import astdump
 import driver
-from driver import FrontOpts, Frontend, Profile, display_path, VERSION
+from driver import FrontOpts, Frontend, Profile, Platform, display_path, VERSION
 import verify
 import project
 import fmt
@@ -20,7 +20,7 @@ const GUIDE = embed("../docs/QUICKREF.md")
 
 fn help_text() -> str:
     return "\n".join(
-        ["brine — a verified, natively parallel systems language", "", "Usage: brine <command> [options]", "", "Project:", "  new <name>            Create a new project in ./<name>", "  init                  Create a project in the current directory", "", "Build and run:", "  run [file] [-- args]  Build and run (default: the current project)", "      --release           optimize more", "      --threads <n>       worker threads for `par` (default: all cores)", "      --ranks <n>         run <n> cooperating processes (the `world` module)", "  build [file]          Build a native executable", "      --release | --debug   optimization profile (default: dev)", "      -o <path>             output path", "      --emit-c              also write the generated C next to the output", "  check [file]          Type-check and verify without building (fastest)", "      --report              list every runtime check the prover could not remove", "  test [file] [filter]  Run `test \"...\":` blocks in parallel", "  debug [file] [-- args]  Debug build, then launch gdb or lldb", "", "Tools:", "  fmt [files] [--check] Format source files (default: the whole project)", "  explain <code>        Explain an error code, e.g. `brine explain E0601`", "  guide                 Print the language quick reference", "  doctor                Check that your toolchain works", "  version               Print the version", "", "Global options:", "  --json                Machine-readable output (one JSON object per line)", "  --color <when>        auto | always | never", "  -q, --quiet           Only print errors", ""]
+        ["brine — a verified, natively parallel systems language", "", "Usage: brine <command> [options]", "", "Project:", "  new <name>            Create a new project in ./<name>", "  init                  Create a project in the current directory", "", "Build and run:", "  run [file] [-- args]  Build and run (default: the current project)", "      --release           optimize more", "      --threads <n>       worker threads for `par` (default: all cores)", "      --ranks <n>         run <n> cooperating processes (the `world` module)", "      --target wasm       build WebAssembly and run it with Node.js", "  build [file]          Build a native executable", "      --release | --debug   optimization profile (default: dev)", "      -o <path>             output path", "      --emit-c              also write the generated C next to the output", "      --target <t>          host (default), wasm (a .wasm module) or web (a page)", "  check [file]          Type-check and verify without building (fastest)", "      --report              list every runtime check the prover could not remove", "  test [file] [filter]  Run `test \"...\":` blocks in parallel (also --target wasm)", "  debug [file] [-- args]  Debug build, then launch gdb or lldb", "", "Tools:", "  fmt [files] [--check] Format source files (default: the whole project)", "  explain <code>        Explain an error code, e.g. `brine explain E0601`", "  guide                 Print the language quick reference", "  doctor                Check that your toolchain works", "  version               Print the version", "", "Global options:", "  --json                Machine-readable output (one JSON object per line)", "  --color <when>        auto | always | never", "  -q, --quiet           Only print errors", ""]
     )
 
 # Print text that already ends with a newline (`print` adds one).
@@ -121,7 +121,7 @@ struct Args:
         return Ok(())
 
 fn parse_args(raw: [str]) -> Result[Args, str]:
-    let value_flags = ["--ranks", "--threads", "-o", "--color"]
+    let value_flags = ["--ranks", "--threads", "-o", "--color", "--target"]
     var a = Args(pos=[], flags=[], rest=[])
     var i = 0
     while i < len(raw):
@@ -264,16 +264,16 @@ struct Target:
             case None:
                 return project.join(os.temp_dir(), "brine-cache")
 
-    fn out_dir(self, p: Profile) -> str:
+    fn out_dir(self, p: Profile, plat: Platform) -> str:
         match self.root:
             case Some(r):
-                return project.join(project.join(r, "target"), driver.out_name(p))
+                return project.join(project.join(r, "target"), driver.out_name(p, plat))
             case None:
                 let abs = os.abs_path(self.entry).unwrap_or(self.entry)
                 let base = project.join(os.temp_dir(), "brine-cache")
                 return project.join(
                     project.join(base, driver.hex16(driver.fnv(abs))),
-                    driver.out_name(p)
+                    driver.out_name(p, plat)
                 )
 
 fn resolve(file: Option[str]) -> Result[Target, str]:
@@ -339,6 +339,18 @@ fn profile_of(a: Args) -> Profile:
         return Profile.Debug
     return Profile.Dev
 
+# `--target host|wasm|web` (default: host).
+fn platform_of(a: Args) -> Result[Platform, str]:
+    match a.val("--target"):
+        case Some(v):
+            match driver.parse_platform(v):
+                case Some(p):
+                    return Ok(p)
+                case None:
+                    return Err(f"unknown target `{v}` (use host, wasm or web)")
+        case None:
+            return Ok(Platform.Host)
+
 fn first_pos(a: Args) -> Option[str]:
     return Some(a.pos[0]) if len(a.pos) > 0 else None
 
@@ -348,21 +360,22 @@ fn build(
     profile: Profile,
     tests: bool,
     out: Option[str],
-    emit_c: bool
+    emit_c: bool,
+    plat: Platform
 ) -> Result[Option[str], str]:
     let t0 = clock()
     let fe = driver.frontend(t.entry, FrontOpts(verify=true, need_main=not tests, typed=t.typed))
     g.diags(fe)
     if fe.has_errors():
         return Ok(None)
-    let code = driver.gen_code(fe, profile, tests)
+    let code = driver.gen_code(fe, profile, tests, plat)
     let stem = t.name + "-tests" if tests else t.name
     var exe = ""
     match out:
         case Some(o):
             exe = o
         case None:
-            exe = project.join(t.out_dir(profile), driver.exe_name(stem))
+            exe = project.join(t.out_dir(profile, plat), driver.out_file(stem, plat))
     if emit_c:
         let cp = driver.with_extension(exe, "c")
         match project.parent(cp):
@@ -373,9 +386,9 @@ fn build(
                             pass
             case None:
                 pass
-        write_file(cp, driver.gen_c(fe, profile, tests))?
+        write_file(cp, driver.gen_c(fe, profile, tests, plat))?
         g.status("Wrote", display_path(cp))
-    match driver.compile(code, exe, t.cache_dir(), profile):
+    match driver.compile(code, exe, t.cache_dir(), profile, plat):
         case Ok(ran):
             if ran or not tests:
                 var what = t.name
@@ -388,7 +401,8 @@ fn build(
                         case None:
                             pass
                 let verb = "Built" if ran else "Fresh"
-                g.status(verb, f"{what} [{profile.name()}] in {clock() - t0:.2f}s")
+                let kind = profile.name() if plat == Platform.Host else f"{profile.name()}, {plat.name()}"
+                g.status(verb, f"{what} [{kind}] in {clock() - t0:.2f}s")
             return Ok(Some(exe))
         case Err(d):
             g.diag_list([d], fe.sm)
@@ -433,26 +447,32 @@ fn cmd_init(g: G, a: Args) -> Result[int, str]:
     return Ok(0)
 
 fn cmd_build(g: G, a: Args) -> Result[int, str]:
-    a.check_flags(["--release", "--debug", "-o", "--emit-c", "--typed"])?
+    a.check_flags(["--release", "--debug", "-o", "--emit-c", "--typed", "--target"])?
+    let plat = platform_of(a)?
     let t = resolve(first_pos(a))?.typed_if(a)
     var out: Option[str] = None
     match a.val("-o"):
         case Some(o):
             var p = o
             let n = project.file_name(p).unwrap_or("")
-            if driver.file_stem(p) == n and project.is_windows():
+            if driver.file_stem(p) == n and project.is_windows() and plat == Platform.Host:
                 p = p + ".exe"
             out = Some(p)
         case None:
             # single files build next to where you are, like a C compiler would
             if t.root.is_none():
-                out = Some(driver.exe_name(t.name))
-    match build(g, t, profile_of(a), false, out, a.has("--emit-c"))?:
+                out = Some(driver.out_file(t.name, plat))
+    match build(g, t, profile_of(a), false, out, a.has("--emit-c"), plat)?:
         case Some(exe):
             if g.json:
                 print("{\"built\":" + json_str(display_path(exe)) + "}")
             else:
                 g.status("Output", display_path(exe))
+                if plat == Platform.Web and not g.quiet:
+                    let d = display_path(exe)
+                    eprint(
+                        f"\nOpen its index.html over HTTP, e.g. `python3 -m http.server -d {d}` and http://localhost:8000"
+                    )
             return Ok(0)
         case None:
             return Ok(1)
@@ -466,15 +486,16 @@ fn spawn_env(threads: Option[str]) -> {str: str}:
             pass
     return env
 
-fn run_exe(exe: str, argv: [str], threads: Option[str], ranks: int) -> Result[int, str]:
-    var cmd = [exe]
+# `launch` is the program (or the WebAssembly runner and the module).
+fn run_exe(launch: [str], argv: [str], threads: Option[str], ranks: int) -> Result[int, str]:
+    var cmd = launch
     cmd.extend(argv)
     if ranks <= 1:
         match os.spawn(cmd, spawn_env(threads), false, true):
             case Ok(p):
                 return Ok(os.wait(p))
             case Err(e):
-                return Err("could not start " + exe + ": " + e)
+                return Err("could not start " + launch[0] + ": " + e)
     var ports: [int] = []
     match os.free_ports(ranks):
         case Ok(ps):
@@ -526,7 +547,12 @@ fn run_exe(exe: str, argv: [str], threads: Option[str], ranks: int) -> Result[in
     return Ok(0)
 
 fn cmd_run(g: G, a: Args) -> Result[int, str]:
-    a.check_flags(["--release", "--debug", "--threads", "--ranks", "--typed"])?
+    a.check_flags(["--release", "--debug", "--threads", "--ranks", "--typed", "--target"])?
+    let plat = platform_of(a)?
+    if plat == Platform.Web:
+        return Err(
+            "a web build runs in a browser: build it with `brine build --target web` and open its index.html"
+        )
     let t = resolve(first_pos(a))?.typed_if(a)
     var ranks = 1
     match a.val("--ranks"):
@@ -550,12 +576,17 @@ fn cmd_run(g: G, a: Args) -> Result[int, str]:
                     return Err("`--threads` must be a positive number")
         case None:
             pass
+    if ranks > 1 and plat.is_wasm():
+        return Err("`--ranks` needs native processes; WebAssembly programs run as one rank")
     var exe = ""
-    match build(g, t, profile_of(a), false, None, false)?:
+    match build(g, t, profile_of(a), false, None, false, plat)?:
         case Some(x):
             exe = x
         case None:
             return Ok(1)
+    var launch = [exe]
+    if plat.is_wasm():
+        launch = driver.wasm_command(exe, t.cache_dir())?
     var argv = a.pos[1:] if len(a.pos) > 0 else []
     argv.extend(a.rest)
     if not g.quiet and not g.json:
@@ -563,7 +594,7 @@ fn cmd_run(g: G, a: Args) -> Result[int, str]:
         let extra = f" ({ranks} ranks)" if ranks > 1 else ""
         let verb = "Running"
         eprint(f"{c.bold()}{c.green()}{verb:>10}{c.reset()} {display_path(exe)}{extra}")
-    return run_exe(exe, argv, a.val("--threads"), ranks)
+    return run_exe(launch, argv, a.val("--threads"), ranks)
 
 # A plain unsigned decimal number (no sign, no spaces).
 fn parse_int(s: str) -> Option[int]:
@@ -589,7 +620,7 @@ fn cmd_debug(g: G, a: Args) -> Result[int, str]:
     a.check_flags([])?
     let t = resolve(first_pos(a))?
     var exe = ""
-    match build(g, t, Profile.Debug, false, None, false)?:
+    match build(g, t, Profile.Debug, false, None, false, Platform.Host)?:
         case Some(x):
             exe = x
         case None:
@@ -678,7 +709,10 @@ struct TestResult:
     secs: float
 
 fn cmd_test(g: G, a: Args) -> Result[int, str]:
-    a.check_flags(["--release", "--typed"])?
+    a.check_flags(["--release", "--typed", "--target"])?
+    let plat = platform_of(a)?
+    if plat == Platform.Web:
+        return Err("tests run with `--target wasm` (Node.js), not in a browser")
     # `brine test foo.br [filter]` or `brine test [filter]` inside a project
     var file: Option[str] = None
     var filter: Option[str] = None
@@ -693,13 +727,18 @@ fn cmd_test(g: G, a: Args) -> Result[int, str]:
     let t = resolve(file)?.typed_if(a)
     let profile = Profile.Release if a.has("--release") else Profile.Dev
     var exe = ""
-    match build(g, t, profile, true, None, false)?:
+    match build(g, t, profile, true, None, false, plat)?:
         case Some(x):
             exe = x
         case None:
             return Ok(1)
+    var launch = [exe]
+    if plat.is_wasm():
+        launch = driver.wasm_command(exe, t.cache_dir())?
     var lp = 0
-    match os.spawn([exe, "--list"], {}, true, false):
+    var list_cmd = launch
+    list_cmd.push("--list")
+    match os.spawn(list_cmd, {}, true, false):
         case Ok(p):
             lp = p
         case Err(e):
@@ -735,7 +774,9 @@ fn cmd_test(g: G, a: Args) -> Result[int, str]:
             let (idx, name) = tests[k]
             let start = clock()
             # each test runs in its own process with one worker thread pool
-            match os.spawn([exe, "--run", idx], {"BRINE_THREADS": "2", "BRINE": me}, true, false):
+            var cmd = launch
+            cmd.extend(["--run", idx])
+            match os.spawn(cmd, {"BRINE_THREADS": "2", "BRINE": me}, true, false):
                 case Ok(p):
                     running.push(Running(k=k, name=name, handle=p, start=start))
                 case Err(e):
@@ -897,7 +938,8 @@ fn cmd_doctor(g: G) -> Result[int, str]:
             Profile.Dev,
             false,
             Some(project.join(dir, driver.exe_name("doctor"))),
-            false
+            false,
+            Platform.Host
         ):
             case Ok(Some(exe)):
                 built = Some(exe)
@@ -923,11 +965,18 @@ fn cmd_doctor(g: G) -> Result[int, str]:
                     "could not build a test program (see errors above)"
                 ) and ok
     let dbg = find_debugger()
+    let wasi = driver.find_wasi_cc()
     if not g.json:
         let mark = f"{c.green()}✓{c.reset()}" if dbg.is_some() else f"{c.yellow()}-{c.reset()}"
         let what = "debugger"
         let detail = dbg.unwrap_or("none (optional, for `brine debug`)")
         print(f"  {mark} {what:<16} {detail}")
+        let wmark = f"{c.green()}✓{c.reset()}" if wasi.is_some() else f"{c.yellow()}-{c.reset()}"
+        let wwhat = "WebAssembly"
+        let wdetail = wasi.unwrap_or(
+            "no wasi-sdk (optional, for `--target wasm`; set WASI_SDK_PATH)"
+        )
+        print(f"  {wmark} {wwhat:<16} {wdetail}")
     return Ok(0 if ok else 1)
 
 # `brine lex [--comments] <file>` (hidden): one line per token, then one per error.
@@ -979,7 +1028,7 @@ fn cmd_emit_c(g: G, a: Args) -> Result[int, str]:
     g.diags(fe)
     if fe.has_errors():
         return Ok(1)
-    let c = driver.gen_c(fe, profile_of(a), tests)
+    let c = driver.gen_c(fe, profile_of(a), tests, platform_of(a)?)
     match a.val("-o"):
         case Some(out):
             write_file(out, c)?

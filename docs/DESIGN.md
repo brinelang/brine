@@ -381,6 +381,12 @@ prebuilt runtime, so builds don't need a C toolchain at all; SIMD, MSVC support 
 the C backend. GPUs (§2.3): arrays kept on the device between constructs, `par(...)`
 forks and nested constructs.
 
+**WebAssembly:** `--target wasm` and `web` compile the generated C with wasi-sdk
+(wasm32-wasip1); the runtime keeps its 64-bit memory layout, with pointers in
+8-byte slots. Next: threads (wasi-threads, Web Workers), so `par` runs in parallel
+there too; files in the browser; and a playground page running the compiler
+itself, which already builds for WebAssembly.
+
 **TODO: AMD and Intel GPUs**, once there is hardware to test on: Vulkan compute
 with SPIR-V kernels (the driver loaded at run time, as CUDA is), exactly rounded
 `/` and `sqrt` in the kernels, a capability check for denormals and f64, and a
