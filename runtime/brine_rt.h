@@ -265,6 +265,68 @@ static inline void brine_str_reset(brine_str **ps, brine_str *lit) {
     brine_str_release(a);
     *ps = lit;
 }
+/* A loop whose only use of string variable s is `s += t[i]` (or a one-byte
+   literal) appends through an appender: the length and the first 8 bytes
+   stay in the appender, which the C compiler keeps in registers, instead of
+   going through s's block on every byte. Nothing reads s during the loop;
+   brine_app_close writes the length back when it ends. While s is unshared,
+   bytes go straight into its block (the first word, `w0`, at the end), up
+   to `room`, and `lim` is the end of the bytes `w0` takes; when s is shared,
+   room is -1 and the first byte makes it a block of its own. */
+typedef struct {
+    char *data;
+    int64_t len, room, lim;
+    uint64_t w0;
+} brine_app;
+typedef struct {
+    brine_str *s;
+    int64_t len, room, lim;
+    uint64_t w0;
+} brine_app_st;
+brine_app_st brine_app_more(brine_str *a, int64_t n, int64_t room, uint64_t w0, uint8_t c);
+static inline void brine_app_open(brine_str **ps, void *ap) {
+    brine_app *p = (brine_app *)ap;
+    brine_str *a = *ps;
+    int64_t n = a->len;
+    int64_t room = __atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 ? brine_str_room(n) : -1;
+    p->data = a->data;
+    p->len = n;
+    p->room = room;
+    p->lim = room < 8 ? room : 8;
+    p->w0 = brine_ld8(a->data) & brine_lowmask((uint64_t)n);
+}
+static inline void brine_app_byte(brine_str **ps, void *ap, uint8_t c) {
+    brine_app *p = (brine_app *)ap;
+    int64_t n = p->len;
+    if (BR_LIKELY(n < p->lim)) {
+        p->w0 |= (uint64_t)c << (8 * n);
+        p->len = n + 1;
+        return;
+    }
+    if (BR_LIKELY(n > 8 && n < p->room)) {
+        p->data[n] = (char)c;
+        p->len = n + 1;
+        return;
+    }
+    /* by value, so the appender's address doesn't escape */
+    brine_app_st x = brine_app_more(*ps, n, p->room, p->w0, c);
+    *ps = x.s;
+    p->data = x.s->data;
+    p->len = x.len;
+    p->room = x.room;
+    p->lim = x.lim;
+    p->w0 = x.w0;
+}
+static inline void brine_app_close(brine_str **ps, void *ap) {
+    brine_app *p = (brine_app *)ap;
+    brine_str *a = *ps;
+    int64_t n = p->len;
+    if (a->len == n) return; /* nothing appended */
+    a->len = n;
+    /* the bytes past n in w0 are 0: the NUL */
+    if (n <= 8) brine_st8(p->data, p->w0);
+    if (n >= 8) p->data[n] = 0;
+}
 bool brine_str_eq_long(brine_str *a, brine_str *b);
 static inline bool brine_str_eq(brine_str *a, brine_str *b) {
     if (a == b) return true;

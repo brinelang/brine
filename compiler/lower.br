@@ -144,6 +144,9 @@ struct FnCx:
     # loop-body `var s = "..."` variables whose string block `reset_strs`
     # keeps from one iteration to the next
     reset: {int: bool}
+    # string variables a loop appends bytes to through an appender
+    # (`open_apps`): the appender's address
+    apps: {int: int}
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -191,7 +194,8 @@ fn new_cx(f: Func) -> FnCx:
         hit_map=-1,
         hit_key=-1,
         hit_e=-1,
-        reset={}
+        reset={},
+        apps={}
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -2084,6 +2088,15 @@ struct Lower:
         self.pop_scope()
 
     fn stmt(ref self, s: Stmt):
+        let ids = self.open_apps(s)
+        self.stmt_in(s)
+        for id in ids:
+            if not self.cx.fb.ends():
+                let home = self.local_ptr(id)
+                self.cx.fb.rt_void("brine_app_close", [home, self.cx.apps[id]])
+            self.cx.apps.remove(id)
+
+    fn stmt_in(ref self, s: Stmt):
         if self.opts.debug:
             let file = self.sm.file(s.span.file)
             let (l, _) = file.line_col(s.span.lo)
@@ -2467,6 +2480,53 @@ struct Lower:
     fn unreset(ref self, ids: [int]):
         for id in ids:
             self.cx.reset.remove(id)
+
+    # A loop that uses a string variable only to append bytes to it
+    # (`s += t[i]`, `s += "c"`) appends through an appender (brine_app_* in
+    # the runtime): its length and first word stay in locals the C compiler
+    # keeps in registers, and go back to the variable when the loop ends.
+    # Nothing can read the variable before then: not the loop, which doesn't
+    # mention it otherwise, nor anything else, as it is a local with no
+    # alias. Not in the copies of a twin loop, whose second copy is entered
+    # midway (one opened around the whole loop serves both). Returns the
+    # variables, for the closes after the loop.
+    fn open_apps(ref self, s: Stmt) -> [int]:
+        var ids: [int] = []
+        if self.opts.debug or self.cx.lifted or len(self.cx.jx.act) > 0 or self.cx.twin != 0:
+            return ids
+        match s.kind:
+            case StmtKind.While(_, _, _):
+                pass
+            case StmtKind.For(_, _, _, _, _, _, is_par):
+                if is_par:
+                    return ids
+            case _:
+                return ids
+        var u = AppUse(seen={}, good={}, decl={}, in_par=0)
+        u.stmt(s)
+        for id in u.good:
+            if u.good[id] != u.seen.get(id).unwrap_or(0) or id in u.decl or id in self.cx.apps:
+                continue
+            let lc = self.flocals[id]
+            if lc.kind != LocalKind.Var or lc.ty != Ty.Str:
+                continue
+            if id in self.cx.lptr or id not in self.cx.lslot:
+                continue
+            let ap = self.cx.fb.temp_mem(40, 8)
+            let home = self.local_ptr(id)
+            self.cx.fb.rt_void("brine_app_open", [home, ap])
+            self.cx.apps[id] = ap
+            ids.push(id)
+        return ids
+
+    # The appender of the string variable `t`, if a loop appends to it
+    # through one.
+    fn app_of(self, t: Expr) -> Option[int]:
+        match local_of(t):
+            case Some(l):
+                return self.cx.apps.get(l)
+            case None:
+                return None
 
     # ============================================================ range versioning
     # A loop ranges.br found free of overflow while its inputs are within a
@@ -3160,7 +3220,11 @@ struct Lower:
                     let c = self.str_byte(value)
                     if c >= 0:
                         let lp = self.lvalue(target)
-                        self.cx.fb.rt_void("brine_str_add_byte", [lp, c])
+                        match self.app_of(target):
+                            case Some(ap):
+                                self.cx.fb.rt_void("brine_app_byte", [lp, ap, c])
+                            case None:
+                                self.cx.fb.rt_void("brine_str_add_byte", [lp, c])
                         return
                 let v = self.expr(value)
                 let lp = self.lvalue(target)
@@ -5741,6 +5805,84 @@ struct IndexUse:
                 self.target(base)
             case _:
                 pass
+
+# How a loop uses its variables, for `open_apps`: `seen` counts the mentions,
+# `good` those that append a byte to a string (`s += t[i]`, `s += "c"`), not in
+# a `par` body. `decl`: declared in the loop.
+struct AppUse:
+    seen: {int: int}
+    good: {int: int}
+    decl: {int: bool}
+    in_par: int
+
+    fn expr(ref self, e: Expr):
+        match local_of(e):
+            case Some(l):
+                self.seen[l] = self.seen.get(l).unwrap_or(0) + 1
+            case None:
+                pass
+        for c in children(e):
+            self.expr(c)
+
+    fn stmt(ref self, s: Stmt):
+        var lifted = false
+        match s.kind:
+            case StmtKind.Assign(t, op, v):
+                match op:
+                    case Some(o):
+                        if o == BinOp.Add and self.in_par == 0 and is_byte(v):
+                            match local_of(t):
+                                case Some(l):
+                                    self.good[l] = self.good.get(l).unwrap_or(0) + 1
+                                case None:
+                                    pass
+                    case None:
+                        pass
+            case StmtKind.Let(_, _, _, _, _):
+                for l in s.locals:
+                    self.decl[l] = true
+            case StmtKind.For(_, _, _, _, _, _, is_par):
+                self.decl[s.local] = true
+                lifted = is_par
+            case StmtKind.Match(_, cases):
+                for c in cases:
+                    self.pat(c.pat)
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            self.expr(e)
+        if lifted:
+            self.in_par += 1
+        for b in stmt_blocks(s):
+            for x in b.stmts:
+                self.stmt(x)
+        if lifted:
+            self.in_par -= 1
+
+    fn pat(ref self, p: Pattern):
+        match p.kind:
+            case PatKind.Bind(_):
+                self.decl[p.local] = true
+            case PatKind.Tuple(ps):
+                for q in ps:
+                    self.pat(q)
+            case PatKind.Or(ps):
+                for q in ps:
+                    self.pat(q)
+            case _:
+                pass
+        for q in p.fields:
+            self.pat(q)
+
+# `v` is a byte to append to a string (`str_byte`)
+fn is_byte(v: Expr) -> bool:
+    match v.kind:
+        case ExprKind.Str(s):
+            return len(s) == 1
+        case ExprKind.Index(base, _):
+            return base.ty == Ty.Str
+        case _:
+            return false
 
 fn dbase(name: str, k: K) -> DType:
     return DType(tag=DT_BASE, name=name, size=k.size(), k=k, to=-1, fields=[])

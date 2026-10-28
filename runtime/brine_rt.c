@@ -612,6 +612,34 @@ void brine_str_add_byte_slow(brine_str **ps, uint8_t c) {
     brine_str_release(a);
     *ps = s;
 }
+/* brine_app_byte past the appender's fast paths: the 9th byte, a shared
+   string, or a full block */
+brine_app_st brine_app_more(brine_str *a, int64_t n, int64_t room, uint64_t w0, uint8_t c) {
+    brine_app_st x;
+    if (n == 8 && n < room) {
+        brine_st8(a->data, w0);
+        a->data[8] = (char)c;
+        x.s = a;
+        x.len = 9;
+        x.room = room;
+        x.lim = 0;
+        x.w0 = 0;
+        return x;
+    }
+    if (room >= 0) { /* unshared: write the appender back first */
+        if (n <= 8) brine_st8(a->data, w0);
+        a->len = n;
+        a->data[n] = 0;
+    }
+    brine_str_add_byte_slow(&a, c);
+    n++;
+    x.s = a;
+    x.len = n;
+    x.room = brine_str_room(n);
+    x.lim = n < 8 && x.room >= 8 ? 8 : 0;
+    x.w0 = brine_ld8(a->data) & brine_lowmask((uint64_t)n);
+    return x;
+}
 bool brine_str_eq_long(brine_str *a, brine_str *b) { return memcmp(a->data, b->data, (size_t)a->len) == 0; }
 bool brine_str_contains(brine_str *s, brine_str *sub) {
     if (sub->len == 0) return true;
@@ -5945,6 +5973,9 @@ brine_str *brine_x_str_byte(brine_str *s, int64_t i) { return brine_str_byte(s, 
 void brine_x_str_add(brine_str **ps, brine_str *b) { brine_str_add(ps, b); }
 void brine_x_str_add_byte(brine_str **ps, uint8_t c) { brine_str_add_byte(ps, c); }
 void brine_x_str_reset(brine_str **ps, brine_str *lit) { brine_str_reset(ps, lit); }
+void brine_x_app_open(brine_str **ps, void *ap) { brine_app_open(ps, ap); }
+void brine_x_app_byte(brine_str **ps, void *ap, uint8_t c) { brine_app_byte(ps, ap, c); }
+void brine_x_app_close(brine_str **ps, void *ap) { brine_app_close(ps, ap); }
 bool brine_x_str_eq(brine_str *a, brine_str *b) { return brine_str_eq(a, b); }
 uint64_t brine_x_hash_str(brine_str *s) { return brine_hash_str(s); }
 bool brine_x_map_has(brine_map *m, const void *k) { return brine_map_has(m, k); }
