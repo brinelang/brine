@@ -405,7 +405,8 @@ par for i in 0..n:                            # parallel loop
 let (a, b) = par(work(1), work(2))            # fork-join
 ```
 Rules: inside a `par` body, outer variables are read-only, except that
-`par for i` may write `arr[i]` (exactly the loop variable) of an outer array.
+`par for i in lo..hi` (over a range) may write `arr[i]` (exactly the loop
+variable) of an outer array.
 Reductions are deterministic: same result bits on any machine and thread count.
 They fold leaves of 16 consecutive elements left to right, then combine the leaves
 in a balanced pairwise tree (so `par sum` of floats can differ in the last bits from
