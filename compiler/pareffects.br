@@ -1,0 +1,188 @@
+# Effects inside `par` through function calls.
+#
+# The checker rejects `write_file`, `input`, `os.spawn`, ... written directly
+# in a `par` body: their effects would happen in a different order on each
+# run. This pass rejects calling a function that reaches one of them.
+from diag import Span, Diag
+import diag
+from types import CallRes, Builtin, OsOp
+from ast import Expr, ExprKind, Stmt, StmtKind, Block, Program, children, stmt_exprs, stmt_blocks
+from info import ProgramInfo
+
+# What a function does that can't run inside `par`: the call it makes, and the
+# function it goes through (empty when it makes the call itself).
+struct Effect:
+    what: str
+    via: str
+
+# The name of a call, as written.
+fn call_name(e: Expr) -> str:
+    match e.kind:
+        case ExprKind.MethodCall(recv, name, _, _):
+            match recv.kind:
+                case ExprKind.Ident(r):
+                    return r + "." + name
+                case _:
+                    return name
+        case ExprKind.Call(callee, _):
+            match callee.kind:
+                case ExprKind.Ident(n):
+                    return n
+                case _:
+                    return "?"
+        case _:
+            return "?"
+
+# Is `e` itself a call that can't run inside `par`?
+fn direct(e: Expr) -> bool:
+    match e.cres:
+        case CallRes.Builtin(b):
+            match b:
+                case Builtin.WriteFile | Builtin.AppendFile | Builtin.Run | Builtin.Input | Builtin.ReadStdin:
+                    return true
+                case _:
+                    return false
+        case CallRes.Os(op):
+            return op.has_effects()
+        case _:
+            return false
+
+fn callee(e: Expr) -> Option[int]:
+    match e.cres:
+        case CallRes.Fn(id):
+            return Some(id)
+        case CallRes.Method(id):
+            return Some(id)
+        case _:
+            return None
+
+# The first direct effect in `b`, and every function it calls.
+fn scan_block(b: Block, ref first: Option[str], ref calls: [int]):
+    for s in b.stmts:
+        for e in stmt_exprs(s):
+            scan_expr(e, ref first, ref calls)
+        for sb in stmt_blocks(s):
+            scan_block(sb, ref first, ref calls)
+
+fn scan_expr(e: Expr, ref first: Option[str], ref calls: [int]):
+    if first.is_none() and direct(e):
+        first = Some(call_name(e))
+    match callee(e):
+        case Some(id):
+            calls.push(id)
+        case None:
+            pass
+    for c in children(e):
+        scan_expr(c, ref first, ref calls)
+
+struct Walker:
+    info: ProgramInfo
+    effects: [Option[Effect]]
+    diags: [Diag]
+
+    fn block(ref self, b: Block, in_par: bool):
+        for s in b.stmts:
+            self.stmt(s, in_par)
+
+    fn stmt(ref self, s: Stmt, in_par: bool):
+        match s.kind:
+            case StmtKind.For(_, _, _, iter, invs, body, is_par):
+                self.expr(iter, in_par)
+                for x in invs:
+                    self.expr(x, in_par)
+                self.block(body, in_par or is_par)
+            case _:
+                for e in stmt_exprs(s):
+                    self.expr(e, in_par)
+                for sb in stmt_blocks(s):
+                    self.block(sb, in_par)
+
+    fn expr(ref self, e: Expr, in_par: bool):
+        if in_par:
+            match callee(e):
+                case Some(id):
+                    self.report(e, id)
+                case None:
+                    pass
+        match e.kind:
+            case ExprKind.Comp(c):
+                # the iterable is evaluated before the parallel part starts
+                self.expr(c.iter, in_par)
+                self.expr(c.body, in_par or c.par)
+                match c.filter:
+                    case Some(f):
+                        self.expr(f, in_par or c.par)
+                    case None:
+                        pass
+            case ExprKind.ParTuple(es):
+                for x in es:
+                    self.expr(x, true)
+            case _:
+                for c in children(e):
+                    self.expr(c, in_par)
+
+    fn report(ref self, e: Expr, id: int):
+        match self.effects[id]:
+            case Some(ef):
+                let name = self.info.fns[id].name
+                var d = (
+                    diag.error(
+                        "E0503",
+                        f"can't call `{name}` inside a `par` body: it calls `{ef.what}`"
+                    )
+                    .label(e.span, "not allowed here")
+                    .with_help(
+                        "its effects would happen in an unpredictable order; do it before or after the `par`"
+                    )
+                )
+                if ef.via != "":
+                    d = d.note(f"`{name}` calls `{ef.what}` through `{ef.via}`")
+                self.diags.push(d)
+            case None:
+                pass
+
+fn check(prog: Program, info: ProgramInfo) -> [Diag]:
+    let n = len(info.fns)
+    var effects: [Option[Effect]] = [None] * n
+    var calls: [[int]] = [[]] * n
+    var any = false
+    for m in prog.modules:
+        for f in m.fns:
+            if f.is_extern:
+                continue
+            var first: Option[str] = None
+            var cs: [int] = []
+            scan_block(f.body, ref first, ref cs)
+            match first:
+                case Some(w):
+                    effects[f.id] = Some(Effect(what=w, via=""))
+                    any = true
+                case None:
+                    pass
+            calls[f.id] = cs
+    if not any:
+        return []
+    # spread to callers until nothing changes
+    var changed = true
+    while changed:
+        changed = false
+        for id in 0..n:
+            if effects[id].is_some():
+                continue
+            for c in calls[id]:
+                match effects[c]:
+                    case Some(ef):
+                        let via = info.fns[c].name if ef.via == "" else ef.via
+                        effects[id] = Some(Effect(what=ef.what, via=via))
+                        changed = true
+                        break
+                    case None:
+                        pass
+    var w = Walker(info=info, effects=effects, diags=[])
+    for m in prog.modules:
+        for f in m.fns:
+            if not f.is_extern:
+                w.block(f.body, false)
+        for t in m.tests:
+            w.block(t.body, false)
+    return w.diags

@@ -450,7 +450,8 @@ getenv("HOME")                          # Option[str]
 run(["cc", "-O2", "-o", "app", "app.c"])  # Result[int, str]: Ok(exit code), Err if it can't start
 ```
 `write_file`, `append_file`, `run`, `input` and `read_stdin` can't be used inside
-`par` (their effects would happen in an unpredictable order).
+`par` (their effects would happen in an unpredictable order), nor can a function
+that calls one of them, directly or through other functions.
 
 The `os` module (built in, no import; errors are `Err` values with the OS's
 message, e.g. `"The system cannot find the file specified. (os error 2)"`):
