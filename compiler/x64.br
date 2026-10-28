@@ -20,7 +20,7 @@
 # at a line, variables are in memory where the debug info says.
 
 from ir import K, Op, Inst, Func, Module
-from opt import promote, reads
+from opt import promote, reads, switches
 from dwarf import Dwarf, DFn, DRow, DLocal, new_dwarf, loc_breg, loc_deref, write_dwarf
 from obj import ObjFile, OSym, ORel, new_obj, write_coff, write_elf, put16, put32, put64, set32, uleb, sleb, log2
 from obj import SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, SEC_UNWIND, R_PC32, R_CALL, R_ABS64, R_GOT, R_RVA32
@@ -286,6 +286,10 @@ struct X:
     lpos: [int]
     jat: [int]
     jlab: [int]
+    # jump table entries: where, the label, and the table's start
+    tat: [int]
+    tlab: [int]
+    tbase: [int]
     stubs: [Stub]
     # home of the hidden pointer to a 128-bit result (0: none)
     retp: int
@@ -1014,6 +1018,9 @@ struct X:
         self.lpos = [-1] * f.nlabels
         self.jat = []
         self.jlab = []
+        self.tat = []
+        self.tlab = []
+        self.tbase = []
         self.stubs = []
         var ndef = [0] * nv
         var dpos = [0] * nv
@@ -1248,6 +1255,8 @@ struct X:
                 )
         for j in 0..len(self.jat):
             set32(ref self.o.text, self.jat[j], self.lpos[self.jlab[j]] - (self.jat[j] + 4))
+        for j in 0..len(self.tat):
+            set32(ref self.o.text, self.tat[j], self.lpos[self.tlab[j]] - self.tbase[j])
         if self.win:
             self.unwind_coff()
         else:
@@ -1863,6 +1872,8 @@ struct X:
                         self.rm(0, 0, 128, 7, self.vm(x.a), 1)
                         self.b(0)
                     self.jcc_label(CC_NE if want else CC_E, x.n)
+            case Op.Switch:
+                self.switch(x)
             case Op.Ret:
                 self.op_ret(x)
             case Op.Unreachable:
@@ -1871,6 +1882,38 @@ struct X:
                 if self.dbg:
                     self.line_row(x)
         return i + 1
+
+    # A jump table in .text after the jump: 32-bit offsets from its start.
+    fn switch(ref self, x: Inst):
+        self.ld(RAX, x.a)
+        if x.n != 0:
+            self.alu_ri(SUB, RAX, x.n)
+        self.alu_ri(CMP, RAX, len(x.args) - 1)
+        self.jcc_label(CC_AE, x.args[0])
+        # lea r11, [rip + table]
+        self.b(76)
+        self.b(141)
+        self.b(29)
+        let at = self.pos()
+        self.b32(0)
+        # movsxd rax, dword [r11 + rax * 4]; add rax, r11; jmp rax
+        self.b(73)
+        self.b(99)
+        self.b(4)
+        self.b(131)
+        self.alu_rr(ADD, RAX, R11)
+        self.b(255)
+        self.b(224)
+        while self.pos() % 4 != 0:
+            self.b(204)
+        let base = self.pos()
+        set32(ref self.o.text, at, base - (at + 4))
+        for l in x.args[1:]:
+            self.tat.push(self.pos())
+            self.tlab.push(l)
+            self.tbase.push(base)
+            self.b32(0)
+        self.cpos = -1
 
     fn op_const(ref self, x: Inst):
         let k = self.vk[x.d]
@@ -2504,6 +2547,9 @@ fn emit(m: Module, windows: bool, dbg: bool, src: str, comp_dir: str, producer: 
         lpos=[],
         jat=[],
         jlab=[],
+        tat=[],
+        tlab=[],
+        tbase=[],
         stubs=[],
         retp=0,
         creg=0,
@@ -2560,7 +2606,7 @@ fn emit(m: Module, windows: bool, dbg: bool, src: str, comp_dir: str, producer: 
                 x.o.drel.push(rel)
     x.entry_main = dbg and any(f.name == "main__main" for f in m.funcs)
     for f in emit_order(m.funcs, dbg):
-        x.func(f if dbg else promote(f))
+        x.func(f if dbg else switches(promote(f)))
     # references inside .text need no relocation
     var keep: [ORel] = []
     for r in x.o.trel:
