@@ -450,6 +450,38 @@ test "web builds run through their loader":
     let o = exec(["node", d + "/load.mjs", d + "/site"], {})
     # the C library's debug info is left out of builds without --debug
     assert o.code == 0 and o.out == "Hello, world!\nexit 0\ndebug sections 0\n", o.all()
+    # `runInWorker` (what the page uses) runs it in a Web Worker: Node.js has
+    # none, so a stand-in made of a worker thread
+    let shim = [
+        "import { parentPort, workerData } from 'node:worker_threads';",
+        "globalThis.WorkerGlobalScope = class {};",
+        "globalThis.postMessage = (m) => parentPort.postMessage(m);",
+        "globalThis.addEventListener = (type, f) => parentPort.once('message', (data) => f({ data }));",
+        "await import(workerData);"
+    ]
+    write(d + "/shim.mjs", "\n".join(shim) + "\n")
+    let main = [
+        "import { Worker } from 'node:worker_threads';",
+        "import { readFileSync } from 'node:fs';",
+        "import { pathToFileURL } from 'node:url';",
+        "const dir = process.argv[2];",
+        "globalThis.Worker = class {",
+        "  constructor(url) {",
+        "    this.w = new Worker(new URL('./shim.mjs', import.meta.url), { workerData: url.href });",
+        "    this.w.on('message', (data) => this.onmessage({ data }));",
+        "  }",
+        "  postMessage(m) { this.w.postMessage(m); }",
+        "  terminate() { this.w.terminate(); }",
+        "};",
+        "const { runInWorker } = await import(pathToFileURL(dir + '/brine.js').href);",
+        "let out = '';",
+        "const mod = new WebAssembly.Module(readFileSync(dir + '/program.wasm'));",
+        "const code = await runInWorker(mod, { stdout: (t) => (out += t), stderr: (t) => (out += t) });",
+        "console.log(out + 'exit ' + code);"
+    ]
+    write(d + "/worker.mjs", "\n".join(main) + "\n")
+    let w = exec(["node", d + "/worker.mjs", d + "/site"], {})
+    assert w.code == 0 and w.out == "Hello, world!\nexit 0\n", w.all()
 
 test "main can return a Result":
     let d = scratch("main")
