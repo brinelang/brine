@@ -413,7 +413,16 @@ static void *br_alloc_slow(br_heap_th *h, int c, size_t n) {
     return ch;
 }
 
-static void *br_alloc(size_t n) {
+/* the common cases of br_alloc and br_free inline and without a stack frame;
+   the rest out of line */
+#if defined(__GNUC__) || defined(__clang__)
+#define BR_HOT inline __attribute__((always_inline))
+#define BR_COLD __attribute__((noinline))
+#else
+#define BR_HOT inline
+#define BR_COLD
+#endif
+static BR_COLD void *br_alloc_miss(size_t n) {
     if (n > BR_SMALL || !br_heap_base) return br_big(n);
     int c = br_class_of(n ? n : 1);
     br_heap_th *h = br_th_get();
@@ -425,8 +434,27 @@ static void *br_alloc(size_t n) {
     }
     return br_alloc_slow(h, c, n);
 }
+static BR_HOT void *br_alloc(size_t n) {
+    /* n - 1 < BR_SMALL: 1 <= n <= BR_SMALL */
+    if (BR_LIKELY(n - 1 < BR_SMALL && br_heap_base)) {
+        br_heap_th *h = br_th_peek();
+        if (BR_LIKELY(h != NULL)) {
+            int c = br_class_of(n);
+            void *p = h->head[c];
+            if (BR_LIKELY(p != NULL)) {
+                h->head[c] = *(void **)p;
+                h->count[c] -= h->count[c] > 0;
+                return p;
+            }
+        }
+    }
+    return br_alloc_miss(n);
+}
 
-static void br_free(void *p) {
+/* a thread keeps BR_SPARE bytes of free blocks per class */
+#define BR_TOO_MANY(h, c) (++(h)->count[c] * (int64_t)br_class_size(c) > BR_SPARE)
+static BR_COLD void br_give_cold(br_heap_th *h, int c) { br_give(h, c); }
+static BR_COLD void br_free_miss(void *p) {
     if (!br_in_heap(p)) {
         free(p);
         return;
@@ -435,7 +463,20 @@ static void br_free(void *p) {
     br_heap_th *h = br_th_get();
     *(void **)p = h->head[c];
     h->head[c] = p;
-    if (++h->count[c] * (int64_t)br_class_size(c) > BR_SPARE) br_give(h, c);
+    if (BR_TOO_MANY(h, c)) br_give(h, c);
+}
+static BR_HOT void br_free(void *p) {
+    if (BR_LIKELY(br_in_heap(p))) {
+        br_heap_th *h = br_th_peek();
+        if (BR_LIKELY(h != NULL)) {
+            int c = br_chunk_class[((uintptr_t)p - br_heap_base) / BR_CHUNK];
+            *(void **)p = h->head[c];
+            h->head[c] = p;
+            if (BR_UNLIKELY(BR_TOO_MANY(h, c))) br_give_cold(h, c);
+            return;
+        }
+    }
+    br_free_miss(p);
 }
 
 static void *br_realloc(void *p, size_t n) {
@@ -475,7 +516,9 @@ void *brine_alloc(int64_t n) { return br_alloc(n > 0 ? (size_t)n : 1); }
 void brine_free(void *p) { br_free(p); }
 /* live string/array count, reported at exit when BRINE_LEAKCHECK is set */
 static int64_t br_live;
-#define BR_LIVE(d) __atomic_fetch_add(&br_live, (d), __ATOMIC_RELAXED)
+/* counted only for BRINE_LEAKCHECK: a locked add on every allocation costs */
+static bool br_leakcheck;
+#define BR_LIVE(d) (BR_UNLIKELY(br_leakcheck) ? (void)__atomic_fetch_add(&br_live, (d), __ATOMIC_RELAXED) : (void)0)
 void brine_str_free(brine_str *s) {
     BR_LIVE(-1);
     free(s);
@@ -506,7 +549,7 @@ void brine_rl_arr(void *p) { brine_arr_release(*(brine_arr **)p); }
 /* ============================================================ strings */
 #define br_str_size brine_str_size
 static brine_str *br_str_alloc(int64_t n) {
-    brine_str *s = (brine_str *)brine_alloc((int64_t)br_str_size(n));
+    brine_str *s = (brine_str *)br_alloc(br_str_size(n));
     BR_LIVE(1);
     s->rc = 1;
     s->len = n;
@@ -4267,6 +4310,7 @@ static void br_utf8_args(void) {
 #endif
 
 void brine_rt_init(int argc, char **argv) {
+    br_leakcheck = getenv("BRINE_LEAKCHECK") != NULL;
     br_heap_init();
     br_argc = argc;
     br_argv = argv;
@@ -4296,7 +4340,7 @@ void brine_rt_shutdown(void) {
     br_gpu_settle();
     if (br_size > 1) brine_world_barrier();
     br_flush();
-    if (getenv("BRINE_LEAKCHECK")) fprintf(stderr, "brine: %lld live objects at exit\n", (long long)__atomic_load_n(&br_live, __ATOMIC_RELAXED));
+    if (br_leakcheck) fprintf(stderr, "brine: %lld live objects at exit\n", (long long)__atomic_load_n(&br_live, __ATOMIC_RELAXED));
 }
 
 /* ============================================================ files and processes */
