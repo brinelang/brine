@@ -4,36 +4,59 @@
 //
 // `brine run --target wasm` and `brine test --target wasm` use it.
 import { readFile } from "node:fs/promises";
+import { writeSync } from "node:fs";
 import { WASI } from "node:wasi";
+import { Worker, isMainThread, workerData } from "node:worker_threads";
 import process from "node:process";
 
-const [file, ...args] = process.argv.slice(2);
-// paths relative to the current folder work as they do natively. Only that
-// folder: with "/" also open, wasi-libc resolves relative paths under "/".
-const preopens = { ".": "." };
-const wasi = new WASI({
-  version: "preview1",
-  args: [file, ...args],
-  env: process.env,
-  preopens,
-  returnOnExit: true,
-});
-const module = await WebAssembly.compile(await readFile(file));
-const instance = await WebAssembly.instantiate(module, wasi.getImportObject());
-try {
-  process.exitCode = wasi.start(instance);
-} catch (e) {
-  // a trap: what the program printed before it is still in its buffer
-  try {
-    instance.exports.brine_flush?.();
-  } catch {}
-  if (e instanceof RangeError) {
-    // the engine's call stack ran out: report it as native code does
-    process.stderr.write("\npanic: stack overflow (recursion too deep)\n");
-    process.exitCode = 101;
-  } else {
-    // brine panics exit with 101, so this is a crash
-    process.stderr.write(`\nWebAssembly trap: ${e && e.message ? e.message : e}\n`);
+// WebAssembly frames live on the thread's native stack, about 1 MB on the
+// main thread: recursion that runs natively would trap after ~10k calls. A
+// worker thread can have a big stack.
+const STACK_MB = 256;
+
+if (isMainThread) {
+  const worker = new Worker(new URL(import.meta.url), {
+    workerData: process.argv.slice(2),
+    resourceLimits: { stackSizeMb: STACK_MB },
+  });
+  worker.on("exit", (code) => {
+    process.exitCode = code;
+  });
+  worker.on("error", (e) => {
+    writeSync(2, `\nbrine: the WebAssembly runner failed: ${e && e.stack ? e.stack : e}\n`);
     process.exitCode = 134;
+  });
+} else {
+  const [file, ...args] = workerData;
+  // paths relative to the current folder work as they do natively. Only that
+  // folder: with "/" also open, wasi-libc resolves relative paths under "/".
+  const preopens = { ".": "." };
+  const wasi = new WASI({
+    version: "preview1",
+    args: [file, ...args],
+    env: process.env,
+    preopens,
+    returnOnExit: true,
+  });
+  const module = await WebAssembly.compile(await readFile(file));
+  const instance = await WebAssembly.instantiate(module, wasi.getImportObject());
+  let code = 0;
+  try {
+    code = wasi.start(instance);
+  } catch (e) {
+    // a trap: what the program printed before it is still in its buffer
+    try {
+      instance.exports.brine_flush?.();
+    } catch {}
+    if (e instanceof RangeError) {
+      // the engine's call stack ran out: report it as native code does
+      writeSync(2, "\npanic: stack overflow (recursion too deep)\n");
+      code = 101;
+    } else {
+      // brine panics exit with 101, so this is a crash
+      writeSync(2, `\nWebAssembly trap: ${e && e.message ? e.message : e}\n`);
+      code = 134;
+    }
   }
+  process.exit(code);
 }

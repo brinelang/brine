@@ -49,7 +49,52 @@ fn same_tokens(a: str, b: str) -> bool:
     var code_b: [Tok] = []
     var comments_b: [str] = []
     split_comments(tb, ref code_b, ref comments_b)
-    return code_a == code_b and comments_a == comments_b
+    return drop_wraps(code_a) == drop_wraps(code_b) and comments_a == comments_b
+
+# Drops the parentheses a long line may be put in to break it (`x = (...)`,
+# `if (...):`): they don't change what it means.
+fn drop_wraps(ts: [Tok]) -> [Tok]:
+    let n = len(ts)
+    var drop = [false] * n
+    for i in 1..n:
+        if ts[i] != Tok.LParen or not wraps_after(ts[i - 1]):
+            continue
+        var depth = 0
+        var j = i
+        var comma = false
+        while j < n:
+            if opens(ts[j]):
+                depth += 1
+            elif closes(ts[j]):
+                depth -= 1
+                if depth == 0:
+                    break
+            elif depth == 1 and ts[j] == Tok.Comma:
+                comma = true
+            j += 1
+        if j + 1 < n and not comma:
+            let next = ts[j + 1]
+            if next == Tok.Colon or next == Tok.Newline or next == Tok.Comma or next == Tok.Eof:
+                drop[i] = true
+                drop[j] = true
+    var out: [Tok] = []
+    for i in 0..n:
+        if not drop[i]:
+            out.push(ts[i])
+    return out
+
+fn wraps_after(t: Tok) -> bool:
+    match t:
+        case Tok.Keyword(k):
+            match k:
+                case Kw.Return | Kw.If | Kw.Elif | Kw.While | Kw.In | Kw.Assert:
+                    return true
+                case Kw.Requires | Kw.Ensures | Kw.Invariant:
+                    return true
+                case _:
+                    return false
+        case _:
+            return is_assign(t)
 
 fn split_comments(toks: [Token], ref code: [Tok], ref comments: [str]):
     for t in toks:
@@ -265,7 +310,10 @@ fn format_inner(src: str) -> str:
     let lines = group_lines(src, starts)
     let depths = line_depths(lines)
     var out: [str] = []
+    var skip_to = -1
     for i in 0..len(lines):
+        if i <= skip_to:
+            continue
         let l = lines[i]
         let d = depths[i]
         if i > 0:
@@ -285,24 +333,24 @@ fn format_inner(src: str) -> str:
                 out.push("\n")
         let ind = INDENT.repeat(d)
         let nt = len(l.toks)
+        if l.comment_only and fmt_switch(src, l) == "off":
+            # `# fmt: off` to `# fmt: on` (or the end): kept as it is
+            var j = i + 1
+            while (
+                j < len(lines) and not (lines[j].comment_only and fmt_switch(src, lines[j]) == "on")
+            ):
+                j += 1
+            j = min(j, len(lines) - 1)
+            for ln in l.first_line..lines[j].last_line + 1:
+                out.push(source_line(src, starts, ln) + "\n")
+            skip_to = j
+            continue
         var interior_comment = false
         for k in 0..nt:
             if is_comment(l.toks[k].tok) and k + 1 < nt:
                 interior_comment = true
         if interior_comment:
-            # keep the author's layout; only fix the indentation
-            for ln in l.first_line..l.last_line + 1:
-                let s = starts[ln]
-                let e = starts[ln + 1] - 1 if ln + 1 < len(starts) else len(src)
-                var raw = src[s:e]
-                while raw.ends_with("\r"):
-                    raw = raw[0:len(raw) - 1]
-                let body = raw.lstrip()
-                var shifted = ind + body
-                if ln != l.first_line:
-                    let rel = len(raw) - len(body) - l.col
-                    shifted = ind + " ".repeat(max(rel, 0)) + body
-                out.push(shifted.rstrip() + "\n")
+            keep_layout(ref out, src, starts, l, ind)
             continue
         var code = l.toks
         var cm = ""
@@ -314,17 +362,48 @@ fn format_inner(src: str) -> str:
         let spaces = spacing(code)
         let joined = render(src, code, spaces, 0, len(code))
         let full = ind + joined + cm
-        var done = false
-        if len(full) > WIDTH and char_count(full) > WIDTH:
-            done = explode(ref out, src, code, spaces, ind, cm)
-        if not done:
+        if len(full) <= WIDTH or char_count(full) <= WIDTH:
             out.push(full.rstrip() + "\n")
+        elif l.first_line < l.last_line and has_table(starts, code):
+            keep_layout(ref out, src, starts, l, ind)
+        else:
+            for s in layout_line(src, code, spaces, ind, cm):
+                out.push(s.rstrip() + "\n")
     var res = "".join(out)
     if res.rstrip() == "":
         return ""
     while res.ends_with("\n\n"):
         res = res[0:len(res) - 1]
     return res
+
+fn source_line(src: str, starts: [int], ln: int) -> str:
+    let s = starts[ln]
+    let e = starts[ln + 1] - 1 if ln + 1 < len(starts) else len(src)
+    var raw = src[s:e]
+    while raw.ends_with("\r"):
+        raw = raw[0:len(raw) - 1]
+    return raw
+
+# "off" for a `# fmt: off` comment, "on" for `# fmt: on`
+fn fmt_switch(src: str, l: Line) -> str:
+    let t = l.toks[0]
+    let c = src[t.lo:t.hi].replace(" ", "")
+    if c == "#fmt:off":
+        return "off"
+    if c == "#fmt:on":
+        return "on"
+    return ""
+
+# keep the author's layout of a line; only fix the indentation
+fn keep_layout(ref out: [str], src: str, starts: [int], l: Line, ind: str):
+    for ln in l.first_line..l.last_line + 1:
+        let raw = source_line(src, starts, ln)
+        let body = raw.lstrip()
+        var shifted = ind + body
+        if ln != l.first_line:
+            let rel = len(raw) - len(body) - l.col
+            shifted = ind + " ".repeat(max(rel, 0)) + body
+        out.push(shifted.rstrip() + "\n")
 
 fn render(src: str, code: [Token], spaces: [bool], a: int, b: int) -> str:
     var parts: [str] = []
@@ -365,7 +444,12 @@ fn spacing(code: [Token]) -> [bool]:
             elif prev == Tok.Colon and in_brackets:
                 # a slice: `s[a:b]`
                 s = false
-            elif cur == Tok.DotDot or cur == Tok.DotDotEq or prev == Tok.DotDot or prev == Tok.DotDotEq:
+            elif (
+                cur == Tok.DotDot
+                or cur == Tok.DotDotEq
+                or prev == Tok.DotDot
+                or prev == Tok.DotDotEq
+            ):
                 s = false
             elif (cur == Tok.Assign or prev == Tok.Assign) and in_parens:
                 s = false
@@ -382,40 +466,346 @@ fn spacing(code: [Token]) -> [bool]:
             brackets.pop()
     return sp
 
-# Break a long line at its first top-level bracket: one element per line.
-fn explode(ref out: [str], src: str, code: [Token], spaces: [bool], ind: str, cm: str) -> bool:
-    let n = len(code)
-    var open = -1
-    for i in 0..n:
-        if opens(code[i].tok):
-            open = i
-            break
-    if open < 0:
-        return false
+# Breaking long lines
+#
+# A line that doesn't fit is broken inside brackets, one element per line
+# after each comma, or inside brackets before the operators that bind
+# loosest. A long expression after `=`, `return`, `if` and the like is put in
+# parentheses first so it can break the same way. Each part is broken again
+# until it fits.
+struct Lay:
+    src: str
+    code: [Token]
+    spaces: [bool]
+
+# how many layouts one line may try before settling
+const BUDGET = 4000
+
+fn text(y: Lay, a: int, b: int) -> str:
+    return render(y.src, y.code, y.spaces, a, b)
+
+fn fits(ls: [str]) -> bool:
+    for l in ls:
+        if char_count(l) > WIDTH:
+            return false
+    return true
+
+fn overflow(ls: [str]) -> int:
+    var o = 0
+    for l in ls:
+        o += max(char_count(l) - WIDTH, 0)
+    return o
+
+fn better(x: [str], than: [str]) -> bool:
+    let a = overflow(x)
+    let b = overflow(than)
+    return a < b or (a == b and len(x) < len(than))
+
+fn is_assign(t: Tok) -> bool:
+    match t:
+        case Tok.Assign | Tok.PlusEq | Tok.MinusEq | Tok.StarEq | Tok.SlashEq | Tok.PercentEq:
+            return true
+        case _:
+            return false
+
+fn is_number(t: Tok) -> bool:
+    match t:
+        case Tok.Int(_) | Tok.Float(_):
+            return true
+        case _:
+            return false
+
+# the first `t` outside brackets in code[a:b], or b
+fn top_find(code: [Token], a: int, b: int, t: Tok) -> int:
     var depth = 0
-    var close = -1
-    var commas: [int] = []
-    for k in open..n:
+    for k in a..b:
+        let c = code[k].tok
+        if opens(c):
+            depth += 1
+        elif closes(c):
+            depth -= 1
+        elif depth == 0 and c == t:
+            return k
+    return b
+
+# the bracket closing the one at `o`, or -1
+fn close_of(code: [Token], o: int) -> int:
+    var depth = 0
+    for k in o..len(code):
+        if opens(code[k].tok):
+            depth += 1
+        elif closes(code[k].tok):
+            depth -= 1
+            if depth == 0:
+                return k
+    return -1
+
+# the non-empty bracket groups outside brackets in code[a:b]
+fn groups(code: [Token], a: int, b: int) -> [(int, int)]:
+    var gs: [(int, int)] = []
+    var depth = 0
+    var o = -1
+    for k in a..b:
+        let t = code[k].tok
+        if opens(t):
+            if depth == 0:
+                o = k
+            depth += 1
+        elif closes(t):
+            depth -= 1
+            if depth == 0 and o >= 0 and k > o + 1:
+                gs.push((o, k))
+    return gs
+
+# The class of the operator at `k` when a line may break before it, loosest
+# first; -1 if it can't.
+fn op_class(code: [Token], a: int, k: int) -> int:
+    if k <= a:
+        return -1
+    let t = code[k].tok
+    match t:
+        case Tok.Keyword(kw):
+            if kw == Kw.If or kw == Kw.Else or kw == Kw.For:
+                return 0
+            if kw == Kw.Or:
+                return 1
+            if kw == Kw.And:
+                return 2
+            return -1
+        case _:
+            pass
+    # binary operators only: not the `-` of `-1`
+    if not value_end(code[k - 1].tok):
+        return -1
+    match t:
+        case Tok.EqEq | Tok.Ne | Tok.Lt | Tok.Le | Tok.Gt | Tok.Ge:
+            return 3
+        case Tok.Pipe:
+            return 4
+        case Tok.Caret:
+            return 5
+        case Tok.Amp:
+            return 6
+        case Tok.Shl | Tok.Shr:
+            return 7
+        case Tok.Plus | Tok.Minus:
+            return 8
+        case Tok.Star | Tok.Slash | Tok.Percent:
+            return 9
+        case Tok.Dot:
+            # a method chain: `f(x).g(y).h(z)` breaks before `.g` and `.h`
+            return 10 if closes(code[k - 1].tok) else -1
+        case _:
+            return -1
+
+# where code[a:b] may break before an operator: the loosest ones outside brackets
+fn top_ops(code: [Token], a: int, b: int) -> [int]:
+    var best = 99
+    var at: [int] = []
+    var depth = 0
+    for k in a..b:
         let t = code[k].tok
         if opens(t):
             depth += 1
         elif closes(t):
             depth -= 1
-            if depth == 0:
-                close = k
-                break
-        elif depth == 1 and t == Tok.Comma:
-            commas.push(k)
-    if close < 0:
-        return false
-    if close == open + 1:
-        return false
-    out.push(ind + render(src, code, spaces, 0, open + 1) + "\n")
-    var a = open + 1
-    for c in commas:
-        out.push(ind + INDENT + render(src, code, spaces, a, c + 1) + "\n")
-        a = c + 1
-    if a < close:
-        out.push(ind + INDENT + render(src, code, spaces, a, close) + "\n")
-    out.push((ind + render(src, code, spaces, close, n) + cm).rstrip() + "\n")
-    return true
+        elif depth == 0:
+            let c = op_class(code, a, k)
+            if c >= 0 and c < best:
+                best = c
+                at = [k]
+            elif c >= 0 and c == best:
+                at.push(k)
+    # moving a single method call to its own line looks wrong
+    if best == 10 and len(at) < 2:
+        return []
+    return at
+
+# the commas outside brackets in code[a:b]
+fn top_commas(code: [Token], a: int, b: int) -> [int]:
+    var at: [int] = []
+    var depth = 0
+    for k in a..b:
+        let t = code[k].tok
+        if opens(t):
+            depth += 1
+        elif closes(t):
+            depth -= 1
+        elif depth == 0 and t == Tok.Comma:
+            at.push(k)
+    return at
+
+# whether code[a:b] is a list of plain numbers
+fn all_numbers(code: [Token], a: int, b: int) -> bool:
+    var n = 0
+    for k in a..b:
+        let t = code[k].tok
+        if is_number(t):
+            n += 1
+        elif t != Tok.Comma and t != Tok.Minus:
+            return false
+    return n >= 2
+
+# whether a list of numbers is laid out in rows, several numbers on a line:
+# such a table is kept as it is
+fn has_table(starts: [int], code: [Token]) -> bool:
+    for o in 0..len(code):
+        if code[o].tok != Tok.LBracket:
+            continue
+        let c = close_of(code, o)
+        if c < 0 or not all_numbers(code, o + 1, c):
+            continue
+        for k in o + 2..c - 1:
+            if code[k].tok == Tok.Comma and is_number(code[k - 1].tok):
+                let m = k + 2 if code[k + 1].tok == Tok.Minus else k + 1
+                if m < c and line_of(starts, code[k - 1].lo) == line_of(starts, code[m].lo):
+                    return true
+    return false
+
+# The expression of a statement that may go in parentheses to break: after
+# `=`, `return`, `if`... (empty if none).
+fn rhs_of(code: [Token]) -> (int, int):
+    let n = len(code)
+    if n == 0:
+        return (0, 0)
+    match code[0].tok:
+        case Tok.Keyword(k):
+            if k == Kw.If or k == Kw.Elif or k == Kw.While:
+                return (1, top_find(code, 1, n, Tok.Colon))
+            if k == Kw.For:
+                let i = top_find(code, 1, n, Tok.Keyword(Kw.In))
+                if i >= n:
+                    return (0, 0)
+                return (i + 1, top_find(code, i + 1, n, Tok.Colon))
+            if k == Kw.Return:
+                return (1, n)
+            if k == Kw.Assert or k == Kw.Requires or k == Kw.Ensures or k == Kw.Invariant:
+                return (1, top_find(code, 1, n, Tok.Comma))
+        case _:
+            pass
+    var depth = 0
+    for k in 0..n:
+        let t = code[k].tok
+        if opens(t):
+            depth += 1
+        elif closes(t):
+            depth -= 1
+        elif depth == 0 and is_assign(t):
+            return (k + 1, n)
+    return (0, 0)
+
+# The order to try layouts in: an index into `gs` explodes that bracket
+# group, -1 breaks at the operators. Operators come first, except in
+# `x * (...)`: one operator, and a bracket group after it ends the expression.
+fn preference(gs: [(int, int)], ops: [int], b: int) -> [int]:
+    let ng = len(gs)
+    var order: [int] = []
+    var first = -2
+    if len(ops) > 0:
+        if len(ops) == 1 and ng > 0 and gs[0].0 > ops[0] and gs[ng - 1].1 == b - 1:
+            first = ng - 1
+            order.push(first)
+        order.push(-1)
+    for g in 0..ng:
+        if g != first:
+            order.push(g)
+    return order
+
+# A statement that doesn't fit on a line.
+fn layout_line(src: str, code: [Token], spaces: [bool], ind: str, cm: str) -> [str]:
+    let y = Lay(src=src, code=code, spaces=spaces)
+    let n = len(code)
+    var left = BUDGET
+    let (ra, rb) = rhs_of(code)
+    var gs = groups(code, 0, n)
+    var ops: [int] = []
+    if rb > ra:
+        # never break the target of an assignment or a `for`
+        gs = groups(code, ra, rb)
+        if len(top_commas(code, ra, rb)) == 0:
+            ops = top_ops(code, ra, rb)
+    var best: [str] = []
+    for c in preference(gs, ops, rb):
+        var ls: [str] = []
+        if c < 0:
+            ls = [ind + text(y, 0, ra) + " ("]
+            ls.extend(lay_expr(y, ra, rb, ind + INDENT, "", "", ref left))
+            ls.push(ind + ")" + text(y, rb, n) + cm)
+        else:
+            ls = explode(y, 0, n, gs[c], ind, "", cm, ref left)
+        if fits(ls):
+            return ls
+        if len(best) == 0 or better(ls, best):
+            best = ls
+    if len(best) == 0:
+        return [ind + text(y, 0, n) + cm]
+    return best
+
+# code[a:b] inside brackets, its first line starting with `lead` and its last
+# one ending with `trail`
+fn lay_expr(y: Lay, a: int, b: int, ind: str, lead: str, trail: str, ref left: int) -> [str]:
+    let one = ind + lead + text(y, a, b) + trail
+    left -= 1
+    if char_count(one) <= WIDTH or left <= 0:
+        return [one]
+    let gs = groups(y.code, a, b)
+    let ops = top_ops(y.code, a, b)
+    var best = [one]
+    for c in preference(gs, ops, b):
+        var ls: [str] = []
+        if c < 0:
+            ls = lay_expr(y, a, ops[0], ind, lead, "", ref left)
+            for i in 0..len(ops):
+                let p = ops[i]
+                let e = ops[i + 1] if i + 1 < len(ops) else b
+                let t = trail if e == b else ""
+                let op = text(y, p, p + 1) + ("" if y.code[p].tok == Tok.Dot else " ")
+                ls.extend(lay_expr(y, p + 1, e, ind, op, t, ref left))
+        else:
+            ls = explode(y, a, b, gs[c], ind, lead, trail, ref left)
+        if fits(ls):
+            return ls
+        if better(ls, best):
+            best = ls
+    return best
+
+# code[a:b] broken inside the bracket group `g`
+fn explode(
+    y: Lay,
+    a: int,
+    b: int,
+    g: (int, int),
+    ind: str,
+    lead: str,
+    trail: str,
+    ref left: int
+) -> [str]:
+    let (o, c) = g
+    var ls = [ind + lead + text(y, a, o + 1)]
+    ls.extend(lay_body(y, o + 1, c, ind + INDENT, ref left))
+    ls.push(ind + text(y, c, b) + trail)
+    return ls
+
+# the inside of brackets: one element per line, or as many numbers as fit
+fn lay_body(y: Lay, a: int, b: int, ind: str, ref left: int) -> [str]:
+    let commas = top_commas(y.code, a, b)
+    if len(commas) == 0:
+        return lay_expr(y, a, b, ind, "", "", ref left)
+    let numbers = all_numbers(y.code, a, b)
+    var ls: [str] = []
+    var s = a
+    for k in 0..len(commas) + 1:
+        let e = commas[k] if k < len(commas) else b
+        if s >= e:
+            break
+        let comma = "," if e < b else ""
+        let n = len(ls)
+        if numbers and n > 0:
+            let item = text(y, s, e) + comma
+            if char_count(ls[n - 1]) + 1 + char_count(item) <= WIDTH:
+                ls[n - 1] = ls[n - 1] + " " + item
+                s = e + 1
+                continue
+        ls.extend(lay_expr(y, s, e, ind, "", comma, ref left))
+        s = e + 1
+    return ls
