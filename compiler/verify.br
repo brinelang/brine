@@ -1323,7 +1323,7 @@ struct Vf:
             return a0
         let a = a0.unwrap()
         let b = b0.unwrap()
-        let (env, ea, eb) = self.merge_env(a.env, b.env)
+        let (env, ea, eb, hull) = self.merge_env(a.env, b.env)
         let k = min(k0, min(len(a.facts), len(b.facts)))
         var facts = a.facts[:k]
         var fa = a.facts[k:]
@@ -1338,14 +1338,16 @@ struct Vf:
             for f in fa:
                 if f in fb:
                     facts.push(f)
+        facts.extend(hull)
         return Some(St(env=env, facts=facts))
 
     # The variables of two paths' environments: a fresh value where they
     # differ, with what it equals on each path.
-    fn merge_env(ref self, a: {int: V}, b: {int: V}) -> ({int: V}, [F], [F]):
+    fn merge_env(ref self, a: {int: V}, b: {int: V}) -> ({int: V}, [F], [F], [F]):
         var env: {int: V} = {}
         var ea: [F] = []
         var eb: [F] = []
+        var hull: [F] = []
         # in a fixed order, so fresh atoms and facts are the same on every run
         var keys = [x for x in a.keys() if x in b]
         keys.sort()
@@ -1366,8 +1368,9 @@ struct Vf:
                     eb.push(f)
                 case None:
                     pass
+            hull_facts(nv, va, vb, ref hull)
             env[id] = nv
-        return (env, ea, eb)
+        return (env, ea, eb, hull)
 
     # Before code that runs on some paths only (`a if c else b`, the right
     # side of `and`/`or`, the later operands of `a < b < c`, a `match`
@@ -1389,7 +1392,7 @@ struct Vf:
             return a0
         let a = a0.unwrap()
         let b = b0.unwrap()
-        let (env, ea, eb) = self.merge_env(a.env, b.env)
+        let (env, ea, eb, hull) = self.merge_env(a.env, b.env)
         var fa = new_facts(a.facts, fk)
         fa.extend(ea)
         var fb = new_facts(b.facts, fk)
@@ -1401,6 +1404,7 @@ struct Vf:
             let both = F.or_([F.and_(fa), F.and_(fb)])
             if both.size() <= MERGE_MAX:
                 facts.push(both)
+        facts.extend(hull)
         return Some(St(env=env, facts=facts))
 
     # Evaluate `e` on the path where `guard` holds only; the other path runs nothing.
@@ -3384,3 +3388,38 @@ fn count_steps(b: Block, info: ProgramInfo, ref dirs: {int: int}, ref other: {in
             mods_expr(e, info, ref other)
         for blk in stmt_blocks(s):
             count_steps(blk, info, ref dirs, ref other)
+
+# Facts that hold on both paths of a merge, for a value `nv` that is `va` on
+# one and `vb` on the other: when they differ by a constant, `nv` is between
+# them. Plain facts the solver uses without splitting on the paths.
+fn hull_facts(nv: V, va: V, vb: V, ref out: [F]):
+    match (nv, va, vb):
+        case (V.Int(n), V.Int(x), V.Int(y)):
+            hull_lin(n, x, y, ref out)
+        case (V.Arr(_, n), V.Arr(_, x), V.Arr(_, y)):
+            hull_lin(n, x, y, ref out)
+        case (V.Str(n), V.Str(x), V.Str(y)):
+            hull_lin(n, x, y, ref out)
+        case (V.Agg(ns), V.Agg(xs), V.Agg(ys)):
+            if len(ns) == len(xs) and len(xs) == len(ys):
+                for i in 0..len(ns):
+                    hull_facts(ns[i], xs[i], ys[i], ref out)
+        case _:
+            pass
+
+fn hull_lin(n: Lin, x: Lin, y: Lin, ref out: [F]):
+    match x.sub(y):
+        case Some(d0):
+            match d0.is_const():
+                case Some(d):
+                    let z: i128 = 0
+                    match (y.add_c(min(z, d)), y.add_c(max(z, d))):
+                        case (Some(lo), Some(hi)):
+                            out.push(F.le(lo, n))
+                            out.push(F.le(n, hi))
+                        case _:
+                            pass
+                case None:
+                    pass
+        case None:
+            pass
