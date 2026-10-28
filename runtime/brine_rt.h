@@ -184,6 +184,19 @@ static inline size_t brine_str_size(int64_t n) {
     size_t g = (size_t)1 << (61 - __builtin_clzll(t));
     return (t + g - 1) & ~(g - 1);
 }
+/* A string's bytes start 8-byte aligned, and every string (heap blocks by
+   brine_str_size, literals by padding) can be read to the end of the 8-byte
+   word that holds its terminating NUL. So short strings are read, compared and
+   hashed a word at a time, with the bytes past the end masked off. All
+   targets are little-endian. */
+static inline uint64_t brine_ld8(const char *p) {
+    uint64_t v;
+    __builtin_memcpy(&v, p, 8);
+    return v;
+}
+static inline void brine_st8(char *p, uint64_t v) { __builtin_memcpy(p, &v, 8); }
+/* the low n bytes of a word, 0 <= n <= 8 */
+static inline uint64_t brine_lowmask(uint64_t n) { return n >= 8 ? ~0ULL : ~(~0ULL << (n * 8)); }
 /* `s += t`: in place when s is unshared and its block has room */
 static inline void brine_str_add(brine_str **ps, brine_str *b) {
     brine_str *a = *ps;
@@ -196,7 +209,14 @@ static inline void brine_str_add(brine_str **ps, brine_str *b) {
     }
     brine_str_append(ps, b);
 }
-bool brine_str_eq(brine_str *a, brine_str *b);
+bool brine_str_eq_long(brine_str *a, brine_str *b);
+static inline bool brine_str_eq(brine_str *a, brine_str *b) {
+    if (a == b) return true;
+    uint64_t n = (uint64_t)a->len;
+    if (n != (uint64_t)b->len) return false;
+    if (BR_LIKELY(n <= 8)) return ((brine_ld8(a->data) ^ brine_ld8(b->data)) & brine_lowmask(n)) == 0;
+    return brine_str_eq_long(a, b);
+}
 bool brine_str_contains(brine_str *s, brine_str *sub);
 /* `s[i]`: the byte at i as a one-character string, from a table of immortal
    ones so indexing never allocates */
@@ -409,7 +429,51 @@ static inline uint64_t brine_hash_u64(uint64_t x) {
 }
 static inline uint64_t brine_hash_mix(uint64_t h, uint64_t x) { return brine_hash_u64(h ^ (x + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2))); }
 static inline uint64_t brine_hash_u128(brine_u128 x) { return brine_hash_mix(brine_hash_u64((uint64_t)x), (uint64_t)(x >> 64)); }
-uint64_t brine_hash_str(brine_str *s);
+/* A one-to-one mix for string hashes: an odd multiply carries every bit
+   upwards, and the byte swap brings the top bits, which depend on all of
+   the word, down to the bits a map's index uses. Cheaper than
+   brine_hash_u64, which matters for short keys. */
+static inline uint64_t brine_hash_word(uint64_t x) { return __builtin_bswap64(x * 0x9e3779b97f4a7c15ULL); }
+uint64_t brine_hash_long(const char *p, uint64_t n);
+/* A string of up to 7 bytes is its bytes and its length in one word, mixed by
+   brine_hash_word, a bijection: two such strings hash equally only if they
+   are equal. Longer strings hash to words with the top bit set before the
+   same mixing, so they never hash like a short one. A map can then take
+   equal hashes of short keys as equal keys (brine_map_probe). */
+static inline uint64_t brine_hash_str(brine_str *s) {
+    uint64_t n = (uint64_t)s->len;
+    if (BR_LIKELY(n < 8)) return brine_hash_word((brine_ld8(s->data) & brine_lowmask(n)) | n << 56);
+    return brine_hash_long(s->data, n);
+}
+/* Entry number of key k (hash h) in m, or -1. keq compares two keys of ksz
+   bytes; `exact` says h was made by a hash that is one-to-one for k (see
+   brine_hash_str), so an equal hash is an equal key. The C backend inlines
+   this with keq known. */
+static inline __attribute__((always_inline)) int64_t brine_map_probe(const brine_map *m, const void *k, uint64_t h, void *keqp,
+                                                                     int64_t ksz, bool exact) {
+    brine_eq_fn keq = (brine_eq_fn)keqp;
+    if (m->len == 0) return -1;
+    uint64_t mask = (uint64_t)(m->nidx - 1);
+    const int64_t *ix = m->index;
+    const uint64_t *hs = m->hashes;
+    for (uint64_t i = h & mask;; i = (i + 1) & mask) {
+        int64_t e = ix[i];
+        if (e == -1) return -1;
+        if (e >= 0 && hs[e] == h && (exact || keq(m->keys + e * ksz, k))) return e;
+    }
+}
+/* the value of entry e (from brine_map_probe; -1 panics for the missing key k) */
+static inline void *brine_map_val(brine_map *m, int64_t e, const void *k, int64_t vsz, const char *loc) {
+    if (BR_UNLIKELY(e < 0)) return brine_map_at(m, k, loc);
+    return m->vals + e * vsz;
+}
+void *brine_map_val_mut_slow(brine_map **pm, int64_t e, const void *k, const char *loc);
+/* same, after making the map unique so the value can be changed */
+static inline void *brine_map_val_mut(brine_map **pm, int64_t e, const void *k, int64_t vsz, const char *loc) {
+    brine_map *m = *pm;
+    if (BR_LIKELY(e >= 0 && __atomic_load_n(&m->rc, __ATOMIC_ACQUIRE) == 1)) return m->vals + e * vsz;
+    return brine_map_val_mut_slow(pm, e, k, loc);
+}
 
 static inline int64_t brine_idx(int64_t i, int64_t len, const char *loc) {
     if (BR_UNLIKELY((uint64_t)i >= (uint64_t)len)) brine_panic_idx(i, len, loc);

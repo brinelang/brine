@@ -740,7 +740,9 @@ struct Lower:
                 le_bytes(ref b, -1, 8)
                 le_bytes(ref b, len(s), 8)
                 str_bytes(ref b, s)
-                b.push(u8(0))
+                # to the end of the word holding the NUL: strings are read a word at a time
+                while len(b) % 8 != 0 or len(b) == 16 + len(s):
+                    b.push(u8(0))
                 self.data.push(Data(name=sym, align=8, bytes=b, relocs=[], readonly=false))
         return self.cx.fb.global(sym)
 
@@ -1643,7 +1645,7 @@ struct Lower:
     fn eq_code(ref self, a: int, b: int, t: Ty) -> int:
         match t:
             case Ty.Str:
-                return self.cx.fb.call(K.Bool, "brine_str_eq", [a, b])
+                return self.cx.fb.rt(K.Bool, "brine_str_eq", [a, b])
             case Ty.Map(_, _):
                 self.map_ty(t)
                 return self.cx.fb.call(K.Bool, "brine_map_eq", [a, b])
@@ -1762,7 +1764,7 @@ struct Lower:
                 let f = self.need_hash(t)
                 return self.cx.fb.call(K.U64, f, [v])
             case Ty.Str:
-                return self.cx.fb.call(K.U64, "brine_hash_str", [v])
+                return self.cx.fb.rt(K.U64, "brine_hash_str", [v])
             case Ty.Array(_) | Ty.Tuple(_) | Ty.Struct(_):
                 let f = self.need_hash(t)
                 return self.cx.fb.call(K.U64, f, [v])
@@ -1903,6 +1905,17 @@ struct Lower:
         let kf = self.ld(1, 0, k)
         self.fmt_code(0, kf, k, true)
         self.finish_helper(s4)
+        # br_mf_<m>(map, &key): the key's entry or -1, with the hash and the
+        # key comparison known, so the C compiler inlines the whole lookup
+        let s5 = self.start_helper("br_mf_" + m, [K.Ptr, K.Ptr], true, K.I64)
+        let fk = self.ld(1, 0, k)
+        let hx = self.hash_code(fk, k)
+        let kq = self.fn_ptr("br_kq_" + m)
+        let ksz = self.cx.fb.konst(K.I64, self.lay(k).size)
+        let exact = self.exact_hash(fk, k)
+        let found = self.cx.fb.rt(K.I64, "brine_map_probe", [0, 1, hx, kq, ksz, exact])
+        self.cx.fb.ret(found)
+        self.finish_helper(s5)
         let (krt, krl) = self.elem_fns(k)
         let (vrt, vrl) = self.elem_fns(v)
         var b: [u8] = []
@@ -1916,6 +1929,29 @@ struct Lower:
             le_bytes(ref b, 0, 8)
         self.data.push(Data(name=name, align=8, bytes=b, relocs=relocs, readonly=true))
         return self.cx.fb.global(name)
+
+    # The function finding a key in a map of type `t` (see `map_ty`).
+    fn map_find(ref self, t: Ty) -> str:
+        self.map_ty(t)
+        return "br_mf_" + self.mangle(t)
+
+    # Bool: is `hash_code(v, t)` one-to-one for this value, so that equal
+    # hashes mean equal keys? (Integers up to 64 bits and the like go
+    # through a bijection; strings of up to 7 bytes too, see brine_hash_str.)
+    fn exact_hash(ref self, v: int, t: Ty) -> int:
+        match t:
+            case Ty.Int(k):
+                return self.cx.fb.konst(K.Bool, 1 if k.bits() <= 64 else 0)
+            case Ty.Bool:
+                return self.cx.fb.konst(K.Bool, 1)
+            case Ty.Enum(_):
+                return self.cx.fb.konst(K.Bool, 0 if self.boxed(t) else 1)
+            case Ty.Str:
+                let n = self.cx.fb.load(K.I64, v, 8)
+                let eight = self.cx.fb.konst(K.I64, 8)
+                return self.cx.fb.cmp(Op.Lt, n, eight)
+            case _:
+                return self.cx.fb.konst(K.Bool, 0)
 
     # ============================================================ Option and Result
     fn variant_index(self, eid: int, name: str, dflt: int) -> int:
@@ -3043,7 +3079,7 @@ struct Lower:
                 self.cx.fb.brnot(c, fail)
             case PatKind.Str(s):
                 let l = self.str_lit(s)
-                let c = self.cx.fb.call(K.Bool, "brine_str_eq", [v, l])
+                let c = self.cx.fb.rt(K.Bool, "brine_str_eq", [v, l])
                 self.cx.fb.brnot(c, fail)
             case PatKind.Bool(b):
                 if b:
@@ -3138,7 +3174,11 @@ struct Lower:
                         let kp = self.addr_of(k, idx.ty)
                         let b = self.lvalue(base)
                         let loc = self.loc(e.span)
-                        return self.cx.fb.call(K.Ptr, "brine_map_at_mut", [b, kp, loc])
+                        let m = self.cx.fb.load(K.Ptr, b, 0)
+                        let mf = self.map_find(base.ty)
+                        let en = self.cx.fb.call(K.I64, mf, [m, kp])
+                        let vsz = self.cx.fb.konst(K.I64, self.lay(e.ty).size)
+                        return self.cx.fb.rt(K.Ptr, "brine_map_val_mut", [b, en, kp, vsz, loc])
                     case _:
                         pass
                 let i = self.expr(idx)
@@ -3403,7 +3443,10 @@ struct Lower:
                         let k = self.expr(idx)
                         let kp = self.addr_of(k, idx.ty)
                         let loc = self.loc(e.span)
-                        let p = self.cx.fb.call(K.Ptr, "brine_map_at", [b, kp, loc])
+                        let mf = self.map_find(base.ty)
+                        let en = self.cx.fb.call(K.I64, mf, [b, kp])
+                        let vsz = self.cx.fb.konst(K.I64, self.lay(e.ty).size)
+                        let p = self.cx.fb.rt(K.Ptr, "brine_map_val", [b, en, kp, vsz, loc])
                         return self.ld(p, 0, e.ty)
                     case _:
                         pass
@@ -3448,7 +3491,10 @@ struct Lower:
                 match coll.ty:
                     case Ty.Map(_, _):
                         let kp = self.addr_of(x, item.ty)
-                        tst = self.cx.fb.rt(K.Bool, "brine_map_has", [c, kp])
+                        let mf = self.map_find(coll.ty)
+                        let en = self.cx.fb.call(K.I64, mf, [c, kp])
+                        let zero = self.cx.fb.konst(K.I64, 0)
+                        tst = self.cx.fb.cmp(Op.Ge, en, zero)
                     case Ty.Str:
                         tst = self.cx.fb.call(K.Bool, "brine_str_contains", [c, x])
                     case _:
@@ -3676,9 +3722,9 @@ struct Lower:
             case Ty.Str:
                 match op:
                     case CmpOp.Eq:
-                        return self.cx.fb.call(K.Bool, "brine_str_eq", [a, b])
+                        return self.cx.fb.rt(K.Bool, "brine_str_eq", [a, b])
                     case CmpOp.Ne:
-                        let q = self.cx.fb.call(K.Bool, "brine_str_eq", [a, b])
+                        let q = self.cx.fb.rt(K.Bool, "brine_str_eq", [a, b])
                         return self.cx.fb.un(Op.Not, K.Bool, q)
                     case _:
                         let c = self.cx.fb.call(K.I32, "brine_str_cmp", [a, b])

@@ -591,9 +591,7 @@ void brine_str_append(brine_str **ps, brine_str *b) {
     s->data[n] = 0;
     *ps = s;
 }
-bool brine_str_eq(brine_str *a, brine_str *b) {
-    return a == b || (a->len == b->len && memcmp(a->data, b->data, (size_t)a->len) == 0);
-}
+bool brine_str_eq_long(brine_str *a, brine_str *b) { return memcmp(a->data, b->data, (size_t)a->len) == 0; }
 bool brine_str_contains(brine_str *s, brine_str *sub) {
     if (sub->len == 0) return true;
     for (int64_t i = 0; i + sub->len <= s->len; i++)
@@ -1274,13 +1272,27 @@ brine_str *brine_s_repeat(brine_str *s, int64_t n, const char *loc) {
     for (int64_t i = 0; i < n; i++) brine_sb_str(&sb, s);
     return brine_sb_finish(&sb);
 }
-uint64_t brine_hash_str(brine_str *s) {
-    uint64_t h = 0xcbf29ce484222325ULL; /* FNV-1a, then mixed */
-    for (int64_t i = 0; i < s->len; i++) {
-        h ^= (unsigned char)s->data[i];
-        h *= 0x100000001b3ULL;
+/* strings of 8 bytes or more (brine_hash_str has the rest): 16 bytes per
+   folded 64x64->128 multiply (wyhash's scheme), then the last 1 to 16 bytes as
+   two masked words, mixed with the top bit set */
+static inline uint64_t br_mum(uint64_t a, uint64_t b) {
+    __extension__ unsigned __int128 r = (unsigned __int128)a * b;
+    return (uint64_t)r ^ (uint64_t)(r >> 64);
+}
+uint64_t brine_hash_long(const char *p, uint64_t n) {
+    const uint64_t k0 = 0xa0761d6478bd642fULL, k1 = 0xe7037ed1a0b428dbULL;
+    uint64_t seed = k0 ^ n, len = n;
+    while (n > 16) {
+        seed = br_mum(brine_ld8(p) ^ k1, brine_ld8(p + 8) ^ seed);
+        p += 16;
+        n -= 16;
     }
-    return brine_hash_u64(h ^ (uint64_t)s->len);
+    uint64_t a = brine_ld8(p), b = 0;
+    if (n < 8)
+        a &= brine_lowmask(n);
+    else if (n > 8)
+        b = brine_ld8(p + 8) & brine_lowmask(n - 8);
+    return brine_hash_word(br_mum(k1 ^ len, br_mum(a ^ k1, b ^ seed)) | 1ULL << 63);
 }
 int brine_str_cmp(brine_str *a, brine_str *b) {
     int64_t n = a->len < b->len ? a->len : b->len;
@@ -1559,7 +1571,8 @@ void brine_map_free(brine_map *m) {
 }
 static void br_map_reindex(brine_map *m) {
     int64_t n = 8;
-    while (n < 2 * m->cap) n *= 2;
+    /* a sparse index: fewer probes, and few maps are big enough for it to cost much */
+    while (n < 4 * m->cap) n *= 2;
     free(m->index);
     m->nidx = n;
     m->index = (int64_t *)brine_alloc(n * (int64_t)sizeof(int64_t));
@@ -1653,6 +1666,13 @@ void *brine_map_at(brine_map *m, const void *k, const char *loc) {
 void *brine_map_at_mut(brine_map **pm, const void *k, const char *loc) {
     int64_t e = brine_map_find(*pm, k);
     if (BR_UNLIKELY(e < 0)) br_map_missing(*pm, k, loc);
+    brine_map *before = *pm;
+    brine_map_unique(pm);
+    if (*pm != before) e = brine_map_find(*pm, k); /* copying compacts the entries */
+    return (*pm)->vals + e * (*pm)->ty->vsz;
+}
+void *brine_map_val_mut_slow(brine_map **pm, int64_t e, const void *k, const char *loc) {
+    if (e < 0) return brine_map_at_mut(pm, k, loc); /* panics */
     brine_map *before = *pm;
     brine_map_unique(pm);
     if (*pm != before) e = brine_map_find(*pm, k); /* copying compacts the entries */
@@ -5902,6 +5922,8 @@ void brine_x_map_release(brine_map *m) { brine_map_release(m); }
 brine_str *brine_x_str_at(brine_str *s, int64_t i, const char *loc) { return brine_str_at(s, i, loc); }
 brine_str *brine_x_str_byte(brine_str *s, int64_t i) { return brine_str_byte(s, i); }
 void brine_x_str_add(brine_str **ps, brine_str *b) { brine_str_add(ps, b); }
+bool brine_x_str_eq(brine_str *a, brine_str *b) { return brine_str_eq(a, b); }
+uint64_t brine_x_hash_str(brine_str *s) { return brine_hash_str(s); }
 bool brine_x_map_has(brine_map *m, const void *k) { return brine_map_has(m, k); }
 bool brine_x_arr_shl(brine_arr **pa, int64_t lo, int64_t hi) { return brine_arr_shl(pa, lo, hi); }
 bool brine_x_arr_copy(brine_arr **pb, brine_arr *a, int64_t lo, int64_t hi) { return brine_arr_copy(pb, a, lo, hi); }
@@ -5911,6 +5933,15 @@ bool brine_x_bytes_rotl(char *d, int64_t n, int64_t lo, int64_t hi) { return bri
 bool brine_x_arr_rotl(brine_arr **pa, int64_t lo, int64_t hi) { return brine_arr_rotl(pa, lo, hi); }
 bool brine_x_bytes_copy(char *db, int64_t nb, const char *da, int64_t na, int64_t lo, int64_t hi) {
     return brine_bytes_copy(db, nb, da, na, lo, hi);
+}
+int64_t brine_x_map_probe(const brine_map *m, const void *k, uint64_t h, void *keq, int64_t ksz, bool exact) {
+    return brine_map_probe(m, k, h, keq, ksz, exact);
+}
+void *brine_x_map_val(brine_map *m, int64_t e, const void *k, int64_t vsz, const char *loc) {
+    return brine_map_val(m, e, k, vsz, loc);
+}
+void *brine_x_map_val_mut(brine_map **pm, int64_t e, const void *k, int64_t vsz, const char *loc) {
+    return brine_map_val_mut(pm, e, k, vsz, loc);
 }
 uint64_t brine_x_hash_u64(uint64_t x) { return brine_hash_u64(x); }
 uint64_t brine_x_hash_mix(uint64_t h, uint64_t x) { return brine_hash_mix(h, x); }
