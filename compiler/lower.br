@@ -124,10 +124,14 @@ struct FnCx:
     nv: bool
     # lowering a loop twice (idiom.twin_body): 1 in the first copy, 2 in the
     # second; the labels in the second the idioms of the first fail over to
-    # (by span), and the stack slots of the locals the copies share
+    # (by span), the stack slots of the locals the copies share, and the
+    # (slot, address) vregs the second copy has made so far: it is entered
+    # midway, so each landing sets them again (a scope releases a local
+    # through its address)
     twin: int
     twin_out: {str: int}
     twin_slots: {int: int}
+    twin_ptrs: [(int, int)]
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -170,7 +174,8 @@ fn new_cx(f: Func) -> FnCx:
         nv=false,
         twin=0,
         twin_out={},
-        twin_slots={}
+        twin_slots={},
+        twin_ptrs=[]
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -1032,20 +1037,25 @@ struct Lower:
             match self.cx.twin_slots.get(id):
                 case Some(s0):
                     self.cx.lslot[id] = s0
-                    return self.cx.fb.slot_addr(s0)
+                    let p0 = self.cx.fb.slot_addr(s0)
+                    self.cx.twin_ptrs.push((s0, p0))
+                    return p0
                 case None:
                     pass
         let lay = self.lay(t)
         let s = self.cx.fb.slot(lay.size, lay.align)
-        if self.cx.twin == 1:
-            self.cx.twin_slots[id] = s
         self.cx.fb.name_slot(s, self.flocals[id].name, not self.agg(t), self.kind(t))
         self.cx.lslot[id] = s
         if self.opts.debug:
             let lk = self.flocals[id].kind
             let param = lk == LocalKind.Param or lk == LocalKind.RefParam
             self.dbg_var(id, s, -1, param)
-        return self.cx.fb.slot_addr(s)
+        if self.cx.twin == 1:
+            self.cx.twin_slots[id] = s
+        let p = self.cx.fb.slot_addr(s)
+        if self.cx.twin == 2:
+            self.cx.twin_ptrs.push((s, p))
+        return p
 
     fn local_ptr(ref self, id: int) -> int:
         match self.cx.lptr.get(id):
@@ -2185,6 +2195,9 @@ struct Lower:
         match self.cx.twin_out.get(key):
             case Some(l):
                 self.cx.fb.place(l)
+                for sp in self.cx.twin_ptrs:
+                    let a = self.cx.fb.slot_addr(sp.0)
+                    self.cx.fb.mov(sp.1, a)
             case None:
                 pass
 
@@ -2245,6 +2258,7 @@ struct Lower:
         self.cx.twin = 1
         self.cx.twin_out = {}
         self.cx.twin_slots = {}
+        self.cx.twin_ptrs = []
         self.stmt(s)
         let end = self.cx.fb.label()
         if not self.cx.fb.ends():
@@ -2255,6 +2269,7 @@ struct Lower:
         self.cx.twin = 0
         self.cx.twin_out = {}
         self.cx.twin_slots = {}
+        self.cx.twin_ptrs = []
         self.cx.fb.place(end)
         self.cx.arrc = saved
         return true
