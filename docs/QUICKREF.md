@@ -193,7 +193,7 @@ end with `case _:` when listing values isn't possible. Variant data is read with
 Cost: an enum whose variants hold at most 64 bytes and that can't contain itself
 (`Shape`, `Option[int]`, `Result[int, str]`) is stored in place, like a struct: making
 one allocates nothing. A recursive enum (`Expr`) or a bigger one is a pointer to a
-shared, reference-counted box.
+shared, reference-counted box. `match (a, b)` on variables doesn't copy them.
 
 ## Generics, `Option` and `Result`
 
