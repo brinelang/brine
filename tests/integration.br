@@ -148,6 +148,47 @@ test "world programs run on several processes":
     )
     # idioms the deadlock checker must accept
     run_ok("tests/programs/world_idioms.br", "100 2 [0, 1, 2] Ok(30) [3, 2, 4]\n", ["--ranks", "3"])
+    run_ok("tests/programs/world_child.br", "inherited: [false, false, false]\n", ["--ranks", "3"])
+    run_ok("tests/programs/world_exit.br", "total 3 true\n", ["--ranks", "3"])
+
+test "world runtime failures are clear":
+    # every rank exits with the same code: it's the launcher's
+    let o = brine(["run", "-q", "--ranks", "3", "tests/programs/world_exit.br", "--", "x"])
+    assert o.code == 3 and o.out == "total 3 true\n" and "error:" not in o.err, o.all()
+    # ranks in different collectives (two programs in one world: the compiler
+    # rejects a program that could do this) panic, naming both call sites
+    let d = scratch("mismatch")
+    write(f"{d}/a.br", "fn main():\n    print(world.sum(1))\n")
+    write(f"{d}/b.br", "fn main():\n    world.barrier()\n")
+    var exes: [str] = []
+    for n in ["a", "b"]:
+        let b = brine(["build", "-q", f"{d}/{n}.br", "-o", f"{d}/{n}.exe"])
+        assert b.code == 0, b.all()
+        exes.push(f"{d}/{n}.exe")
+    var peers = ""
+    match os.free_ports(2):
+        case Ok(ps):
+            peers = f"127.0.0.1:{ps[0]},127.0.0.1:{ps[1]}"
+        case Err(e):
+            panic(e)
+    var kids: [int] = []
+    for r in 0..2:
+        let env = {"BRINE_RANK": f"{r}", "BRINE_WORLD_SIZE": "2", "BRINE_PEERS": peers}
+        match os.spawn([exes[r]], env, true, false):
+            case Ok(k):
+                kids.push(k)
+            case Err(e):
+                panic(e)
+    var errs: [str] = []
+    for k in kids:
+        let code = os.wait(k)
+        let (_, er) = os.output(k)
+        assert code == 101, er
+        errs.push(er.replace("\r\n", "\n"))
+    let (e0, e1) = (errs[0], errs[1])
+    assert "mismatched communication: this rank is in `world.sum`, but rank 1 is in `world.barrier` at " in e0, e0
+    assert "b.br:2:5" in e0, e0
+    assert "this rank is in `world.barrier`, but rank 0 is in `world.sum` at " in e1, e1
 
 fn features() -> [str]:
     return [
