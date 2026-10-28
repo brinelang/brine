@@ -5,6 +5,44 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) 
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-28
+### Added
+- WebAssembly: `brine build --target wasm` makes a WASI module (wasm32-wasip1) and
+  `brine build --target web` makes a folder for the browser (the module, a small
+  loader `brine.js` and a starter page that rebuilds keep). `brine run` and
+  `brine test` run WASI modules with Node.js, or with `$BRINE_WASM_RUNNER`. It needs
+  wasi-sdk (`WASI_SDK_PATH`). On WebAssembly programs run on one thread and one
+  `world` rank (`par` runs in order with the same results); processes, sockets and
+  the GPU fail with a clear message, and the browser has no files.
+
+### Changed
+- Much faster release builds: on the benchmarks, `--release` now takes 0.28x to
+  0.67x C's time (`gcc -O2`) on seven of eight programs, and ties C on wordfreq.
+  Output and panics are unchanged; every fast path checks its conditions at run
+  time or falls back to the code as written.
+  - x86-64 release programs carry plain, AVX2 (x86-64-v3) and AVX-512 (x86-64-v4)
+    copies and pick the newest one the CPU supports, so executables still run on
+    any x86-64 machine. `BRINE_CPU=base` or `v3` caps the level.
+  - The prover removes more overflow checks: compound assignments (`i += 1`) and
+    loop counters.
+  - Loops whose inputs are small run a copy without overflow checks, so C
+    compilers vectorize them.
+  - Independent loop iterations run four at a time (mandelbrot: 0.59 s to 0.43 s).
+  - Local `[bool]` arrays are kept as bits and small integer arrays as bytes;
+    reverse, rotate and copy loops run as one operation (fannkuch: 1.6 s to
+    0.96 s).
+  - Small fixed-size float array loops run as vector kernels with bit-identical
+    results (nbody: 0.71 s to 0.49 s).
+  - Faster strings and maps: inlined map lookups, one lookup for
+    `if k in m: m[k] += v`, in-place byte appends for `s += t[i]`, and string
+    buffers reused across loop iterations (wordfreq: 77.6 ms to 17.6 ms).
+- Programs start 2 ms faster on Windows (3.0 ms for an empty program, from 5.0 ms).
+- `BRINE_LEAKCHECK` is the only thing that counts live objects now, so allocation
+  no longer pays for a locked counter.
+
+### Fixed
+- `brine test` reported zero tests and success when listing the tests failed.
+
 ## [0.4.0] - 2026-10-27
 ### Added
 - `par for`, `par [...]` maps and `par` reductions run on the GPU when that's
@@ -128,7 +166,8 @@ The first version.
 - The compiler is written in brine and builds itself; `bootstrap/brinec.c` builds it
   from scratch with only a C compiler.
 
-[Unreleased]: https://github.com/brinelang/brine/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/brinelang/brine/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/brinelang/brine/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/brinelang/brine/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/brinelang/brine/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/brinelang/brine/compare/v0.1.0...v0.2.0
