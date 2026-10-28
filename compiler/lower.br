@@ -24,6 +24,7 @@ from ir import K, Op, Func, Data, Reloc, Module, FB, new_func, le_bytes, str_byt
 from ir import DType, DField, DVar, DT_BASE, DT_STRUCT, DT_UNION, DT_ENUM, DT_PTR, DT_TYPEDEF, DT_ARRAY
 import ptx
 import msl
+import jam
 
 struct Options:
     # generate a test-runner `main` instead of the program's `main`
@@ -32,6 +33,8 @@ struct Options:
     debug: bool
     # compile `par` bodies for a GPU (not on WebAssembly)
     gpu: bool
+    # optimizations that make more code (release builds): interleaved loops
+    fast: bool
 
 struct Temp:
     v: int
@@ -97,6 +100,27 @@ struct FnCx:
     sret: int
     # debug builds: the number of `Func.dvars` when each scope opened
     dmark: [int]
+    # the body of a `par` construct
+    lifted: bool
+    # the lanes of the interleaved loop being lowered
+    jx: JamCx
+
+# The lanes of an interleaved loop (see jam.br): vregs, one per lane.
+struct JamCx:
+    # does the lane run the current statement
+    act: [int]
+    # the inner loops, innermost last: the lanes still looping, and those
+    # that did `continue` in this iteration
+    alive: [[int]]
+    cont: [[int]]
+    # each lane's stack slot for each variable of the body
+    slots: {int: [int]}
+    # reductions, by variable: does the lane add something, and what
+    has: {int: [int]}
+    val: {int: [int]}
+
+fn no_jam() -> JamCx:
+    return JamCx(act=[], alive=[], cont=[], slots={}, has={}, val={})
 
 fn new_cx(f: Func) -> FnCx:
     return FnCx(
@@ -110,7 +134,9 @@ fn new_cx(f: Func) -> FnCx:
         lptr={},
         loc=-1,
         sret=-1,
-        dmark=[]
+        dmark=[],
+        lifted=false,
+        jx=no_jam()
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -1903,6 +1929,8 @@ struct Lower:
             case StmtKind.For(_, _, _, iter, _, body, is_par):
                 if is_par:
                     self.par_for(iter, s.local, s.caps, s.writes, body, s.span)
+                elif self.opts.fast and not self.cx.lifted and self.jam_for(iter, s.local, body):
+                    pass
                 else:
                     self.push_scope()
                     self.push_frame()
@@ -1963,6 +1991,376 @@ struct Lower:
                 self.cx.fb.place(ok)
                 self.pop_frame()
             case _:
+                pass
+
+    # ============================================================ interleaving
+    # `for x in lo..hi:` whose iterations jam.br found independent: LANES
+    # iterations at a time while that many are left, so the CPU overlaps
+    # their long dependency chains, then the rest one by one. Returns false,
+    # having emitted nothing, when the loop doesn't qualify.
+    fn jam_for(ref self, iter: Expr, var_id: int, body: Block) -> bool:
+        var p = jam.Plan(locals=[], reds=[])
+        match jam.plan(iter, var_id, body, self.flocals):
+            case Some(x):
+                p = x
+            case None:
+                return false
+        let n = jam.LANES
+        self.push_scope()
+        self.push_frame()
+        let dom = self.domain(iter, true)
+        self.pop_frame()
+        let saved = self.loop_arrays([iter], body)
+        var kt = IntTy.I64
+        var lo = -1
+        var hi = -1
+        match dom:
+            case Dom.Range(t, l, h, _, _):
+                kt = t
+                lo = l
+                hi = h
+            case _:
+                pass
+        let kk = int_kind(kt)
+        let head = self.cx.fb.label()
+        let rest = self.cx.fb.label()
+        let x = self.cx.fb.copy_of(lo)
+        var jx = no_jam()
+        var ids = [var_id]
+        ids.extend(p.locals)
+        for id in ids:
+            let t = self.flocals[id].ty
+            let lay = self.lay(t)
+            var ss: [int] = []
+            for _ in 0..n:
+                let sl = self.cx.fb.slot(lay.size, lay.align)
+                self.cx.fb.name_slot(sl, self.flocals[id].name, true, self.kind(t))
+                ss.push(sl)
+            jx.slots[id] = ss
+        for r in p.reds:
+            let rk = self.kind(self.flocals[r].ty)
+            var hs: [int] = []
+            var vs: [int] = []
+            for _ in 0..n:
+                hs.push(self.cx.fb.vreg(K.Bool))
+                vs.push(self.cx.fb.vreg(rk))
+            jx.has[r] = hs
+            jx.val[r] = vs
+        for _ in 0..n:
+            jx.act.push(self.cx.fb.vreg(K.Bool))
+        self.cx.fb.place(head)
+        # a whole group is left: x < hi and hi - x >= n (in u64: no overflow)
+        let more = self.cx.fb.cmp(Op.Lt, x, hi)
+        self.cx.fb.brnot(more, rest)
+        let hu = self.cx.fb.conv(K.U64, hi)
+        let xu = self.cx.fb.conv(K.U64, x)
+        let left = self.cx.fb.bin(Op.Sub, K.U64, hu, xu)
+        let nk = self.cx.fb.konst(K.U64, n)
+        let enough = self.cx.fb.cmp(Op.Ge, left, nk)
+        self.cx.fb.brnot(enough, rest)
+        let yes = self.cx.fb.konst(K.Bool, 1)
+        let no = self.cx.fb.konst(K.Bool, 0)
+        for l in 0..n:
+            let lk = self.cx.fb.konst(kk, l)
+            let xl = self.cx.fb.bin(Op.Add, kk, x, lk)
+            let xp = self.cx.fb.slot_addr(jx.slots[var_id][l])
+            self.cx.fb.store(xp, 0, xl)
+            self.cx.fb.mov(jx.act[l], yes)
+            for r in p.reds:
+                self.cx.fb.mov(jx.has[r][l], no)
+        self.cx.jx = jx
+        self.jam_block(body)
+        self.cx.jx = no_jam()
+        # the reductions, in the order of the iterations
+        for l in 0..n:
+            for r in p.reds:
+                let skip = self.cx.fb.label()
+                self.cx.fb.brnot(jx.has[r][l], skip)
+                self.jam_reduce(body, r, jx.val[r][l])
+                self.cx.fb.place(skip)
+        let step = self.cx.fb.konst(kk, n)
+        let x2 = self.cx.fb.bin(Op.Add, kk, x, step)
+        self.cx.fb.mov(x, x2)
+        self.cx.fb.jmp(head)
+        self.cx.fb.place(rest)
+        # the rest, one at a time
+        let dom2 = Dom.Range(kt, x, hi, false, -1)
+        let lc = self.loop_open(dom2, var_id)
+        self.cx.loops.push(Loop(depth=len(self.cx.scopes), brk=lc.brk, cont=lc.cont))
+        self.block(body)
+        self.cx.loops.pop()
+        self.loop_close(dom2, lc)
+        self.cx.arrc = saved
+        self.pop_scope()
+        return true
+
+    # Adds a lane's part `v` into reduction `r`, as its statement in `b`
+    # would have (checked unless proven).
+    fn jam_reduce(ref self, b: Block, r: int, v: int):
+        for s in b.stmts:
+            match s.kind:
+                case StmtKind.Assign(t, op, _):
+                    if jam.local_id(t) == r:
+                        let ty = self.flocals[r].ty
+                        let lp = self.local_ptr(r)
+                        let cur = self.ld(lp, 0, ty)
+                        let c = self.arith(
+                            op.unwrap_or(BinOp.Add),
+                            cur,
+                            v,
+                            ty,
+                            not s.proven,
+                            s.span
+                        )
+                        self.st(lp, 0, ty, c)
+                        return
+                case _:
+                    pass
+            for blk in jam.nested_blocks(s):
+                self.jam_reduce(blk, r, v)
+
+    # Points the body's variables at lane `l`'s copies.
+    fn lane(ref self, l: int):
+        for id in self.cx.jx.slots:
+            self.cx.lslot[id] = self.cx.jx.slots[id][l]
+
+    # The value of `e` in lane `l`. When `e` can fault on values its own
+    # iteration never has, only computed if `guard` (the lane runs it).
+    fn jam_expr(ref self, e: Expr, l: int, guard: int) -> int:
+        self.lane(l)
+        if not jam.traps(e):
+            self.push_frame()
+            let v = self.expr(e)
+            self.pop_frame()
+            return v
+        let k = self.kind(e.ty)
+        let t = self.cx.fb.vreg(k)
+        let z = self.zero_of(k, 0)
+        self.cx.fb.mov(t, z)
+        let skip = self.cx.fb.label()
+        self.cx.fb.brnot(guard, skip)
+        self.push_frame()
+        let v = self.expr(e)
+        self.pop_frame()
+        self.cx.fb.mov(t, v)
+        self.cx.fb.place(skip)
+        return t
+
+    fn jam_ptr(ref self, id: int, l: int) -> int:
+        return self.cx.fb.slot_addr(self.cx.jx.slots[id][l])
+
+    fn jam_any(ref self, m: [int]) -> int:
+        var a = m[0]
+        for i in 1..len(m):
+            a = self.cx.fb.bin(Op.Or, K.Bool, a, m[i])
+        return a
+
+    fn jam_copy(ref self, m: [int]) -> [int]:
+        var out: [int] = []
+        for v in m:
+            out.push(self.cx.fb.copy_of(v))
+        return out
+
+    fn jam_set(ref self, d: [int], m: [int]):
+        for i in 0..len(d):
+            self.cx.fb.mov(d[i], m[i])
+
+    # After an `if`: the lanes that ran before it run on, except those that
+    # left the inner loop or continued it.
+    fn jam_restore(ref self, before: [int], brk: bool, cont: bool):
+        let k = len(self.cx.jx.alive)
+        for l in 0..len(before):
+            var a = before[l]
+            if brk:
+                a = self.cx.fb.bin(Op.And, K.Bool, a, self.cx.jx.alive[k - 1][l])
+            if cont:
+                let nc = self.cx.fb.un(Op.Not, K.Bool, self.cx.jx.cont[k - 1][l])
+                a = self.cx.fb.bin(Op.And, K.Bool, a, nc)
+            self.cx.fb.mov(self.cx.jx.act[l], a)
+
+    fn jam_block(ref self, b: Block):
+        for s in b.stmts:
+            self.jam_stmt(s)
+
+    # The head of an inner loop, once `alive` has the lanes still looping:
+    # leaves when none is, else runs those.
+    fn jam_loop_head(ref self, alive: [int], cont: [int], out: int):
+        let any = self.jam_any(alive)
+        self.cx.fb.brnot(any, out)
+        self.jam_set(self.cx.jx.act, alive)
+        self.cx.jx.alive.push(alive)
+        self.cx.jx.cont.push(cont)
+
+    fn jam_loop_end(ref self):
+        self.cx.jx.alive.pop()
+        self.cx.jx.cont.pop()
+
+    fn jam_stmt(ref self, s: Stmt):
+        let n = len(self.cx.jx.act)
+        match s.kind:
+            case StmtKind.Let(_, _, _, init, _):
+                let id = s.locals[0]
+                let ty = self.flocals[id].ty
+                for l in 0..n:
+                    let v = self.jam_expr(init, l, self.cx.jx.act[l])
+                    let ptr = self.jam_ptr(id, l)
+                    self.st(ptr, 0, ty, v)
+            case StmtKind.Assign(target, op, value):
+                let id = jam.local_id(target)
+                let ty = self.flocals[id].ty
+                let red = id in self.cx.jx.has
+                for l in 0..n:
+                    let act = self.cx.jx.act[l]
+                    let v = self.jam_expr(value, l, act)
+                    let skip = self.cx.fb.label()
+                    self.cx.fb.brnot(act, skip)
+                    if red:
+                        let one = self.cx.fb.konst(K.Bool, 1)
+                        self.cx.fb.mov(self.cx.jx.has[id][l], one)
+                        self.cx.fb.mov(self.cx.jx.val[id][l], v)
+                    else:
+                        let ptr = self.jam_ptr(id, l)
+                        var nv = v
+                        match op:
+                            case Some(o):
+                                # jam.br only allows proven (or float) ones
+                                let cur = self.ld(ptr, 0, ty)
+                                nv = self.arith(o, cur, v, ty, false, s.span)
+                            case None:
+                                pass
+                        self.st(ptr, 0, ty, nv)
+                    self.cx.fb.place(skip)
+            case StmtKind.If(branches, els):
+                let before = self.jam_copy(self.cx.jx.act)
+                let rem = self.jam_copy(self.cx.jx.act)
+                for br_ in branches:
+                    var run: [int] = []
+                    for l in 0..n:
+                        let c = self.jam_expr(br_.0, l, rem[l])
+                        let t = self.cx.fb.bin(Op.And, K.Bool, rem[l], c)
+                        let nc = self.cx.fb.un(Op.Not, K.Bool, c)
+                        let r2 = self.cx.fb.bin(Op.And, K.Bool, rem[l], nc)
+                        self.cx.fb.mov(rem[l], r2)
+                        run.push(t)
+                    let skip = self.cx.fb.label()
+                    if not jam.flat(br_.1):
+                        let any = self.jam_any(run)
+                        self.cx.fb.brnot(any, skip)
+                    self.jam_set(self.cx.jx.act, run)
+                    self.jam_block(br_.1)
+                    self.cx.fb.place(skip)
+                match els:
+                    case Some(eb):
+                        let skip = self.cx.fb.label()
+                        if not jam.flat(eb):
+                            let any = self.jam_any(rem)
+                            self.cx.fb.brnot(any, skip)
+                        self.jam_set(self.cx.jx.act, rem)
+                        self.jam_block(eb)
+                        self.cx.fb.place(skip)
+                    case None:
+                        pass
+                var brk = false
+                var cnt = false
+                for nb in jam.nested_blocks(s):
+                    brk = brk or jam.exits(nb, false)
+                    cnt = cnt or jam.exits(nb, true)
+                self.jam_restore(before, brk, cnt)
+            case StmtKind.While(cond, _, body):
+                let before = self.jam_copy(self.cx.jx.act)
+                let alive = self.jam_copy(self.cx.jx.act)
+                var cont: [int] = []
+                if jam.exits(body, true):
+                    for _ in 0..n:
+                        cont.push(self.cx.fb.vreg(K.Bool))
+                let top = self.cx.fb.label()
+                let out = self.cx.fb.label()
+                self.cx.fb.place(top)
+                for l in 0..n:
+                    if len(cont) > 0:
+                        let f0 = self.cx.fb.konst(K.Bool, 0)
+                        self.cx.fb.mov(cont[l], f0)
+                    let c = self.jam_expr(cond, l, alive[l])
+                    let a2 = self.cx.fb.bin(Op.And, K.Bool, alive[l], c)
+                    self.cx.fb.mov(alive[l], a2)
+                self.jam_loop_head(alive, cont, out)
+                self.jam_block(body)
+                self.jam_loop_end()
+                self.cx.fb.jmp(top)
+                self.cx.fb.place(out)
+                self.jam_set(self.cx.jx.act, before)
+            case StmtKind.For(_, _, _, iter, _, body, _):
+                var lo_e = iter
+                var hi_e = iter
+                match iter.kind:
+                    case ExprKind.Range(a, b, _):
+                        lo_e = a
+                        hi_e = b
+                    case _:
+                        pass
+                let id = s.local
+                let ty = self.flocals[id].ty
+                let kk = self.kind(ty)
+                let before = self.jam_copy(self.cx.jx.act)
+                var his: [int] = []
+                for l in 0..n:
+                    let a = self.jam_expr(lo_e, l, before[l])
+                    let b = self.jam_expr(hi_e, l, before[l])
+                    let ptr = self.jam_ptr(id, l)
+                    self.st(ptr, 0, ty, a)
+                    his.push(self.cx.fb.copy_of(b))
+                let alive = self.jam_copy(self.cx.jx.act)
+                var cont: [int] = []
+                if jam.exits(body, true):
+                    for _ in 0..n:
+                        cont.push(self.cx.fb.vreg(K.Bool))
+                let top = self.cx.fb.label()
+                let out = self.cx.fb.label()
+                self.cx.fb.place(top)
+                for l in 0..n:
+                    if len(cont) > 0:
+                        let f0 = self.cx.fb.konst(K.Bool, 0)
+                        self.cx.fb.mov(cont[l], f0)
+                    let ptr = self.jam_ptr(id, l)
+                    let k = self.ld(ptr, 0, ty)
+                    let c = self.cx.fb.cmp(Op.Lt, k, his[l])
+                    let a2 = self.cx.fb.bin(Op.And, K.Bool, alive[l], c)
+                    self.cx.fb.mov(alive[l], a2)
+                self.jam_loop_head(alive, cont, out)
+                self.jam_block(body)
+                self.jam_loop_end()
+                # step the lanes still looping (k < hi, so k + 1 can't overflow)
+                for l in 0..n:
+                    let skip = self.cx.fb.label()
+                    self.cx.fb.brnot(alive[l], skip)
+                    let ptr = self.jam_ptr(id, l)
+                    let k = self.ld(ptr, 0, ty)
+                    let one = self.cx.fb.konst(kk, 1)
+                    let k2 = self.cx.fb.bin(Op.Add, kk, k, one)
+                    self.st(ptr, 0, ty, k2)
+                    self.cx.fb.place(skip)
+                self.cx.fb.jmp(top)
+                self.cx.fb.place(out)
+                self.jam_set(self.cx.jx.act, before)
+            case StmtKind.Break:
+                let k = len(self.cx.jx.alive) - 1
+                for l in 0..n:
+                    let na = self.cx.fb.un(Op.Not, K.Bool, self.cx.jx.act[l])
+                    let a = self.cx.jx.alive[k][l]
+                    let a2 = self.cx.fb.bin(Op.And, K.Bool, a, na)
+                    self.cx.fb.mov(a, a2)
+                    let f0 = self.cx.fb.konst(K.Bool, 0)
+                    self.cx.fb.mov(self.cx.jx.act[l], f0)
+            case StmtKind.Continue:
+                let k = len(self.cx.jx.cont) - 1
+                for l in 0..n:
+                    let c = self.cx.jx.cont[k][l]
+                    let c2 = self.cx.fb.bin(Op.Or, K.Bool, c, self.cx.jx.act[l])
+                    self.cx.fb.mov(c, c2)
+                    let f0 = self.cx.fb.konst(K.Bool, 0)
+                    self.cx.fb.mov(self.cx.jx.act[l], f0)
+            case _:
+                # pass, prove, contracts and proven asserts do nothing here
                 pass
 
     # Before a loop: the local arrays it only indexes (and measures) can't be
@@ -3958,6 +4356,7 @@ struct Lower:
     ) -> FnCx:
         let saved = self.cx
         self.cx = new_cx(new_func(name, params, false, K.I64))
+        self.cx.lifted = true
         for w in par_writes:
             self.cx.par_writes[w] = true
         for c in captures:

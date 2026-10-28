@@ -1,0 +1,622 @@
+# Interleaved loops: which `for` loops over a range can run several
+# iterations at once, in lockstep (lower.br's `jam_for` does the lowering).
+#
+# A loop like
+#
+#     for px in 0..n:
+#         var z = 0.0
+#         var i = 0
+#         while i < 50 and z < 4.0:
+#             z = z * z + c
+#             i += 1
+#         if z < 4.0:
+#             count += 1
+#
+# spends its time in an inner loop whose every step waits for the one
+# before: one iteration at a time leaves most of the CPU idle. Iterations
+# that don't depend on each other can run LANES at a time, each in its own
+# copy of the body's variables, with a flag per lane for the lanes still
+# running: the C compiler then overlaps them, or puts them in vector
+# registers. That is only allowed when nothing can tell the difference:
+#
+# * the body changes no outer variable but through reductions, a single
+#   `total += x` (or `-=`, `*=`) per variable, outside inner loops, and
+#   reads no reduction variable. Each lane keeps its `x`, and after the
+#   lanes finish they are applied in the order of the iterations, so the
+#   result, its rounding and any overflow panic are the same;
+# * nothing else in the body can panic or have an effect: only scalar
+#   variables, arithmetic whose checks the prover removed, float math,
+#   comparisons, reads of outer arrays with proven indexes;
+# * every inner loop ends: a `for` over a range, or a `while i < n` that
+#   adds a positive constant to `i` at the end of each iteration (and has
+#   no `continue`), so a lane can't run forever where the original program
+#   would have stopped at a panic of an earlier iteration's reduction.
+#
+# Only loops with an inner loop are interleaved: a straight body is
+# something the C compiler vectorizes or unrolls on its own.
+from types import Ty, IntTy, Res, CallRes, Builtin, LocalInfo
+from ast import BinOp, CmpOp, UnOp, Expr, ExprKind, LetPat, Stmt, StmtKind, Block
+
+const LANES = 4
+# past this many statements and expressions the copies make the code too big
+const MAX_NODES = 400
+
+struct Plan:
+    # the variables the body declares: each lane has its own
+    locals: [int]
+    # the outer variables the body adds to, in the order of their statements
+    reds: [int]
+
+# The plan for interleaving `for <var> in <iter>: body`, if it may be.
+fn plan(iter: Expr, var_id: int, body: Block, locals: [LocalInfo]) -> Option[Plan]:
+    match iter.kind:
+        case ExprKind.Range(_, _, inclusive):
+            if inclusive or not small_int(iter_ty(iter)):
+                return None
+        case _:
+            return None
+    var j = Jam(
+        locals=locals,
+        declared={},
+        decl_order=[],
+        reds=[],
+        red_set={},
+        reads={},
+        depth=0,
+        nodes=0,
+        inner=false,
+        ok=true
+    )
+    j.declared[var_id] = true
+    j.block(body)
+    if not j.ok or not j.inner or j.nodes > MAX_NODES:
+        return None
+    for r in j.reds:
+        if r in j.reads:
+            return None
+    return Some(Plan(locals=j.decl_order, reds=j.reds))
+
+fn iter_ty(iter: Expr) -> Ty:
+    match iter.kind:
+        case ExprKind.Range(lo, _, _):
+            return lo.ty
+        case _:
+            return iter.ty
+
+# An integer of at most 64 bits.
+fn small_int(t: Ty) -> bool:
+    match t:
+        case Ty.Int(k):
+            return k.bits() <= 64
+        case _:
+            return false
+
+# A value a lane can keep in a register.
+fn scalar(t: Ty) -> bool:
+    match t:
+        case Ty.Int(k):
+            return k.bits() <= 64
+        case Ty.Float(_) | Ty.Bool:
+            return true
+        case _:
+            return false
+
+# Can evaluating `e` fault or misbehave in C when a lane computes it with
+# values its iteration never has (a division by zero, an index out of
+# bounds, a shift too far)? Such expressions are only evaluated for the lanes
+# that run them.
+fn traps(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Binary(op, l, r):
+            match e.ty:
+                case Ty.Int(_):
+                    if op == BinOp.Div or op == BinOp.Mod or op == BinOp.Shl or op == BinOp.Shr:
+                        return true
+                case _:
+                    pass
+            return traps(l) or traps(r)
+        case ExprKind.Index(_, _):
+            return true
+        case _:
+            pass
+    for c in sub_exprs(e):
+        if traps(c):
+            return true
+    return false
+
+fn sub_exprs(e: Expr) -> [Expr]:
+    match e.kind:
+        case ExprKind.Unary(_, x):
+            return [x]
+        case ExprKind.Binary(_, l, r):
+            return [l, r]
+        case ExprKind.Compare(first, rest):
+            var out = [first]
+            for r in rest:
+                out.push(r.1)
+            return out
+        case ExprKind.IfElse(c, t, f):
+            return [c, t, f]
+        case ExprKind.Call(_, args):
+            return [a.expr for a in args]
+        case ExprKind.Index(b, i):
+            return [b, i]
+        case _:
+            return []
+
+struct Jam:
+    locals: [LocalInfo]
+    declared: {int: bool}
+    decl_order: [int]
+    reds: [int]
+    red_set: {int: bool}
+    # the variables the body reads
+    reads: {int: bool}
+    # inner loops around the current statement
+    depth: int
+    nodes: int
+    inner: bool
+    ok: bool
+
+    fn no(ref self):
+        self.ok = false
+
+    fn declare(ref self, id: int):
+        if not scalar(self.locals[id].ty):
+            self.no()
+            return
+        self.declared[id] = true
+        self.decl_order.push(id)
+
+    fn block(ref self, b: Block):
+        for s in b.stmts:
+            if not self.ok:
+                return
+            self.stmt(s)
+
+    fn stmt(ref self, s: Stmt):
+        self.nodes += 1
+        match s.kind:
+            case StmtKind.Let(_, pat, _, init, is_ref):
+                match pat:
+                    case LetPat.Name(_, _):
+                        pass
+                    case _:
+                        self.no()
+                        return
+                if is_ref:
+                    self.no()
+                    return
+                self.expr(init)
+                for id in s.locals:
+                    self.declare(id)
+            case StmtKind.Assign(target, op, value):
+                self.expr(value)
+                var id = -1
+                match target.kind:
+                    case ExprKind.Ident(_):
+                        match target.res:
+                            case Res.Local(x):
+                                id = x
+                            case _:
+                                pass
+                    case _:
+                        pass
+                if id < 0 or not scalar(target.ty):
+                    self.no()
+                    return
+                if id in self.declared:
+                    match op:
+                        case Some(o):
+                            if not self.compound_ok(o, target.ty, s.proven):
+                                self.no()
+                        case None:
+                            pass
+                    return
+                # an outer variable: a reduction
+                match op:
+                    case Some(o):
+                        if o != BinOp.Add and o != BinOp.Sub and o != BinOp.Mul:
+                            self.no()
+                            return
+                    case None:
+                        self.no()
+                        return
+                if self.depth > 0 or id in self.red_set:
+                    self.no()
+                    return
+                self.red_set[id] = true
+                self.reds.push(id)
+            case StmtKind.If(branches, els):
+                for b in branches:
+                    self.expr(b.0)
+                    self.block(b.1)
+                match els:
+                    case Some(eb):
+                        self.block(eb)
+                    case None:
+                        pass
+            case StmtKind.While(cond, _, body):
+                self.expr(cond)
+                if not self.counted(cond, body):
+                    self.no()
+                    return
+                self.inner = true
+                self.depth += 1
+                self.block(body)
+                self.depth -= 1
+            case StmtKind.For(_, _, _, iter, _, body, is_par):
+                if is_par:
+                    self.no()
+                    return
+                match iter.kind:
+                    case ExprKind.Range(lo, hi, inclusive):
+                        if inclusive or not small_int(lo.ty):
+                            self.no()
+                            return
+                        self.expr(lo)
+                        self.expr(hi)
+                    case _:
+                        self.no()
+                        return
+                self.declare(s.local)
+                self.inner = true
+                self.depth += 1
+                self.block(body)
+                self.depth -= 1
+            case StmtKind.Break | StmtKind.Continue:
+                if self.depth == 0:
+                    self.no()
+            case StmtKind.Pass | StmtKind.Prove(_) | StmtKind.Contract(_, _):
+                pass
+            case StmtKind.Assert(_, _):
+                if not s.proven:
+                    self.no()
+            case _:
+                self.no()
+
+    # `x op= v` on a lane's own variable: nothing may panic
+    fn compound_ok(self, op: BinOp, t: Ty, proven: bool) -> bool:
+        match t:
+            case Ty.Float(_):
+                return op != BinOp.Mod
+            case Ty.Int(_):
+                return proven and (op == BinOp.Add or op == BinOp.Sub or op == BinOp.Mul)
+            case _:
+                return false
+
+    # `while i < n:` (or `<=`) where the body ends with `i += c` (c > 0), and
+    # changes neither `i` elsewhere nor anything `n` reads, and has no `continue`.
+    fn counted(self, cond: Expr, body: Block) -> bool:
+        var counter = -1
+        var bound: [Expr] = []
+        match cond.kind:
+            case ExprKind.Compare(first, rest):
+                if len(rest) != 1:
+                    return false
+                let op = rest[0].0
+                if op != CmpOp.Lt and op != CmpOp.Le:
+                    return false
+                match first.kind:
+                    case ExprKind.Ident(_):
+                        match first.res:
+                            case Res.Local(x):
+                                counter = x
+                            case _:
+                                return false
+                    case _:
+                        return false
+                bound.push(rest[0].1)
+            case _:
+                return false
+        if counter < 0 or counter not in self.declared or len(body.stmts) == 0:
+            return false
+        match self.locals[counter].ty:
+            case Ty.Int(_):
+                pass
+            case _:
+                return false
+        let last = body.stmts[len(body.stmts) - 1]
+        match last.kind:
+            case StmtKind.Assign(t, op, v):
+                if op != Some(BinOp.Add) or not is_local(t, counter):
+                    return false
+                match v.kind:
+                    case ExprKind.Int(c):
+                        if c <= 0:
+                            return false
+                    case _:
+                        return false
+            case _:
+                return false
+        var w = Writes(set={}, cont=false)
+        w.block(body, 0)
+        if w.cont:
+            return false
+        # the step itself is the one write of the counter
+        var others = 0
+        for s in body.stmts:
+            match s.kind:
+                case StmtKind.Assign(t, _, _):
+                    if is_local(t, counter):
+                        others += 1
+                case _:
+                    pass
+        if others != 1 or w.nested_counter(body, counter):
+            return false
+        for b in bound:
+            if w.reads_any(b):
+                return false
+        return true
+
+    fn expr(ref self, e: Expr):
+        if not self.ok:
+            return
+        self.nodes += 1
+        if not scalar(e.ty):
+            self.no()
+            return
+        match e.kind:
+            case ExprKind.Int(_) | ExprKind.Float(_) | ExprKind.Bool(_):
+                return
+            case ExprKind.Ident(_):
+                match e.res:
+                    case Res.Local(id):
+                        self.reads[id] = true
+                    case Res.Const(_):
+                        pass
+                    case _:
+                        self.no()
+                return
+            case ExprKind.Unary(op, x):
+                match e.ty:
+                    case Ty.Int(_):
+                        # signed negation checks for overflow
+                        if op == UnOp.Neg:
+                            self.no()
+                            return
+                    case _:
+                        pass
+                self.expr(x)
+            case ExprKind.Binary(op, l, r):
+                match e.ty:
+                    case Ty.Int(_):
+                        if e.checked:
+                            self.no()
+                            return
+                    case _:
+                        pass
+                self.expr(l)
+                self.expr(r)
+            case ExprKind.Compare(first, rest):
+                self.expr(first)
+                for r in rest:
+                    self.expr(r.1)
+            case ExprKind.IfElse(c, t, f):
+                self.expr(c)
+                self.expr(t)
+                self.expr(f)
+            case ExprKind.Call(_, args):
+                match e.cres:
+                    case CallRes.Convert(t):
+                        if len(args) != 1:
+                            self.no()
+                            return
+                        let from = args[0].expr.ty
+                        if not convert_ok(t, from):
+                            self.no()
+                            return
+                    case CallRes.Builtin(b):
+                        match b:
+                            case Builtin.Min | Builtin.Max:
+                                pass
+                            case Builtin.Abs:
+                                match e.ty:
+                                    case Ty.Float(_):
+                                        pass
+                                    case _:
+                                        self.no()
+                                        return
+                            case Builtin.Sqrt | Builtin.Sin | Builtin.Cos | Builtin.Tan | Builtin.Exp | Builtin.Log | Builtin.Floor | Builtin.Ceil | Builtin.Round:
+                                pass
+                            case _:
+                                self.no()
+                                return
+                    case _:
+                        self.no()
+                        return
+                for a in args:
+                    if a.by_ref:
+                        self.no()
+                        return
+                    self.expr(a.expr)
+            case ExprKind.Index(b, i):
+                # an outer array, read at a proven index
+                if e.checked:
+                    self.no()
+                    return
+                match b.kind:
+                    case ExprKind.Ident(_):
+                        match b.res:
+                            case Res.Local(id):
+                                if id in self.declared:
+                                    self.no()
+                                    return
+                                self.reads[id] = true
+                            case _:
+                                self.no()
+                                return
+                    case _:
+                        self.no()
+                        return
+                match b.ty:
+                    case Ty.Array(et):
+                        if not scalar(et):
+                            self.no()
+                            return
+                    case _:
+                        self.no()
+                        return
+                self.expr(i)
+            case _:
+                self.no()
+
+# Conversions that can't fail: to a float, and to a wider integer.
+fn convert_ok(to: Ty, from: Ty) -> bool:
+    match (to, from):
+        case (Ty.Float(_), Ty.Int(k)):
+            return k.bits() <= 64
+        case (Ty.Float(_), Ty.Float(_)):
+            return true
+        case (Ty.Int(k), Ty.Int(j)):
+            return k == j or (
+                k.bits() > j.bits() and (k.signed() or not j.signed()) and k.bits() <= 64
+            )
+        case (Ty.Int(k), Ty.Bool):
+            return k.bits() <= 64
+        case _:
+            return false
+
+fn is_local(e: Expr, id: int) -> bool:
+    match e.kind:
+        case ExprKind.Ident(_):
+            match e.res:
+                case Res.Local(x):
+                    return x == id
+                case _:
+                    return false
+        case _:
+            return false
+
+# The variables a loop body assigns, and whether it has a `continue` of its own.
+struct Writes:
+    set: {int: bool}
+    cont: bool
+
+    fn block(ref self, b: Block, depth: int):
+        for s in b.stmts:
+            match s.kind:
+                case StmtKind.Assign(t, _, _):
+                    match t.kind:
+                        case ExprKind.Ident(_):
+                            match t.res:
+                                case Res.Local(x):
+                                    self.set[x] = true
+                                case _:
+                                    pass
+                        case _:
+                            pass
+                case StmtKind.Let(_, _, _, _, _):
+                    for l in s.locals:
+                        self.set[l] = true
+                case StmtKind.For(_, _, _, _, _, body, _):
+                    self.set[s.local] = true
+                    self.block(body, depth + 1)
+                    continue
+                case StmtKind.While(_, _, body):
+                    self.block(body, depth + 1)
+                    continue
+                case StmtKind.Continue:
+                    if depth == 0:
+                        self.cont = true
+                case _:
+                    pass
+            match s.kind:
+                case StmtKind.If(branches, els):
+                    for br_ in branches:
+                        self.block(br_.1, depth)
+                    match els:
+                        case Some(eb):
+                            self.block(eb, depth)
+                        case None:
+                            pass
+                case _:
+                    pass
+
+    # Is the counter assigned inside a nested block (not at the top level)?
+    fn nested_counter(self, body: Block, counter: int) -> bool:
+        var w = Writes(set={}, cont=false)
+        for s in body.stmts:
+            for b in nested_blocks(s):
+                w.block(b, 1)
+        return counter in w.set
+
+    fn reads_any(self, e: Expr) -> bool:
+        match e.kind:
+            case ExprKind.Ident(_):
+                match e.res:
+                    case Res.Local(x):
+                        return x in self.set
+                    case _:
+                        return false
+            case _:
+                pass
+        for c in sub_exprs(e):
+            if self.reads_any(c):
+                return true
+        return false
+
+fn nested_blocks(s: Stmt) -> [Block]:
+    match s.kind:
+        case StmtKind.If(branches, els):
+            var out = [b.1 for b in branches]
+            match els:
+                case Some(b):
+                    out.push(b)
+                case None:
+                    pass
+            return out
+        case StmtKind.While(_, _, body):
+            return [body]
+        case StmtKind.For(_, _, _, _, _, body, _):
+            return [body]
+        case _:
+            return []
+
+# The local `e` names, or -1.
+fn local_id(e: Expr) -> int:
+    match e.kind:
+        case ExprKind.Ident(_):
+            match e.res:
+                case Res.Local(x):
+                    return x
+                case _:
+                    return -1
+        case _:
+            return -1
+
+# Is `b` short and loop-free? Then running it masked costs less than testing
+# whether any lane runs it.
+fn flat(b: Block) -> bool:
+    if len(b.stmts) > 4:
+        return false
+    for s in b.stmts:
+        match s.kind:
+            case StmtKind.While(_, _, _):
+                return false
+            case StmtKind.For(_, _, _, _, _, _, _):
+                return false
+            case _:
+                pass
+        for nb in nested_blocks(s):
+            if not flat(nb):
+                return false
+    return true
+
+# Does `b` have a `break` (or a `continue`) of the loop around it?
+fn exits(b: Block, cont: bool) -> bool:
+    for s in b.stmts:
+        match s.kind:
+            case StmtKind.Break:
+                if not cont:
+                    return true
+            case StmtKind.Continue:
+                if cont:
+                    return true
+            case StmtKind.If(_, _):
+                for nb in nested_blocks(s):
+                    if exits(nb, cont):
+                        return true
+            case _:
+                pass
+    return false
