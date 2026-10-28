@@ -836,6 +836,7 @@ fn new_vf(
         terms={},
         content_names=[],
         content_ranges=[],
+        looped={},
         defs=[],
         st=St(env={}, facts=[]),
         live=false,
@@ -865,6 +866,8 @@ struct Vf:
     content_names: [str]
     # the range of every element of a content, when known (from a literal)
     content_ranges: [Option[(i128, i128)]]
+    # the atoms a loop made for what it changes (for messages)
+    looped: {int: bool}
     defs: [F]
     # the current state; `live` is false where execution can't reach
     st: St
@@ -1178,7 +1181,11 @@ struct Vf:
                 s += " - " if k < 0 else " + "
             if ak != 1:
                 s += f"{ak}*"
-            s += name
+            # `4*(m / 4)`, `-(a - b)`: a name that is an expression
+            if " " in name and (ak != 1 or k < 0):
+                s += "(" + name + ")"
+            else:
+                s += name
         if l.c > 0:
             s += f" + {l.c}"
         elif l.c < 0:
@@ -1200,6 +1207,14 @@ struct Vf:
         for p in l.t:
             if p.1 < 0:
                 neg_t.push((p.0, wrapping_neg(p.1)))
+        if len(pos.t) == 0 and len(neg_t) > 0:
+            # -t + c op 0: `t <= c` reads better than `0 >= t - c`
+            let t = self.show_lin(Lin(c=zero, t=neg_t))
+            if op0 == ">=":
+                if l.c == -1:
+                    return t + " < 0"
+                return t + f" <= {l.c}"
+            return t + " " + op0 + f" {l.c}"
         var rhs_c = wrapping_neg(l.c)
         var op = op0
         if op == ">=" and rhs_c == 1:
@@ -1229,13 +1244,21 @@ struct Vf:
             case F.Or(xs):
                 return "(" + " or ".join([self.show_f(x) for x in xs]) + ")"
 
-    fn known_facts_note(self, goal: F) -> Option[str]:
+    fn known_facts_note(self, goal: F) -> [str]:
         if not self.live:
-            return None
+            return []
         var ga = AtomSet.new()
         goal.atoms(ref ga)
+        # the newest value of each name in the goal: facts about older values
+        # of the same variable (before a loop changed it) would only confuse
+        var newest: {str: int} = {}
+        for a0 in ga.xs:
+            let n0 = self.atom_name(a0)
+            if a0 > newest.get(n0).unwrap_or(-1):
+                newest[n0] = a0
         var out: [str] = []
         var unlisted = false
+        var mentioned = AtomSet.new()
         var facts: [F] = []
         for f0 in self.st.facts:
             conjuncts(f0, ref facts)
@@ -1244,19 +1267,38 @@ struct Vf:
             f.atoms(ref fa)
             if not any(ga.contains(a) for a in fa.xs):
                 continue
-            if f.size() > 9 or huge(f) or any(self.atom_name(a) == "?" for a in fa.xs):
+            # (bounds near the type's limits are noise: left out silently)
+            if huge(f):
+                continue
+            if any(
+                not ga.contains(a) and a < newest.get(self.atom_name(a)).unwrap_or(-1) for a in fa.xs
+            ):
+                continue
+            for a1 in fa.xs:
+                mentioned.insert(a1)
+            if f.size() > 9 or any(self.atom_name(a) == "?" for a in fa.xs):
                 unlisted = true
                 continue
             let s = self.show_f(f)
             if s not in out:
                 out.push(s)
+        var notes: [str] = []
         if len(out) == 0:
             if unlisted:
-                return Some("what is known here about the values involved is too long to list")
-            return Some("nothing is known here about the values involved")
-        if len(out) > 6:
-            out = out[len(out) - 6:]
-        return Some("known facts here: " + ", ".join(out))
+                notes.push("what is known here about the values involved is too long to list")
+            else:
+                notes.push("nothing is known here about the values involved")
+        else:
+            if len(out) > 6:
+                out = out[len(out) - 6:]
+            notes.push("known facts here: " + ", ".join(out))
+        for a2 in ga.xs:
+            if a2 in self.looped and not mentioned.contains(a2):
+                let n2 = self.atom_name(a2)
+                notes.push(
+                    f"`{n2}` is changed by a loop before this point whose invariants say nothing about it: add one there that says what is needed here"
+                )
+        return notes
 
     fn snippet(self, s: Span) -> str:
         return self.sm.snippet(s)
@@ -1266,12 +1308,24 @@ struct Vf:
         if goal == F.False:
             d = d.note("with the values used here, this is always false")
         else:
-            match self.known_facts_note(goal):
-                case Some(n):
-                    d = d.note(n)
-                case None:
+            # of a conjunction, show the parts that aren't proven
+            var open = goal
+            var rest_proven = false
+            match goal:
+                case F.And(xs):
+                    if self.live:
+                        let left = [x for x in xs if not self.holds(x)]
+                        if 0 < len(left) < len(xs):
+                            open = F.and_(left)
+                            rest_proven = true
+                case _:
                     pass
-            d = d.note("to prove: " + self.show_f(goal))
+            for n in self.known_facts_note(open):
+                d = d.note(n)
+            if rest_proven:
+                d = d.note("to prove: " + self.show_f(open) + " (the rest of it is proven)")
+            else:
+                d = d.note("to prove: " + self.show_f(goal))
             if self.live:
                 var all = self.st.facts
                 all.extend(self.defs)
@@ -1284,6 +1338,16 @@ struct Vf:
                         "check it with `assert` (at runtime) instead, or move the branches before this point into a function whose `ensures` states just what is needed here"
                     ]
         self.diags.push(d)
+
+    # Name the values made since atom `na` and content `nc` after `to`
+    # instead of the expression `from` (only in messages).
+    fn rename_since(ref self, na: int, nc: int, from: str, to: str):
+        if from == "" or from == to or "'" in to or from.ends_with("..."):
+            return
+        for a in na..len(self.atom_names):
+            self.atom_names[a] = self.atom_names[a].replace(from, to)
+        for c in nc..len(self.content_names):
+            self.content_names[c] = self.content_names[c].replace(from, to)
 
     # Short source text for naming unknown values in messages.
     fn name_of(self, e: Expr) -> str:
@@ -1363,11 +1427,21 @@ struct Vf:
     fn stmt(ref self, s: Stmt):
         match s.kind:
             case StmtKind.Let(_, pat, _, init, _):
+                let na = len(self.atom_names)
+                let nc = len(self.content_names)
                 let v = self.eval(init)
+                # in messages, `let t = mk(n)` makes `len(t.xs)`, not `len(mk(n).xs)`
+                let from = self.name_of(init)
                 match pat:
                     case LetPat.Name(_, _):
+                        self.rename_since(na, nc, from, self.local_name(s.locals[0]))
                         self.bind(s.locals[0], v)
                     case LetPat.Tuple(_):
+                        # the last first: `.1` is the start of `.10`
+                        var j = len(s.locals)
+                        while j > 0:
+                            j -= 1
+                            self.rename_since(na, nc, f"{from}.{j}", self.local_name(s.locals[j]))
                         for i, id in enumerate(s.locals):
                             var x = V.Opaque
                             var have = false
@@ -1810,6 +1884,12 @@ struct Vf:
 
     # Forget what code that runs an unknown number of times may change.
     fn havoc_mods(ref self, mods: {int: [[int]]}):
+        let na = len(self.atom_names)
+        self.havoc_paths(mods)
+        for a in na..len(self.atom_names):
+            self.looped[a] = true
+
+    fn havoc_paths(ref self, mods: {int: [[int]]}):
         var ids = mods.keys()
         ids.sort()
         for id in ids:
@@ -1888,6 +1968,15 @@ struct Vf:
                     "loop invariant might not be preserved by the loop body"
                 ).label(inv.span, "might be false after an iteration").label(at, "at the end of this iteration").with_help("make sure every path through the loop body re-establishes the invariant")
                 self.fail(d, f)
+                match next:
+                    case Some((id, V.Int(l))):
+                        let n = self.local_name(id)
+                        let last = len(self.diags) - 1
+                        self.diags[
+                            last
+                        ] = self.diags[last].note(f"it's checked for the next iteration, where `{n}` is {self.show_lin(l)}")
+                    case _:
+                        pass
         match (next, saved):
             case (Some((id, _)), Some(v)):
                 self.bind(id, v)
