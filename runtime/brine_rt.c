@@ -26,6 +26,13 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <winternl.h>
+#elif defined(__wasi__)
+/* WebAssembly (WASI preview 1): one thread, no processes, sockets or shared
+ * libraries. `par` runs on the calling thread and `world` has one rank. */
+#define BR_WASM 1
+#include <unistd.h>
+#include <time.h>
+#include <sys/types.h>
 #else
 #include <pthread.h>
 #include <dlfcn.h>
@@ -40,6 +47,11 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #endif
+
+/* generated code hardcodes these (lower.br) */
+_Static_assert(offsetof(brine_arr, data) == 48, "brine_arr layout");
+_Static_assert(offsetof(brine_map, keys) == 48 && sizeof(brine_map) == 88, "brine_map layout");
+_Static_assert(sizeof(brine_map_ty) == 80 && sizeof(brine_sb) == 24, "brine_map_ty/brine_sb layout");
 
 /* ============================================================ platform layer */
 static void br_heap_exit(void);
@@ -82,6 +94,32 @@ static void br_sleep_ms(int ms) { Sleep(ms); }
 typedef SOCKET br_sock;
 #define BR_BAD_SOCK INVALID_SOCKET
 static void br_sock_close(br_sock s) { closesocket(s); }
+#elif defined(BR_WASM)
+/* one thread: locks are free, and a thread never starts, so nothing waits */
+typedef int br_mutex;
+typedef int br_cond;
+typedef int br_thread;
+static void br_mutex_init(br_mutex *m) { (void)m; }
+static void br_lock(br_mutex *m) { (void)m; }
+static void br_unlock(br_mutex *m) { (void)m; }
+static int br_trylock(br_mutex *m) { return (void)m, 1; }
+static void br_cond_init(br_cond *c) { (void)c; }
+static void br_cond_wait(br_cond *c, br_mutex *m) {
+    (void)c, (void)m;
+    fprintf(stderr, "internal error: waiting for a thread on WebAssembly\n");
+    abort();
+}
+static void br_cond_broadcast(br_cond *c) { (void)c; }
+static int br_thread_start(br_thread *th, void (*fn)(void *), void *arg) { return (void)th, (void)fn, (void)arg, 0; }
+static void br_thread_join(br_thread th) { (void)th; }
+static int br_ncpu(void) { return 1; }
+static void br_sleep_ms(int ms) {
+    struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+typedef int br_sock;
+#define BR_BAD_SOCK (-1)
+static void br_sock_close(br_sock s) { (void)s; }
 #else
 typedef pthread_mutex_t br_mutex;
 typedef pthread_cond_t br_cond;
@@ -194,7 +232,12 @@ void brine_unreachable(void) {
 #define BR_SMALL 256
 #define BR_NCLASS 12
 #define BR_CHUNK ((uintptr_t)1 << 16)
+#ifdef BR_WASM
+/* no address space to reserve: every block comes from malloc */
+#define BR_RESERVE BR_CHUNK
+#else
 #define BR_RESERVE ((uintptr_t)1 << 36)
+#endif
 #define BR_SPARE ((int64_t)1 << 16) /* bytes a thread may keep free per class */
 static uintptr_t br_heap_base, br_heap_end, br_heap_next;
 static uint8_t br_chunk_class[BR_RESERVE / BR_CHUNK];
@@ -255,6 +298,8 @@ static void br_heap_init(void) {
 #endif
     /* reservations are 64 KiB aligned */
     uintptr_t b = (uintptr_t)VirtualAlloc(NULL, BR_RESERVE, MEM_RESERVE, PAGE_NOACCESS);
+#elif defined(BR_WASM)
+    uintptr_t b = 0;
 #else
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_NORESERVE
@@ -274,6 +319,8 @@ static char *br_chunk_new(int c) {
     if (ch + BR_CHUNK > br_heap_end) return NULL;
 #ifdef _WIN32
     if (!VirtualAlloc((void *)ch, BR_CHUNK, MEM_COMMIT, PAGE_READWRITE)) return NULL;
+#elif defined(BR_WASM)
+    return NULL;
 #else
     if (mprotect((void *)ch, BR_CHUNK, PROT_READ | PROT_WRITE) != 0) return NULL;
 #endif
@@ -539,8 +586,13 @@ int64_t brine_s_find(brine_str *s, brine_str *sub, const char *loc) {
     (void)loc;
     return br_find(s, sub, 0);
 }
-static brine_arr *br_strs(void) { return brine_arr_new(0, sizeof(brine_str *), brine_rt_str, brine_rl_str, ""); }
-static void br_push_str(brine_arr **a, brine_str *s) { brine_arr_push(a, &s); }
+/* a `[str]`: its elements are pointer slots (BR_PSLOT, brine_rt.h) */
+static brine_arr *br_strs(void) { return brine_arr_new(0, BR_PSLOT, brine_rt_str, brine_rl_str, ""); }
+static void br_push_str(brine_arr **a, brine_str *s) {
+    uint64_t slot = (uint64_t)(uintptr_t)s;
+    brine_arr_push(a, &slot);
+}
+static brine_str *br_str_at(const brine_arr *a, int64_t i) { return *(brine_str **)(a->data + i * BR_PSLOT); }
 brine_arr *brine_s_split(brine_str *s, brine_str *sep, const char *loc) {
     if (sep->len == 0) brine_panic_at(loc, "split() separator is empty");
     brine_arr *out = br_strs();
@@ -1030,7 +1082,7 @@ brine_str *brine_s_join(brine_str *sep, brine_arr *parts, const char *loc) {
     brine_sb_init(&sb);
     for (int64_t i = 0; i < parts->len; i++) {
         if (i) brine_sb_str(&sb, sep);
-        brine_sb_str(&sb, ((brine_str **)parts->data)[i]);
+        brine_sb_str(&sb, br_str_at(parts, i));
     }
     return brine_sb_finish(&sb);
 }
@@ -1781,12 +1833,10 @@ double brine_clock(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 #endif
 }
+const char *brine_arg(int64_t i) { return i >= 0 && i < br_argc ? br_argv[i] : NULL; }
 brine_arr *brine_args(void) {
-    brine_arr *a = brine_arr_new(0, sizeof(brine_str *), brine_rt_str, brine_rl_str, "<args>");
-    for (int i = 1; i < br_argc; i++) {
-        brine_str *s = brine_str_new(br_argv[i], (int64_t)strlen(br_argv[i]));
-        brine_arr_push(&a, &s);
-    }
+    brine_arr *a = br_strs();
+    for (int i = 1; i < br_argc; i++) br_push_str(&a, brine_str_new(br_argv[i], (int64_t)strlen(br_argv[i])));
     return a;
 }
 
@@ -1825,6 +1875,9 @@ static int br_threads(void) {
         int n = e ? atoi(e) : 0;
         if (n <= 0) n = br_ncpu();
         if (n > 1024) n = 1024;
+#ifdef BR_WASM
+        n = 1;
+#endif
         br_pool.nthreads = n;
         __atomic_store_n(&br_task_budget, (int64_t)(n - 1), __ATOMIC_SEQ_CST);
     }
@@ -2651,6 +2704,9 @@ static const char *br_dev_err(br_gpu_res r) {
 #ifdef _WIN32
 static void *br_cu_open(void) { return (void *)LoadLibraryA("nvcuda.dll"); }
 static void *br_cu_sym(void *lib, const char *name) { return (void *)GetProcAddress((HMODULE)lib, name); }
+#elif defined(BR_WASM)
+static void *br_cu_open(void) { return NULL; }
+static void *br_cu_sym(void *lib, const char *name) { return (void)lib, (void)name, NULL; }
 #else
 static void *br_cu_open(void) {
     void *h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
@@ -3511,6 +3567,11 @@ typedef struct {
 
 static br_peer *br_peers;
 
+#ifdef BR_WASM
+/* one rank: no peers to talk to */
+static int br_write_all(br_sock s, const char *p, int64_t n) { return (void)s, (void)p, (void)n, 0; }
+static int br_read_all(br_sock s, char *p, int64_t n) { return (void)s, (void)p, (void)n, 0; }
+#else
 static int br_write_all(br_sock s, const char *p, int64_t n) {
     while (n > 0) {
         int chunk = n > (1 << 30) ? (1 << 30) : (int)n;
@@ -3551,6 +3612,8 @@ static int br_read_all(br_sock s, char *p, int64_t n) {
     }
     return 1;
 }
+
+#endif
 
 static void br_enqueue(br_peer *pr, br_msg *m) {
     m->next = NULL;
@@ -3642,6 +3705,15 @@ static br_msg *br_recv(int64_t src, int64_t chan, int64_t kind, const char *loc)
     }
 }
 
+#ifdef BR_WASM
+static void br_world_init(void) {
+    const char *es = getenv("BRINE_WORLD_SIZE");
+    if (es && atoll(es) > 1) {
+        fprintf(stderr, "brine: `world` programs can't run with more than one rank on WebAssembly\n");
+        exit(2);
+    }
+}
+#else
 static br_sock br_connect(const char *host, const char *port) {
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof hints);
@@ -3769,6 +3841,8 @@ static void br_world_init(void) {
     free(ports);
 }
 
+#endif
+
 /* ============================================================ world: API */
 int64_t brine_world_rank(void) { return br_rank; }
 int64_t brine_world_size(void) { return br_size; }
@@ -3815,8 +3889,8 @@ static void br_buf_put(br_buf *b, const void *data, int64_t n) {
 static int64_t br_desc_size(const char *d) {
     switch (*d) {
     case 'b': return (int64_t)sizeof(bool);
-    case 's': return (int64_t)sizeof(brine_str *);
-    case 'a': return (int64_t)sizeof(brine_arr *);
+    case 's':
+    case 'a': return BR_PSLOT;
     default: return 8;
     }
 }
@@ -4077,7 +4151,9 @@ void brine_rt_shutdown(void) {
 }
 
 /* ============================================================ files and processes */
-#ifndef _WIN32
+#ifdef BR_WASM
+#include <sys/stat.h>
+#elif !defined(_WIN32)
 #include <spawn.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -4310,12 +4386,11 @@ bool brine_run(brine_arr *argv, int64_t *code, brine_str **err) {
         *err = br_strf("run() needs a program name, but the command list is empty");
         return false;
     }
-    brine_str **items = (brine_str **)argv->data;
     int64_t n = argv->len;
     char **cv = (char **)brine_alloc((int64_t)sizeof(char *) * (n + 1));
     bool ok = true;
     for (int64_t i = 0; i < n; i++) {
-        cv[i] = br_cstr(items[i]);
+        cv[i] = br_cstr(br_str_at(argv, i));
         if (!cv[i] && ok) {
             *err = br_strf("run(): argument %lld contains a NUL byte", (long long)i);
             ok = false;
@@ -4355,6 +4430,9 @@ bool brine_run(brine_arr *argv, int64_t *code, brine_str **err) {
             *code = (int64_t)(int32_t)c;
         }
         free(wl);
+#elif defined(BR_WASM)
+        *err = br_strf("cannot run %s: WebAssembly programs can't start processes", cv[0]);
+        ok = false;
 #else
         pid_t pid;
         int r = posix_spawnp(&pid, cv[0], NULL, NULL, cv, environ);
@@ -4465,7 +4543,7 @@ bool brine_os_list_dir(brine_str *path, brine_arr **out, brine_str **err) {
         *err = br_nul_err();
         return false;
     }
-    brine_arr *a = brine_arr_new(0, sizeof(brine_str *), brine_rt_str, brine_rl_str, "<os.list_dir>");
+    brine_arr *a = br_strs();
 #ifdef _WIN32
     size_t n = strlen(p);
     char *pat = (char *)brine_alloc((int64_t)n + 3);
@@ -4490,8 +4568,7 @@ bool brine_os_list_dir(brine_str *path, brine_arr **out, brine_str **err) {
     } else {
         do {
             if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-            brine_str *s = br_from_wide(fd.cFileName, -1);
-            brine_arr_push(&a, &s);
+            br_push_str(&a, br_from_wide(fd.cFileName, -1));
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
@@ -4507,8 +4584,7 @@ bool brine_os_list_dir(brine_str *path, brine_arr **out, brine_str **err) {
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
         if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
-        brine_str *s = brine_str_new(ent->d_name, (int64_t)strlen(ent->d_name));
-        brine_arr_push(&a, &s);
+        br_push_str(&a, brine_str_new(ent->d_name, (int64_t)strlen(ent->d_name)));
     }
     closedir(d);
 #endif
@@ -4857,6 +4933,8 @@ brine_str *brine_os_name(void) {
     const char *n = "dragonfly";
 #elif defined(__sun)
     const char *n = "solaris";
+#elif defined(__wasi__)
+    const char *n = "wasi";
 #else
     const char *n = "unknown";
 #endif
@@ -4864,7 +4942,9 @@ brine_str *brine_os_name(void) {
 }
 
 brine_str *brine_os_arch(void) {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__wasm32__)
+    const char *n = "wasm32";
+#elif defined(__x86_64__) || defined(_M_X64)
     const char *n = "x86_64";
 #elif defined(__aarch64__) || defined(_M_ARM64)
     const char *n = "aarch64";
@@ -4889,6 +4969,8 @@ brine_str *brine_os_arch(void) {
 int64_t brine_os_pid(void) {
 #ifdef _WIN32
     return (int64_t)GetCurrentProcessId();
+#elif defined(BR_WASM)
+    return 1; /* WASI has no processes */
 #else
     return (int64_t)getpid();
 #endif
@@ -4972,6 +5054,11 @@ void brine_os_enable_ansi(void) {
 }
 
 bool brine_os_free_ports(int64_t n, brine_arr **out, brine_str **err) {
+#ifdef BR_WASM
+    (void)n, (void)out;
+    *err = br_strf("WebAssembly programs have no network ports");
+    return false;
+#else
 #ifdef _WIN32
     static int wsa_ready;
     if (!wsa_ready) {
@@ -5023,6 +5110,7 @@ bool brine_os_free_ports(int64_t n, brine_arr **out, brine_str **err) {
     }
     *out = a;
     return true;
+#endif
 }
 
 /* ------------------------------------------------------------ processes */
@@ -5333,6 +5421,14 @@ static bool br_start(br_proc *rec, char **cv, int64_t n, char **ek, char **ev, i
     free(app);
     return ok;
 }
+#elif defined(BR_WASM)
+static brine_str *br_read_capture(int fd) { return (void)fd, brine_str_new("", 0); }
+
+static bool br_start(br_proc *rec, char **cv, int64_t n, char **ek, char **ev, int64_t ne, bool capture, bool in, brine_str **err) {
+    (void)rec, (void)n, (void)ek, (void)ev, (void)ne, (void)capture, (void)in;
+    *err = br_strf("cannot run %s: WebAssembly programs can't start processes", cv[0]);
+    return false;
+}
 #else
 static int br_capture_fd(void) {
     brine_str *dir = brine_os_temp_dir();
@@ -5447,12 +5543,11 @@ bool brine_os_spawn(brine_arr *cmd, brine_map *env, bool capture, bool in, int64
         *err = br_strf("os.spawn needs a program name, but the command list is empty");
         return false;
     }
-    brine_str **items = (brine_str **)cmd->data;
     int64_t n = cmd->len;
     char **cv = (char **)brine_alloc((int64_t)sizeof(char *) * (n + 1));
     bool ok = true, bad_name = false;
     for (int64_t i = 0; i < n; i++) {
-        cv[i] = br_cstr(items[i]);
+        cv[i] = br_cstr(br_str_at(cmd, i));
         if (!cv[i]) ok = false;
     }
     cv[n] = NULL;
@@ -5462,8 +5557,8 @@ bool brine_os_spawn(brine_arr *cmd, brine_map *env, bool capture, bool in, int64
     char **ev = (char **)brine_alloc((int64_t)sizeof(char *) * (env->len + 1));
     for (int64_t i = 0; i < env->used; i++) {
         if (!env->live[i]) continue;
-        ek[ne] = br_cstr(((brine_str **)env->keys)[i]);
-        ev[ne] = br_cstr(((brine_str **)env->vals)[i]);
+        ek[ne] = br_cstr(*(brine_str **)(env->keys + i * BR_PSLOT));
+        ev[ne] = br_cstr(*(brine_str **)(env->vals + i * BR_PSLOT));
         if (!ek[ne] || !ev[ne]) ok = false;
         else if (!ek[ne][0] || strchr(ek[ne] + 1, '=')) bad_name = true;
         ne++;
@@ -5501,7 +5596,7 @@ bool brine_os_spawn(brine_arr *cmd, brine_map *env, bool capture, bool in, int64
     return true;
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(BR_WASM)
 static int64_t br_status_code(int st) { return WIFEXITED(st) ? (int64_t)WEXITSTATUS(st) : 101; }
 #endif
 
@@ -5518,6 +5613,12 @@ static bool br_proc_reap(br_proc *p, bool block) {
     code = (int64_t)(int32_t)c;
     p->out = p->capture ? br_read_capture(p->out_f) : brine_str_new("", 0);
     p->err = p->capture ? br_read_capture(p->err_f) : brine_str_new("", 0);
+#elif defined(BR_WASM)
+    /* never started (br_start fails) */
+    (void)block;
+    code = 101;
+    p->out = brine_str_new("", 0);
+    p->err = brine_str_new("", 0);
 #else
     int st = 0;
     pid_t r;
@@ -5561,7 +5662,7 @@ void brine_os_kill(int64_t handle, const char *loc) {
     if (!p->done) {
 #ifdef _WIN32
         TerminateProcess(p->proc, 1);
-#else
+#elif !defined(BR_WASM)
         kill(p->pid, SIGKILL);
 #endif
         br_proc_reap(p, true);
