@@ -16,7 +16,7 @@ from types import Ty, IntTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, Loca
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import children, stmt_exprs, stmt_blocks, lvalue_root
 from info import ProgramInfo, ConstVal
-from solver import Lin, F, AtomSet, prove_, wrapping_abs, wrapping_neg, ATOM_UNKNOWN, I64_BOUND
+from solver import Lin, F, AtomSet, prove_, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
 
 struct Report:
     diags: [Diag]
@@ -1951,8 +1951,60 @@ struct Vf:
         let v = self.eval(e)
         return self.as_bool(v)
 
+    # ------------------------------------------------------------ bounds
+    # Constant bounds of `l` from the atoms' ranges and the facts here that
+    # bound one atom alone: cheap, and enough for products and bit operations.
+    fn bounds(self, l: Lin) -> (Option[i128], Option[i128]):
+        var lo: Option[i128] = Some(l.c)
+        var hi: Option[i128] = Some(l.c)
+        for a, k in l.t:
+            let ab = self.atom_bounds(a)
+            if k > 0:
+                lo = add_opt(lo, mul_opt(k, ab.0))
+                hi = add_opt(hi, mul_opt(k, ab.1))
+            else:
+                lo = add_opt(lo, mul_opt(k, ab.1))
+                hi = add_opt(hi, mul_opt(k, ab.0))
+        if len(l.t) > 1:
+            var b = (lo, hi)
+            if self.live:
+                for f in self.st.facts:
+                    b = tighten_lin(f, l, b)
+            for f in self.defs:
+                b = tighten_lin(f, l, b)
+            return b
+        return (lo, hi)
+
+    fn atom_bounds(self, a: int) -> (Option[i128], Option[i128]):
+        var b: (Option[i128], Option[i128]) = (None, None)
+        if a < len(self.ranges):
+            match self.ranges[a]:
+                case Some(r):
+                    b = (Some(r.0), Some(r.1))
+                case None:
+                    pass
+        if self.live:
+            for f in self.st.facts:
+                b = tighten(f, a, b)
+        for f in self.defs:
+            b = tighten(f, a, b)
+        return b
+
+    fn assume_bounds(ref self, l: Lin, b: (Option[i128], Option[i128])):
+        match b.0:
+            case Some(x):
+                self.assume(F.le(Lin.konst(x), l))
+            case None:
+                pass
+        match b.1:
+            case Some(x):
+                self.assume(F.le(l, Lin.konst(x)))
+            case None:
+                pass
+
     fn arith_val(ref self, op: BinOp, a: Lin, b: Lin, k: IntTy) -> V:
         var r: Option[Lin] = None
+        let small = k.bits() <= 64
         match op:
             case BinOp.Add:
                 r = a.add(b)
@@ -1968,14 +2020,19 @@ struct Vf:
                                 r = a.scale(c)
                             case None:
                                 let t = Term.Mul(a, b) if lin_le(a, b) else Term.Mul(b, a)
-                                r = Some(Lin.atom(self.term(t, None)))
+                                let p = Lin.atom(self.term(t, None))
+                                var pb = mul_bounds(self.bounds(a), self.bounds(b))
+                                if lin_key(a) == lin_key(b) and not nonneg(pb):
+                                    pb = (Some(0), pb.1)
+                                self.assume_bounds(p, pb)
+                                r = Some(p)
             case BinOp.Div | BinOp.Mod:
                 var q: Option[Lin] = None
                 match b.is_const():
                     case Some(c):
                         if c > 0:
                             q = Some(Lin.atom(self.term(Term.Div(a, Lin.konst(c)), None)))
-                        elif c < 0:
+                        elif c < 0 and wrapping_neg(c) > 0:
                             # floor(a / c) == floor(-a / -c)
                             match a.neg():
                                 case Some(na):
@@ -1997,13 +2054,145 @@ struct Vf:
                                 case None:
                                     r = None
                     case None:
-                        if op == BinOp.Div:
-                            r = Some(Lin.atom(self.term(Term.Div(a, b), None)))
-                        else:
-                            r = Some(Lin.atom(self.term(Term.Mod(a, b), None)))
+                        if b.is_const().is_none():
+                            r = Some(self.div_var(op, a, b))
+            case BinOp.BitAnd:
+                if small:
+                    for x, y in [(a, b), (b, a)]:
+                        match y.is_const():
+                            case Some(c):
+                                if c == -1:
+                                    return V.Int(x)
+                                # in two's complement the low k bits are x mod 2^k
+                                if c > 0 and log2_exact(c + 1) > 0:
+                                    return self.arith_val(BinOp.Mod, x, Lin.konst(c + 1), k)
+                                if c < 0 and log2_exact(-c) > 0:
+                                    match self.arith_val(BinOp.Mod, x, Lin.konst(-c), k):
+                                        case V.Int(ml):
+                                            match x.sub(ml):
+                                                case Some(d):
+                                                    return V.Int(d)
+                                                case None:
+                                                    pass
+                                        case _:
+                                            pass
+                            case None:
+                                pass
+                let v = Lin.atom(self.new_atom(self.op_name(" & ", a, b), int_range(k)))
+                for x in [a, b]:
+                    if nonneg(self.bounds(x)):
+                        self.assume(F.ge(v))
+                        self.assume(F.le(v, x))
+                return V.Int(v)
+            case BinOp.BitOr | BinOp.BitXor:
+                let nm = self.op_name(" | " if op == BinOp.BitOr else " ^ ", a, b)
+                let v = Lin.atom(self.new_atom(nm, int_range(k)))
+                let ab = self.bounds(a)
+                let bb = self.bounds(b)
+                if nonneg(ab) and nonneg(bb):
+                    self.assume(F.ge(v))
+                    match a.add(b):
+                        case Some(s):
+                            self.assume(F.le(v, s))
+                        case None:
+                            pass
+                    if op == BinOp.BitOr:
+                        self.assume(F.le(a, v))
+                        self.assume(F.le(b, v))
+                    match (ab.1, bb.1):
+                        case (Some(x), Some(y)):
+                            if max(x, y) < 4611686018427387904:
+                                self.assume(F.le(v, Lin.konst(ones_above(max(x, y)))))
+                        case _:
+                            pass
+                return V.Int(v)
+            case BinOp.Shr:
+                match b.is_const():
+                    case Some(c):
+                        # an arithmetic shift is floor division
+                        if small and 0 <= c < i128(k.bits()) and c <= 62:
+                            if c == 0:
+                                return V.Int(a)
+                            let one: i128 = 1
+                            return self.arith_val(BinOp.Div, a, Lin.konst(one << c), k)
+                    case None:
+                        pass
+                let v = Lin.atom(self.new_atom(self.op_name(" >> ", a, b), int_range(k)))
+                let ab = self.bounds(a)
+                if nonneg(ab):
+                    self.assume(F.ge(v))
+                    self.assume(F.le(v, a))
+                else:
+                    match ab.1:
+                        case Some(x):
+                            if x < 0:
+                                self.assume(F.le(a, v))
+                                self.assume(F.lt(v, Lin.konst(0)))
+                        case None:
+                            pass
+                return V.Int(v)
+            case BinOp.Shl:
+                match b.is_const():
+                    case Some(c):
+                        # it wraps: exact only when the product fits
+                        if small and 0 <= c < i128(k.bits()) and c <= 62:
+                            let one: i128 = 1
+                            match a.scale(one << c):
+                                case Some(p):
+                                    let ab = self.bounds(a)
+                                    let pb = (mul_opt(one << c, ab.0), mul_opt(one << c, ab.1))
+                                    match (pb.0, pb.1):
+                                        case (Some(x), Some(y)):
+                                            if k.min() <= x and y <= k.max():
+                                                return V.Int(p)
+                                        case _:
+                                            pass
+                                case None:
+                                    pass
+                    case None:
+                        pass
+                return V.Int(Lin.atom(self.new_atom(self.op_name(" << ", a, b), int_range(k))))
             case _:
                 return V.Int(self.fresh_int("?", k))
         return V.Int(self.lin(r, "?"))
+
+    # `a / b` or `a % b` for a `b` that isn't a constant
+    fn div_var(ref self, op: BinOp, a: Lin, b: Lin) -> Lin:
+        let bb = self.bounds(b)
+        var is_pos = bb.0.is_some() and bb.0.unwrap() >= 1
+        var is_neg = bb.1.is_some() and bb.1.unwrap() <= -1
+        if not is_pos and not is_neg:
+            is_pos = self.holds(F.le(Lin.konst(1), b))
+            if not is_pos:
+                is_neg = self.holds(F.le(b, Lin.konst(-1)))
+        if op == BinOp.Mod:
+            let m = Lin.atom(self.term(Term.Mod(a, b), None))
+            # `%` takes the sign of the divisor
+            if is_pos:
+                self.assume(F.ge(m))
+                self.assume(F.lt(m, b))
+            elif is_neg:
+                self.assume(F.lt(b, m))
+                self.assume(F.le(m, Lin.konst(0)))
+            return m
+        let q = Lin.atom(self.term(Term.Div(a, b), None))
+        if is_pos:
+            let ab = self.bounds(a)
+            if nonneg(ab):
+                self.assume(F.ge(q))
+                self.assume(F.le(q, a))
+            else:
+                match ab.1:
+                    case Some(x):
+                        if x < 0:
+                            self.assume(F.le(a, q))
+                            self.assume(F.lt(q, Lin.konst(0)))
+                    case None:
+                        pass
+        return q
+
+    fn op_name(self, op: str, a: Lin, b: Lin) -> str:
+        return self.show_lin_p(a) + op + self.show_lin_p(b)
 
     fn eval(ref self, e: Expr) -> V:
         match e.kind:
@@ -2058,7 +2247,16 @@ struct Vf:
                         let f = self.as_bool(v)
                         return V.Bool(f.not_())
                     case (UnOp.BitNot, Ty.Int(k)):
-                        return V.Int(self.fresh_int("?", k))
+                        # two's complement: ~x is -x - 1, or 2^bits - 1 - x unsigned
+                        let l = self.as_int(v, x.ty)
+                        if k.bits() <= 64:
+                            let top: i128 = -1 if k.signed() else k.max()
+                            match Lin.konst(top).sub(l):
+                                case Some(n):
+                                    return V.Int(n)
+                                case None:
+                                    pass
+                        return V.Int(self.fresh_int("~" + self.show_lin_p(l), k))
                     case _:
                         return V.Opaque
             case ExprKind.Binary(op, l, r):
@@ -2906,3 +3104,178 @@ fn val_eq(a: V, b: V) -> Option[F]:
             return Some(F.and_(fs))
         case _:
             return None
+
+# ================================================================ bounds
+# Constant bounds `(lo, hi)`; None is unbounded.
+
+fn add_opt(a: Option[i128], b: Option[i128]) -> Option[i128]:
+    match (a, b):
+        case (Some(x), Some(y)):
+            return add_i128(x, y)
+        case _:
+            return None
+
+fn mul_opt(k: i128, a: Option[i128]) -> Option[i128]:
+    match a:
+        case Some(x):
+            return mul_i128(k, x)
+        case None:
+            return None
+
+# The bounds of `a` tightened by fact `f` when it bounds `a` alone.
+fn tighten(f: F, a: int, b: (Option[i128], Option[i128])) -> (Option[i128], Option[i128]):
+    var lo = b.0
+    var hi = b.1
+    match f:
+        case F.Ge(l):
+            if len(l.t) == 1 and l.t[0].0 == a:
+                # k*a + c >= 0
+                let k = l.t[0].1
+                let c = l.c
+                if k > 0:
+                    match neg_i128(c / k):
+                        case Some(v):
+                            if lo.is_none() or v > lo.unwrap():
+                                lo = Some(v)
+                        case None:
+                            pass
+                else:
+                    match neg_i128(k):
+                        case Some(m):
+                            let v = c / m
+                            if hi.is_none() or v < hi.unwrap():
+                                hi = Some(v)
+                        case None:
+                            pass
+        case F.Eq(l):
+            if len(l.t) == 1 and l.t[0].0 == a:
+                let k = l.t[0].1
+                let c = l.c
+                if k != -1 and c % k == 0:
+                    match neg_i128(c / k):
+                        case Some(v):
+                            lo = Some(v)
+                            hi = Some(v)
+                        case None:
+                            pass
+                elif k == -1:
+                    lo = Some(c)
+                    hi = Some(c)
+        case F.And(xs):
+            for x in xs:
+                let t = tighten(x, a, (lo, hi))
+                lo = t.0
+                hi = t.1
+        case _:
+            pass
+    return (lo, hi)
+
+# The bounds of `x * y` for `x` in `a` and `y` in `b`.
+fn mul_bounds(
+    a: (Option[i128], Option[i128]),
+    b: (Option[i128], Option[i128])
+) -> (Option[i128], Option[i128]):
+    match (a.0, a.1, b.0, b.1):
+        case (Some(al), Some(ah), Some(bl), Some(bh)):
+            let ps = [mul_i128(al, bl), mul_i128(al, bh), mul_i128(ah, bl), mul_i128(ah, bh)]
+            if all(p.is_some() for p in ps):
+                var lo = ps[0].unwrap()
+                var hi = lo
+                for p in ps:
+                    lo = min(lo, p.unwrap())
+                    hi = max(hi, p.unwrap())
+                return (Some(lo), Some(hi))
+        case _:
+            pass
+    match (a.0, b.0):
+        case (Some(al), Some(bl)):
+            if al >= 0 and bl >= 0:
+                return (mul_i128(al, bl), None)
+        case _:
+            pass
+    return (None, None)
+
+fn nonneg(b: (Option[i128], Option[i128])) -> bool:
+    match b.0:
+        case Some(x):
+            return x >= 0
+        case None:
+            return false
+
+# 2^k - 1 for the smallest k with 2^k > x (0 <= x < 2^62)
+fn ones_above(x: i128) -> i128:
+    var p: i128 = 1
+    while p <= x:
+        p *= 2
+    return p - 1
+
+# k when c == 2^k (0 < k < 63), else -1
+fn log2_exact(c: i128) -> int:
+    var p: i128 = 2
+    var k = 1
+    while p < c and k < 62:
+        p *= 2
+        k += 1
+    return k if p == c else -1
+
+# Do `a`'s terms equal `s` times `b`'s?
+fn same_terms(a: Lin, b: Lin, s: i128) -> bool:
+    if len(a.t) != len(b.t):
+        return false
+    for i in 0..len(a.t):
+        let k = b.t[i].1
+        if a.t[i].0 != b.t[i].0 or wrapping_neg(k) == k:
+            return false
+        if a.t[i].1 != (k if s > 0 else -k):
+            return false
+    return true
+
+# The bounds of `l` tightened by fact `f` when it bounds `l`'s terms as a whole.
+fn tighten_lin(f: F, l: Lin, b: (Option[i128], Option[i128])) -> (Option[i128], Option[i128]):
+    match f:
+        case F.Ge(g):
+            return tighten_by(g, false, l, b)
+        case F.Eq(g):
+            return tighten_by(g, true, l, b)
+        case F.And(xs):
+            var r = b
+            for x in xs:
+                r = tighten_lin(x, l, r)
+            return r
+        case _:
+            return b
+
+# `g >= 0` (or `g == 0` when `eq`) where `g`'s terms are plus or minus `l`'s
+fn tighten_by(
+    g: Lin,
+    eq: bool,
+    l: Lin,
+    b: (Option[i128], Option[i128])
+) -> (Option[i128], Option[i128]):
+    var lo = b.0
+    var hi = b.1
+    if same_terms(g, l, 1):
+        # l's terms >= -g.c
+        match neg_i128(g.c):
+            case Some(ng):
+                match add_i128(l.c, ng):
+                    case Some(v):
+                        if lo.is_none() or v > lo.unwrap():
+                            lo = Some(v)
+                        if eq:
+                            hi = Some(v)
+                    case None:
+                        pass
+            case None:
+                pass
+    elif same_terms(g, l, -1):
+        # l's terms <= g.c
+        match add_i128(l.c, g.c):
+            case Some(v):
+                if hi.is_none() or v < hi.unwrap():
+                    hi = Some(v)
+                if eq:
+                    lo = Some(v)
+            case None:
+                pass
+    return (lo, hi)
