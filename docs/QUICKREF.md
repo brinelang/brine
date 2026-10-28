@@ -229,7 +229,7 @@ fn main() -> Result[(), str]:           # an Err prints "error: ..." and exits w
 
 `Option[T]` (`Some(value)`, `None`) and `Result[T, E]` (`Ok(value)`, `Err(error)`)
 are always available. Methods: `is_some()`, `is_none()`, `is_ok()`, `is_err()`,
-`unwrap()` (panics on `None`/`Err`), `unwrap_or(default)`, `ok()` (Result to Option).
+`unwrap()` (panics on `None`, and on `Err` with the error), `unwrap_or(default)`, `ok()` (Result to Option).
 Each use of a generic function or type with new type arguments makes a
 specialized copy, so generic code is as fast as hand-written code. A generic
 function's body is checked for each set of type arguments it's used with:
