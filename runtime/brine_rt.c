@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <stddef.h>
+#include <float.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -2044,9 +2045,33 @@ void brine_sb_fmt_i128(brine_sb *sb, brine_i128 v, int kind) {
     else
         brine_sb_i128(sb, v);
 }
-/* shortest round-trip representation, Python style */
-static void br_fmt_float(brine_sb *sb, double v, int maxprec, int is_f32) {
-    char e[64], buf[400];
+/* |v| rounded to p significant digits: the digits go to d, the result is the
+ * decimal exponent. Whether they read back as v is in *back. */
+static int br_digits(double v, int p, char *d, int is_f32, bool *back) {
+    char e[40];
+    snprintf(e, sizeof e, "%.*e", p - 1, v);
+    const char *q = e + (e[0] == '-');
+    uint64_t m = 0;
+    int n = 0;
+    for (; *q != 'e'; q++)
+        if (*q != '.') {
+            d[n++] = *q;
+            m = m * 10 + (uint64_t)(*q - '0');
+        }
+    int x = atoi(q + 1);
+    double r;
+    if (!(p <= 15 && br_dec_fast(m, x - (p - 1), &r))) r = fabs(strtod(e, NULL));
+    double a = fabs(v);
+    *back = is_f32 ? (float)r == (float)a : r == a;
+    return x;
+}
+/* The shortest representation that reads back as v, Python style (repr):
+ * 0.1, 1e+16, 2.5e-08. A decimal of up to 15 digits (6 for an f32) reads
+ * back as a normal double that prints as itself at that precision, so when
+ * the 15 digits read back the shortest is them without their trailing
+ * zeros; otherwise it takes 16 or 17. Subnormals, with fewer bits, search
+ * from 1 digit up. */
+static void br_fmt_float(brine_sb *sb, double v, int is_f32) {
     if (isnan(v)) {
         br_sb_cstr(sb, "nan");
         return;
@@ -2055,28 +2080,48 @@ static void br_fmt_float(brine_sb *sb, double v, int maxprec, int is_f32) {
         br_sb_cstr(sb, v < 0 ? "-inf" : "inf");
         return;
     }
-    int p;
-    for (p = 1; p <= maxprec; p++) {
-        snprintf(e, sizeof e, "%.*e", p - 1, v);
-        double back = strtod(e, NULL);
-        if (is_f32 ? ((float)back == (float)v) : (back == v)) break;
+    char d[24], buf[64];
+    int hi = is_f32 ? 9 : 17, lo = is_f32 ? 6 : 15;
+    double a = fabs(v);
+    if (a == 0 || a < (is_f32 ? (double)FLT_MIN : DBL_MIN)) lo = 1;
+    int p = lo, x = 0;
+    bool back = false;
+    for (; p < hi; p++) {
+        x = br_digits(v, p, d, is_f32, &back);
+        if (back) break;
     }
-    if (p > maxprec) p = maxprec;
-    snprintf(e, sizeof e, "%.*e", p - 1, v);
-    char *ep = strchr(e, 'e');
-    int x = ep ? atoi(ep + 1) : 0;
+    if (!back) x = br_digits(v, p = hi, d, is_f32, &back);
+    while (p > 1 && d[p - 1] == '0') p--;
+    int n = 0;
+    if (signbit(v)) buf[n++] = '-';
     if (x >= -4 && x < 16) {
-        int dec = p - 1 - x;
-        if (dec < 0) dec = 0;
-        snprintf(buf, sizeof buf, "%.*f", dec, v);
-        if (!strchr(buf, '.')) strcat(buf, ".0");
-        br_sb_cstr(sb, buf);
+        if (x < 0) {
+            buf[n++] = '0';
+            buf[n++] = '.';
+            for (int i = 0; i < -x - 1; i++) buf[n++] = '0';
+            for (int i = 0; i < p; i++) buf[n++] = d[i];
+        } else if (is_f32 && p <= x) {
+            /* a big f32 integer prints all its digits: 16777216.0, not 16777220.0
+             * (for a double below 10^16 the two are the same) */
+            n += snprintf(buf + n, sizeof buf - (size_t)n, "%.0f.0", a);
+        } else {
+            for (int i = 0; i <= x; i++) buf[n++] = i < p ? d[i] : '0';
+            buf[n++] = '.';
+            if (p <= x + 1) buf[n++] = '0';
+            for (int i = x + 1; i < p; i++) buf[n++] = d[i];
+        }
     } else {
-        br_sb_cstr(sb, e);
+        buf[n++] = d[0];
+        if (p > 1) {
+            buf[n++] = '.';
+            for (int i = 1; i < p; i++) buf[n++] = d[i];
+        }
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "e%c%02d", x < 0 ? '-' : '+', x < 0 ? -x : x);
     }
+    brine_sb_cat(sb, buf, n);
 }
-void brine_sb_f64(brine_sb *sb, double v) { br_fmt_float(sb, v, 17, 0); }
-void brine_sb_f32(brine_sb *sb, float v) { br_fmt_float(sb, (double)v, 9, 1); }
+void brine_sb_f64(brine_sb *sb, double v) { br_fmt_float(sb, v, 0); }
+void brine_sb_f32(brine_sb *sb, float v) { br_fmt_float(sb, (double)v, 1); }
 void brine_sb_bool(brine_sb *sb, bool v) { br_sb_cstr(sb, v ? "true" : "false"); }
 static void br_sb_bin(brine_sb *sb, uint64_t v) {
     char b[65];
