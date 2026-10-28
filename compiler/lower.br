@@ -6035,10 +6035,19 @@ struct Lower:
         real: [(str, Ty, int)],
         span: Span
     ) -> int:
-        let ptrs = self.gpu_ptrs(pc, real)
+        let (ptrs, why) = self.gpu_ptrs(pc, real)
         let wh = self.cstr_sym(self.sm.loc(span))
         self.gsites.push(
-            GpuSite(id=pc.id, kind=kind, op=op, vk=vk, where_sym=wh, ctx_size=pc.size, ptrs=ptrs)
+            GpuSite(
+                id=pc.id,
+                kind=kind,
+                op=op,
+                vk=vk,
+                where_sym=wh,
+                ctx_size=pc.size,
+                ptrs=ptrs,
+                why=why
+            )
         )
         return self.cx.fb.global(f"br_gk_{pc.id}")
 
@@ -6046,8 +6055,9 @@ struct Lower:
     # device: [nfields, (offset, flags, node)*, nodes...]. A node describes an
     # array: [element size, n, (offset in the element, node)*] for the arrays
     # inside each element; nodes are numbered from the first node's position.
-    # Empty: something in the context can't be copied (strings, maps, boxes).
-    fn gpu_ptrs(self, pc: ParCtx, real: [(str, Ty, int)]) -> [int]:
+    # Empty, with the reason: something in the context can't be copied
+    # (strings, maps, boxes).
+    fn gpu_ptrs(self, pc: ParCtx, real: [(str, Ty, int)]) -> ([int], str):
         var fields: [int] = []
         var nodes: [int] = []
         var nf = 0
@@ -6059,16 +6069,18 @@ struct Lower:
                     ty = x.1
                     flags = x.2
             var subs: [(int, Ty)] = []
-            if not self.gpu_plain(ty, pc.offs[i], ref subs):
-                return []
+            let what = self.gpu_what(ty, pc.offs[i], ref subs)
+            if what != "":
+                return ([], self.gpu_field(name, ty, what))
             for sub in subs:
-                let node = self.gpu_node(sub.1, ref nodes, 0)
+                var why = ""
+                let node = self.gpu_node(sub.1, ref nodes, 0, ref why)
                 if node < 0:
-                    return []
+                    return ([], self.gpu_field(name, ty, why))
                 let top = sub.0 == pc.offs[i]
                 # arrays written on the device are copied back: no pointers in them
                 if flags != 0 and (not top or nodes[node + 1] != 0):
-                    return []
+                    return ([], self.gpu_field(name, ty, "arrays"))
                 fields.push(sub.0)
                 fields.push(flags if top else 0)
                 fields.push(node)
@@ -6076,11 +6088,49 @@ struct Lower:
         var out = [nf]
         out.extend(fields)
         out.extend(nodes)
-        return out
+        return (out, "")
 
-    fn gpu_node(self, elem: Ty, ref nodes: [int], depth: int) -> int:
+    # Why a construct whose context field `name` (of type `ty`) holds `what`
+    # can't run on a GPU.
+    fn gpu_field(self, name: str, ty: Ty, what: str) -> str:
+        if name == "res":
+            match ty:
+                case Ty.Array(e):
+                    var subs: [(int, Ty)] = []
+                    if (
+                        self.gpu_what(e, 0, ref subs) == what
+                        or (what == "arrays" and len(subs) == 1 and subs[0].0 == 0)
+                    ):
+                        return f"its results are {what}"
+                case _:
+                    pass
+            return f"its results hold {what}"
+        if name == "darr":
+            return f"it loops over an array that holds {what}"
+        if name.starts_with("c"):
+            let n = self.flocals[int(name[1:])].name
+            if what == "arrays":
+                return f"it writes `{n}`, whose elements hold arrays"
+            let tn = self.info.ty_name(ty)
+            var subs: [(int, Ty)] = []
+            match ty:
+                case Ty.Str:
+                    return f"it reads `{n}`, a string"
+                case Ty.Map(_, _):
+                    return f"it reads `{n}`, a map"
+                case Ty.Array(_) | Ty.Tuple(_) | Ty.Struct(_):
+                    return f"it reads `{n}`, whose type `{tn}` holds {what}"
+                case _:
+                    return f"it reads `{n}`, a `{tn}`"
+        return f"its context holds {what}"
+
+    fn gpu_node(self, elem: Ty, ref nodes: [int], depth: int, ref why: str) -> int:
         var subs: [(int, Ty)] = []
-        if depth > 8 or not self.gpu_plain(elem, 0, ref subs):
+        if depth > 8:
+            why = "arrays nested too deeply"
+            return -1
+        why = self.gpu_what(elem, 0, ref subs)
+        if why != "":
             return -1
         let at = len(nodes)
         nodes.push(self.lay(elem).size)
@@ -6089,31 +6139,39 @@ struct Lower:
             nodes.push(0)
             nodes.push(0)
         for j, sub in enumerate(subs):
-            let child = self.gpu_node(sub.1, ref nodes, depth + 1)
+            let child = self.gpu_node(sub.1, ref nodes, depth + 1, ref why)
             if child < 0:
                 return -1
             nodes[at + 2 + 2 * j] = sub.0
             nodes[at + 3 + 2 * j] = child
         return at
 
-    # Is a value of type t plain data and arrays of it? `subs` gets the
-    # offsets (from `base`) and element types of the arrays in it.
-    fn gpu_plain(self, t: Ty, base: int, ref subs: [(int, Ty)]) -> bool:
+    # "" if a value of type t is plain data and arrays of it, otherwise what
+    # it holds that isn't. `subs` gets the offsets (from `base`) and element
+    # types of the arrays in it.
+    fn gpu_what(self, t: Ty, base: int, ref subs: [(int, Ty)]) -> str:
         match t:
             case Ty.Int(_) | Ty.Float(_) | Ty.Bool | Ty.Unit:
-                return true
+                return ""
+            case Ty.Str:
+                return "strings"
+            case Ty.Map(_, _):
+                return "maps"
             case Ty.Enum(eid):
-                return not self.info.enums[eid].has_payload()
+                if self.info.enums[eid].has_payload():
+                    return "enums with payloads"
+                return ""
             case Ty.Array(e):
                 subs.push((base, e))
-                return true
+                return ""
             case Ty.Tuple(_) | Ty.Struct(_):
                 for i, x in enumerate(self.field_tys(t)):
-                    if not self.gpu_plain(x, base + self.field_off(t, i), ref subs):
-                        return false
-                return true
+                    let w = self.gpu_what(x, base + self.field_off(t, i), ref subs)
+                    if w != "":
+                        return w
+                return ""
             case _:
-                return false
+                return self.info.ty_name(t) + " values"
 
     # The GPU code of the program's parallel constructs, and their descriptors
     # (`brine_kernel` in brine_rt.h).
@@ -6166,7 +6224,7 @@ struct Lower:
             if not ok:
                 var w = code.why[i]
                 if len(g.ptrs) == 0:
-                    w = "its context holds strings, maps or enums with payloads"
+                    w = g.why
                 rel.push(Reloc(off=96, sym=self.cstr_sym(w), add=0))
             if len(g.ptrs) > 0:
                 var pb: [u8] = []
@@ -6377,6 +6435,8 @@ struct GpuSite:
     where_sym: str
     ctx_size: int
     ptrs: [int]
+    # why the context can't be copied to a device (`ptrs` is empty)
+    why: str
 
 # A lifted parallel body's context: its fields' names and offsets.
 struct ParCtx:
