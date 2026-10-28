@@ -267,6 +267,12 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
   split into one translation unit per core (by a hash of each function's name, each
   unit declaring only what it uses), compiled in parallel; an edit recompiles only
   the units it touches. An unchanged program skips the link (`.brine-hash` stamp).
+* **CPU levels:** an x86-64 `--release` build compiles the program three times,
+  for plain x86-64, x86-64-v3 (AVX2) and x86-64-v4 (AVX-512), and
+  `runtime/brine_cpu.c` runs the newest one the machine supports. The executable
+  runs anywhere and still uses wide vectors where there are some; float results
+  are the same in all three (no fused multiply-adds). `BRINE_CPU=base` or `=v3`
+  caps the choice at run time.
 * **Parallel:** the compiler uses `par` itself: imported modules are parsed a wave
   of imports at a time, and the prover takes every function on its own. Results
   are combined in a fixed order, so the output doesn't depend on the thread count.
