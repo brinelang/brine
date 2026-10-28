@@ -2053,7 +2053,10 @@ void brine_sb_fmt_u64(brine_sb *sb, uint64_t v, int kind) {
 }
 void brine_sb_fmt_f64(brine_sb *sb, double v, int prec, int kind) {
     char b[400];
-    if (kind == 'f') {
+    /* spelled the same everywhere (C libraries print `-nan(ind)`, `nan`, ...) */
+    if (isnan(v) || isinf(v)) {
+        brine_sb_f64(sb, v);
+    } else if (kind == 'f') {
         snprintf(b, sizeof b, "%.*f", prec < 0 ? 6 : prec, v);
         br_sb_cstr(sb, b);
     } else if (kind == 'e') {
