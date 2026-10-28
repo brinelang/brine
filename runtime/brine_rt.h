@@ -653,6 +653,7 @@ brine_str *brine_os_name(void);
 brine_str *brine_os_arch(void);
 int64_t brine_os_pid(void);
 int64_t brine_os_cpu_count(void);
+int64_t brine_os_thread_count(void);
 void brine_os_sleep(double seconds);
 bool brine_os_is_terminal(int64_t fd);
 void brine_os_enable_ansi(void);

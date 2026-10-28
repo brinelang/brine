@@ -355,6 +355,7 @@ os.exe_path()           # str: the absolute path of the running program
 os.abs_path(path)       # Result[str, str]: canonical; on Windows `\\?\C:\...`
 os.name(), os.arch()    # "windows"/"macos"/"linux"..., "x86_64"/"aarch64"...
 os.pid(), os.cpu_count()                     # int (cpu_count >= 1)
+os.thread_count()       # int: threads `par` uses (BRINE_THREADS / --threads; 1 on wasm)
 os.sleep(0.5)           # seconds
 os.is_terminal(2)       # is fd 1 (stdout) / 2 (stderr) / 0 a terminal?
 os.enable_ansi()        # Windows: let the console show color codes

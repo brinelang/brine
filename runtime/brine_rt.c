@@ -5510,6 +5510,7 @@ int64_t brine_os_cpu_count(void) {
     int n = br_ncpu();
     return n > 0 ? n : 1;
 }
+int64_t brine_os_thread_count(void) { return br_threads(); }
 
 void brine_os_sleep(double seconds) {
     if (!(seconds > 0)) return;
