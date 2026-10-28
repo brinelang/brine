@@ -2395,6 +2395,8 @@ static int br_in_par_get(void) {
 }
 static void br_in_par_set(int v) { br_th_get()->in_par = v; }
 static int64_t br_task_budget = 0;
+/* see brine_rt.h */
+int brine_mt = 0;
 
 static int br_threads(void) {
     if (br_pool.nthreads == 0) {
@@ -2473,6 +2475,8 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
         br_run_chunks(&job);
         return;
     }
+    /* (before the workers can see the job, after they are done below) */
+    __atomic_add_fetch(&brine_mt, 1, __ATOMIC_SEQ_CST);
     if (!br_pool.started) {
         br_pool.started = 1;
         for (int i = 0; i < br_pool.nthreads - 1; i++) {
@@ -2498,6 +2502,7 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
         __atomic_store_n(&br_pool.main_waits, 0, __ATOMIC_SEQ_CST);
         br_unlock(&br_pool.mu);
     }
+    __atomic_sub_fetch(&brine_mt, 1, __ATOMIC_SEQ_CST);
     br_unlock(&br_pool.job_lock);
 }
 
@@ -2523,6 +2528,7 @@ void brine_par_tasks(int64_t k, brine_task_fn fn, void *ctx) {
         tasks[i].idx = i;
         spawned[i] = 0;
     }
+    __atomic_add_fetch(&brine_mt, 1, __ATOMIC_SEQ_CST);
     /* spawn all but the last task while thread budget remains */
     for (int64_t i = 0; i + 1 < k; i++) {
         if (__atomic_sub_fetch(&br_task_budget, 1, __ATOMIC_SEQ_CST) >= 0) {
@@ -2541,6 +2547,7 @@ void brine_par_tasks(int64_t k, brine_task_fn fn, void *ctx) {
             br_thread_join(ths[i]);
             __atomic_add_fetch(&br_task_budget, 1, __ATOMIC_SEQ_CST);
         }
+    __atomic_sub_fetch(&brine_mt, 1, __ATOMIC_SEQ_CST);
     free(tasks);
     free(ths);
     free(spawned);

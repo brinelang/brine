@@ -138,20 +138,40 @@ void brine_free(void *p);
 void brine_str_free(brine_str *s);
 void brine_arr_free(brine_arr *a);
 
+/* Nonzero while threads other than the one running brine code may touch
+   values (a `par` region or task group is running): only then do reference
+   counts need locked instructions. The thread that starts the others raises
+   it before they start and lowers it once they are done with every value. */
+extern int brine_mt;
+#define BR_ONE_THREAD() __builtin_expect(__atomic_load_n(&brine_mt, __ATOMIC_RELAXED) == 0, 1)
+static inline void br_rc_inc(int64_t *rc) {
+    if (BR_ONE_THREAD())
+        __atomic_store_n(rc, __atomic_load_n(rc, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
+    else
+        __atomic_fetch_add(rc, 1, __ATOMIC_RELAXED);
+}
+/* drops a reference that isn't the last (rc > 1); true if it was after all */
+static inline bool br_rc_dec(int64_t *rc, int64_t was) {
+    if (BR_ONE_THREAD()) {
+        __atomic_store_n(rc, was - 1, __ATOMIC_RELAXED);
+        return false;
+    }
+    return __atomic_sub_fetch(rc, 1, __ATOMIC_ACQ_REL) == 0;
+}
 static inline void brine_str_retain(brine_str *s) {
-    if (__atomic_load_n(&s->rc, __ATOMIC_RELAXED) >= 0) __atomic_fetch_add(&s->rc, 1, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&s->rc, __ATOMIC_RELAXED) >= 0) br_rc_inc(&s->rc);
 }
 /* A count of 1 is our own reference: no other thread holds one to change it,
    so the last release frees without a locked instruction. */
 static inline void brine_str_release(brine_str *s) {
     int64_t rc = __atomic_load_n(&s->rc, __ATOMIC_ACQUIRE);
     if (rc < 0) return;
-    if (rc == 1 || __atomic_sub_fetch(&s->rc, 1, __ATOMIC_ACQ_REL) == 0) brine_str_free(s);
+    if (rc == 1 || br_rc_dec(&s->rc, rc)) brine_str_free(s);
 }
-static inline void brine_arr_retain(brine_arr *a) { __atomic_fetch_add(&a->rc, 1, __ATOMIC_RELAXED); }
+static inline void brine_arr_retain(brine_arr *a) { br_rc_inc(&a->rc); }
 static inline void brine_arr_release(brine_arr *a) {
-    if (__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 || __atomic_sub_fetch(&a->rc, 1, __ATOMIC_ACQ_REL) == 0)
-        brine_arr_free(a);
+    int64_t rc = __atomic_load_n(&a->rc, __ATOMIC_ACQUIRE);
+    if (rc == 1 || br_rc_dec(&a->rc, rc)) brine_arr_free(a);
 }
 void *brine_box_new(int64_t size, int64_t tag);
 void brine_box_free(void *p);
@@ -159,23 +179,24 @@ void brine_box_free(void *p);
 void brine_drop(void *p, void (*fn)(void *));
 static inline void brine_box_retain(void *p) {
     brine_box *b = (brine_box *)p;
-    if (__atomic_load_n(&b->rc, __ATOMIC_RELAXED) >= 0) __atomic_fetch_add(&b->rc, 1, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&b->rc, __ATOMIC_RELAXED) >= 0) br_rc_inc(&b->rc);
 }
 /* drops one reference; true when the box must be freed */
 static inline bool brine_box_dec(void *p) {
     brine_box *b = (brine_box *)p;
     int64_t rc = __atomic_load_n(&b->rc, __ATOMIC_ACQUIRE);
     if (rc < 0) return false;
-    return rc == 1 || __atomic_sub_fetch(&b->rc, 1, __ATOMIC_ACQ_REL) == 0;
+    return rc == 1 || br_rc_dec(&b->rc, rc);
 }
 void brine_rt_str(void *p);
 void brine_rl_str(void *p);
 void brine_rt_arr(void *p);
 void brine_rl_arr(void *p);
 void brine_map_free(brine_map *m);
-static inline void brine_map_retain(brine_map *m) { __atomic_fetch_add(&m->rc, 1, __ATOMIC_RELAXED); }
+static inline void brine_map_retain(brine_map *m) { br_rc_inc(&m->rc); }
 static inline void brine_map_release(brine_map *m) {
-    if (__atomic_sub_fetch(&m->rc, 1, __ATOMIC_ACQ_REL) == 0) brine_map_free(m);
+    int64_t rc = __atomic_load_n(&m->rc, __ATOMIC_ACQUIRE);
+    if (rc == 1 || br_rc_dec(&m->rc, rc)) brine_map_free(m);
 }
 void brine_rt_map(void *p);
 void brine_rl_map(void *p);

@@ -426,6 +426,8 @@ in a balanced pairwise tree (so `par sum` of floats can differ in the last bits 
 a sequential `sum`, usually by being more accurate). Integer overflow of any partial
 result in that order traps.
 `BRINE_THREADS=n` or `brine run --threads n` sets the thread count.
+Cost: reference counts use locked (atomic) instructions only while a `par` construct
+is running; the rest of the program updates them with plain ones.
 
 **GPUs.** `par for`, `par [...]` and `par` reductions also run on a GPU (NVIDIA
 through CUDA, Apple silicon through Metal) when the runtime expects that to be
