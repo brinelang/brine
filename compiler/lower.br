@@ -2241,7 +2241,10 @@ struct Lower:
             if self.take_at(b.stmts, k):
                 k += 2
                 continue
-            if self.put_back(b.stmts, k) or self.move_let(b.stmts, k):
+            if self.put_back(
+                b.stmts,
+                k
+            ) or self.move_let(b.stmts, k) or self.borrow_let(b.stmts, k):
                 k += 1
                 continue
             self.stmt(b.stmts[k])
@@ -2647,6 +2650,109 @@ struct Lower:
             case _:
                 return false
 
+    # `let d = r.f` or `let d = r[i].g`, where nothing in the rest of the
+    # block can change `r` or move it: `d` borrows the value, which `r` keeps
+    # alive, instead of retaining it and releasing it at the end.
+    fn borrow_let(ref self, stmts: [Stmt], k: int) -> bool:
+        if not self.moves_ok():
+            return false
+        let s = stmts[k]
+        match s.kind:
+            case StmtKind.Let(mutable, pat, _, init, is_ref):
+                if mutable or is_ref or len(
+                    s.locals
+                ) != 1 or not is_name(pat) or not borrow_place(init):
+                    return false
+                let d = s.locals[0]
+                let ty = self.flocals[d].ty
+                if not self.managed(ty) or init.ty != ty or not self.plain_local(d):
+                    return false
+                var r = -1
+                match place_path(init):
+                    case Some((l, _)):
+                        r = l
+                    case None:
+                        return false
+                let rk = self.flocals[r].kind
+                if rk == LocalKind.Var or rk == LocalKind.Let:
+                    if r in self.cx.lptr or r in self.cx.packed or r in self.cx.narrow:
+                        return false
+                elif rk != LocalKind.Param and rk != LocalKind.RefParam:
+                    return false
+                for i in k + 1..len(stmts):
+                    if not self.keeps_root(stmts[i], r):
+                        return false
+                match self.fnd:
+                    case Some(f):
+                        for t in f.body.stmts:
+                            if ref_alias(t, r):
+                                return false
+                    case None:
+                        return false
+                self.push_frame()
+                let v = self.expr(init)
+                let own = self.claim(v)
+                let home = self.new_local(d, ty)
+                self.st(home, 0, ty, v)
+                if own:
+                    self.add_local_home(home, ty, d)
+                self.pop_frame()
+                return true
+            case _:
+                return false
+
+    # Does statement `s` leave the value of variable `r` (and all it holds)
+    # alone: no write, `ref` or changing method through it, and no read of
+    # the whole variable a move could take (`var t = r`, `p = r`)?
+    fn keeps_root(self, s: Stmt, r: int) -> bool:
+        match s.kind:
+            case StmtKind.Let(_, _, _, init, is_ref):
+                if local_of(init) == Some(r) or is_ref and mentions_local(init, r):
+                    return false
+            case StmtKind.Assign(t, _, v):
+                if mentions_local(t, r) or local_of(v) == Some(r):
+                    return false
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            if not self.keeps_root_in(e, r):
+                return false
+        for b in stmt_blocks(s):
+            for t in b.stmts:
+                if not self.keeps_root(t, r):
+                    return false
+        return true
+
+    fn keeps_root_in(self, e: Expr, r: int) -> bool:
+        match e.kind:
+            case ExprKind.MethodCall(recv, _, _, args):
+                var changes = true
+                match e.cres:
+                    case CallRes.Builtin(b):
+                        changes = b.mutates_recv()
+                    case CallRes.Method(id):
+                        let ps = self.info.fns[id].params
+                        changes = len(ps) == 0 or ps[0].by_ref
+                    case CallRes.Fn(_):
+                        changes = false
+                    case _:
+                        pass
+                if changes and mentions_local(recv, r):
+                    return false
+                for a in args:
+                    if a.by_ref and mentions_local(a.expr, r):
+                        return false
+            case ExprKind.Call(_, args):
+                for a in args:
+                    if a.by_ref and mentions_local(a.expr, r):
+                        return false
+            case _:
+                pass
+        for c in children(e):
+            if not self.keeps_root_in(c, r):
+                return false
+        return true
+
     # A variable kept in its home as itself (not as bits, bytes or an appender).
     fn plain_local(self, id: int) -> bool:
         let lc = self.flocals[id]
@@ -2668,7 +2774,9 @@ struct Lower:
                     return false
                 match local_of(v):
                     case Some(w):
-                        if not self.movable(w) or mentions_local(t, w) or not last_use(stmts, j, w):
+                        if not self.movable(
+                            w
+                        ) or not self.has_home(w) or mentions_local(t, w) or not last_use(stmts, j, w):
                             return false
                         match place_path(t):
                             case Some((root, _)):
@@ -6763,3 +6871,18 @@ fn consumes(f: FnDecl, pi: int) -> bool:
             case _:
                 pass
     return false
+
+# A field or array element of a variable, at any depth: a place whose value
+# stays put while the variable does (see `borrow_let`).
+fn borrow_place(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Field(b, _, _):
+            return local_of(b).is_some() or borrow_place(b)
+        case ExprKind.Index(b, _):
+            match b.ty:
+                case Ty.Array(_):
+                    return local_of(b).is_some() or borrow_place(b)
+                case _:
+                    return false
+        case _:
+            return false
