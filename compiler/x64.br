@@ -1551,30 +1551,60 @@ struct X:
                     let y = f.code[i + 1]
                     if (y.op == Op.Br or y.op == Op.BrNot) and y.a == x.d:
                         w[x.d] = -1000000000
-        # Temporaries: vregs made once and read only before the next label.
-        # Their lives are short and known, so they share registers below
-        # instead of taking one for the whole function.
+        # Short-lived vregs share registers below instead of taking one for
+        # the whole function, each over an interval: a vreg made once and read
+        # only before the next label (a temporary) from its write to its last
+        # read; or one first mentioned by a write at lo and last mentioned at
+        # hi where every loop is outside lo..hi or inside it, so that every
+        # path between its mentions stays in lo..hi (the lowering never reads
+        # a vreg on a path that doesn't write it first).
         var temp = [false] * nv
+        var tlo = [-1] * nv
         var tend = [-1] * nv
         var bad = [false] * nv
         var tlab = [-1] * nv
+        var wfirst = [false] * nv
         var lab = -1
+        var back: [int] = []
         for i in 0..ncode:
             let x = f.code[i]
             if x.op == Op.Label:
                 lab = i
+            elif x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot:
+                let l = lat[x.n]
+                if l >= 0 and l <= i:
+                    back.push(l)
+                    back.push(i)
             for v in reads(x, nv):
                 if not temp[v] or tlab[v] != lab:
                     bad[v] = true
+                if tlo[v] < 0:
+                    tlo[v] = i
                 tend[v] = i
-            if x.d >= 0 and ndef[x.d] == 1 and x.d >= f.nparams:
-                temp[x.d] = true
-                tlab[x.d] = lab
+            let xd = x.d
+            if xd >= 0:
+                if tlo[xd] < 0:
+                    tlo[xd] = i
+                    wfirst[xd] = true
+                tend[xd] = i
+                if ndef[xd] == 1 and xd >= f.nparams:
+                    temp[xd] = true
+                    tlab[xd] = lab
         for v in 0..nv:
+            var ok = temp[v] and not bad[v]
+            if not ok and wfirst[v] and v >= f.nparams:
+                ok = true
+                var j = 0
+                while j < len(back):
+                    let l = back[j]
+                    let e = back[j + 1]
+                    j += 2
+                    if not (e < tlo[v] or l > tend[v] or (tlo[v] <= l and e <= tend[v])):
+                        ok = false
+                        break
             temp[v] = (
-                temp[v]
-                and not bad[v]
-                and tend[v] >= 0
+                ok
+                and tend[v] > tlo[v]
                 and w[v] > 0
                 and self.fold[v] == F_NONE
                 and not f.vk[v].is_wide()
@@ -1638,37 +1668,39 @@ struct X:
         var fpool: [int] = []
         for xr in first..16:
             fpool.push(16 + xr)
+        var starts: [[int]] = [[] for _ in 0..ncode]
+        for v in 0..nv:
+            if temp[v]:
+                starts[tlo[v]].push(v)
         for i in 0..ncode:
-            let td = f.code[i].d
-            if td < 0 or not temp[td]:
-                continue
-            let fl = f.vk[td].is_float()
-            let rs = fpool if fl else pool
-            var pick = -1
-            for r in rs:
-                if busy[r] != -2 and busy[r] < i:
-                    let used = (
-                        busy[r] >= 0
-                        or (not fl and r in self.saved)
-                        or (fl and r - 16 in self.fsaved)
-                    )
-                    if pick < 0 or used:
-                        pick = r
-                    if used:
-                        break
-            if pick < 0:
-                continue
-            if busy[pick] == -1:
-                if not fl:
-                    if pick not in self.saved:
-                        self.saved.push(pick)
-                elif self.win and pick - 16 not in self.fsaved:
-                    self.fsaved.push(pick - 16)
-            busy[pick] = tend[td]
-            if fl:
-                self.freg[td] = pick - 16
-            else:
-                self.reg[td] = pick
+            for td in starts[i]:
+                let fl = f.vk[td].is_float()
+                let rs = fpool if fl else pool
+                var pick = -1
+                for r in rs:
+                    if busy[r] != -2 and busy[r] < i:
+                        let used = (
+                            busy[r] >= 0
+                            or (not fl and r in self.saved)
+                            or (fl and r - 16 in self.fsaved)
+                        )
+                        if pick < 0 or used:
+                            pick = r
+                        if used:
+                            break
+                if pick < 0:
+                    continue
+                if busy[pick] == -1:
+                    if not fl:
+                        if pick not in self.saved:
+                            self.saved.push(pick)
+                    elif self.win and pick - 16 not in self.fsaved:
+                        self.fsaved.push(pick - 16)
+                busy[pick] = tend[td]
+                if fl:
+                    self.freg[td] = pick - 16
+                else:
+                    self.reg[td] = pick
         if not self.win:
             self.live_ranges(f, lat, ndef)
 
