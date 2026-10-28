@@ -12,8 +12,9 @@
 # parameters and aggregate parameters) the caller's memory behind a pointer.
 #
 # Memory layouts are C's (the runtime is C and shares them):
-# tuples and structs are C structs, enums with payload are boxes
-# `{rc, tag, union of variant structs}`, other enums are int32.
+# tuples and structs are C structs; enums with payload are `{tag, union of
+# variant structs}` in place when small and not recursive, else boxes
+# `{rc, tag, union}` (see `BoxLay`); other enums are int32.
 from diag import Span, SourceMap
 from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, LocalKind, int_ty
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
@@ -233,12 +234,16 @@ struct Lay:
     size: int
     align: int
 
-# Where the fields of an enum box are.
+# Where the fields of an enum with payloads are: in a box `{rc, tag (i64),
+# union}`, or (`inline`) in the value itself, `{tag (i32), union}`, handled
+# like a struct.
 struct BoxLay:
+    inline: bool
     # offset of the union of variant structs
     uoff: int
-    # size of the whole box
+    # size of the whole box (or the inline value)
     size: int
+    align: int
     # per variant: its size (to the end of its struct) and its field offsets
     vsize: [int]
     voffs: [[int]]
@@ -289,6 +294,7 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         soffs=[],
         sdone=[],
         blays=[],
+        edone=[],
         done={},
         strs={},
         cstrs={},
@@ -326,6 +332,7 @@ struct Lower:
     soffs: [[int]]
     sdone: [bool]
     blays: [BoxLay]
+    edone: [bool]
     done: {str: bool}
     # string literal objects and plain C strings, by text
     strs: {str: str}
@@ -610,18 +617,24 @@ struct Lower:
                     match try_kind(self.info, sig.ret):
                         case Some(TryKind.Res(_, err_v, _, err)):
                             # `main() -> Result[(), E]`: an `Err` prints "error: ..." and exits with 1
-                            let r = self.cx.fb.call(K.Ptr, sym, [])
+                            let eid = cg_enum_id(sig.ret)
+                            var r = -1
+                            if self.agg(sig.ret):
+                                let lay = self.lay(sig.ret)
+                                r = self.cx.fb.temp_mem(lay.size, lay.align)
+                                self.cx.fb.call_void(sym, [r])
+                            else:
+                                r = self.cx.fb.call(K.Ptr, sym, [])
                             code = self.cx.fb.vreg(K.I32)
                             let zero = self.cx.fb.konst(K.I32, 0)
                             self.cx.fb.mov(code, zero)
-                            let tag = self.cx.fb.load(K.I64, r, 8)
-                            let ev = self.cx.fb.konst(K.I64, err_v)
+                            let tag = self.etag(eid, r)
+                            let ev = self.cx.fb.konst(self.tagk(eid), err_v)
                             let is_err = self.cx.fb.cmp(Op.Eq, tag, ev)
                             let skip = self.cx.fb.label()
                             self.cx.fb.brnot(is_err, skip)
                             let sb = self.sb_new()
                             self.sb_lit(sb, "error: ")
-                            let eid = cg_enum_id(sig.ret)
                             let fv = self.ld(r, self.vfield_off(eid, err_v, 0), err)
                             self.fmt_code(sb, fv, err, false)
                             self.cx.fb.call_void("brine_eprint_sb", [sb])
@@ -984,24 +997,60 @@ struct Lower:
             case Ty.Struct(sid):
                 return any(self.managed(f.1) for f in self.info.structs[sid].fields)
             case Ty.Enum(eid):
+                if self.inl_e(eid):
+                    for v in self.info.enums[eid].variants:
+                        if any(self.managed(fd.1) for fd in v.fields):
+                            return true
+                    return false
                 return self.info.enums[eid].has_payload()
             case _:
                 return false
 
+    # An enum stored in shared boxes (see `BoxLay`).
     fn boxed(self, t: Ty) -> bool:
+        match t:
+            case Ty.Enum(eid):
+                return self.info.enums[eid].has_payload() and not self.inl_e(eid)
+            case _:
+                return false
+
+    # An enum with payloads stored in the value itself (see `BoxLay`).
+    fn inl(self, t: Ty) -> bool:
+        match t:
+            case Ty.Enum(eid):
+                return self.inl_e(eid)
+            case _:
+                return false
+
+    fn inl_e(self, eid: int) -> bool:
+        return eid < len(self.blays) and self.blays[eid].inline
+
+    # Does enum type `t` have a variant with fields?
+    fn payload(self, t: Ty) -> bool:
         match t:
             case Ty.Enum(eid):
                 return self.info.enums[eid].has_payload()
             case _:
                 return false
 
-    # Tuples and structs: values in memory, handled through pointers.
+    # The kind of the tag of an enum with payloads, and the tag of the value at p.
+    fn tagk(self, eid: int) -> K:
+        return K.I32 if self.inl_e(eid) else K.I64
+
+    fn etag(ref self, eid: int, p: int) -> int:
+        if self.inl_e(eid):
+            return self.cx.fb.load(K.I32, p, 0)
+        return self.cx.fb.load(K.I64, p, 8)
+
+    # Tuples, structs and inline enums: values in memory, handled through pointers.
     fn agg(self, t: Ty) -> bool:
         match t:
             case Ty.Tuple(ts):
                 return len(ts) > 0
             case Ty.Struct(_):
                 return true
+            case Ty.Enum(eid):
+                return self.inl_e(eid)
             case _:
                 return false
 
@@ -1079,6 +1128,9 @@ struct Lower:
             case Ty.Bool | Ty.Unit:
                 return Lay(size=1, align=1)
             case Ty.Enum(eid):
+                if self.inl_e(eid):
+                    let bl = self.blays[eid]
+                    return Lay(size=bl.size, align=bl.align)
                 if self.info.enums[eid].has_payload():
                     return Lay(size=8, align=8)
                 return Lay(size=4, align=4)
@@ -1122,18 +1174,29 @@ struct Lower:
     fn vfield_off(self, eid: int, vi: int, fi: int) -> int:
         return self.blays[eid].voffs[vi][fi]
 
-    # Struct layouts depend on the layouts of the structs they contain, so they
-    # are computed once, up front, inner structs first.
+    # Struct and inline enum layouts depend on the layouts of the structs and
+    # enums they contain, so they are computed once, up front, inner ones
+    # first. An enum that can hold itself is boxed (its size is a pointer's),
+    # which breaks every cycle.
     fn prep_layouts(ref self):
         let ns = len(self.info.structs)
         self.slays = [Lay(size=1, align=1)] * ns
         let none: [int] = []
         self.soffs = [none] * ns
         self.sdone = [false] * ns
+        let ne = len(self.info.enums)
+        let nb: [int] = []
+        let nvo: [[int]] = []
+        self.blays = [BoxLay(inline=false, uoff=16, size=16, align=8, vsize=nb, voffs=nvo)] * ne
+        self.edone = [false] * ne
+        for eid in 0..ne:
+            self.prep_enum(eid)
         for sid in 0..ns:
             self.prep_struct(sid)
-        for eid in 0..len(self.info.enums):
-            self.blays.push(self.make_box_lay(eid))
+        # boxes only now: their payloads may hold structs that hold the enum
+        for eid in 0..ne:
+            if not self.blays[eid].inline:
+                self.blays[eid] = self.make_box_lay(eid, false)
 
     fn prep_ty(ref self, t: Ty):
         match t:
@@ -1142,8 +1205,29 @@ struct Lower:
             case Ty.Tuple(ts):
                 for x in ts:
                     self.prep_ty(x)
+            case Ty.Enum(eid):
+                self.prep_enum(eid)
             case _:
                 pass
+
+    # An enum with payloads of at most 64 bytes that can't hold itself is
+    # stored inline: `Some(i)` needs no allocation and no reference count.
+    fn prep_enum(ref self, eid: int):
+        if self.edone[eid]:
+            return
+        self.edone[eid] = true
+        let en = self.info.enums[eid]
+        if not en.has_payload():
+            return
+        var seen: {str: bool} = {}
+        if self.self_holding(Ty.Enum(eid), eid, ref seen):
+            return
+        for v in en.variants:
+            for fd in v.fields:
+                self.prep_ty(fd.1)
+        let bl = self.make_box_lay(eid, true)
+        if bl.size - bl.uoff <= 64:
+            self.blays[eid] = bl
 
     fn prep_struct(ref self, sid: int):
         if self.sdone[sid]:
@@ -1156,7 +1240,7 @@ struct Lower:
         self.slays[sid] = r.0
         self.soffs[sid] = r.1
 
-    fn make_box_lay(self, eid: int) -> BoxLay:
+    fn make_box_lay(self, eid: int, inline: bool) -> BoxLay:
         let en = self.info.enums[eid]
         var ual = 1
         var usz = 0
@@ -1167,8 +1251,8 @@ struct Lower:
             if len(v.fields) > 0:
                 ual = max(ual, r.0.align)
                 usz = max(usz, r.0.size)
-        let uoff = align_up(16, ual)
-        let bal = max(8, ual)
+        let uoff = align_up(4 if inline else 16, ual)
+        let bal = max(4 if inline else 8, ual)
         var vsize: [int] = []
         var voffs: [[int]] = []
         for i, v in enumerate(en.variants):
@@ -1176,8 +1260,10 @@ struct Lower:
             vsize.push(uoff + (r.0.size if len(v.fields) > 0 else 0))
             voffs.push([uoff + o for o in r.1])
         return BoxLay(
+            inline=inline,
             uoff=uoff,
             size=align_up(uoff + align_up(usz, ual), bal),
+            align=bal,
             vsize=vsize,
             voffs=voffs
         )
@@ -1410,8 +1496,9 @@ struct Lower:
                 # a box: {rc, tag, the union of the variants with fields}
                 let int = self.dty(int_ty())
                 let bl = self.blays[eid]
+                let tk = self.tagk(eid)
                 let tag = self.dty_add(
-                    DType(tag=DT_ENUM, name=name + ".tag", size=8, k=K.I64, to=-1, fields=vals)
+                    DType(tag=DT_ENUM, name=name + ".tag", size=tk.size(), k=tk, to=-1, fields=vals)
                 )
                 var vs: [DField] = []
                 for vi, v in enumerate(en.variants):
@@ -1432,6 +1519,12 @@ struct Lower:
                         fields=vs
                     )
                 )
+                if bl.inline:
+                    return dstruct(
+                        name,
+                        bl.size,
+                        [dfield("tag", tag, 0), dfield("variant", u, bl.uoff)]
+                    )
                 let fs = [
                     dfield("rc", int, 0),
                     dfield("tag", tag, 8),
@@ -1454,6 +1547,9 @@ struct Lower:
             case Ty.Enum(_):
                 if self.boxed(t):
                     self.cx.fb.rt_void("brine_box_retain", [v])
+                elif self.managed(t):
+                    let m = self.need_rc(t)
+                    self.cx.fb.call_void("br_retain_" + m, [v])
             case Ty.Tuple(_) | Ty.Struct(_):
                 if self.managed(t):
                     let m = self.need_rc(t)
@@ -1493,6 +1589,43 @@ struct Lower:
     fn need_rc(ref self, t: Ty) -> str:
         let m = self.mangle(t)
         if not self.mark_done("rc_" + m):
+            return m
+        if self.inl(t):
+            # the fields of the variant the tag names
+            let eid = cg_enum_id(t)
+            for which in 0..2:
+                let s1 = self.start_helper(
+                    ("br_retain_" if which == 0 else "br_release_") + m,
+                    [K.Ptr],
+                    false,
+                    K.I64
+                )
+                let tag = self.etag(eid, 0)
+                let out = self.cx.fb.label()
+                for vi, v in enumerate(self.info.enums[eid].variants):
+                    if not any(self.managed(fd.1) for fd in v.fields):
+                        continue
+                    let next = self.cx.fb.label()
+                    let vv = self.cx.fb.konst(K.I32, vi)
+                    let hit = self.cx.fb.cmp(Op.Eq, tag, vv)
+                    self.cx.fb.brnot(hit, next)
+                    for fi, fd in enumerate(v.fields):
+                        if self.managed(fd.1):
+                            let x = self.ld(0, self.vfield_off(eid, vi, fi), fd.1)
+                            if which == 0:
+                                self.retain(x, fd.1)
+                            else:
+                                self.release(x, fd.1)
+                    self.cx.fb.jmp(out)
+                    self.cx.fb.place(next)
+                self.cx.fb.place(out)
+                self.finish_helper(s1)
+            let s7 = self.start_helper("br_rtp_" + m, [K.Ptr], false, K.I64)
+            self.cx.fb.call_void("br_retain_" + m, [0])
+            self.finish_helper(s7)
+            let s8 = self.start_helper("br_rlp_" + m, [K.Ptr], false, K.I64)
+            self.cx.fb.call_void("br_release_" + m, [0])
+            self.finish_helper(s8)
             return m
         match t:
             case Ty.Enum(eid):
@@ -1800,11 +1933,11 @@ struct Lower:
                 let boxed = en.has_payload()
                 var tag = v
                 if boxed:
-                    tag = self.cx.fb.load(K.I64, v, 8)
+                    tag = self.etag(eid, v)
                 let out = self.cx.fb.label()
                 for vi, var_ in enumerate(en.variants):
                     let next = self.cx.fb.label()
-                    let vv = self.cx.fb.konst(K.I64 if boxed else K.I32, vi)
+                    let vv = self.cx.fb.konst(self.tagk(eid) if boxed else K.I32, vi)
                     let hit = self.cx.fb.cmp(Op.Eq, tag, vv)
                     self.cx.fb.brnot(hit, next)
                     let head = en.variant_label(vi) + ("" if len(var_.fields) == 0 else "(")
@@ -1843,7 +1976,7 @@ struct Lower:
                 let f = self.need_eq(t)
                 return self.cx.fb.call(K.Bool, f, [a, b])
             case Ty.Enum(_):
-                if self.boxed(t):
+                if self.payload(t):
                     let f = self.need_eq(t)
                     return self.cx.fb.call(K.Bool, f, [a, b])
                 return self.cx.fb.cmp(Op.Eq, a, b)
@@ -1896,15 +2029,15 @@ struct Lower:
                 let lyes = self.cx.fb.label()
                 let same = self.cx.fb.cmp(Op.Eq, a, b)
                 self.cx.fb.br(same, lyes)
-                let ta = self.cx.fb.load(K.I64, a, 8)
-                let tb = self.cx.fb.load(K.I64, b, 8)
+                let ta = self.etag(eid, a)
+                let tb = self.etag(eid, b)
                 let dt = self.cx.fb.cmp(Op.Ne, ta, tb)
                 self.cx.fb.br(dt, lno)
                 for vi, v in enumerate(variants):
                     if len(v.fields) == 0:
                         continue
                     let next = self.cx.fb.label()
-                    let vv = self.cx.fb.konst(K.I64, vi)
+                    let vv = self.cx.fb.konst(self.tagk(eid), vi)
                     let hit = self.cx.fb.cmp(Op.Eq, ta, vv)
                     self.cx.fb.brnot(hit, next)
                     for fi, fd in enumerate(v.fields):
@@ -1943,7 +2076,7 @@ struct Lower:
                 let x = self.cx.fb.conv(K.U64, v)
                 return self.cx.fb.rt(K.U64, "brine_hash_u64", [x])
             case Ty.Enum(_):
-                if not self.boxed(t):
+                if not self.payload(t):
                     let x = self.cx.fb.conv(K.U64, v)
                     return self.cx.fb.rt(K.U64, "brine_hash_u64", [x])
                 let f = self.need_hash(t)
@@ -1990,7 +2123,7 @@ struct Lower:
                 self.cx.fb.mov(h, h3)
             case Ty.Enum(eid):
                 let variants = self.info.enums[eid].variants
-                let tag = self.cx.fb.load(K.I64, v, 8)
+                let tag = self.etag(eid, v)
                 let tu = self.cx.fb.conv(K.U64, tag)
                 let h1 = self.cx.fb.rt(K.U64, "brine_hash_mix", [h, tu])
                 self.cx.fb.mov(h, h1)
@@ -1999,7 +2132,7 @@ struct Lower:
                     if len(var_.fields) == 0:
                         continue
                     let next = self.cx.fb.label()
-                    let vv = self.cx.fb.konst(K.I64, vi)
+                    let vv = self.cx.fb.konst(self.tagk(eid), vi)
                     let hit = self.cx.fb.cmp(Op.Eq, tag, vv)
                     self.cx.fb.brnot(hit, next)
                     for fi, fd in enumerate(var_.fields):
@@ -2130,7 +2263,7 @@ struct Lower:
             case Ty.Bool:
                 return self.cx.fb.konst(K.Bool, 1)
             case Ty.Enum(_):
-                return self.cx.fb.konst(K.Bool, 0 if self.boxed(t) else 1)
+                return self.cx.fb.konst(K.Bool, 0 if self.payload(t) else 1)
             case Ty.Str:
                 let n = self.cx.fb.load(K.I64, v, 8)
                 let eight = self.cx.fb.konst(K.I64, 8)
@@ -2146,16 +2279,25 @@ struct Lower:
         return dflt
 
     # A new box for variant `vi` of enum `eid` (fields unset).
+    # (An inline enum: new stack memory with the tag set.)
     fn box_new(ref self, eid: int, vi: int, full: bool) -> int:
         let bl = self.box_lay(eid)
+        if bl.inline:
+            let p = self.cx.fb.temp_mem(bl.size, bl.align)
+            let tg = self.cx.fb.konst(K.I32, vi)
+            self.cx.fb.store(p, 0, tg)
+            return p
         let size = bl.size if full else bl.vsize[vi]
         let sz = self.cx.fb.konst(K.I64, size)
         let tg = self.cx.fb.konst(K.I64, vi)
         return self.cx.fb.call(K.Ptr, "brine_box_new", [sz, tg])
 
-    # A variant without fields: a static immortal box, or (no payloads) a number.
+    # A variant without fields: a static immortal box, or (no payloads) a
+    # number, or (inline) new stack memory with the tag set.
     fn variant_const(ref self, t: Ty, vi: int) -> int:
         let eid = cg_enum_id(t)
+        if self.inl(t):
+            return self.box_new(eid, vi, true)
         if self.boxed(t):
             let ct = self.info.enums[eid].c_name
             let name = f"br_ev_{ct}_{vi}"
@@ -2173,6 +2315,19 @@ struct Lower:
         let eid = cg_enum_id(oty)
         let some = self.variant_index(eid, "Some", 0)
         let none = self.variant_index(eid, "None", 1)
+        if self.inl(oty):
+            let p = self.box_new(eid, none, true)
+            let skip0 = self.cx.fb.label()
+            self.cx.fb.brnot(present, skip0)
+            let tg = self.cx.fb.konst(K.I32, some)
+            self.cx.fb.store(p, 0, tg)
+            let off0 = self.vfield_off(eid, some, 0)
+            let val0 = self.ld(vp, 0, vt)
+            self.st(p, off0, vt, val0)
+            let fv0 = self.ld(p, off0, vt)
+            self.retain(fv0, vt)
+            self.cx.fb.place(skip0)
+            return self.temp(p, oty)
         let t = self.cx.fb.vreg(K.Ptr)
         let nc = self.variant_const(oty, none)
         self.cx.fb.mov(t, nc)
@@ -2193,6 +2348,19 @@ struct Lower:
         let eid = cg_enum_id(rty)
         let okv = self.variant_index(eid, "Ok", 0)
         let errv = self.variant_index(eid, "Err", 1)
+        if self.inl(rty):
+            let p = self.box_new(eid, okv, true)
+            let lerr0 = self.cx.fb.label()
+            let done0 = self.cx.fb.label()
+            self.cx.fb.brnot(ok, lerr0)
+            self.st(p, self.vfield_off(eid, okv, 0), vty, val)
+            self.cx.fb.jmp(done0)
+            self.cx.fb.place(lerr0)
+            let tg = self.cx.fb.konst(K.I32, errv)
+            self.cx.fb.store(p, 0, tg)
+            self.cx.fb.store(p, self.vfield_off(eid, errv, 0), err)
+            self.cx.fb.place(done0)
+            return self.temp(p, rty)
         let t = self.cx.fb.vreg(K.Ptr)
         let lerr = self.cx.fb.label()
         let done = self.cx.fb.label()
@@ -4014,14 +4182,14 @@ struct Lower:
             case PatKind.Variant(_, _):
                 match p.vres:
                     case Some((eid, vi)):
-                        if not self.boxed(ty):
+                        if not self.payload(ty):
                             let k = self.cx.fb.konst(K.I32, vi)
                             let c = self.cx.fb.cmp(Op.Eq, v, k)
                             self.cx.fb.brnot(c, fail)
                             return
                         let fts = self.info.enums[eid].variants[vi].fields
-                        let tag = self.cx.fb.load(K.I64, v, 8)
-                        let k = self.cx.fb.konst(K.I64, vi)
+                        let tag = self.etag(eid, v)
+                        let k = self.cx.fb.konst(self.tagk(eid), vi)
                         let c = self.cx.fb.cmp(Op.Eq, tag, k)
                         self.cx.fb.brnot(c, fail)
                         for i in 0..min(len(p.fields), len(fts)):
@@ -4730,13 +4898,13 @@ struct Lower:
             case TryKind.Res(okv, errv, _, _):
                 fail_v = errv
                 ok_v = okv
-        let tag = self.cx.fb.load(K.I64, v, 8)
-        let fv = self.cx.fb.konst(K.I64, fail_v)
+        let xe = cg_enum_id(x.ty)
+        let tag = self.etag(xe, v)
+        let fv = self.cx.fb.konst(self.tagk(xe), fail_v)
         let failed = self.cx.fb.cmp(Op.Eq, tag, fv)
         let ok = self.cx.fb.label()
         self.cx.fb.brnot(failed, ok)
         var ret = -1
-        let xe = cg_enum_id(x.ty)
         let rk = try_kind(self.info, rty)
         match (kind, rk):
             case (TryKind.Res(_, _, _, err), Some(TryKind.Res(_, rerr_v, _, _))):
@@ -4752,6 +4920,9 @@ struct Lower:
                 ret = self.variant_const(rty, none)
             case _:
                 panic("`?` in a function that doesn't return Option/Result")
+        if self.cx.sret >= 0:
+            self.cx.fb.copy(self.cx.sret, ret, self.lay(rty).size)
+            ret = -1
         # leave the function: release this statement's temps and every local
         var temps: [Temp] = []
         for fr in self.cx.frames:

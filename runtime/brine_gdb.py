@@ -122,14 +122,16 @@ class TuplePrinter:
 
 
 class BoxPrinter:
-    def __init__(self, v):
+    # v: a pointer to a box, or (inline) the enum value itself
+    def __init__(self, v, inline=False):
         self.v = v
+        self.inline = inline
 
     def to_string(self):
-        if _ptr(self.v) is None:
+        if not self.inline and _ptr(self.v) is None:
             return "<null>"
         try:
-            b = self.v.dereference()
+            b = self.v if self.inline else self.v.dereference()
             label = _fmt(b["tag"])
             name = label.rsplit(".", 1)[-1]
             u = b["variant"]
@@ -175,6 +177,13 @@ def lookup(v):
         target = t.target()
         if target.tag is not None and target.tag.startswith("brine_box "):
             return BoxPrinter(v)
+    if t.code == gdb.TYPE_CODE_STRUCT:
+        # an enum stored inline: {tag, variant}
+        fs = t.fields()
+        if len(fs) == 2 and fs[0].name == "tag" and fs[1].name == "variant":
+            tn = fs[0].type.name
+            if tn is not None and tn.endswith(".tag"):
+                return BoxPrinter(v, True)
     return None
 
 

@@ -190,6 +190,11 @@ Every `match` must handle every value (error E0320 shows one it misses);
 end with `case _:` when listing values isn't possible. Variant data is read with
 `match`, never with `.field`.
 
+Cost: an enum whose variants hold at most 64 bytes and that can't contain itself
+(`Shape`, `Option[int]`, `Result[int, str]`) is stored in place, like a struct: making
+one allocates nothing. A recursive enum (`Expr`) or a bigger one is a pointer to a
+shared, reference-counted box.
+
 ## Generics, `Option` and `Result`
 
 ```python
