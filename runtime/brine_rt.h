@@ -155,6 +155,8 @@ static inline void brine_arr_release(brine_arr *a) {
 }
 void *brine_box_new(int64_t size, int64_t tag);
 void brine_box_free(void *p);
+/* fn(p) finishes freeing the dead object p; deep structures go iteratively */
+void brine_drop(void *p, void (*fn)(void *));
 static inline void brine_box_retain(void *p) {
     brine_box *b = (brine_box *)p;
     if (__atomic_load_n(&b->rc, __ATOMIC_RELAXED) >= 0) __atomic_fetch_add(&b->rc, 1, __ATOMIC_RELAXED);
@@ -523,6 +525,35 @@ void brine_arr_insert(brine_arr **pa, int64_t i, const void *elem, const char *l
 void brine_arr_extend(brine_arr **pa, brine_arr *b);
 void brine_arr_reverse(brine_arr **pa);
 void brine_arr_clear(brine_arr **pa);
+/* push, pop and clear with their common case inline: the array is this
+   variable's alone and, for a push, has room. `esz` is the element size, a
+   constant the compiler passes so the copy becomes a store. */
+static inline void brine_arr_push_in(brine_arr **pa, const void *elem, int64_t esz) {
+    brine_arr *a = *pa;
+    if (BR_LIKELY(a->len < a->cap && __atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1)) {
+        __builtin_memcpy(a->data + a->len * esz, elem, (size_t)esz);
+        a->len++;
+        return;
+    }
+    brine_arr_push(pa, elem);
+}
+static inline void brine_arr_pop_in(brine_arr **pa, void *out, int64_t esz, const char *loc) {
+    brine_arr *a = *pa;
+    if (BR_LIKELY(a->len > 0 && __atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1)) {
+        a->len--;
+        __builtin_memcpy(out, a->data + a->len * esz, (size_t)esz);
+        return;
+    }
+    brine_arr_pop(pa, out, loc);
+}
+static inline void brine_arr_clear_in(brine_arr **pa) {
+    brine_arr *a = *pa;
+    if (BR_LIKELY(a->release == NULL && __atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1)) {
+        a->len = 0;
+        return;
+    }
+    brine_arr_clear(pa);
+}
 /* stable sort; cmp returns <0, 0 or >0 */
 void brine_arr_sort(brine_arr **pa, int (*cmp)(const void *, const void *));
 brine_arr *brine_arr_slice(brine_arr *a, int64_t lo, int64_t hi, const char *loc);
@@ -718,10 +749,41 @@ static inline double brine_f_fmod(double a, double b) { double r = fmod(a, b); r
 static inline float brine_f_fmodf(float a, float b) { float r = fmodf(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
 /* float min and max: a NaN loses to a number, and -0.0 is less than 0.0 (C's
  * fmin may return either zero), so the result is the same on every platform
- * and on a GPU (ptx.br) */
-#define BR_MINMAX(T, S)                                                             static inline T brine_f_fmin##S(T a, T b) {                                       if (a < b || b != b) return a;                                                 if (b < a || a != a) return b;                                                 return signbit(a) ? a : b;                                                 }                                                                              static inline T brine_f_fmax##S(T a, T b) {                                       if (a > b || b != b) return a;                                                 if (b > a || a != a) return b;                                                 return signbit(a) ? b : a;                                                 }
-BR_MINMAX(double, )
-BR_MINMAX(float, f)
+ * and on a GPU (ptx.br). With AVX (the x86-64-v3 and v4 builds of a release)
+ * they are two selects and no branch, so loops that use them vectorize; equal
+ * values are merged bitwise, which only matters for the sign of a zero.
+ * Without vector blends the selects become slower than the branches. */
+#if defined(__AVX__)
+#define BR_MINMAX(T, U, S)                                                      \
+static inline T brine_f_fmin##S(T a, T b) {                                     \
+    U x, y; T e;                                                                \
+    __builtin_memcpy(&x, &a, sizeof x); __builtin_memcpy(&y, &b, sizeof y);     \
+    x |= y; __builtin_memcpy(&e, &x, sizeof e);                                 \
+    T r = ((a < b) | (b != b)) ? a : b;                                         \
+    return a == b ? e : r;                                                      \
+}                                                                               \
+static inline T brine_f_fmax##S(T a, T b) {                                     \
+    U x, y; T e;                                                                \
+    __builtin_memcpy(&x, &a, sizeof x); __builtin_memcpy(&y, &b, sizeof y);     \
+    x &= y; __builtin_memcpy(&e, &x, sizeof e);                                 \
+    T r = ((a > b) | (b != b)) ? a : b;                                         \
+    return a == b ? e : r;                                                      \
+}
+#else
+#define BR_MINMAX(T, U, S)                                                      \
+static inline T brine_f_fmin##S(T a, T b) {                                     \
+    if (a < b || b != b) return a;                                              \
+    if (b < a || a != a) return b;                                              \
+    return signbit(a) ? a : b;                                                  \
+}                                                                               \
+static inline T brine_f_fmax##S(T a, T b) {                                     \
+    if (a > b || b != b) return a;                                              \
+    if (b > a || a != a) return b;                                              \
+    return signbit(a) ? b : a;                                                  \
+}
+#endif
+BR_MINMAX(double, uint64_t, )
+BR_MINMAX(float, uint32_t, f)
 
 /* ------------------------------------------------------------ checked integer arithmetic */
 /* r = a * b; true when it overflows. Clang turns a signed 128-bit overflow

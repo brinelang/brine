@@ -55,6 +55,8 @@ struct Owned:
     v: int
     ty: Ty
     home: bool
+    # the local whose home this is, else -1
+    lid: int
 
 # For `x / 2^k` and `x % 2^k` on a signed integer, k (else -1): floor division
 # by a power of two is an arithmetic shift and the floored remainder a mask.
@@ -147,6 +149,22 @@ struct FnCx:
     # string variables a loop appends bytes to through an appender
     # (`open_apps`): the appender's address
     apps: {int: int}
+    # index values evaluated ahead of their place (`pre_index`), by span
+    pre_idx: {str: int}
+    # the keys in `arrc` (negative) of the array fields loops cache, by path
+    fkeys: {str: int}
+    # `var`s that only ever borrow (see `borrow_let`): assigning one
+    # neither retains the new value nor releases the old
+    borrowed: {int: bool}
+    # parameters this body owns (an `__own` clone, see `own_call`) and the
+    # depth of the scope of the body's own statements
+    own_params: {int: bool}
+    body_depth: int
+    # the next call_fn call takes argument `own_arg` moved from `own_slot`
+    # and calls the clone that owns it
+    own_arg: int
+    own_slot: int
+    own_mask: int
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -195,7 +213,15 @@ fn new_cx(f: Func) -> FnCx:
         hit_key=-1,
         hit_e=-1,
         reset={},
-        apps={}
+        apps={},
+        pre_idx={},
+        fkeys={},
+        borrowed={},
+        own_params={},
+        body_depth=-1,
+        own_arg=-1,
+        own_slot=-1,
+        own_mask=0
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -279,6 +305,10 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         clones=[],
         cloned={},
         nc_body=false,
+        odecls={},
+        own_clones=[],
+        own_seen={},
+        own_body=0,
         khints={},
         kernels=[]
     )
@@ -319,6 +349,13 @@ struct Lower:
     cloned: {int: bool}
     # the body being lowered is such a clone
     nc_body: bool
+    # every brine function by id, the clones that own some by-value
+    # parameters (`own_call`: id and a mask of parameters), and the mask of
+    # the body being lowered
+    odecls: {int: FnDecl}
+    own_clones: [(int, int)]
+    own_seen: {str: bool}
+    own_body: int
     # the array lengths callers pass (kernel.br), and the kernels made
     khints: {int: [int]}
     kernels: [str]
@@ -337,18 +374,30 @@ struct Lower:
         for m in prog.modules:
             for f in m.fns:
                 if not f.is_extern:
+                    self.odecls[f.id] = f
+        for m in prog.modules:
+            for f in m.fns:
+                if not f.is_extern:
                     self.gen_body(f, self.info.fns[f.id].c_name, false)
         if self.opts.tests:
             self.gen_tests()
         else:
             self.gen_main()
         var ci = 0
-        while ci < len(self.clones):
-            let f = self.fdecls[self.clones[ci]]
-            self.nc_body = true
-            self.gen_body(f, self.info.fns[f.id].c_name + "__nc", false)
-            self.nc_body = false
-            ci += 1
+        var oi = 0
+        while ci < len(self.clones) or oi < len(self.own_clones):
+            if ci < len(self.clones):
+                let f = self.fdecls[self.clones[ci]]
+                self.nc_body = true
+                self.gen_body(f, self.info.fns[f.id].c_name + "__nc", false)
+                self.nc_body = false
+                ci += 1
+            else:
+                let (id, mask) = self.own_clones[oi]
+                self.own_body = mask
+                self.gen_body(self.odecls[id], own_name(self.info.fns[id].c_name, mask), false)
+                self.own_body = 0
+                oi += 1
         var externs: [Func] = []
         var seen: {str: bool} = {}
         for sig in self.info.fns:
@@ -400,6 +449,7 @@ struct Lower:
             self.dbg_func(f, is_test)
         elif self.opts.fast:
             self.cx.packed = pack.find(f.body, f.locals)
+        var owned: [(int, int, Ty)] = []
         if not is_test:
             let sig = self.info.fns[f.id]
             var pi = 0
@@ -411,7 +461,16 @@ struct Lower:
                     continue
                 let v = pi + i
                 let id = f.param_locals[i]
-                if p.by_ref or self.agg(p.ty):
+                if not p.by_ref and owns_param(self.own_body, i):
+                    # an `__own` clone: the parameter is this body's to release
+                    let a = self.new_local(id, p.ty)
+                    if self.agg(p.ty):
+                        self.cx.fb.copy(a, v, self.lay(p.ty).size)
+                    else:
+                        self.cx.fb.store(a, 0, v)
+                    self.cx.own_params[id] = true
+                    owned.push((a, id, p.ty))
+                elif p.by_ref or self.agg(p.ty):
                     self.cx.lptr[id] = v
                     self.dbg_ptr_var(id, v, true)
                 else:
@@ -419,11 +478,16 @@ struct Lower:
                     self.cx.fb.store(a, 0, v)
             if self.tracks_caller(f.id):
                 self.cx.loc = len(ks) - 1
-            elif f.id in self.khints and not self.nc_body:
+            elif f.id in self.khints and not self.nc_body and self.own_body == 0:
                 self.kernel_entry(f, name)
         var nw = narrow.Narrow(arrs={}, guards=[])
-        if self.opts.fast and not self.opts.debug:
+        if self.opts.fast and not self.opts.debug and self.own_body == 0:
             nw = narrow.find(f.body, f.locals)
+        if len(owned) > 0:
+            self.push_scope()
+            for a, id, t in owned:
+                self.add_local_home(a, t, id)
+            self.cx.body_depth = len(self.cx.scopes) + 1
         if len(nw.arrs) > 0 and len(nw.guards) > 0:
             # bytes only while the parameters allow it, else plain arrays
             let slow = self.cx.fb.label()
@@ -440,6 +504,8 @@ struct Lower:
         else:
             self.cx.narrow = nw.arrs
         self.block(f.body)
+        if len(owned) > 0:
+            self.pop_scope()
         self.end_body(has)
         self.funcs.push(self.cx.fb.f)
 
@@ -827,13 +893,37 @@ struct Lower:
     fn add_home(ref self, p: int, ty: Ty):
         if self.managed(ty):
             let k = len(self.cx.scopes) - 1
-            self.cx.scopes[k].push(Owned(v=p, ty=ty, home=true))
+            self.cx.scopes[k].push(Owned(v=p, ty=ty, home=true, lid=-1))
+
+    # The home of local `id`, which the current scope releases unless its
+    # value is moved out (`drop_home`).
+    fn add_local_home(ref self, p: int, ty: Ty, id: int):
+        if self.managed(ty):
+            let k = len(self.cx.scopes) - 1
+            self.cx.scopes[k].push(Owned(v=p, ty=ty, home=true, lid=id))
+
+    fn has_home(self, id: int) -> bool:
+        for sc in self.cx.scopes:
+            for o in sc:
+                if o.lid == id:
+                    return true
+        return false
+
+    # Local `id`'s value was moved out: no exit from here on releases it.
+    fn drop_home(ref self, id: int):
+        for i in 0..len(self.cx.scopes):
+            var j = 0
+            while j < len(self.cx.scopes[i]):
+                if self.cx.scopes[i][j].lid == id:
+                    self.cx.scopes[i].pop(j)
+                else:
+                    j += 1
 
     # An owned value that the current scope releases.
     fn add_owned(ref self, v: int, ty: Ty):
         if self.managed(ty):
             let k = len(self.cx.scopes) - 1
-            self.cx.scopes[k].push(Owned(v=v, ty=ty, home=false))
+            self.cx.scopes[k].push(Owned(v=v, ty=ty, home=false, lid=-1))
 
     fn release_scopes_from(ref self, depth: int):
         var i = len(self.cx.scopes) - 1
@@ -1410,24 +1500,71 @@ struct Lower:
                 let s1 = self.start_helper("br_retain_" + m, [K.Ptr], false, K.I64)
                 self.cx.fb.rt_void("brine_box_retain", [0])
                 self.finish_helper(s1)
-                let s2 = self.start_helper("br_release_" + m, [K.Ptr], false, K.I64)
-                let dead = self.cx.fb.rt(K.Bool, "brine_box_dec", [0])
+                # an enum that can hold itself (a list, a tree) may be deep:
+                # its dead boxes are freed through `brine_drop`, which doesn't
+                # recurse without bound
+                var seen: {str: bool} = {}
+                let deep = self.self_holding(t, eid, ref seen)
+                if deep:
+                    let s0 = self.start_helper("br_release_" + m, [K.Ptr], false, K.I64)
+                    let dead0 = self.cx.fb.rt(K.Bool, "brine_box_dec", [0])
+                    let out0 = self.cx.fb.label()
+                    self.cx.fb.brnot(dead0, out0)
+                    let f = self.fn_ptr("br_drop_" + m)
+                    self.cx.fb.call_void("brine_drop", [0, f])
+                    self.cx.fb.place(out0)
+                    self.finish_helper(s0)
+                let s2 = self.start_helper(
+                    ("br_drop_" if deep else "br_release_") + m,
+                    [K.Ptr],
+                    false,
+                    K.I64
+                )
                 let out = self.cx.fb.label()
-                self.cx.fb.brnot(dead, out)
-                let tag = self.cx.fb.load(K.I64, 0, 8)
+                if not deep:
+                    let dead = self.cx.fb.rt(K.Bool, "brine_box_dec", [0])
+                    self.cx.fb.brnot(dead, out)
+                # a variant's last field of this enum (a list's tail) is freed
+                # by looping, so a chain needs one `brine_drop`, not one a box
+                let cur = self.cx.fb.copy_of(0)
+                let f0 = self.cx.fb.konst(K.Bool, 0)
+                let more = self.cx.fb.copy_of(f0)
+                let nx = self.cx.fb.copy_of(0)
+                let head = self.cx.fb.label()
+                var looped = false
+                self.cx.fb.place(head)
+                let tag = self.cx.fb.load(K.I64, cur, 8)
                 for vi, v in enumerate(variants):
                     if not any(self.managed(fd.1) for fd in v.fields):
                         continue
+                    var tail = -1
+                    if deep:
+                        for fi, fd in enumerate(v.fields):
+                            if fd.1 == t:
+                                tail = fi
                     let next = self.cx.fb.label()
                     let vv = self.cx.fb.konst(K.I64, vi)
                     let hit = self.cx.fb.cmp(Op.Eq, tag, vv)
                     self.cx.fb.brnot(hit, next)
                     for fi, fd in enumerate(v.fields):
-                        if self.managed(fd.1):
-                            let x = self.ld(0, self.vfield_off(eid, vi, fi), fd.1)
+                        if fi == tail:
+                            let x = self.ld(cur, self.vfield_off(eid, vi, fi), fd.1)
+                            self.cx.fb.mov(nx, x)
+                            let f1 = self.cx.fb.konst(K.Bool, 1)
+                            self.cx.fb.mov(more, f1)
+                            looped = true
+                        elif self.managed(fd.1):
+                            let x = self.ld(cur, self.vfield_off(eid, vi, fi), fd.1)
                             self.release(x, fd.1)
                     self.cx.fb.place(next)
-                self.cx.fb.call_void("brine_box_free", [0])
+                self.cx.fb.call_void("brine_box_free", [cur])
+                if looped:
+                    self.cx.fb.brnot(more, out)
+                    self.cx.fb.mov(more, f0)
+                    let dead1 = self.cx.fb.rt(K.Bool, "brine_box_dec", [nx])
+                    self.cx.fb.brnot(dead1, out)
+                    self.cx.fb.mov(cur, nx)
+                    self.cx.fb.jmp(head)
                 self.cx.fb.place(out)
                 self.finish_helper(s2)
                 let s3 = self.start_helper("br_rtp_" + m, [K.Ptr], false, K.I64)
@@ -1462,6 +1599,31 @@ struct Lower:
         self.cx.fb.call_void("br_release_" + m, [0])
         self.finish_helper(s8)
         return m
+
+    # Can a value of type `t` hold a value of enum `eid` (in a field, an
+    # element or a payload)? `seen`: the types already looked into.
+    fn self_holding(self, t: Ty, eid: int, ref seen: {str: bool}) -> bool:
+        var inner: [Ty] = []
+        match t:
+            case Ty.Enum(e):
+                for v in self.info.enums[e].variants:
+                    for fd in v.fields:
+                        inner.push(fd.1)
+            case Ty.Struct(_) | Ty.Tuple(_):
+                inner = self.field_tys(t)
+            case Ty.Array(x):
+                inner = [x]
+            case Ty.Map(k, v):
+                inner = [k, v]
+            case _:
+                return false
+        seen[self.mangle(t)] = true
+        for x in inner:
+            if x == Ty.Enum(eid):
+                return true
+            if self.mangle(x) not in seen and self.self_holding(x, eid, ref seen):
+                return true
+        return false
 
     # The element retain/release functions arrays of `t` use (or "" for none).
     fn elem_fns(ref self, t: Ty) -> (str, str):
@@ -2087,6 +2249,16 @@ struct Lower:
         self.push_scope()
         var k = 0
         while k < len(b.stmts):
+            if self.take_at(b.stmts, k):
+                k += 2
+                continue
+            if (
+                self.put_back(b.stmts, k)
+                or self.move_let(b.stmts, k)
+                or self.borrow_let(b.stmts, k)
+            ):
+                k += 1
+                continue
             self.stmt(b.stmts[k])
             if self.rot_after(b.stmts, k):
                 k += 3
@@ -2130,7 +2302,7 @@ struct Lower:
                         let ty = self.flocals[id].ty
                         let p = self.new_local(id, ty)
                         self.st(p, 0, ty, v)
-                        self.add_home(p, ty)
+                        self.add_local_home(p, ty, id)
                     case LetPat.Tuple(_):
                         for i, id in enumerate(s.locals):
                             let ty = self.flocals[id].ty
@@ -2400,6 +2572,309 @@ struct Lower:
             self.stmt(stmts[k + 2])
             self.cx.fb.place(end)
         return true
+
+    # Moving an array between a variable and a place instead of retaining it
+    # and releasing what it replaces: only in plain straight-line lowering.
+    fn moves_ok(self) -> bool:
+        return (
+            not self.opts.debug
+            and not self.cx.lifted
+            and len(self.cx.jx.act) == 0
+            and self.cx.twin == 0
+            and not self.cx.fb.ends()
+        )
+
+    fn movable(self, id: int) -> bool:
+        let lc = self.flocals[id]
+        if lc.kind != LocalKind.Var and lc.kind != LocalKind.Let:
+            return false
+        if (
+            id in self.cx.packed
+            or id in self.cx.narrow
+            or id in self.cx.reset
+            or id in self.cx.apps
+        ):
+            return false
+        match lc.ty:
+            case Ty.Array(_):
+                return true
+            case _:
+                return false
+
+    # `var w = p` then `p = []`, for an array place `p` (the "take" idiom):
+    # move the array out of `p` into `w`. Nothing runs between the two, so
+    # `w` holds the reference `p` held, as a retain then a release would leave it.
+    fn take_at(ref self, stmts: [Stmt], k: int) -> bool:
+        if k + 1 >= len(stmts) or not self.moves_ok():
+            return false
+        match take_pair(stmts[k], stmts[k + 1]):
+            case Some((id, place, empty)):
+                if not self.movable(id):
+                    return false
+                match place_path(place):
+                    case Some((root, _)):
+                        if root in self.cx.packed or root in self.cx.narrow:
+                            return false
+                    case None:
+                        return false
+                let ty = self.flocals[id].ty
+                self.push_frame()
+                let lp = self.lvalue(place)
+                let w = self.cx.fb.load(K.Ptr, lp, 0)
+                let e = self.owned(empty)
+                self.cx.fb.store(lp, 0, e)
+                self.pop_frame()
+                let home = self.new_local(id, ty)
+                self.st(home, 0, ty, w)
+                self.add_local_home(home, ty, id)
+                self.cx.hit_e = -1
+                return true
+            case None:
+                return false
+
+    # `var t = s` as the last use of `s`, a variable this block declared or a
+    # parameter this body owns: `t` takes over the value instead of sharing
+    # it, so changing `t` doesn't copy it.
+    fn move_let(ref self, stmts: [Stmt], k: int) -> bool:
+        if not self.moves_ok():
+            return false
+        let s = stmts[k]
+        match s.kind:
+            case StmtKind.Let(_, pat, _, init, is_ref):
+                if is_ref or len(s.locals) != 1 or not is_name(pat):
+                    return false
+                match local_of(init):
+                    case Some(src):
+                        let t = s.locals[0]
+                        let ty = self.flocals[t].ty
+                        if (
+                            not self.managed(ty)
+                            or self.flocals[src].ty != ty
+                            or not self.has_home(src)
+                        ):
+                            return false
+                        if not self.plain_local(t) or not self.plain_local(src):
+                            return false
+                        let param = (
+                            src in self.cx.own_params and len(self.cx.scopes) == self.cx.body_depth
+                        )
+                        if not param and src in self.cx.own_params:
+                            return false
+                        if not last_use_from(stmts, k, src, param):
+                            return false
+                        let v = self.read_local(src)
+                        let home = self.new_local(t, ty)
+                        self.st(home, 0, ty, v)
+                        self.add_local_home(home, ty, t)
+                        self.drop_home(src)
+                        return true
+                    case None:
+                        return false
+            case _:
+                return false
+
+    # `let d = r.f` or `let d = r[i].g`, where nothing in the rest of the
+    # block can change `r` or move it: `d` borrows the value, which `r` keeps
+    # alive, instead of retaining it and releasing it at the end. A `var d`
+    # too, when all it is ever given is such places (`d = q.f`) and nothing
+    # else changes it.
+    fn borrow_let(ref self, stmts: [Stmt], k: int) -> bool:
+        if not self.moves_ok():
+            return false
+        let s = stmts[k]
+        match s.kind:
+            case StmtKind.Let(mutable, pat, _, init, is_ref):
+                if is_ref or len(s.locals) != 1 or not is_name(pat) or not borrow_place(init):
+                    return false
+                let d = s.locals[0]
+                let ty = self.flocals[d].ty
+                if not self.managed(ty) or init.ty != ty or not self.plain_local(d):
+                    return false
+                var roots = [place_path(init).unwrap().0]
+                if mutable:
+                    for i in k + 1..len(stmts):
+                        if not self.only_borrows(stmts[i], d, ref roots):
+                            return false
+                    match self.fnd:
+                        case Some(f):
+                            for t in f.body.stmts:
+                                if ref_alias(t, d):
+                                    return false
+                        case None:
+                            return false
+                for r in roots:
+                    if r == d or not self.keeps_alive(stmts, k, r):
+                        return false
+                self.push_frame()
+                let v = self.expr(init)
+                let own = self.claim(v)
+                let home = self.new_local(d, ty)
+                self.st(home, 0, ty, v)
+                if own:
+                    self.add_local_home(home, ty, d)
+                elif mutable:
+                    self.cx.borrowed[d] = true
+                self.pop_frame()
+                return true
+            case _:
+                return false
+
+    # Does variable `r` keep what is borrowed from it alive through the
+    # statements after `stmts[k]`?
+    fn keeps_alive(self, stmts: [Stmt], k: int, r: int) -> bool:
+        let rk = self.flocals[r].kind
+        if rk == LocalKind.Var or rk == LocalKind.Let:
+            if (
+                r in self.cx.lptr
+                or r in self.cx.packed
+                or r in self.cx.narrow
+                or r in self.cx.borrowed
+            ):
+                return false
+        elif rk != LocalKind.Param and rk != LocalKind.RefParam:
+            return false
+        for i in k + 1..len(stmts):
+            if not self.keeps_root(stmts[i], r):
+                return false
+        match self.fnd:
+            case Some(f):
+                for t in f.body.stmts:
+                    if ref_alias(t, r):
+                        return false
+                return true
+            case None:
+                return false
+
+    # Is `var d` in statement `s` only read, or given a place to borrow
+    # (`d = q.f`, whose root is added to `roots`)?
+    fn only_borrows(self, s: Stmt, d: int, ref roots: [int]) -> bool:
+        match s.kind:
+            case StmtKind.Assign(t, op, v):
+                if local_of(t) == Some(d):
+                    if op.is_some() or not borrow_place(v) or mentions_local(v, d):
+                        return false
+                    roots.push(place_path(v).unwrap().0)
+                    return self.keeps_root_in(v, d)
+            case _:
+                pass
+        if not self.keeps_root_flat(s, d):
+            return false
+        for b in stmt_blocks(s):
+            for t in b.stmts:
+                if not self.only_borrows(t, d, ref roots):
+                    return false
+        return true
+
+    # Does statement `s` leave the value of variable `r` (and all it holds)
+    # alone: no write, `ref` or changing method through it, and no read of
+    # the whole variable a move could take (`var t = r`, `p = r`)?
+    fn keeps_root(self, s: Stmt, r: int) -> bool:
+        if not self.keeps_root_flat(s, r):
+            return false
+        for b in stmt_blocks(s):
+            for t in b.stmts:
+                if not self.keeps_root(t, r):
+                    return false
+        return true
+
+    # `keeps_root` for `s` itself, not the blocks in it
+    fn keeps_root_flat(self, s: Stmt, r: int) -> bool:
+        match s.kind:
+            case StmtKind.Let(_, _, _, init, is_ref):
+                if local_of(init) == Some(r) or is_ref and mentions_local(init, r):
+                    return false
+            case StmtKind.Assign(t, _, v):
+                if mentions_local(t, r) or local_of(v) == Some(r):
+                    return false
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            if not self.keeps_root_in(e, r):
+                return false
+        return true
+
+    fn keeps_root_in(self, e: Expr, r: int) -> bool:
+        match e.kind:
+            case ExprKind.MethodCall(recv, _, _, args):
+                var changes = true
+                match e.cres:
+                    case CallRes.Builtin(b):
+                        changes = b.mutates_recv()
+                    case CallRes.Method(id):
+                        let ps = self.info.fns[id].params
+                        changes = len(ps) == 0 or ps[0].by_ref
+                    case CallRes.Fn(_):
+                        changes = false
+                    case _:
+                        pass
+                if changes and mentions_local(recv, r):
+                    return false
+                for a in args:
+                    if a.by_ref and mentions_local(a.expr, r):
+                        return false
+            case ExprKind.Call(_, args):
+                for a in args:
+                    if a.by_ref and mentions_local(a.expr, r):
+                        return false
+            case _:
+                pass
+        for c in children(e):
+            if not self.keeps_root_in(c, r):
+                return false
+        return true
+
+    # A variable kept in its home as itself (not as bits, bytes or an appender).
+    fn plain_local(self, id: int) -> bool:
+        let lc = self.flocals[id]
+        if lc.kind != LocalKind.Var and lc.kind != LocalKind.Let and lc.kind != LocalKind.Param:
+            return false
+        return not (
+            id in self.cx.packed
+            or id in self.cx.narrow
+            or id in self.cx.reset
+            or id in self.cx.apps
+            or id in self.cx.lptr
+        )
+
+    # `p = w` with `w` an array variable this block declared and never uses
+    # again: swap the two, so `p` takes w's reference and the scope frees
+    # what `p` held, instead of a retain and a release.
+    fn put_back(ref self, stmts: [Stmt], j: int) -> bool:
+        if not self.moves_ok():
+            return false
+        match stmts[j].kind:
+            case StmtKind.Assign(t, op, v):
+                if op.is_some() or t.ty != v.ty or not array_place(t):
+                    return false
+                match local_of(v):
+                    case Some(w):
+                        if (
+                            not self.movable(w)
+                            or not self.has_home(w)
+                            or mentions_local(t, w)
+                            or not last_use(stmts, j, w)
+                        ):
+                            return false
+                        match place_path(t):
+                            case Some((root, _)):
+                                if root in self.cx.packed or root in self.cx.narrow:
+                                    return false
+                            case None:
+                                return false
+                        self.push_frame()
+                        let lp = self.lvalue(t)
+                        let home = self.local_ptr(w)
+                        let nv = self.cx.fb.load(K.Ptr, home, 0)
+                        let old = self.cx.fb.load(K.Ptr, lp, 0)
+                        self.cx.fb.store(lp, 0, nv)
+                        self.cx.fb.store(home, 0, old)
+                        self.pop_frame()
+                        self.cx.hit_e = -1
+                        return true
+                    case None:
+                        return false
+            case _:
+                return false
 
     # A loop idiom.twin_body allows, in two copies. Returns false having
     # emitted nothing when it doesn't qualify.
@@ -2979,7 +3454,16 @@ struct Lower:
     # loaded once, and those it writes are made unique once. Returns the old set.
     fn loop_arrays(ref self, head: [Expr], body: Block) -> {int: ArrCache}:
         let saved = self.cx.arrc
-        var u = IndexUse(info=self.info, seen={}, written={}, bad={}, decl={})
+        var u = IndexUse(
+            info=self.info,
+            seen={},
+            written={},
+            bad={},
+            decl={},
+            fseen={},
+            fwritten={},
+            whole=[]
+        )
         for e in head:
             u.expr(e)
         u.block(body)
@@ -3007,15 +3491,60 @@ struct Lower:
                     self.cx.arrc[l] = ArrCache(arr=a, data=d, len=n)
                 case _:
                     pass
+        # array fields (`self.stack`), when the loop uses nothing that holds
+        # them in any other way: a `self.f()` or `self.stack.push(x)` could
+        # replace or grow the array
+        for k in u.fseen:
+            let base = u.fseen[k]
+            let (l, p) = field_path(base).unwrap()
+            if l in u.decl or l in self.cx.par_writes:
+                continue
+            if not (l in self.cx.lslot or l in self.cx.lptr):
+                continue
+            if any(w.0 == l and steps_overlap(w.1, p) for w in u.whole):
+                continue
+            if k in u.fwritten:
+                match self.flocals[l].kind:
+                    case LocalKind.Var | LocalKind.RefParam:
+                        pass
+                    case _:
+                        continue
+            match base.ty:
+                case Ty.Array(_):
+                    pass
+                case _:
+                    continue
+            if not (k in self.cx.fkeys):
+                self.cx.fkeys[k] = -1 - len(self.cx.fkeys)
+            let key = self.cx.fkeys[k]
+            if key in self.cx.arrc:
+                continue
+            let fp = self.lvalue(base)
+            if k in u.fwritten:
+                self.cx.fb.call_void("brine_arr_unique", [fp])
+            let a = self.cx.fb.load(K.Ptr, fp, 0)
+            let n = self.cx.fb.load(K.I64, a, 8)
+            let d = self.cx.fb.load(K.Ptr, a, 48)
+            self.cx.arrc[key] = ArrCache(arr=a, data=d, len=n)
         return saved
 
-    # The local array `e` names, when an enclosing loop cached it.
+    # The local array or array field `e` names, when an enclosing loop cached it.
     fn cached_arr(self, e: Expr) -> Option[ArrCache]:
         match local_of(e):
             case Some(l):
                 return self.cx.arrc.get(l)
             case None:
-                return None
+                if len(self.cx.fkeys) == 0:
+                    return None
+                match field_path(e):
+                    case Some((l, p)):
+                        match self.cx.fkeys.get(path_key(l, p)):
+                            case Some(key):
+                                return self.cx.arrc.get(key)
+                            case None:
+                                return None
+                    case None:
+                        return None
 
     # The type an array's elements are stored as: bytes for narrow.br's
     # arrays (the program sees `t`).
@@ -3173,6 +3702,31 @@ struct Lower:
 
     fn assign(ref self, target: Expr, op: Option[BinOp], value: Expr, checked: bool, span: Span):
         let ty = target.ty
+        # `s = s + a + b`: append in place, as `s += a` then `s += b`, when
+        # the parts don't read `s` (else rebuilding the string is quadratic)
+        if op.is_none() and ty == Ty.Str:
+            match self_append(target, value):
+                case Some(parts):
+                    for p in parts:
+                        self.assign(target, Some(BinOp.Add), p, checked, span)
+                    return
+                case None:
+                    pass
+        if op.is_none() and len(self.cx.borrowed) > 0:
+            match local_of(target):
+                case Some(l):
+                    if l in self.cx.borrowed:
+                        # see `borrow_let`: `value` is a place, never a temp
+                        let v = self.expr(value)
+                        if self.claim(v):
+                            panic("lowering: a borrowing variable was given an owned value")
+                        let home = self.local_ptr(l)
+                        self.st(home, 0, ty, v)
+                        return
+                case None:
+                    pass
+        if op.is_none() and self.own_call(target, value):
+            return
         match target.kind:
             case ExprKind.Index(b0, i0):
                 if self.is_bits(b0):
@@ -3201,8 +3755,20 @@ struct Lower:
                         if op.is_none():
                             # `m[k] = v` inserts
                             let vks = self.owned_all([value, i0])
-                            let vs = self.addr_of(vks[0], ty)
-                            let ks = self.addr_of(vks[1], i0.ty)
+                            # the map may grow: copy plain data read from it
+                            var vv = vks[0]
+                            var kv = vks[1]
+                            match place_path(b0):
+                                case Some(pp):
+                                    if reaches(value, [pp]):
+                                        vv = self.snapshot(vv, ty)
+                                    if reaches(i0, [pp]):
+                                        kv = self.snapshot(kv, i0.ty)
+                                case None:
+                                    vv = self.snapshot(vv, ty)
+                                    kv = self.snapshot(kv, i0.ty)
+                            let vs = self.addr_of(vv, ty)
+                            let ks = self.addr_of(kv, i0.ty)
                             let b = self.lvalue(b0)
                             self.cx.fb.call_void("brine_map_set", [b, ks, vs])
                             return
@@ -3245,6 +3811,97 @@ struct Lower:
                     let cur = self.cx.fb.load(self.kind(ty), lp, 0)
                     let c = self.arith(o2, cur, v, ty, checked, span)
                     self.cx.fb.store(lp, 0, c)
+
+    # `x = f(x)` (or `x = x.step()`), `x` a variable or a place in one, where
+    # f starts a variable with that parameter: move x's value into a clone of
+    # f that owns the parameter, and store the result without releasing the
+    # old value (the clone did), so f changes it in place instead of copying.
+    # Nothing else in the call may read x, which is stale until the store.
+    fn own_call(ref self, target: Expr, value: Expr) -> bool:
+        if not self.moves_ok() or not self.managed(target.ty) or not array_place(target):
+            return false
+        var id = -1
+        var recv: Option[Expr] = None
+        var args: [Arg] = []
+        match value.kind:
+            case ExprKind.Call(_, a):
+                match value.cres:
+                    case CallRes.Fn(fid):
+                        id = fid
+                        args = a
+                    case _:
+                        return false
+            case ExprKind.MethodCall(r, _, _, a):
+                match value.cres:
+                    case CallRes.Fn(fid):
+                        id = fid
+                        args = a
+                    case CallRes.Method(fid):
+                        id = fid
+                        recv = Some(r)
+                        args = a
+                    case _:
+                        return false
+            case _:
+                return false
+        if id not in self.odecls:
+            return false
+        let sig = self.info.fns[id]
+        if (
+            sig.ret != target.ty
+            or len(self.cx.nc_calls) > 0 and ranges.key(value.span) in self.cx.nc_calls
+        ):
+            return false
+        var items: [Expr] = []
+        match recv:
+            case Some(r):
+                items.push(r)
+            case None:
+                pass
+        for a in args:
+            items.push(a.expr)
+        if len(items) > len(sig.params):
+            return false
+        var root = -1
+        match place_path(target):
+            case Some((l, _)):
+                root = l
+            case None:
+                return false
+        if (
+            root in self.cx.packed
+            or root in self.cx.narrow
+            or root in self.cx.lptr and self.flocals[root].kind != LocalKind.RefParam
+        ):
+            return false
+        var ai = -1
+        for i, x in enumerate(items):
+            if has_try(x):
+                return false
+            if (
+                ai < 0
+                and not sig.params[i].by_ref
+                and sig.params[i].ty == target.ty
+                and same_place(x, target)
+            ):
+                ai = i
+            elif mentions_local(x, root):
+                return false
+        if ai < 0 or not consumes(self.odecls[id], ai):
+            return false
+        let mask = 1 << ai
+        let key = f"{id}:{mask}"
+        if key not in self.own_seen:
+            self.own_seen[key] = true
+            self.own_clones.push((id, mask))
+        let lp = self.lvalue(items[ai])
+        self.cx.own_arg = ai
+        self.cx.own_slot = lp
+        self.cx.own_mask = mask
+        let r = self.call_fn(id, recv, args, value.span)
+        self.claim(r)
+        self.st(lp, 0, target.ty, r)
+        return true
 
     # ------------------------------------------------------------ match
     fn match_stmt(ref self, scrut: Expr, cases: [Case]):
@@ -3418,7 +4075,7 @@ struct Lower:
             case ExprKind.Index(base, idx):
                 match base.ty:
                     case Ty.Map(_, _):
-                        let k = self.expr(idx)
+                        let k = self.index_val(idx)
                         let kp = self.addr_of(k, idx.ty)
                         let b = self.lvalue(base)
                         let loc = self.loc(e.span)
@@ -3431,7 +4088,7 @@ struct Lower:
                         return self.cx.fb.rt(K.Ptr, "brine_map_val_mut", [b, en, kp, vsz, loc])
                     case _:
                         pass
-                let i = self.expr(idx)
+                let i = self.index_val(idx)
                 let et = self.elem_ty(base, e.ty)
                 match self.cached_arr(base):
                     case Some(c):
@@ -3994,32 +4651,59 @@ struct Lower:
         var sig = self.info.fns[id]
         if len(self.cx.nc_calls) > 0 and ranges.key(span) in self.cx.nc_calls:
             sig.c_name = sig.c_name + "__nc"
-        # With a `ref` parameter, by-value arguments may read the variable the call
-        # changes; holding a reference of their own makes copy-on-write protect them.
-        let has_ref = any(p.by_ref for p in sig.params)
+        # set by `own_call` for this call only, not for calls in its arguments
+        let own_arg = self.cx.own_arg
+        let own_slot = self.cx.own_slot
+        self.cx.own_arg = -1
+        if own_arg >= 0:
+            sig.c_name = own_name(sig.c_name, self.cx.own_mask)
+        var items: [(Expr, bool)] = []
+        match recv:
+            case Some(r):
+                items.push((r, sig.params[0].by_ref))
+            case None:
+                pass
+        let pi = len(items)
+        for i, a in enumerate(args):
+            if pi + i >= len(sig.params):
+                break
+            items.push((a.expr, sig.params[pi + i].by_ref))
+        let hold = self.held_args(items)
+        # A `ref` to an array element made before a held argument would point
+        # into the array that argument then shares: make it after them all.
+        var late: [bool] = []
+        for i, it in enumerate(items):
+            var lt = false
+            if it.1:
+                match place_path(it.0):
+                    case Some(pp):
+                        if -1 in pp.1:
+                            for j in i + 1..len(items):
+                                if hold[j] and reaches(items[j].0, [pp]):
+                                    lt = true
+                    case None:
+                        pass
+            late.push(lt)
         var cargs: [int] = []
         var sret = -1
         if self.agg(sig.ret):
             let lay = self.lay(sig.ret)
             sret = self.cx.fb.temp_mem(lay.size, lay.align)
             cargs.push(sret)
-        var pi = 0
-        match recv:
-            case Some(r):
-                if sig.params[0].by_ref:
-                    cargs.push(self.lvalue(r))
-                else:
-                    cargs.push(self.value_arg(r, has_ref))
-                pi = 1
-            case None:
-                pass
-        for i, a in enumerate(args):
-            if pi + i >= len(sig.params):
-                break
-            if sig.params[pi + i].by_ref:
-                cargs.push(self.lvalue(a.expr))
+        let base = len(cargs)
+        for i, it in enumerate(items):
+            if i == own_arg:
+                cargs.push(self.ld(own_slot, 0, it.0.ty))
+            elif late[i]:
+                self.pre_index(it.0)
+                cargs.push(-1)
+            elif it.1:
+                cargs.push(self.lvalue(it.0))
             else:
-                cargs.push(self.value_arg(a.expr, has_ref))
+                cargs.push(self.value_arg(it.0, hold[i]))
+        for i, it in enumerate(items):
+            if late[i]:
+                cargs[base + i] = self.lvalue(it.0)
         if self.tracks_caller(id):
             cargs.push(self.loc(span))
         if sret >= 0:
@@ -4078,13 +4762,88 @@ struct Lower:
         self.cx.fb.place(ok)
         return self.ld(v, self.vfield_off(xe, ok_v, 0), e.ty)
 
-    # A by-value argument; `hold` keeps a reference until the end of the statement.
+    # By-value arguments are snapshots taken before the call. Which of `items`
+    # (argument, by `ref`) are memory a `ref` argument reaches, so the callee
+    # could change or free them? Those are held (a shared array or string is
+    # copied before a write), or copied when they are plain data.
+    fn held_args(self, items: [(Expr, bool)]) -> [bool]:
+        var refs: [(int, [int])] = []
+        var any_ref = false
+        var known = true
+        for x, by_ref in items:
+            if by_ref:
+                any_ref = true
+                match place_path(x):
+                    case Some(pp):
+                        refs.push(pp)
+                    case None:
+                        known = false
+        var out: [bool] = []
+        for x, by_ref in items:
+            out.push(any_ref and not by_ref and (not known or reaches(x, refs)))
+        return out
+
+    # A by-value argument; `hold` keeps a reference until the end of the
+    # statement, or for plain data in memory, a copy.
     fn value_arg(ref self, e: Expr, hold: bool) -> int:
-        if not hold or not self.managed(e.ty):
+        if not hold:
             return self.expr(e)
+        if self.managed(e.ty):
+            let v = self.owned(e)
+            self.register(v, e.ty)
+            return v
+        let v = self.expr(e)
+        return self.snapshot(v, e.ty)
+
+    # A copy of the plain data in memory at `v` (other values are returned as is).
+    fn snapshot(ref self, v: int, ty: Ty) -> int:
+        if not self.agg(ty) or self.managed(ty):
+            return v
+        let lay = self.lay(ty)
+        let t = self.cx.fb.temp_mem(lay.size, lay.align)
+        self.cx.fb.copy(t, v, lay.size)
+        return t
+
+    # The owned value of `e`, to be stored into the place `dest`, which may
+    # move (an array or map that grows): plain data read from it is copied.
+    fn owned_for(ref self, e: Expr, dest: Expr) -> int:
         let v = self.owned(e)
-        self.register(v, e.ty)
-        return v
+        match place_path(dest):
+            case Some(pp):
+                if not reaches(e, [pp]):
+                    return v
+            case None:
+                pass
+        return self.snapshot(v, e.ty)
+
+    # Evaluate the indexes in the place `e` now, for an `lvalue(e)` later.
+    fn pre_index(ref self, e: Expr):
+        match e.kind:
+            case ExprKind.Field(b, _, _):
+                self.pre_index(b)
+            case ExprKind.Index(b, i):
+                # in `lvalue`'s order: a map's key before its base
+                match b.ty:
+                    case Ty.Map(_, _):
+                        self.cx.pre_idx[ranges.key(i.span)] = self.expr(i)
+                        self.pre_index(b)
+                    case _:
+                        self.pre_index(b)
+                        self.cx.pre_idx[ranges.key(i.span)] = self.expr(i)
+            case _:
+                pass
+
+    # The value of an index in a place, unless `pre_index` has it.
+    fn index_val(ref self, i: Expr) -> int:
+        if len(self.cx.pre_idx) > 0:
+            let k = ranges.key(i.span)
+            match self.cx.pre_idx.get(k):
+                case Some(v):
+                    self.cx.pre_idx.remove(k)
+                    return v
+                case None:
+                    pass
+        return self.expr(i)
 
     # The positions of named arguments among `fields`.
     fn arg_slots(self, args: [Arg], fields: [(str, Ty)]) -> [int]:
@@ -4336,10 +5095,11 @@ struct Lower:
             case Builtin.Push:
                 let r = recv.unwrap()
                 let el = r.ty.elem()
-                let v = self.owned(args[0].expr)
+                let v = self.owned_for(args[0].expr, r)
                 let tp = self.addr_of(v, el)
                 let lp = self.lvalue(r)
-                self.cx.fb.call_void("brine_arr_push", [lp, tp])
+                let esz = self.cx.fb.konst(K.I64, self.lay(el).size)
+                self.cx.fb.rt_void("brine_arr_push_in", [lp, tp, esz])
                 return self.unit()
             case Builtin.Pop | Builtin.PopAt:
                 let r = recv.unwrap()
@@ -4354,14 +5114,15 @@ struct Lower:
                 if idx >= 0:
                     self.cx.fb.call_void("brine_arr_pop_at", [lp, idx, out, loc])
                 else:
-                    self.cx.fb.call_void("brine_arr_pop", [lp, out, loc])
+                    let esz = self.cx.fb.konst(K.I64, lay.size)
+                    self.cx.fb.rt_void("brine_arr_pop_in", [lp, out, esz, loc])
                 let v = self.ld(out, 0, e.ty)
                 return self.temp(v, e.ty)
             case Builtin.Insert:
                 let r = recv.unwrap()
                 let i0 = self.expr(args[0].expr)
                 let i = self.cx.fb.conv(K.I64, i0)
-                let v = self.owned(args[1].expr)
+                let v = self.owned_for(args[1].expr, r)
                 let tp = self.addr_of(v, r.ty.elem())
                 let lp = self.lvalue(r)
                 let loc = self.loc(e.span)
@@ -4379,7 +5140,7 @@ struct Lower:
                 if b == Builtin.Reverse:
                     self.cx.fb.call_void("brine_arr_reverse", [lp])
                 elif b == Builtin.Clear:
-                    self.cx.fb.call_void("brine_arr_clear", [lp])
+                    self.cx.fb.rt_void("brine_arr_clear_in", [lp])
                 else:
                     let c = self.need_cmp(r.ty.elem())
                     let fp = self.cx.fb.global(c)
@@ -5757,6 +6518,11 @@ struct IndexUse:
     bad: {int: bool}
     # declared inside the loop: not there yet when it starts
     decl: {int: bool}
+    # fields (`self.stack`) indexed and written, by `path_key`, and the
+    # places used in any other way (a variable alone: no steps)
+    fseen: {str: Expr}
+    fwritten: {str: bool}
+    whole: [(int, [int])]
 
     fn expr(ref self, e: Expr):
         match e.kind:
@@ -5765,6 +6531,20 @@ struct IndexUse:
                     case Some(l):
                         self.seen[l] = true
                         self.expr(idx)
+                        return
+                    case None:
+                        pass
+                match field_path(base):
+                    case Some((l, p)):
+                        self.fseen[path_key(l, p)] = base
+                        self.expr(idx)
+                        return
+                    case None:
+                        pass
+            case ExprKind.Field(_, _, _):
+                match field_path(e):
+                    case Some(pp):
+                        self.whole.push(pp)
                         return
                     case None:
                         pass
@@ -5792,7 +6572,13 @@ struct IndexUse:
                     case CallRes.Builtin(b):
                         match b:
                             case Builtin.Len:
-                                if len(args) == 1 and local_of(args[0].expr).is_some():
+                                if (
+                                    len(args) == 1
+                                    and (
+                                        local_of(args[0].expr).is_some()
+                                        or field_path(args[0].expr).is_some()
+                                    )
+                                ):
                                     return
                             case _:
                                 pass
@@ -5802,6 +6588,7 @@ struct IndexUse:
                 match local_of(e):
                     case Some(l):
                         self.bad[l] = true
+                        self.whole.push((l, []))
                     case None:
                         pass
                 return
@@ -5855,6 +6642,11 @@ struct IndexUse:
                     case Some(l):
                         self.written[l] = true
                     case None:
+                        match field_path(base):
+                            case Some((l, p)):
+                                self.fwritten[path_key(l, p)] = true
+                            case None:
+                                pass
                         self.target(base)
             case ExprKind.Field(base, _, _):
                 self.target(base)
@@ -5950,3 +6742,295 @@ fn dtypedef(name: str, to: int) -> DType:
 
 fn dfield(name: str, ty: int, off: int) -> DField:
     return DField(name=name, ty=ty, off=off)
+
+# A place (`x`, `x.f`, `x[i].g`) as its root local and the steps to it: a
+# field index, or -1 for an element (of an array or a map).
+fn place_path(e: Expr) -> Option[(int, [int])]:
+    match e.kind:
+        case ExprKind.Ident(_):
+            match local_of(e):
+                case Some(l):
+                    return Some((l, []))
+                case None:
+                    return None
+        case ExprKind.Field(b, _, _):
+            match place_path(b):
+                case Some((l, p)):
+                    var q = p
+                    q.push(e.idx)
+                    return Some((l, q))
+                case None:
+                    return None
+        case ExprKind.Index(b, _):
+            match place_path(b):
+                case Some((l, p)):
+                    var q = p
+                    q.push(-1)
+                    return Some((l, q))
+                case None:
+                    return None
+        case _:
+            return None
+
+# Can two places with the same root share memory? Only when neither leaves
+# the other through a different field (elements may be the same one).
+fn steps_overlap(a: [int], b: [int]) -> bool:
+    let n = min(len(a), len(b))
+    for i in 0..n:
+        if a[i] >= 0 and b[i] >= 0 and a[i] != b[i]:
+            return false
+    return true
+
+fn mentions_local(e: Expr, id: int) -> bool:
+    if local_of(e) == Some(id):
+        return true
+    for c in children(e):
+        if mentions_local(c, id):
+            return true
+    return false
+
+# Can the value of `e` (a by-value argument, evaluated before the call) be
+# memory one of the places `refs` reaches? Then the callee could change or
+# free it through the `ref`. Different variables never share memory a `ref`
+# can change in place: a shared array or string is copied before a write.
+fn reaches(e: Expr, refs: [(int, [int])]) -> bool:
+    match place_path(e):
+        case Some((l, p)):
+            for r in refs:
+                if r.0 == l and steps_overlap(r.1, p):
+                    return true
+            return false
+        case None:
+            for r in refs:
+                if mentions_local(e, r.0):
+                    return true
+            return false
+
+# A place reached through fields only (`self.stack`, `s.a.b`), not a bare variable.
+fn field_path(e: Expr) -> Option[(int, [int])]:
+    match e.kind:
+        case ExprKind.Field(_, _, _):
+            match place_path(e):
+                case Some((l, p)):
+                    if -1 in p:
+                        return None
+                    return Some((l, p))
+                case None:
+                    return None
+        case _:
+            return None
+
+fn path_key(l: int, p: [int]) -> str:
+    return f"{l}:" + ".".join([str(x) for x in p])
+
+# `s = s + a + b` with `s` a variable or a field of one: the parts appended
+# (`[a, b]`), if none reads `s` or can leave the function midway (`?`).
+fn self_append(target: Expr, value: Expr) -> Option[[Expr]]:
+    let tp = place_path(target)
+    match tp:
+        case Some((l, p)):
+            if -1 in p:
+                return None
+            var parts: [Expr] = []
+            var v = value
+            while true:
+                match v.kind:
+                    case ExprKind.Binary(BinOp.Add, a, b):
+                        if mentions_local(b, l) or has_try(b):
+                            return None
+                        parts.insert(0, b)
+                        if place_path(a) == tp:
+                            return Some(parts)
+                        v = a
+                    case _:
+                        return None
+            return None
+        case None:
+            return None
+
+fn has_try(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Try(_):
+            return true
+        case _:
+            pass
+    for c in children(e):
+        if has_try(c):
+            return true
+    return false
+
+# `var w = p` then `p = []` (see `take_at`): w's local, `p`, and the `[]`.
+fn take_pair(s: Stmt, t: Stmt) -> Option[(int, Expr, Expr)]:
+    match s.kind:
+        case StmtKind.Let(_, pat, _, init, is_ref):
+            if is_ref or len(s.locals) != 1 or not is_name(pat) or not array_place(init):
+                return None
+            match t.kind:
+                case StmtKind.Assign(target, op, v):
+                    if op.is_some() or not same_place(target, init):
+                        return None
+                    match v.kind:
+                        case ExprKind.Array(es):
+                            if len(es) == 0 and v.ty == init.ty:
+                                return Some((s.locals[0], init, v))
+                        case _:
+                            pass
+                    return None
+                case _:
+                    return None
+        case _:
+            return None
+
+fn is_name(p: LetPat) -> bool:
+    match p:
+        case LetPat.Name(_, _):
+            return true
+        case _:
+            return false
+
+# A variable, or fields and array elements of one at indexes that can be
+# computed again with the same result.
+fn array_place(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Ident(_):
+            return local_of(e).is_some()
+        case ExprKind.Field(b, _, _):
+            return array_place(b)
+        case ExprKind.Index(b, i):
+            match b.ty:
+                case Ty.Array(_):
+                    return pure_index(i) and array_place(b)
+                case _:
+                    return false
+        case _:
+            return false
+
+fn pure_index(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Ident(_):
+            return local_of(e).is_some()
+        case ExprKind.Int(_):
+            return true
+        case ExprKind.Field(b, _, _):
+            return pure_index(b)
+        case ExprKind.Binary(_, l, r):
+            return pure_index(l) and pure_index(r)
+        case _:
+            return false
+
+# The same place, written the same way (see `array_place`).
+fn same_place(a: Expr, b: Expr) -> bool:
+    match a.kind:
+        case ExprKind.Ident(_):
+            return local_of(a).is_some() and local_of(a) == local_of(b)
+        case ExprKind.Int(x):
+            match b.kind:
+                case ExprKind.Int(y):
+                    return x == y and a.ty == b.ty
+                case _:
+                    return false
+        case ExprKind.Field(x, _, _):
+            match b.kind:
+                case ExprKind.Field(y, _, _):
+                    return a.idx == b.idx and same_place(x, y)
+                case _:
+                    return false
+        case ExprKind.Index(x, i):
+            match b.kind:
+                case ExprKind.Index(y, j):
+                    return same_place(x, y) and same_place(i, j)
+                case _:
+                    return false
+        case ExprKind.Binary(o, x, i):
+            match b.kind:
+                case ExprKind.Binary(p, y, j):
+                    return o == p and a.ty == b.ty and same_place(x, y) and same_place(i, j)
+                case _:
+                    return false
+        case _:
+            return false
+
+# Is `stmts[j]` the last use of `w`, a variable an earlier `let`/`var` of
+# this block declared, with no `ref` name for it?
+fn last_use(stmts: [Stmt], j: int, w: int) -> bool:
+    return last_use_from(stmts, j, w, false)
+
+# The same, where `declared` says w is a parameter (declared before them all).
+fn last_use_from(stmts: [Stmt], j: int, w: int, declared0: bool) -> bool:
+    var declared = declared0
+    for i in 0..j:
+        match stmts[i].kind:
+            case StmtKind.Let(_, pat, _, _, is_ref):
+                if not is_ref and is_name(pat) and stmts[i].locals == [w]:
+                    declared = true
+            case _:
+                pass
+    if not declared:
+        return false
+    for i in 0..len(stmts):
+        if ref_alias(stmts[i], w):
+            return false
+        if i > j and stmt_mentions(stmts[i], w):
+            return false
+    return true
+
+fn stmt_mentions(s: Stmt, w: int) -> bool:
+    for e in stmt_exprs(s):
+        if mentions_local(e, w):
+            return true
+    for b in stmt_blocks(s):
+        for t in b.stmts:
+            if stmt_mentions(t, w):
+                return true
+    return false
+
+# `let r = ref ...w...`, here or in a nested block
+fn ref_alias(s: Stmt, w: int) -> bool:
+    match s.kind:
+        case StmtKind.Let(_, _, _, init, is_ref):
+            if is_ref and mentions_local(init, w):
+                return true
+        case _:
+            pass
+    for b in stmt_blocks(s):
+        for t in b.stmts:
+            if ref_alias(t, w):
+                return true
+    return false
+
+fn own_name(c_name: str, mask: int) -> str:
+    return f"{c_name}__own{mask}"
+
+fn owns_param(mask: int, i: int) -> bool:
+    return i < 62 and ((mask >> i) & 1) == 1
+
+# Would a clone of `f` that owns parameter `pi` use it: does the body start
+# a variable with it, as its last use (`var t = p`, or a `mut p` parameter)?
+fn consumes(f: FnDecl, pi: int) -> bool:
+    if pi >= len(f.param_locals):
+        return false
+    let p = f.param_locals[pi]
+    let stmts = f.body.stmts
+    for k in 0..len(stmts):
+        match stmts[k].kind:
+            case StmtKind.Let(_, pat, _, init, is_ref):
+                if not is_ref and is_name(pat) and local_of(init) == Some(p):
+                    return last_use_from(stmts, k, p, true)
+            case _:
+                pass
+    return false
+
+# A field or array element of a variable, at any depth: a place whose value
+# stays put while the variable does (see `borrow_let`).
+fn borrow_place(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Field(b, _, _):
+            return local_of(b).is_some() or borrow_place(b)
+        case ExprKind.Index(b, _):
+            match b.ty:
+                case Ty.Array(_):
+                    return local_of(b).is_some() or borrow_place(b)
+                case _:
+                    return false
+        case _:
+            return false

@@ -328,6 +328,8 @@ them: `print(x, end="")`), `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`
 `args()` (the command-line arguments as `[str]`, without the program's name:
 `brine run app.br -- a b` gives `["a", "b"]`), `exit(code)`, `panic(msg)`,
 `eprint(...)` (print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`, `flush()`.
+On floats, `min` and `max` ignore a NaN (the other argument wins; both NaN gives
+NaN) and order `-0.0` below `0.0`, the same on every target.
 
 The math functions give the same bits on every platform, natively and in
 WebAssembly: brine has its own math library (from musl) rather than the C
