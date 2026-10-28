@@ -1273,6 +1273,26 @@ brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_
     }
     return a;
 }
+/* An integer array kept as bytes (narrow.br), zeroed, with 16 more bytes
+   than it needs for brine_bytes_rev and friends. It is never shared, so
+   never copied. */
+brine_arr *brine_bytes_new(int64_t len, const char *loc) {
+    if (len < 0) br_panicf(loc, "cannot create an array with negative length %lld", (long long)len);
+    brine_arr *a = (brine_arr *)brine_alloc(sizeof(brine_arr));
+    BR_LIVE(1);
+    a->rc = 1;
+    a->len = len;
+    a->cap = len + 16;
+    a->esz = 1;
+    a->retain = NULL;
+    a->release = NULL;
+    a->data = (char *)calloc((size_t)len + 16, 1);
+    if (!a->data) {
+        fprintf(stderr, "out of memory\n");
+        abort();
+    }
+    return a;
+}
 /* A `[bool]` kept as bits (the compiler's pack.br): `len` elements in 64-bit
    words. `esz` 0 marks it; only indexing, `len` and freeing ever see one. */
 brine_arr *brine_bits_new(int64_t len, int64_t fill, const char *loc) {
@@ -5737,6 +5757,15 @@ brine_str *brine_x_str_at(brine_str *s, int64_t i, const char *loc) { return bri
 brine_str *brine_x_str_byte(brine_str *s, int64_t i) { return brine_str_byte(s, i); }
 void brine_x_str_add(brine_str **ps, brine_str *b) { brine_str_add(ps, b); }
 bool brine_x_map_has(brine_map *m, const void *k) { return brine_map_has(m, k); }
+bool brine_x_arr_shl(brine_arr **pa, int64_t lo, int64_t hi) { return brine_arr_shl(pa, lo, hi); }
+bool brine_x_arr_copy(brine_arr **pb, brine_arr *a, int64_t lo, int64_t hi) { return brine_arr_copy(pb, a, lo, hi); }
+bool brine_x_bytes_rev(char *d, int64_t n, int64_t *pi, int64_t *pj) { return brine_bytes_rev(d, n, pi, pj); }
+bool brine_x_bytes_shl(char *d, int64_t n, int64_t lo, int64_t hi) { return brine_bytes_shl(d, n, lo, hi); }
+bool brine_x_bytes_rotl(char *d, int64_t n, int64_t lo, int64_t hi) { return brine_bytes_rotl(d, n, lo, hi); }
+bool brine_x_arr_rotl(brine_arr **pa, int64_t lo, int64_t hi) { return brine_arr_rotl(pa, lo, hi); }
+bool brine_x_bytes_copy(char *db, int64_t nb, const char *da, int64_t na, int64_t lo, int64_t hi) {
+    return brine_bytes_copy(db, nb, da, na, lo, hi);
+}
 uint64_t brine_x_hash_u64(uint64_t x) { return brine_hash_u64(x); }
 uint64_t brine_x_hash_mix(uint64_t h, uint64_t x) { return brine_hash_mix(h, x); }
 uint64_t brine_x_hash_u128(const brine_u128 *x) { return brine_hash_u128(*x); }

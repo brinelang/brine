@@ -27,6 +27,8 @@ import msl
 import jam
 import pack
 import ranges
+import idiom
+import narrow
 
 struct Options:
     # generate a test-runner `main` instead of the program's `main`
@@ -110,12 +112,22 @@ struct FnCx:
     packed: {int: bool}
     # the `[b] * n` being lowered makes one
     bits_init: bool
+    # the local integer arrays kept as bytes (narrow.br), and whether the
+    # array being made is one
+    narrow: {int: bool}
+    narrow_init: bool
     # in a range-versioned copy (ranges.br): integer arithmetic needs no
     # overflow checks, and these calls (by span) go to clones without them
     nc: bool
     nc_calls: {str: int}
     # in the fallback copy of a versioned loop: don't version again
     nv: bool
+    # lowering a loop twice (idiom.twin_body): 1 in the first copy, 2 in the
+    # second; the labels in the second the idioms of the first fail over to
+    # (by span), and the stack slots of the locals the copies share
+    twin: int
+    twin_out: {str: int}
+    twin_slots: {int: int}
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -151,9 +163,14 @@ fn new_cx(f: Func) -> FnCx:
         jx=no_jam(),
         packed={},
         bits_init=false,
+        narrow={},
+        narrow_init=false,
         nc=false,
         nc_calls={},
-        nv=false
+        nv=false,
+        twin=0,
+        twin_out={},
+        twin_slots={}
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -367,13 +384,34 @@ struct Lower:
                     self.cx.fb.store(a, 0, v)
             if self.tracks_caller(f.id):
                 self.cx.loc = len(ks) - 1
+        var nw = narrow.Narrow(arrs={}, guards=[])
+        if self.opts.fast and not self.opts.debug:
+            nw = narrow.find(f.body, f.locals)
+        if len(nw.arrs) > 0 and len(nw.guards) > 0:
+            # bytes only while the parameters allow it, else plain arrays
+            let slow = self.cx.fb.label()
+            for p in nw.guards:
+                let x = self.read_local(p)
+                let top = self.cx.fb.konst(K.I64, 256)
+                let ok = self.cx.fb.cmp(Op.Le, x, top)
+                self.cx.fb.brnot(ok, slow)
+            self.cx.narrow = nw.arrs
+            self.block(f.body)
+            self.end_body(has)
+            self.cx.narrow = {}
+            self.cx.fb.place(slow)
+        else:
+            self.cx.narrow = nw.arrs
         self.block(f.body)
+        self.end_body(has)
+        self.funcs.push(self.cx.fb.f)
+
+    fn end_body(ref self, has: bool):
         if not self.cx.fb.ends():
             if has:
                 self.cx.fb.unreachable()
             else:
                 self.cx.fb.ret(-1)
-        self.funcs.push(self.cx.fb.f)
 
     fn main_sym(self) -> Option[int]:
         let prog = self.prog
@@ -990,8 +1028,17 @@ struct Lower:
 
     # A new home for a local variable of type `t`.
     fn new_local(ref self, id: int, t: Ty) -> int:
+        if self.cx.twin == 2:
+            match self.cx.twin_slots.get(id):
+                case Some(s0):
+                    self.cx.lslot[id] = s0
+                    return self.cx.fb.slot_addr(s0)
+                case None:
+                    pass
         let lay = self.lay(t)
         let s = self.cx.fb.slot(lay.size, lay.align)
+        if self.cx.twin == 1:
+            self.cx.twin_slots[id] = s
         self.cx.fb.name_slot(s, self.flocals[id].name, not self.agg(t), self.kind(t))
         self.cx.lslot[id] = s
         if self.opts.debug:
@@ -1897,8 +1944,13 @@ struct Lower:
     # ============================================================ statements
     fn block(ref self, b: Block):
         self.push_scope()
-        for s in b.stmts:
-            self.stmt(s)
+        var k = 0
+        while k < len(b.stmts):
+            self.stmt(b.stmts[k])
+            if self.rot_after(b.stmts, k):
+                k += 3
+            else:
+                k += 1
         self.pop_scope()
 
     fn stmt(ref self, s: Stmt):
@@ -1910,6 +1962,7 @@ struct Lower:
             case StmtKind.Let(_, pat, _, init, _):
                 self.push_frame()
                 self.cx.bits_init = len(s.locals) > 0 and s.locals[0] in self.cx.packed
+                self.cx.narrow_init = len(s.locals) > 0 and s.locals[0] in self.cx.narrow
                 let v = self.owned(init)
                 match pat:
                     case LetPat.Name(_, _):
@@ -1955,6 +2008,15 @@ struct Lower:
             case StmtKind.Match(scrut, cases):
                 self.match_stmt(scrut, cases)
             case StmtKind.While(cond, _, body):
+                if self.twin_while(s, cond, body):
+                    return
+                let iend = self.idiom_head(
+                    ranges.key(s.span),
+                    idiom.while_idiom(cond, body, self.flocals),
+                    None
+                )
+                if iend == -2:
+                    return
                 let head = self.cx.fb.label()
                 let brk = self.cx.fb.label()
                 let saved = self.loop_arrays([cond], body)
@@ -1970,8 +2032,19 @@ struct Lower:
                     self.cx.fb.jmp(head)
                 self.cx.fb.place(brk)
                 self.cx.arrc = saved
+                if iend >= 0:
+                    self.cx.fb.place(iend)
             case StmtKind.For(_, _, _, iter, _, body, is_par):
-                if is_par:
+                var iend = -1
+                if not is_par:
+                    iend = self.idiom_head(
+                        ranges.key(s.span),
+                        idiom.for_idiom(iter, s.local, body, self.flocals),
+                        Some(iter)
+                    )
+                if iend == -2:
+                    pass
+                elif is_par:
                     self.par_for(iter, s.local, s.caps, s.writes, body, s.span)
                 elif self.opts.fast and not self.cx.lifted and self.version_for(s, iter, body):
                     pass
@@ -1990,6 +2063,8 @@ struct Lower:
                     self.loop_close(dom, lc)
                     self.cx.arrc = saved
                     self.pop_scope()
+                if iend >= 0:
+                    self.cx.fb.place(iend)
             case StmtKind.Return(value):
                 match value:
                     case Some(e):
@@ -2038,6 +2113,171 @@ struct Lower:
                 self.pop_frame()
             case _:
                 pass
+
+    # ============================================================ idioms
+    # A loop idiom.br recognized: one runtime call that does it when all it
+    # touches is in bounds, else (the code that follows) the loop as written.
+    # Returns the label after the loop, -1 having emitted nothing, or -2 in
+    # the first copy of a twin loop: there the loop isn't lowered, a failure
+    # goes to the second copy.
+    fn idiom_head(ref self, key: str, id: Option[idiom.Idiom], iter: Option[Expr]) -> int:
+        if not self.opts.fast or self.cx.lifted or len(self.cx.jx.act) > 0:
+            return -1
+        if self.cx.twin == 2:
+            self.twin_land(key)
+            return -1
+        match id:
+            case Some(x):
+                var ok = -1
+                match x:
+                    case idiom.Idiom.Rev(a, i, j):
+                        # only worth it a register at a time
+                        if not (a in self.cx.narrow):
+                            return -1
+                        let (d, n) = self.bytes_of(a)
+                        let pi = self.local_ptr(i)
+                        let pj = self.local_ptr(j)
+                        ok = self.cx.fb.rt(K.Bool, "brine_bytes_rev", [d, n, pi, pj])
+                    case idiom.Idiom.Shl(a):
+                        if a in self.cx.packed or not self.plain_elems(a):
+                            return -1
+                        let (lo, hi) = self.idiom_bounds(iter.unwrap())
+                        if a in self.cx.narrow:
+                            let (d, n) = self.bytes_of(a)
+                            ok = self.cx.fb.rt(K.Bool, "brine_bytes_shl", [d, n, lo, hi])
+                        else:
+                            let pa = self.local_ptr(a)
+                            ok = self.cx.fb.rt(K.Bool, "brine_arr_shl", [pa, lo, hi])
+                    case idiom.Idiom.Copy(b, a):
+                        if a in self.cx.packed or b in self.cx.packed or not self.plain_elems(a):
+                            return -1
+                        if (a in self.cx.narrow) != (b in self.cx.narrow):
+                            return -1
+                        let (lo, hi) = self.idiom_bounds(iter.unwrap())
+                        if a in self.cx.narrow:
+                            let (db, nb) = self.bytes_of(b)
+                            let (da, na) = self.bytes_of(a)
+                            ok = self.cx.fb.rt(K.Bool, "brine_bytes_copy", [db, nb, da, na, lo, hi])
+                        else:
+                            let pb = self.local_ptr(b)
+                            let av = self.read_local(a)
+                            ok = self.cx.fb.rt(K.Bool, "brine_arr_copy", [pb, av, lo, hi])
+                return self.idiom_fail(key, ok)
+            case None:
+                return -1
+
+    # After an idiom's call: where to go when it returns false (see idiom_head)
+    fn idiom_fail(ref self, key: str, ok: int) -> int:
+        if self.cx.twin == 1:
+            let l = self.cx.fb.label()
+            self.cx.fb.brnot(ok, l)
+            self.cx.twin_out[key] = l
+            return -2
+        let slow = self.cx.fb.label()
+        let end = self.cx.fb.label()
+        self.cx.fb.brnot(ok, slow)
+        self.cx.fb.jmp(end)
+        self.cx.fb.place(slow)
+        return end
+
+    # In the second copy of a twin loop: where the first's idiom `key` fails over to
+    fn twin_land(ref self, key: str):
+        match self.cx.twin_out.get(key):
+            case Some(l):
+                self.cx.fb.place(l)
+            case None:
+                pass
+
+    fn plain_elems(self, a: int) -> bool:
+        match self.flocals[a].ty:
+            case Ty.Array(t):
+                return not self.managed(t)
+            case _:
+                return false
+
+    # `let x = a[lo]` was stmts[k]: when it and the next two statements rotate
+    # a part of `a` (idiom.rot_idiom), the rotation in one call, else the
+    # statements as written. Returns whether it lowered stmts[k + 1..k + 3].
+    fn rot_after(ref self, stmts: [Stmt], k: int) -> bool:
+        if not self.opts.fast or self.cx.lifted or len(self.cx.jx.act) > 0 or self.cx.fb.ends():
+            return false
+        let a = idiom.rot_idiom(stmts, k, self.flocals)
+        if a < 0 or a in self.cx.packed or not self.plain_elems(a):
+            return false
+        let key = ranges.key(stmts[k + 1].span) + "r"
+        if self.cx.twin == 2:
+            self.twin_land(key)
+            return false
+        var lo = -1
+        var hi = -1
+        match stmts[k + 1].kind:
+            case StmtKind.For(_, _, _, it, _, _, _):
+                let (l, h) = self.idiom_bounds(it)
+                lo = l
+                hi = h
+            case _:
+                return false
+        var ok = -1
+        if a in self.cx.narrow:
+            let (d, n) = self.bytes_of(a)
+            ok = self.cx.fb.rt(K.Bool, "brine_bytes_rotl", [d, n, lo, hi])
+        else:
+            let pa = self.local_ptr(a)
+            ok = self.cx.fb.rt(K.Bool, "brine_arr_rotl", [pa, lo, hi])
+        let end = self.idiom_fail(key, ok)
+        if end >= 0:
+            self.stmt(stmts[k + 1])
+            self.stmt(stmts[k + 2])
+            self.cx.fb.place(end)
+        return true
+
+    # A loop idiom.twin_body allows, in two copies. Returns false having
+    # emitted nothing when it doesn't qualify.
+    fn twin_while(ref self, s: Stmt, cond: Expr, body: Block) -> bool:
+        if not self.opts.fast or self.opts.debug or self.cx.lifted or len(
+            self.cx.jx.act
+        ) > 0 or self.cx.twin != 0:
+            return false
+        if not idiom.twin_body(body, self.flocals):
+            return false
+        # the arrays both copies use, cached before either
+        let saved = self.loop_arrays([cond], body)
+        self.cx.twin = 1
+        self.cx.twin_out = {}
+        self.cx.twin_slots = {}
+        self.stmt(s)
+        let end = self.cx.fb.label()
+        if not self.cx.fb.ends():
+            self.cx.fb.jmp(end)
+        self.cx.twin = 2
+        if len(self.cx.twin_out) > 0:
+            self.stmt(s)
+        self.cx.twin = 0
+        self.cx.twin_out = {}
+        self.cx.twin_slots = {}
+        self.cx.fb.place(end)
+        self.cx.arrc = saved
+        return true
+
+    # The data and length of byte array `a` (never shared, so writable).
+    fn bytes_of(ref self, a: int) -> (int, int):
+        match self.cx.arrc.get(a):
+            case Some(c):
+                return (c.data, c.len)
+            case None:
+                let v = self.read_local(a)
+                let n = self.cx.fb.load(K.I64, v, 8)
+                let d = self.cx.fb.load(K.Ptr, v, 48)
+                return (d, n)
+
+    fn idiom_bounds(ref self, iter: Expr) -> (int, int):
+        match iter.kind:
+            case ExprKind.Range(lo, hi, _):
+                let l = self.expr(lo)
+                let h = self.expr(hi)
+                return (l, h)
+            case _:
+                return (-1, -1)
 
     # ============================================================ range versioning
     # A loop ranges.br found free of overflow while its inputs are within a
@@ -2517,6 +2757,19 @@ struct Lower:
             case None:
                 return None
 
+    # The type an array's elements are stored as: bytes for narrow.br's
+    # arrays (the program sees `t`).
+    fn elem_ty(self, base: Expr, t: Ty) -> Ty:
+        if len(self.cx.narrow) == 0:
+            return t
+        match local_of(base):
+            case Some(l):
+                if l in self.cx.narrow:
+                    return Ty.Int(IntTy.U8)
+                return t
+            case None:
+                return t
+
     fn is_bits(self, e: Expr) -> bool:
         match local_of(e):
             case Some(l):
@@ -2574,6 +2827,13 @@ struct Lower:
                     let set = self.cx.fb.bin(Op.Shl, K.U64, vb, sh)
                     let w2 = self.cx.fb.bin(Op.Or, K.U64, keep, set)
                     self.cx.fb.store(p, 0, w2)
+                    return
+                if self.elem_ty(b0, ty) != ty:
+                    # narrow.br only keeps arrays set with `=`, to small values
+                    let v = self.expr(value)
+                    let vb = self.cx.fb.conv(K.U8, v)
+                    let lp = self.lvalue(target)
+                    self.cx.fb.store(lp, 0, vb)
                     return
                 match b0.ty:
                     case Ty.Map(_, _):
@@ -2795,9 +3055,10 @@ struct Lower:
                     case _:
                         pass
                 let i = self.expr(idx)
+                let et = self.elem_ty(base, e.ty)
                 match self.cached_arr(base):
                     case Some(c):
-                        return self.cached_elem_ptr(c, i, e.ty, e.checked, e.span)
+                        return self.cached_elem_ptr(c, i, et, e.checked, e.span)
                     case None:
                         pass
                 let b = self.lvalue(base)
@@ -2814,7 +3075,7 @@ struct Lower:
                 if not skip:
                     self.cx.fb.call_void("brine_arr_unique", [b])
                 let a = self.cx.fb.load(K.Ptr, b, 0)
-                return self.arr_elem_ptr(a, i, e.ty, e.checked, e.span)
+                return self.arr_elem_ptr(a, i, et, e.checked, e.span)
             case _:
                 pass
         let v = self.expr(e)
@@ -3067,17 +3328,20 @@ struct Lower:
                     let bit = self.cx.fb.bin(Op.And, K.U64, x, one)
                     let z = self.cx.fb.konst(K.U64, 0)
                     return self.cx.fb.cmp(Op.Ne, bit, z)
+                let et = self.elem_ty(base, e.ty)
+                var p = -1
                 match self.cached_arr(base):
                     case Some(c):
                         let i = self.expr(idx)
-                        let p = self.cached_elem_ptr(c, i, e.ty, e.checked, e.span)
-                        return self.ld(p, 0, e.ty)
+                        p = self.cached_elem_ptr(c, i, et, e.checked, e.span)
                     case None:
-                        pass
-                let b = self.expr(base)
-                let i = self.expr(idx)
-                let p = self.arr_elem_ptr(b, i, e.ty, e.checked, e.span)
-                return self.ld(p, 0, e.ty)
+                        let b = self.expr(base)
+                        let i = self.expr(idx)
+                        p = self.arr_elem_ptr(b, i, et, e.checked, e.span)
+                let x = self.ld(p, 0, et)
+                if et != e.ty:
+                    return self.cx.fb.conv(self.kind(e.ty), x)
+                return x
             case ExprKind.Map(kvs):
                 let mt = self.map_ty(e.ty)
                 let t = self.cx.fb.call(K.Ptr, "brine_map_new", [mt])
@@ -3123,8 +3387,14 @@ struct Lower:
             case ExprKind.Repeat(elem, count):
                 let bits = self.cx.bits_init
                 self.cx.bits_init = false
-                let el = e.ty.elem()
-                let v = self.expr(elem)
+                var el = e.ty.elem()
+                let bytes = self.cx.narrow_init
+                self.cx.narrow_init = false
+                if bytes:
+                    el = Ty.Int(IntTy.U8)
+                var v = self.expr(elem)
+                if el != e.ty.elem():
+                    v = self.cx.fb.conv(K.U8, v)
                 let n0 = self.expr(count)
                 let n = self.cx.fb.conv(K.I64, n0)
                 let loc = self.loc(e.span)
@@ -3133,7 +3403,11 @@ struct Lower:
                     let b = self.cx.fb.call(K.Ptr, "brine_bits_new", [n, fill, loc])
                     self.register(b, e.ty)
                     return b
-                let t = self.new_arr(el, n, loc)
+                var t = -1
+                if bytes:
+                    t = self.cx.fb.call(K.Ptr, "brine_bytes_new", [n, loc])
+                else:
+                    t = self.new_arr(el, n, loc)
                 self.register(t, e.ty)
                 var zero = false
                 match elem.kind:
@@ -4317,20 +4591,31 @@ struct Lower:
         self.cx.fb.brnot(v, cont)
 
     fn seq_list(ref self, c: Comp, e: Expr) -> int:
-        let el = c.body.ty
+        var el = c.body.ty
+        let bytes = self.cx.narrow_init
+        self.cx.narrow_init = false
+        if bytes:
+            el = Ty.Int(IntTy.U8)
         let loc = self.loc(e.span)
         let dom = self.domain(c.iter, false)
         match c.filter:
             case None:
                 let n = self.dom_count(dom, e.span)
-                let res = self.new_arr(el, n, loc)
+                var res = -1
+                if bytes:
+                    let n64 = self.cx.fb.conv(K.I64, n)
+                    res = self.cx.fb.call(K.Ptr, "brine_bytes_new", [n64, loc])
+                else:
+                    res = self.new_arr(el, n, loc)
                 self.register(res, e.ty)
                 let data = self.cx.fb.load(K.Ptr, res, 48)
                 let k = self.cx.fb.konst(K.I64, 0)
                 let one = self.cx.fb.konst(K.I64, 1)
                 let lc = self.loop_open(dom, e.local)
                 self.push_frame()
-                let v = self.owned(c.body)
+                var v = self.owned(c.body)
+                if bytes:
+                    v = self.cx.fb.conv(K.U8, v)
                 let p = self.cx.fb.elem(data, k, self.lay(el).size)
                 self.st(p, 0, el, v)
                 let k2 = self.cx.fb.bin(Op.Add, K.I64, k, one)

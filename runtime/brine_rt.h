@@ -244,7 +244,132 @@ double brine_parse_f64(brine_str *s, const char *loc);
 /* ------------------------------------------------------------ arrays */
 brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_fn rl, const char *loc);
 brine_arr *brine_bits_new(int64_t len, int64_t fill, const char *loc);
+brine_arr *brine_bytes_new(int64_t len, const char *loc);
 void brine_arr_unique(brine_arr **pa);
+
+/* Loops the compiler recognizes (idiom.br), done in one step when every
+   element they touch is in bounds. They return false, having changed
+   nothing, when the caller must run the loop as written instead (so a panic
+   happens where it would have). */
+static inline bool br_arr_mine(brine_arr **pa) {
+    if (BR_UNLIKELY(__atomic_load_n(&(*pa)->rc, __ATOMIC_ACQUIRE) != 1)) brine_arr_unique(pa);
+    return true;
+}
+/* for i in lo..hi: a[i] = a[i + 1] */
+static inline bool brine_arr_shl(brine_arr **pa, int64_t lo, int64_t hi) {
+    if (lo >= hi) return true;
+    if (lo < 0 || hi >= (*pa)->len || (*pa)->esz == 0) return false;
+    br_arr_mine(pa);
+    brine_arr *a = *pa;
+    int64_t e = a->esz;
+    __builtin_memmove(a->data + lo * e, a->data + (lo + 1) * e, (size_t)((hi - lo) * e));
+    return true;
+}
+/* for i in lo..hi: b[i] = a[i], b and a different variables (so different
+   arrays once b is unique) */
+static inline bool brine_arr_copy(brine_arr **pb, brine_arr *a, int64_t lo, int64_t hi) {
+    if (lo >= hi) return true;
+    if (lo < 0 || hi > a->len || hi > (*pb)->len || a->esz != (*pb)->esz || a->esz == 0) return false;
+    br_arr_mine(pb);
+    brine_arr *b = *pb;
+    int64_t e = a->esz;
+    __builtin_memcpy(b->data + lo * e, a->data + lo * e, (size_t)((hi - lo) * e));
+    return true;
+}
+/* x = a[lo]; for i in lo..hi: a[i] = a[i + 1]; a[hi] = x */
+static inline bool brine_arr_rotl(brine_arr **pa, int64_t lo, int64_t hi) {
+    if (lo > hi || lo < 0 || hi >= (*pa)->len || (*pa)->esz == 0 || (*pa)->esz > 64) return false;
+    br_arr_mine(pa);
+    brine_arr *a = *pa;
+    int64_t e = a->esz;
+    char x[64];
+    __builtin_memcpy(x, a->data + lo * e, (size_t)e);
+    __builtin_memmove(a->data + lo * e, a->data + (lo + 1) * e, (size_t)((hi - lo) * e));
+    __builtin_memcpy(a->data + hi * e, x, (size_t)e);
+    return true;
+}
+
+/* The same on byte arrays (narrow.br): never shared, with 16 bytes to spare
+   after the last element (brine_bytes_new), so these work on 16 bytes in a
+   pair of registers. Data `d`, length `n`. */
+typedef unsigned __int128 br_u128x;
+/* the low n bytes set, n in 0..=16: a table, as a variable 128-bit shift is
+   a chain of dependent instructions */
+static const uint64_t br_low_tab[17][2] = {
+    {0, 0}, {0xff, 0}, {0xffff, 0}, {0xffffff, 0}, {0xffffffffULL, 0}, {0xffffffffffULL, 0},
+    {0xffffffffffffULL, 0}, {0xffffffffffffffULL, 0}, {~0ULL, 0}, {~0ULL, 0xff}, {~0ULL, 0xffff},
+    {~0ULL, 0xffffff}, {~0ULL, 0xffffffffULL}, {~0ULL, 0xffffffffffULL}, {~0ULL, 0xffffffffffffULL},
+    {~0ULL, 0xffffffffffffffULL}, {~0ULL, ~0ULL}};
+static inline br_u128x br_low_bytes(int64_t n) { return ((br_u128x)br_low_tab[n][1] << 64) | br_low_tab[n][0]; }
+static inline br_u128x br_bswap128(br_u128x x) {
+    return ((br_u128x)__builtin_bswap64((uint64_t)x) << 64) | __builtin_bswap64((uint64_t)(x >> 64));
+}
+/* as two 8-byte halves, so a load that follows a store gets it forwarded */
+static inline br_u128x br_ld128(const char *p) {
+    uint64_t a, b;
+    __builtin_memcpy(&a, p, 8);
+    __builtin_memcpy(&b, p + 8, 8);
+    return ((br_u128x)b << 64) | a;
+}
+static inline void br_st128(char *p, br_u128x x) {
+    uint64_t a = (uint64_t)x, b = (uint64_t)(x >> 64);
+    __builtin_memcpy(p, &a, 8);
+    __builtin_memcpy(p + 8, &b, 8);
+}
+/* while i < j: a[i], a[j] = a[j], a[i]; i += 1; j -= 1. Only 16 bytes at
+   most: longer ones gain little over the loop, and a loop around this one
+   then holds nothing else, so the C compiler can keep the bytes in registers. */
+static inline bool brine_bytes_rev(char *d, int64_t n, int64_t *pi, int64_t *pj) {
+    int64_t i = *pi, j = *pj;
+    if (i >= j) return true;
+    if (i < 0 || j >= n || j - i >= 16) return false;
+    /* bytes i..j reversed in place, the rest of the 16 kept */
+    int64_t k = j - i;
+    br_u128x x = br_ld128(d + i);
+    br_u128x m = br_low_bytes(k + 1);
+    br_st128(d + i, ((br_bswap128(x) >> (8 * (15 - k))) & m) | (x & ~m));
+    *pi = i + (k + 1) / 2;
+    *pj = j - (k + 1) / 2;
+    return true;
+}
+/* x = a[lo]; for i in lo..hi: a[i] = a[i + 1]; a[hi] = x */
+static inline bool brine_bytes_rotl(char *d, int64_t n, int64_t lo, int64_t hi) {
+    if (lo > hi || lo < 0 || hi >= n) return false;
+    int64_t k = hi - lo;
+    if (k < 16) {
+        br_u128x x = br_ld128(d + lo);
+        br_u128x rot = ((x >> 8) & br_low_bytes(k)) | ((x & 0xff) << (8 * k));
+        br_u128x m = br_low_bytes(k + 1);
+        br_st128(d + lo, (rot & m) | (x & ~m));
+    } else {
+        char x = d[lo];
+        __builtin_memmove(d + lo, d + lo + 1, (size_t)k);
+        d[hi] = x;
+    }
+    return true;
+}
+static inline bool brine_bytes_shl(char *d, int64_t n, int64_t lo, int64_t hi) {
+    if (lo >= hi) return true;
+    if (lo < 0 || hi >= n) return false;
+    if (hi - lo < 16) {
+        br_u128x x = br_ld128(d + lo);
+        br_u128x m = br_low_bytes(hi - lo);
+        br_st128(d + lo, ((x >> 8) & m) | (x & ~m));
+    } else
+        __builtin_memmove(d + lo, d + lo + 1, (size_t)(hi - lo));
+    return true;
+}
+static inline bool brine_bytes_copy(char *db, int64_t nb, const char *da, int64_t na, int64_t lo, int64_t hi) {
+    if (lo >= hi) return true;
+    if (lo < 0 || hi > na || hi > nb) return false;
+    if (hi == nb && hi - lo <= 16)
+        /* whole 16 bytes (past the end of b is spare), so reads of b right
+           after get the stores forwarded */
+        br_st128(db + lo, br_ld128(da + lo));
+    else
+        __builtin_memcpy(db + lo, da + lo, (size_t)(hi - lo));
+    return true;
+}
 void brine_arr_push(brine_arr **pa, const void *elem);
 void brine_arr_pop(brine_arr **pa, void *out, const char *loc);
 void brine_arr_pop_at(brine_arr **pa, int64_t i, void *out, const char *loc);
