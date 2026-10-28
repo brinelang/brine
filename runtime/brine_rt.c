@@ -89,6 +89,9 @@ static void br_ws_start(void) {
 #include <netdb.h>
 #endif
 
+/* sin, exp, pow, ...: the same bits on every target */
+#include "brine_math.c"
+
 /* generated code hardcodes these (lower.br) */
 _Static_assert(offsetof(brine_arr, data) == 48, "brine_arr layout");
 _Static_assert(offsetof(brine_map, keys) == 48 && sizeof(brine_map) == 88, "brine_map layout");
@@ -6295,13 +6298,27 @@ BR_X_MATH1(sqrt)
 BR_X_MATH1(sin)
 BR_X_MATH1(cos)
 BR_X_MATH1(tan)
+BR_X_MATH1(asin)
+BR_X_MATH1(acos)
+BR_X_MATH1(atan)
+BR_X_MATH1(sinh)
+BR_X_MATH1(cosh)
+BR_X_MATH1(tanh)
 BR_X_MATH1(exp)
+BR_X_MATH1(exp2)
+BR_X_MATH1(expm1)
 BR_X_MATH1(log)
+BR_X_MATH1(log2)
+BR_X_MATH1(log10)
+BR_X_MATH1(log1p)
+BR_X_MATH1(cbrt)
 BR_X_MATH1(floor)
 BR_X_MATH1(ceil)
 BR_X_MATH1(round)
 BR_X_MATH1(fabs)
 double brine_x_f_pow(double a, double b) { return brine_f_pow(a, b); }
+double brine_x_f_atan2(double y, double x) { return brine_f_atan2(y, x); }
+double brine_x_f_hypot(double x, double y) { return brine_f_hypot(x, y); }
 double brine_x_f_fmod(double a, double b) { return brine_f_fmod(a, b); }
 float brine_x_f_fmodf(float a, float b) { return brine_f_fmodf(a, b); }
 double brine_x_f_fmin(double a, double b) { return brine_f_fmin(a, b); }

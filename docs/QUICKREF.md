@@ -321,6 +321,10 @@ them: `print(x, end="")`), `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`
 `args()` (command-line arguments), `exit(code)`, `panic(msg)`, `eprint(...)`
 (print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`, `flush()`.
 
+The math functions give the same bits on every platform, natively and in
+WebAssembly: brine has its own math library (from musl) rather than the C
+library's, whose last bits differ between systems.
+
 `print` output to a terminal or a pipe is written at the end of each line; to a
 file it is buffered (and written at exit, or when `eprint`, `run` or `flush()`
 needs it out). `flush()` writes out what is buffered, such as a prompt printed
