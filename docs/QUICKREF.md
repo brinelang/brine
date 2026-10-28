@@ -280,6 +280,13 @@ There are no negative indexes: write `xs[len(xs) - 1]`. A statement can't both
 change a variable and read it elsewhere (`print(xs.pop(), xs)` is an error), so
 evaluation order never matters.
 
+In release builds, a `for j in lo..hi` loop that indexes arrays at `j`, `j + x`,
+`x + j` or `j - x` (`x` a literal or a variable the loop doesn't change) and
+doesn't change those arrays' lengths checks the first and last index once,
+before the loop, and then runs without per-element checks, so the C compiler can
+vectorize it. If that test fails the loop runs checked as written, panicking at
+the same element it always would.
+
 ## Strings
 
 Strings are immutable UTF-8. `len(s)`, `s[i]` and slices count **bytes**;

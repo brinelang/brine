@@ -18,7 +18,7 @@
 from diag import Span, SourceMap
 from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, LocalKind, int_ty
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
-from ast import FmtSpec, parse_fmt_spec, children, stmt_exprs, stmt_blocks, local_of
+from ast import FmtSpec, parse_fmt_spec, children, stmt_exprs, stmt_blocks, local_of, lvalue_root
 from info import ProgramInfo, ConstVal, TryKind, try_kind, mangle_module, PRELUDE
 from num import u128_bits
 from ir import K, Op, Func, Data, Reloc, Module, FB, new_func, le_bytes, str_bytes, f64_bits, f32_bits
@@ -168,6 +168,11 @@ struct FnCx:
     own_mask: int
     # a `__br` clone: results are returned borrowed (see `bret_ok`)
     bret: bool
+    # in the fast copy of a loop `bounds_version` made: the index checks
+    # (and the additions computing those indexes) it showed can't fail, by
+    # span; and the loops being versioned
+    nochk: {str: bool}
+    bv_keys: {str: bool}
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -225,7 +230,9 @@ fn new_cx(f: Func) -> FnCx:
         own_arg=-1,
         own_slot=-1,
         own_mask=0,
-        bret=false
+        bret=false,
+        nochk={},
+        bv_keys={}
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -2576,6 +2583,8 @@ struct Lower:
                     self.par_for(iter, s.local, s.caps, s.writes, body, s.span)
                 elif self.opts.fast and not self.cx.lifted and self.version_for(s, iter, body):
                     pass
+                elif self.opts.fast and not self.cx.lifted and self.bounds_version(s, iter, body):
+                    pass
                 elif self.opts.fast and not self.cx.lifted and self.jam_for(iter, s.local, body):
                     pass
                 else:
@@ -3253,6 +3262,145 @@ struct Lower:
                 self.cx.fb.place(end)
                 return true
             case None:
+                return false
+
+    # Does index (or index addition) `e` need its check? Not in the fast copy
+    # of a loop `bounds_version` checked up front.
+    fn idx_chk(self, e: Expr) -> bool:
+        if not e.checked:
+            return false
+        return len(self.cx.nochk) == 0 or ranges.key(e.span) not in self.cx.nochk
+
+    # `for j in lo..hi` indexing arrays at `j + x`, `x + j`, `j - x` or `j`
+    # (x a variable the loop doesn't change, or a literal) when the loop
+    # can't change those arrays' lengths: one test before the loop that the
+    # first and last index are in bounds picks a copy of the loop without
+    # those checks (so the C compiler can vectorize it), else the loop runs
+    # checked. Returns false, having emitted nothing, when nothing qualifies.
+    fn bounds_version(ref self, s: Stmt, iter: Expr, body: Block) -> bool:
+        let key = ranges.key(s.span)
+        if len(self.cx.jx.act) > 0 or key in self.cx.bv_keys:
+            return false
+        var lo_e = iter
+        var hi_e = iter
+        var incl = false
+        match iter.kind:
+            case ExprKind.Range(lo, hi, inclusive):
+                lo_e = lo
+                hi_e = hi
+                incl = inclusive
+            case _:
+                return false
+        if (
+            self.flocals[s.local].ty != int_ty()
+            or not self.plain_expr(lo_e)
+            or not self.plain_expr(hi_e)
+        ):
+            return false
+        var bv = BoundsUse(j=s.local, decl={}, found=[], bad={}, par=false)
+        bv.block(body)
+        if bv.par:
+            return false
+        var cands: [IdxCand] = []
+        for c in bv.found:
+            # (locals are numbered in order: those of the body come after j)
+            if c.arr in bv.bad or c.arr in bv.decl or c.x in bv.decl or c.x in bv.bad:
+                continue
+            if c.arr >= s.local or c.x >= s.local:
+                continue
+            if c.arr in self.cx.packed or c.arr in self.cx.narrow:
+                continue
+            match self.flocals[c.arr].ty:
+                case Ty.Array(_):
+                    pass
+                case _:
+                    continue
+            let ak = self.flocals[c.arr].kind
+            if ak != LocalKind.Let and ak != LocalKind.Var and ak != LocalKind.Param:
+                continue
+            if c.x >= 0 and not self.bv_fixed(c.x):
+                continue
+            cands.push(c)
+        if len(cands) == 0:
+            return false
+        # any `ref` alias of a variable could change it behind our back
+        match self.fnd:
+            case Some(f):
+                for c in cands:
+                    for t in f.body.stmts:
+                        if ref_alias(t, c.arr) or c.x >= 0 and ref_alias(t, c.x):
+                            return false
+            case None:
+                return false
+        let slow = self.cx.fb.label()
+        let end = self.cx.fb.label()
+        let lo = self.expr(lo_e)
+        let hi = self.expr(hi_e)
+        let one = self.cx.fb.konst(K.I64, 1)
+        var last = hi
+        if not incl:
+            last = self.cx.fb.bin(Op.Sub, K.I64, hi, one)
+        # an empty loop needs no checks; else every value is kept within
+        # 2^61 so the sums below can't overflow
+        let fast = self.cx.fb.label()
+        let empty = self.cx.fb.cmp(Op.Gt, lo, last)
+        self.cx.fb.br(empty, fast)
+        let big = self.cx.fb.konst(K.I64, 1 << 61)
+        let nbig = self.cx.fb.konst(K.I64, -(1 << 61))
+        let lok = self.cx.fb.cmp(Op.Ge, lo, nbig)
+        self.cx.fb.brnot(lok, slow)
+        let hok = self.cx.fb.cmp(Op.Le, last, big)
+        self.cx.fb.brnot(hok, slow)
+        let zero = self.cx.fb.konst(K.I64, 0)
+        for c in cands:
+            var x = zero
+            if c.x >= 0:
+                let xv = self.read_local(c.x)
+                x = self.cx.fb.conv(K.I64, xv)
+                let xl = self.cx.fb.cmp(Op.Ge, x, nbig)
+                self.cx.fb.brnot(xl, slow)
+                let xh = self.cx.fb.cmp(Op.Le, x, big)
+                self.cx.fb.brnot(xh, slow)
+            elif c.lit != 0:
+                x = self.cx.fb.konst(K.I64, c.lit)
+            let a = self.read_local(c.arr)
+            let n = self.cx.fb.load(K.I64, a, 8)
+            let op = Op.Sub if c.neg else Op.Add
+            let first = self.cx.fb.bin(op, K.I64, lo, x)
+            let f0 = self.cx.fb.cmp(Op.Ge, first, zero)
+            self.cx.fb.brnot(f0, slow)
+            let top = self.cx.fb.bin(op, K.I64, last, x)
+            let t0 = self.cx.fb.cmp(Op.Lt, top, n)
+            self.cx.fb.brnot(t0, slow)
+        self.cx.fb.place(fast)
+        let saved = self.cx.nochk
+        for c in cands:
+            self.cx.nochk[c.idx] = true
+            if c.add != "":
+                self.cx.nochk[c.add] = true
+        self.cx.bv_keys[key] = true
+        self.stmt(s)
+        self.cx.nochk = saved
+        if not self.cx.fb.ends():
+            self.cx.fb.jmp(end)
+        self.cx.fb.place(slow)
+        self.stmt(s)
+        self.cx.bv_keys.remove(key)
+        self.cx.fb.place(end)
+        return true
+
+    # Can't variable `x`, declared before a loop and not assigned in it, change during the loop?
+    fn bv_fixed(self, x: int) -> bool:
+        match self.flocals[x].ty:
+            case Ty.Int(k):
+                if k.bits() > 64 or not k.signed() and k.bits() == 64:
+                    return false
+            case _:
+                return false
+        match self.flocals[x].kind:
+            case LocalKind.Let | LocalKind.Var | LocalKind.Param | LocalKind.ForVar:
+                return true
+            case _:
                 return false
 
     # Is `op` on a `ty` checked, `checked` being what the source asks for? A
@@ -4313,7 +4461,7 @@ struct Lower:
                 let et = self.elem_ty(base, e.ty)
                 match self.cached_arr(base):
                     case Some(c):
-                        return self.cached_elem_ptr(c, i, et, e.checked, e.span)
+                        return self.cached_elem_ptr(c, i, et, self.idx_chk(e), e.span)
                     case None:
                         pass
                 let b = self.lvalue(base)
@@ -4330,7 +4478,7 @@ struct Lower:
                 if not skip:
                     self.cx.fb.call_void("brine_arr_unique", [b])
                 let a = self.cx.fb.load(K.Ptr, b, 0)
-                return self.arr_elem_ptr(a, i, et, e.checked, e.span)
+                return self.arr_elem_ptr(a, i, et, self.idx_chk(e), e.span)
             case _:
                 pass
         let v = self.expr(e)
@@ -4434,7 +4582,7 @@ struct Lower:
                     let c = self.cx.fb.call(K.Ptr, "brine_str_concat", [a, b])
                     return self.temp(c, Ty.Str)
                 let a = self.expr(l)
-                let chk = self.op_checked(Some(op), e.ty, e.checked)
+                let chk = self.op_checked(Some(op), e.ty, e.checked) and self.idx_chk(e)
                 let sh = -1 if chk else pow2_shift(op, r, e.ty)
                 if sh > 0:
                     let kk = self.kind(e.ty)
@@ -4593,11 +4741,11 @@ struct Lower:
                 match self.cached_arr(base):
                     case Some(c):
                         let i = self.expr(idx)
-                        p = self.cached_elem_ptr(c, i, et, e.checked, e.span)
+                        p = self.cached_elem_ptr(c, i, et, self.idx_chk(e), e.span)
                     case None:
                         let b = self.expr(base)
                         let i = self.expr(idx)
-                        p = self.arr_elem_ptr(b, i, et, e.checked, e.span)
+                        p = self.arr_elem_ptr(b, i, et, self.idx_chk(e), e.span)
                 let x = self.ld(p, 0, et)
                 if et != e.ty:
                     return self.cx.fb.conv(self.kind(e.ty), x)
@@ -6870,6 +7018,155 @@ fn world_desc(t: Ty) -> str:
             return "a" + world_desc(e)
         case _:
             return "?"
+
+# An index `arr[j + x]` (`x + j`, `j - x` with `neg`, `j`) in a loop over j:
+# its span and the span of the addition ("" for `arr[j]`); x is a variable
+# (else -1, and `lit` a literal).
+struct IdxCand:
+    idx: str
+    add: str
+    arr: int
+    x: int
+    lit: int
+    neg: bool
+
+# What `bounds_version` needs from a loop body over `j`: the indexes of the
+# form `arr[j + x]`, the variables declared in it, and the variables it may
+# change or use in a way that could change an array's length (anything but
+# `a[i]`, `a[i] = v` and `len(a)` for arrays; assigned, for integers).
+struct BoundsUse:
+    j: int
+    decl: {int: bool}
+    found: [IdxCand]
+    bad: {int: bool}
+    par: bool
+
+    fn block(ref self, b: Block):
+        for s in b.stmts:
+            self.stmt(s)
+
+    fn stmt(ref self, s: Stmt):
+        match s.kind:
+            case StmtKind.Let(_, _, _, init, is_ref):
+                for l in s.locals:
+                    self.decl[l] = true
+                if is_ref:
+                    match lvalue_root(init):
+                        case Some(r):
+                            self.bad[r] = true
+                        case None:
+                            pass
+            case StmtKind.Assign(t, _, _):
+                match t.kind:
+                    case ExprKind.Index(b, _):
+                        if local_of(b).is_none():
+                            self.target(t)
+                    case _:
+                        self.target(t)
+            case StmtKind.For(_, _, _, _, _, _, is_par):
+                self.decl[s.local] = true
+                if is_par:
+                    self.par = true
+            case StmtKind.Match(_, cases):
+                for c in cases:
+                    pat_locals(c.pat, ref self.decl)
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            self.expr(e)
+        for b in stmt_blocks(s):
+            self.block(b)
+
+    # an assigned place: its root variable may change
+    fn target(ref self, t: Expr):
+        match lvalue_root(t):
+            case Some(r):
+                self.bad[r] = true
+            case None:
+                pass
+
+    fn expr(ref self, e: Expr):
+        match e.kind:
+            case ExprKind.Ident(_):
+                match local_of(e):
+                    case Some(l):
+                        # read where its value could go anywhere
+                        if self.flocals_array(e):
+                            self.bad[l] = true
+                    case None:
+                        pass
+                return
+            case ExprKind.Index(b, i):
+                match local_of(b):
+                    case Some(a):
+                        self.index(e, a, i)
+                        self.expr(i)
+                        return
+                    case None:
+                        pass
+            case ExprKind.Call(_, args):
+                if e.cres == CallRes.Builtin(Builtin.Len) and len(args) == 1:
+                    if local_of(args[0].expr).is_some():
+                        return
+                for a in args:
+                    if a.by_ref:
+                        self.target(a.expr)
+            case ExprKind.MethodCall(recv, _, _, args):
+                # a receiver may be changed in place
+                self.target(recv)
+                for a in args:
+                    if a.by_ref:
+                        self.target(a.expr)
+            case ExprKind.Comp(_):
+                self.par = true
+                return
+            case _:
+                pass
+        for c in children(e):
+            self.expr(c)
+
+    fn flocals_array(self, e: Expr) -> bool:
+        match e.ty:
+            case Ty.Array(_):
+                return true
+            case _:
+                return false
+
+    fn index(ref self, e: Expr, a: int, i: Expr):
+        let ik = ranges.key(e.span)
+        match i.kind:
+            case ExprKind.Ident(_):
+                if local_of(i) == Some(self.j):
+                    self.found.push(IdxCand(idx=ik, add="", arr=a, x=-1, lit=0, neg=false))
+            case ExprKind.Binary(op, l, r):
+                if op != BinOp.Add and op != BinOp.Sub:
+                    return
+                let lj = local_of(l) == Some(self.j)
+                let rj = local_of(r) == Some(self.j)
+                if not lj and not (rj and op == BinOp.Add):
+                    return
+                let other = r if lj else l
+                let ak = ranges.key(i.span)
+                let neg = op == BinOp.Sub
+                match other.kind:
+                    case ExprKind.Int(v):
+                        if -(i128(1) << 40) < v < (i128(1) << 40):
+                            self.found.push(
+                                IdxCand(idx=ik, add=ak, arr=a, x=-1, lit=int(v), neg=neg)
+                            )
+                    case ExprKind.Ident(_):
+                        match local_of(other):
+                            case Some(x):
+                                if x != self.j:
+                                    self.found.push(
+                                        IdxCand(idx=ik, add=ak, arr=a, x=x, lit=0, neg=neg)
+                                    )
+                            case None:
+                                pass
+                    case _:
+                        pass
+            case _:
+                pass
 
 # How a loop uses its local arrays: `seen` indexed, `written` changed through
 # an index (assigned, a receiver, a `ref` argument), `bad` used any other way (copied, passed, reassigned, iterated).
