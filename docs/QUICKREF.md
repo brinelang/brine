@@ -548,6 +548,7 @@ fn index_of(xs: [int], target: int) -> int:
 ```python
 import geometry            # loads geometry.br next to the main file
 import util.strings as s   # loads util/strings.br
+import ..common            # loads common.br from the directory above
 
 let a = geometry.area(2.0, 3.0)
 let p = geometry.Point(x=1, y=2)
@@ -555,6 +556,11 @@ let p = geometry.Point(x=1, y=2)
 from geometry import Point, area   # use these names directly
 let q = Point(x=3, y=4)
 ```
+
+Every module path starts at the main file's directory, in whichever module the
+`import` is written. Each leading `..` goes one directory up: `import ..common`,
+`from ..common import Thing`, `import ....shared.util` (two up), and the module
+is named after its last part (`common`, `util`).
 
 `from m import x` only imports items defined in `m` itself. A name can't be both
 imported and defined in the same module.

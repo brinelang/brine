@@ -2,7 +2,7 @@
 # and link.
 from diag import Span, Diag, SourceMap
 import diag
-from ast import Module, Program
+from ast import Module, Program, module_name
 from parser import parse_module
 from types import Ty, IntTy
 from info import ProgramInfo, TryKind, try_kind, PRELUDE
@@ -65,6 +65,31 @@ fn display_path(p: str) -> str:
     if s.starts_with("./"):
         return s[2:]
     return s
+
+# The directory above `d`.
+fn up_dir(d: str) -> str:
+    if d == "." or d == "":
+        return ".."
+    match project.file_name(d):
+        case Some(_):
+            match project.parent(d):
+                case Some(up):
+                    return up if up != "" else "."
+                case None:
+                    pass
+        case None:
+            pass
+    return project.join(d, "..")
+
+# The file `import <path>` loads, from directory `root`.
+fn module_file(root: str, path: [str]) -> str:
+    var p = root
+    for seg in path:
+        if seg == "..":
+            p = up_dir(p)
+        else:
+            p = project.join(p, seg)
+    return p + ".br"
 
 fn dir_of(p: str) -> str:
     match project.parent(p):
@@ -129,17 +154,14 @@ fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
         while i < first_new:
             var targets: [int] = []
             for imp in prog.modules[i].imports:
-                let name = ".".join(imp.path)
+                let name = module_name(imp.path)
                 match by_name.get(name):
                     case Some(t):
                         targets.push(t)
                         continue
                     case None:
                         pass
-                var p = root
-                for seg in imp.path:
-                    p = project.join(p, seg)
-                p += ".br"
+                let p = module_file(root, imp.path)
                 let idx = first_new + len(found)
                 by_name[name] = idx
                 targets.push(idx)
@@ -149,13 +171,7 @@ fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
                             Found(name=name, src=Some(src), file=sm.add(display_path(p), src))
                         )
                     case Err(_):
-                        diags.push(
-                            diag.error("E0701", f"module `{name}` not found")
-                            .label(imp.span, "expected a file at `" + display_path(p) + "`")
-                            .with_help(
-                                "modules are `.br` files next to the main file; `import a.b` loads `a/b.br`"
-                            )
-                        )
+                        diags.push(not_found(name, imp.path, imp.span, root, p))
                         # keeps the numbering: an empty module
                         found.push(Found(name=name, src=None, file=prog.modules[i].file))
             prog.import_targets.push(targets)
@@ -173,6 +189,26 @@ fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
         prog.import_targets.push([])
     prog.main_module = 0
     return Some(prog)
+
+# E0701, with the directory above where the module is, if it is in one.
+fn not_found(name: str, path: [str], span: Span, root: str, p: str) -> Diag:
+    var d = diag.error(
+        "E0701",
+        f"module `{name}` not found"
+    ).label(span, "expected a file at `" + display_path(p) + "`")
+    let shown = display_path(root) if root != "." else "."
+    var up = path
+    for _ in 0..8:
+        up.insert(0, "..")
+        let q = module_file(root, up)
+        if os.is_file(q):
+            let fixed = module_name(up)
+            return d.note(
+                f"modules are found from `{shown}`, the main file's directory"
+            ).with_help(f"`{display_path(q)}` exists: import it with `import {fixed}`")
+    return d.note(f"modules are found from `{shown}`, the main file's directory").with_help(
+        "`import a.b` loads `a/b.br` there, and `import ..a` loads `a.br` from the directory above"
+    )
 
 struct FrontOpts:
     verify: bool
