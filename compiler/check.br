@@ -32,7 +32,13 @@ struct ParCx:
     is_for: bool
     loop_var: Option[int]
     captures: [int]
+    # `par for`: the arrays written, each at `xs[k * i + c]` with its k
+    # (`ks`) and the offsets c of its writes (`cs`)
     writes: [int]
+    ks: [int]
+    cs: [[int]]
+    # writes already reported as clashing with another
+    clashes: [Span]
 
 struct GenType:
     name: str
@@ -1500,7 +1506,16 @@ struct Checker:
                 if is_par:
                     let level = self.cur_level() + 1
                     self.par_stack.push(
-                        ParCx(level=level, is_for=true, loop_var=None, captures=[], writes=[])
+                        ParCx(
+                            level=level,
+                            is_for=true,
+                            loop_var=None,
+                            captures=[],
+                            writes=[],
+                            ks=[],
+                            cs=[],
+                            clashes=[]
+                        )
                     )
                 self.scopes.push([])
                 let id = self.declare(var_name, var_span, elem, kind)
@@ -1541,25 +1556,37 @@ struct Checker:
                     let cx = self.par_stack.pop()
                     s.caps = cx.captures
                     s.writes = cx.writes
-                    for w in cx.writes:
+                    for j, w in enumerate(cx.writes):
                         var bad: [Span] = []
-                        scan_bad_uses_block(body2, w, id, ref bad)
+                        self.bad_uses_block(body2, w, id, cx.ks[j], cx.cs[j], ref bad)
+                        bad = [b for b in bad if b not in cx.clashes]
                         if len(bad) > 0:
                             let n = self.locals[w].name
-                            let vn = var_name
-                            self.err(
+                            let at = " and ".join(
+                                [
+                                    f"`{n}[" + affine_str(cx.ks[j], c, var_name) + "]`"
+                                    for c in cx.cs[j]
+                                ]
+                            )
+                            var d = (
                                 diag.error(
                                     "E0502",
-                                    f"`{n}` is written at `{n}[{vn}]` in this `par for`, so it can't be accessed any other way"
+                                    f"`{n}` is written at {at} in this `par for`, so it can't be accessed any other way"
                                 )
                                 .label(bad[0], "accessed here")
                                 .note(
                                     "other iterations may be writing to the other elements at the same time"
                                 )
-                                .with_help(
-                                    f"only use `{n}[{vn}]` inside the loop, or copy the data you need before the loop"
-                                )
                             )
+                            if cx.ks[j] == 1:
+                                d = d.with_help(
+                                    f"only use {at} inside the loop, or copy the data you need before the loop"
+                                )
+                            else:
+                                d = d.with_help(
+                                    f"inside the loop, only use the elements this iteration writes, or `{n}[{cx.ks[j]} * {var_name} + c]` that no iteration writes; or copy the data you need before the loop"
+                                )
+                            self.err(d)
                 s.kind = StmtKind.For(var_name, var_span, ty, iter2, invs, body2, is_par)
             case StmtKind.Return(e):
                 if len(self.par_stack) > 0:
@@ -2263,6 +2290,162 @@ struct Checker:
                 )
                 return Ty.Error
 
+    # `xs[k * i + c]` written in the `par for` cx (with i its loop variable over
+    # a range, and constants k >= 1 and c): (k, c). The elements of an array
+    # may repeat, so a loop over one may not write.
+    fn par_write_shape(self, e: Expr, cx: ParCx) -> Option[(int, int)]:
+        match root_step(e):
+            case Some(st):
+                match st.kind:
+                    case ExprKind.Index(base, idx):
+                        match base.ty:
+                            case Ty.Array(_):
+                                match cx.loop_var:
+                                    case Some(l):
+                                        if self.locals[l].kind == LocalKind.ForVar:
+                                            return self.affine_of(idx, l)
+                                    case None:
+                                        pass
+                            case _:
+                                pass
+                    case _:
+                        pass
+            case None:
+                pass
+        return None
+
+    # Records a write of `root[k * i + c]` in the `par for` par_stack[top]; false
+    # (with an error) when another write of `root` in it could hit the same
+    # element from another iteration: k * i + c == k * j + c2 for i != j.
+    fn add_par_write(ref self, top: int, root: int, k: int, c: int, span: Span) -> bool:
+        var j = -1
+        for x, w in enumerate(self.par_stack[top].writes):
+            if w == root:
+                j = x
+        if j < 0:
+            self.par_stack[top].writes.push(root)
+            self.par_stack[top].ks.push(k)
+            self.par_stack[top].cs.push([c])
+            return true
+        let k0 = self.par_stack[top].ks[j]
+        var clash = k != k0
+        for c2 in self.par_stack[top].cs[j]:
+            if c2 != c and (c - c2) % k == 0:
+                clash = true
+        if not clash:
+            if c not in self.par_stack[top].cs[j]:
+                self.par_stack[top].cs[j].push(c)
+            return true
+        let n = self.locals[root].name
+        var lv = "i"
+        match self.par_stack[top].loop_var:
+            case Some(l):
+                lv = self.locals[l].name
+            case None:
+                pass
+        self.par_stack[top].clashes.push(span)
+        let first = affine_str(k0, self.par_stack[top].cs[j][0], lv)
+        self.err(
+            diag.error(
+                "E0501",
+                f"two iterations of this `par for` could write the same element of `{n}`"
+            )
+            .label(span, f"`{n}` is also written at `{n}[{first}]`")
+            .note(f"`{n}` is shared by all parallel iterations")
+            .with_help(
+                f"write `{n}` only at `{n}[k * {lv} + c]` with the same constant k everywhere and offsets c that aren't a multiple of k apart, e.g. `{n}[2 * {lv}]` and `{n}[2 * {lv} + 1]`"
+            )
+        )
+        return false
+
+    # `idx` as `k * lv + c` (or `lv`, `lv * k`, `c + k * lv`, `k * lv - c`, ...)
+    # with integer constants k >= 1 and c: (k, c).
+    fn affine_of(self, idx: Expr, lv: int) -> Option[(int, int)]:
+        if local_of(idx) == Some(lv):
+            return Some((1, 0))
+        match idx.kind:
+            case ExprKind.Binary(op, l, r):
+                if op == BinOp.Mul:
+                    for a, b in [(l, r), (r, l)]:
+                        if local_of(a) == Some(lv):
+                            match self.small_const(b):
+                                case Some(k):
+                                    if k >= 1:
+                                        return Some((k, 0))
+                                case None:
+                                    pass
+                elif op == BinOp.Add or op == BinOp.Sub:
+                    match self.small_const(r):
+                        case Some(c):
+                            match self.affine_of(l, lv):
+                                case Some(kc):
+                                    return Some((kc.0, kc.1 + c if op == BinOp.Add else kc.1 - c))
+                                case None:
+                                    pass
+                        case None:
+                            pass
+                    if op == BinOp.Add:
+                        match self.small_const(l):
+                            case Some(c):
+                                match self.affine_of(r, lv):
+                                    case Some(kc):
+                                        return Some((kc.0, kc.1 + c))
+                                    case None:
+                                        pass
+                            case None:
+                                pass
+            case _:
+                pass
+        return None
+
+    fn small_const(self, e: Expr) -> Option[int]:
+        match self.eval_const(e):
+            case Some(ConstVal.Int(v)):
+                if v > -(1 << 30) and v < (1 << 30):
+                    return Some(int(v))
+            case _:
+                pass
+        return None
+
+    # Uses of `w` in a `par for` body (loop variable lv) that may be another
+    # iteration's element: anything but `w[k * lv + c]` where c is one of the
+    # offsets written (`cs`), or isn't any of them plus a multiple of k.
+    fn bad_uses_expr(self, e: Expr, w: int, lv: int, k: int, cs: [int], ref bad: [Span]):
+        match e.kind:
+            case ExprKind.Index(base, idx):
+                if local_of(base) == Some(w):
+                    var ok = false
+                    match self.affine_of(idx, lv):
+                        case Some(kc):
+                            ok = kc.0 == k
+                            for c in cs:
+                                if c != kc.1 and (kc.1 - c) % k == 0:
+                                    ok = false
+                        case None:
+                            pass
+                    if not ok:
+                        bad.push(e.span)
+                    self.bad_uses_expr(idx, w, lv, k, cs, ref bad)
+                    return
+                self.bad_uses_expr(base, w, lv, k, cs, ref bad)
+                self.bad_uses_expr(idx, w, lv, k, cs, ref bad)
+                return
+            case ExprKind.Ident(_):
+                if local_of(e) == Some(w):
+                    bad.push(e.span)
+                return
+            case _:
+                pass
+        for c in children(e):
+            self.bad_uses_expr(c, w, lv, k, cs, ref bad)
+
+    fn bad_uses_block(self, b: Block, w: int, lv: int, k: int, cs: [int], ref bad: [Span]):
+        for s in b.stmts:
+            for e in stmt_exprs(s):
+                self.bad_uses_expr(e, w, lv, k, cs, ref bad)
+            for blk in stmt_blocks(s):
+                self.bad_uses_block(blk, w, lv, k, cs, ref bad)
+
     # Validates that `e` can be mutated: it must be a place rooted at a mutable
     # local, and must respect the race-freedom rules inside `par` bodies.
     fn check_mutation_target(ref self, e: Expr, what: str) -> Option[int]:
@@ -2329,37 +2512,15 @@ struct Checker:
             if top >= 0:
                 let cx = self.par_stack[top]
                 if cx.is_for and info.par_level + 1 == cx.level:
-                    # `xs[i]` only: map entries aren't separate memory
-                    match root_step(e):
-                        case Some(st):
-                            match st.kind:
-                                case ExprKind.Index(base, idx):
-                                    match base.ty:
-                                        case Ty.Array(_):
-                                            match idx.kind:
-                                                case ExprKind.Ident(_):
-                                                    match idx.res:
-                                                        case Res.Local(l):
-                                                            # the elements of an array may repeat
-                                                            ok = (
-                                                                cx.loop_var == Some(l)
-                                                                and self.locals[l].kind
-                                                                == LocalKind.ForVar
-                                                            )
-                                                        case _:
-                                                            pass
-                                                case _:
-                                                    pass
-                                        case _:
-                                            pass
-                                case _:
-                                    pass
+                    # `xs[k * i + c]` only: map entries aren't separate memory
+                    match self.par_write_shape(e, cx):
+                        case Some(kc):
+                            ok = true
+                            if not self.add_par_write(top, root, kc.0, kc.1, e.span):
+                                return None
                         case None:
                             pass
-            if ok:
-                if root not in self.par_stack[top].writes:
-                    self.par_stack[top].writes.push(root)
-            else:
+            if not ok:
                 var lv = "i"
                 var over_range = true
                 if top >= 0:
@@ -2383,7 +2544,7 @@ struct Checker:
                                 pass
                     case None:
                         pass
-                var help = f"a `par for` may only write `{info.name}[{lv}]` (its own element); to combine values use `par sum(...)`, `par [...]`, or a sequential loop"
+                var help = f"a `par for` may only write `{info.name}[{lv}]` (its own element), or `{info.name}[k * {lv} + c]` with constants k and c; to combine values use `par sum(...)`, `par [...]`, or a sequential loop"
                 if not over_range and top >= 0 and self.par_stack[top].is_for:
                     help = f"only a `par for` over a range may write `{info.name}[i]`; loop over the indexes instead, e.g. `par for i in 0..len(xs)`"
                 if on_map:
@@ -3260,7 +3421,16 @@ struct Checker:
                     self.spec_err(span)
                 let level = self.cur_level() + 1
                 self.par_stack.push(
-                    ParCx(level=level, is_for=false, loop_var=None, captures=[], writes=[])
+                    ParCx(
+                        level=level,
+                        is_for=false,
+                        loop_var=None,
+                        captures=[],
+                        writes=[],
+                        ks=[],
+                        cs=[],
+                        clashes=[]
+                    )
                 )
                 var xs = elems
                 let exps = self.tuple_exps(exp, len(xs))
@@ -3620,7 +3790,16 @@ struct Checker:
         if c.par:
             let level = self.cur_level() + 1
             self.par_stack.push(
-                ParCx(level=level, is_for=false, loop_var=None, captures=[], writes=[])
+                ParCx(
+                    level=level,
+                    is_for=false,
+                    loop_var=None,
+                    captures=[],
+                    writes=[],
+                    ks=[],
+                    cs=[],
+                    clashes=[]
+                )
             )
         self.scopes.push([])
         let vname = c.name
@@ -6737,32 +6916,14 @@ fn expr_mentions(e: Expr, id: int) -> bool:
             return true
     return false
 
-fn scan_bad_uses_expr(e: Expr, w: int, lv: int, ref bad: [Span]):
-    match e.kind:
-        case ExprKind.Index(base, idx):
-            if local_of(base) == Some(w):
-                if local_of(idx) != Some(lv):
-                    bad.push(e.span)
-                scan_bad_uses_expr(idx, w, lv, ref bad)
-                return
-            scan_bad_uses_expr(base, w, lv, ref bad)
-            scan_bad_uses_expr(idx, w, lv, ref bad)
-            return
-        case ExprKind.Ident(_):
-            if local_of(e) == Some(w):
-                bad.push(e.span)
-            return
-        case _:
-            pass
-    for c in children(e):
-        scan_bad_uses_expr(c, w, lv, ref bad)
-
-fn scan_bad_uses_block(b: Block, w: int, lv: int, ref bad: [Span]):
-    for s in b.stmts:
-        for e in stmt_exprs(s):
-            scan_bad_uses_expr(e, w, lv, ref bad)
-        for blk in stmt_blocks(s):
-            scan_bad_uses_block(blk, w, lv, ref bad)
+# `k * lv + c`, as written in messages.
+fn affine_str(k: int, c: int, lv: str) -> str:
+    var t = lv if k == 1 else f"{k} * {lv}"
+    if c > 0:
+        t += f" + {c}"
+    elif c < 0:
+        t += f" - {-c}"
+    return t
 
 fn first_binding(p: Pattern) -> Option[Span]:
     match p.kind:

@@ -120,9 +120,13 @@ be a rule that can be broken. Use `assert` explicitly instead.
 | `par(f(a), g(b))` | Fork-join of independent expressions; returns a tuple. |
 
 **Race freedom is a compile-time rule.** Inside a `par` body, variables from the
-enclosing scope are read-only, with one exception: an array declared outside may be
-written *only at the loop index* (`out[i] = ...`), and then it may not be accessed at
-any other index in the body. Function calls cannot receive outer variables as `ref`.
+enclosing scope are read-only, with one exception: in a `par for` over a range, an
+array declared outside may be written *only at the loop index* (`out[i] = ...`), and
+then it may not be accessed at any other index in the body. Strided writes
+generalize this: `out[k * i + c]` with constants `k >= 1` and `c`, the same `k` for
+every write of `out` and offsets `c` that aren't a multiple of `k` apart, never hit
+another iteration's element (k·i + c = k·j + c' needs k | c' - c), and reads at
+offsets that no write has modulo `k` touch elements no iteration writes. Function calls cannot receive outer variables as `ref`.
 Since values have no observable aliasing, this is sufficient for data-race freedom.
 
 Reductions are **deterministic**: they combine in one fixed order that depends only
@@ -178,7 +182,7 @@ panics exactly as it would on the CPU.
   the construct reruns on the CPU, which panics with the usual message. Apple GPUs
   flush subnormal f32 values to zero, so on Metal a subnormal operand or result
   sets the flag too, and the construct reruns on the CPU. Results are
-  only copied back after a launch succeeded, and a body may only write `out[i]`, so
+  only copied back after a launch succeeded, and a body may only write its own elements (`out[i]`), so
   rerunning is safe.
 * *Copies:* every launch copies the arrays the body reads to the device and the ones
   it writes back (arrays are values, so nothing else can see them in between).

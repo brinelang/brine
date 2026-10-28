@@ -401,12 +401,20 @@ let ys = par [f(x) for x in xs]              # parallel map
 let total = par sum(x * x for x in xs)        # parallel reduction
 var out = [0.0] * n
 par for i in 0..n:                            # parallel loop
-    out[i] = xs[i] * 2.0                      # only out[i] of outer arrays may be written
+    out[i] = xs[i] * 2.0                      # outer arrays: only out[i] (or out[k*i + c])
 let (a, b) = par(work(1), work(2))            # fork-join
 ```
 Rules: inside a `par` body, outer variables are read-only, except that
 `par for i in lo..hi` (over a range) may write `arr[i]` (exactly the loop
-variable) of an outer array.
+variable) of an outer array, or `arr[k * i + c]` with integer constants
+`k >= 1` and `c`: every write of `arr` in the loop uses the same `k`, and its
+offsets `c` aren't a multiple of `k` apart, so no two iterations write the same
+element. The loop may also read `arr[k * i + c]` at an element it writes, or at
+one no iteration writes. So in-place red-black sweeps work:
+```python
+par for i in 0..n:
+    a[2 * i + 1] = 0.5 * (a[2 * i] + a[2 * i + 2])   # odd from even
+```
 Reductions are deterministic: same result bits on any machine and thread count.
 They fold leaves of 16 consecutive elements left to right, then combine the leaves
 in a balanced pairwise tree (so `par sum` of floats can differ in the last bits from
