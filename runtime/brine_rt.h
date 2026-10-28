@@ -9,6 +9,13 @@
 #include <stddef.h>
 #include <math.h>
 
+/* a*b+c rounds twice, as written, on every target: no fused multiply-adds
+ * (the driver also passes -ffp-contract=off; this covers a C compiler run by
+ * hand on the output of `brine emit-c`) */
+#ifdef __clang__
+#pragma STDC FP_CONTRACT OFF
+#endif
+
 #if defined(__GNUC__) || defined(__clang__)
 #define BR_NORETURN __attribute__((noreturn))
 #define BR_LIKELY(x) __builtin_expect(!!(x), 1)
