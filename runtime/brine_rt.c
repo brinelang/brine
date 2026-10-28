@@ -212,7 +212,19 @@ static int64_t br_rank = 0, br_size = 1;
 static void br_flush(void) { fflush(stdout); }
 static void br_gpu_settle(void);
 
+/* Set by the first panic. Only that one is reported: a thread that fails
+ * (or prints) after it waits for the exit, so a `par` region failing on many
+ * threads prints one clean message. */
+static int br_panicking;
+static BR_NORETURN void br_park(void) {
+    for (;;) br_sleep_ms(1000);
+}
+static void br_panic_claim(void) {
+    if (__atomic_exchange_n(&br_panicking, 1, __ATOMIC_SEQ_CST)) br_park();
+}
+
 void brine_panic_at(const char *loc, const char *msg) {
+    br_panic_claim();
     /* under the output lock, so other threads' output (the GPU log) can't
      * land in the middle */
     br_lock(&br_io_mu);
@@ -1989,6 +2001,7 @@ brine_str *brine_sb_finish(brine_sb *sb) {
 }
 /* write a finished builder (and free it); `print` adds its own `end` */
 void brine_out_sb(brine_sb *sb) {
+    if (BR_UNLIKELY(__atomic_load_n(&br_panicking, __ATOMIC_RELAXED))) br_park();
     br_lock(&br_io_mu);
     fwrite(sb->p, 1, (size_t)sb->len, stdout);
     br_unlock(&br_io_mu);
@@ -1996,6 +2009,7 @@ void brine_out_sb(brine_sb *sb) {
     sb->p = NULL;
 }
 void brine_err_sb(brine_sb *sb) {
+    if (BR_UNLIKELY(__atomic_load_n(&br_panicking, __ATOMIC_RELAXED))) br_park();
     br_lock(&br_io_mu);
     fflush(stdout);
     fwrite(sb->p, 1, (size_t)sb->len, stderr);
