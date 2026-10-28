@@ -55,6 +55,8 @@ struct Owned:
     v: int
     ty: Ty
     home: bool
+    # the local whose home this is, else -1
+    lid: int
 
 # For `x / 2^k` and `x % 2^k` on a signed integer, k (else -1): floor division
 # by a power of two is an arithmetic shift and the floored remainder a mask.
@@ -151,6 +153,15 @@ struct FnCx:
     pre_idx: {str: int}
     # the keys in `arrc` (negative) of the array fields loops cache, by path
     fkeys: {str: int}
+    # parameters this body owns (an `__own` clone, see `own_call`) and the
+    # depth of the scope of the body's own statements
+    own_params: {int: bool}
+    body_depth: int
+    # the next call_fn call takes argument `own_arg` moved from `own_slot`
+    # and calls the clone that owns it
+    own_arg: int
+    own_slot: int
+    own_mask: int
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -201,7 +212,12 @@ fn new_cx(f: Func) -> FnCx:
         reset={},
         apps={},
         pre_idx={},
-        fkeys={}
+        fkeys={},
+        own_params={},
+        body_depth=-1,
+        own_arg=-1,
+        own_slot=-1,
+        own_mask=0
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -285,6 +301,10 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         clones=[],
         cloned={},
         nc_body=false,
+        odecls={},
+        own_clones=[],
+        own_seen={},
+        own_body=0,
         khints={},
         kernels=[]
     )
@@ -325,6 +345,13 @@ struct Lower:
     cloned: {int: bool}
     # the body being lowered is such a clone
     nc_body: bool
+    # every brine function by id, the clones that own some by-value
+    # parameters (`own_call`: id and a mask of parameters), and the mask of
+    # the body being lowered
+    odecls: {int: FnDecl}
+    own_clones: [(int, int)]
+    own_seen: {str: bool}
+    own_body: int
     # the array lengths callers pass (kernel.br), and the kernels made
     khints: {int: [int]}
     kernels: [str]
@@ -343,18 +370,30 @@ struct Lower:
         for m in prog.modules:
             for f in m.fns:
                 if not f.is_extern:
+                    self.odecls[f.id] = f
+        for m in prog.modules:
+            for f in m.fns:
+                if not f.is_extern:
                     self.gen_body(f, self.info.fns[f.id].c_name, false)
         if self.opts.tests:
             self.gen_tests()
         else:
             self.gen_main()
         var ci = 0
-        while ci < len(self.clones):
-            let f = self.fdecls[self.clones[ci]]
-            self.nc_body = true
-            self.gen_body(f, self.info.fns[f.id].c_name + "__nc", false)
-            self.nc_body = false
-            ci += 1
+        var oi = 0
+        while ci < len(self.clones) or oi < len(self.own_clones):
+            if ci < len(self.clones):
+                let f = self.fdecls[self.clones[ci]]
+                self.nc_body = true
+                self.gen_body(f, self.info.fns[f.id].c_name + "__nc", false)
+                self.nc_body = false
+                ci += 1
+            else:
+                let (id, mask) = self.own_clones[oi]
+                self.own_body = mask
+                self.gen_body(self.odecls[id], own_name(self.info.fns[id].c_name, mask), false)
+                self.own_body = 0
+                oi += 1
         var externs: [Func] = []
         var seen: {str: bool} = {}
         for sig in self.info.fns:
@@ -406,6 +445,7 @@ struct Lower:
             self.dbg_func(f, is_test)
         elif self.opts.fast:
             self.cx.packed = pack.find(f.body, f.locals)
+        var owned: [(int, int, Ty)] = []
         if not is_test:
             let sig = self.info.fns[f.id]
             var pi = 0
@@ -417,7 +457,16 @@ struct Lower:
                     continue
                 let v = pi + i
                 let id = f.param_locals[i]
-                if p.by_ref or self.agg(p.ty):
+                if not p.by_ref and owns_param(self.own_body, i):
+                    # an `__own` clone: the parameter is this body's to release
+                    let a = self.new_local(id, p.ty)
+                    if self.agg(p.ty):
+                        self.cx.fb.copy(a, v, self.lay(p.ty).size)
+                    else:
+                        self.cx.fb.store(a, 0, v)
+                    self.cx.own_params[id] = true
+                    owned.push((a, id, p.ty))
+                elif p.by_ref or self.agg(p.ty):
                     self.cx.lptr[id] = v
                     self.dbg_ptr_var(id, v, true)
                 else:
@@ -425,11 +474,16 @@ struct Lower:
                     self.cx.fb.store(a, 0, v)
             if self.tracks_caller(f.id):
                 self.cx.loc = len(ks) - 1
-            elif f.id in self.khints and not self.nc_body:
+            elif f.id in self.khints and not self.nc_body and self.own_body == 0:
                 self.kernel_entry(f, name)
         var nw = narrow.Narrow(arrs={}, guards=[])
-        if self.opts.fast and not self.opts.debug:
+        if self.opts.fast and not self.opts.debug and self.own_body == 0:
             nw = narrow.find(f.body, f.locals)
+        if len(owned) > 0:
+            self.push_scope()
+            for a, id, t in owned:
+                self.add_local_home(a, t, id)
+            self.cx.body_depth = len(self.cx.scopes) + 1
         if len(nw.arrs) > 0 and len(nw.guards) > 0:
             # bytes only while the parameters allow it, else plain arrays
             let slow = self.cx.fb.label()
@@ -446,6 +500,8 @@ struct Lower:
         else:
             self.cx.narrow = nw.arrs
         self.block(f.body)
+        if len(owned) > 0:
+            self.pop_scope()
         self.end_body(has)
         self.funcs.push(self.cx.fb.f)
 
@@ -833,13 +889,37 @@ struct Lower:
     fn add_home(ref self, p: int, ty: Ty):
         if self.managed(ty):
             let k = len(self.cx.scopes) - 1
-            self.cx.scopes[k].push(Owned(v=p, ty=ty, home=true))
+            self.cx.scopes[k].push(Owned(v=p, ty=ty, home=true, lid=-1))
+
+    # The home of local `id`, which the current scope releases unless its
+    # value is moved out (`drop_home`).
+    fn add_local_home(ref self, p: int, ty: Ty, id: int):
+        if self.managed(ty):
+            let k = len(self.cx.scopes) - 1
+            self.cx.scopes[k].push(Owned(v=p, ty=ty, home=true, lid=id))
+
+    fn has_home(self, id: int) -> bool:
+        for sc in self.cx.scopes:
+            for o in sc:
+                if o.lid == id:
+                    return true
+        return false
+
+    # Local `id`'s value was moved out: no exit from here on releases it.
+    fn drop_home(ref self, id: int):
+        for i in 0..len(self.cx.scopes):
+            var j = 0
+            while j < len(self.cx.scopes[i]):
+                if self.cx.scopes[i][j].lid == id:
+                    self.cx.scopes[i].pop(j)
+                else:
+                    j += 1
 
     # An owned value that the current scope releases.
     fn add_owned(ref self, v: int, ty: Ty):
         if self.managed(ty):
             let k = len(self.cx.scopes) - 1
-            self.cx.scopes[k].push(Owned(v=v, ty=ty, home=false))
+            self.cx.scopes[k].push(Owned(v=v, ty=ty, home=false, lid=-1))
 
     fn release_scopes_from(ref self, depth: int):
         var i = len(self.cx.scopes) - 1
@@ -2161,7 +2241,7 @@ struct Lower:
             if self.take_at(b.stmts, k):
                 k += 2
                 continue
-            if self.put_back(b.stmts, k):
+            if self.put_back(b.stmts, k) or self.move_let(b.stmts, k):
                 k += 1
                 continue
             self.stmt(b.stmts[k])
@@ -2207,7 +2287,7 @@ struct Lower:
                         let ty = self.flocals[id].ty
                         let p = self.new_local(id, ty)
                         self.st(p, 0, ty, v)
-                        self.add_home(p, ty)
+                        self.add_local_home(p, ty, id)
                     case LetPat.Tuple(_):
                         for i, id in enumerate(s.locals):
                             let ty = self.flocals[id].ty
@@ -2522,11 +2602,59 @@ struct Lower:
                 self.pop_frame()
                 let home = self.new_local(id, ty)
                 self.st(home, 0, ty, w)
-                self.add_home(home, ty)
+                self.add_local_home(home, ty, id)
                 self.cx.hit_e = -1
                 return true
             case None:
                 return false
+
+    # `var t = s` as the last use of `s`, a variable this block declared or a
+    # parameter this body owns: `t` takes over the value instead of sharing
+    # it, so changing `t` doesn't copy it.
+    fn move_let(ref self, stmts: [Stmt], k: int) -> bool:
+        if not self.moves_ok():
+            return false
+        let s = stmts[k]
+        match s.kind:
+            case StmtKind.Let(_, pat, _, init, is_ref):
+                if is_ref or len(s.locals) != 1 or not is_name(pat):
+                    return false
+                match local_of(init):
+                    case Some(src):
+                        let t = s.locals[0]
+                        let ty = self.flocals[t].ty
+                        if not self.managed(
+                            ty
+                        ) or self.flocals[src].ty != ty or not self.has_home(src):
+                            return false
+                        if not self.plain_local(t) or not self.plain_local(src):
+                            return false
+                        let param = src in self.cx.own_params and len(
+                            self.cx.scopes
+                        ) == self.cx.body_depth
+                        if not param and src in self.cx.own_params:
+                            return false
+                        if not last_use_from(stmts, k, src, param):
+                            return false
+                        let v = self.read_local(src)
+                        let home = self.new_local(t, ty)
+                        self.st(home, 0, ty, v)
+                        self.add_local_home(home, ty, t)
+                        self.drop_home(src)
+                        return true
+                    case None:
+                        return false
+            case _:
+                return false
+
+    # A variable kept in its home as itself (not as bits, bytes or an appender).
+    fn plain_local(self, id: int) -> bool:
+        let lc = self.flocals[id]
+        if lc.kind != LocalKind.Var and lc.kind != LocalKind.Let and lc.kind != LocalKind.Param:
+            return false
+        return not (
+            id in self.cx.packed or id in self.cx.narrow or id in self.cx.reset or id in self.cx.apps or id in self.cx.lptr
+        )
 
     # `p = w` with `w` an array variable this block declared and never uses
     # again: swap the two, so `p` takes w's reference and the scope frees
@@ -3395,6 +3523,8 @@ struct Lower:
                     return
                 case None:
                     pass
+        if op.is_none() and self.own_call(target, value):
+            return
         match target.kind:
             case ExprKind.Index(b0, i0):
                 if self.is_bits(b0):
@@ -3479,6 +3609,91 @@ struct Lower:
                     let cur = self.cx.fb.load(self.kind(ty), lp, 0)
                     let c = self.arith(o2, cur, v, ty, checked, span)
                     self.cx.fb.store(lp, 0, c)
+
+    # `x = f(x)` (or `x = x.step()`), `x` a variable or a place in one, where
+    # f starts a variable with that parameter: move x's value into a clone of
+    # f that owns the parameter, and store the result without releasing the
+    # old value (the clone did), so f changes it in place instead of copying.
+    # Nothing else in the call may read x, which is stale until the store.
+    fn own_call(ref self, target: Expr, value: Expr) -> bool:
+        if not self.moves_ok() or not self.managed(target.ty) or not array_place(target):
+            return false
+        var id = -1
+        var recv: Option[Expr] = None
+        var args: [Arg] = []
+        match value.kind:
+            case ExprKind.Call(_, a):
+                match value.cres:
+                    case CallRes.Fn(fid):
+                        id = fid
+                        args = a
+                    case _:
+                        return false
+            case ExprKind.MethodCall(r, _, _, a):
+                match value.cres:
+                    case CallRes.Fn(fid):
+                        id = fid
+                        args = a
+                    case CallRes.Method(fid):
+                        id = fid
+                        recv = Some(r)
+                        args = a
+                    case _:
+                        return false
+            case _:
+                return false
+        if id not in self.odecls:
+            return false
+        let sig = self.info.fns[id]
+        if sig.ret != target.ty or len(
+            self.cx.nc_calls
+        ) > 0 and ranges.key(value.span) in self.cx.nc_calls:
+            return false
+        var items: [Expr] = []
+        match recv:
+            case Some(r):
+                items.push(r)
+            case None:
+                pass
+        for a in args:
+            items.push(a.expr)
+        if len(items) > len(sig.params):
+            return false
+        var root = -1
+        match place_path(target):
+            case Some((l, _)):
+                root = l
+            case None:
+                return false
+        if root in self.cx.packed or root in self.cx.narrow or root in self.cx.lptr and self.flocals[
+            root
+        ].kind != LocalKind.RefParam:
+            return false
+        var ai = -1
+        for i, x in enumerate(items):
+            if has_try(x):
+                return false
+            if ai < 0 and not sig.params[
+                i
+            ].by_ref and sig.params[i].ty == target.ty and same_place(x, target):
+                ai = i
+            elif mentions_local(x, root):
+                return false
+        if ai < 0 or not consumes(self.odecls[id], ai):
+            return false
+        let mask = 1 << ai
+        let key = f"{id}:{mask}"
+        if key not in self.own_seen:
+            self.own_seen[key] = true
+            self.own_clones.push((id, mask))
+        let lp = self.lvalue(items[ai])
+        self.cx.own_arg = ai
+        self.cx.own_slot = lp
+        self.cx.own_mask = mask
+        let r = self.call_fn(id, recv, args, value.span)
+        self.claim(r)
+        self.st(lp, 0, target.ty, r)
+        return true
 
     # ------------------------------------------------------------ match
     fn match_stmt(ref self, scrut: Expr, cases: [Case]):
@@ -4226,6 +4441,12 @@ struct Lower:
         var sig = self.info.fns[id]
         if len(self.cx.nc_calls) > 0 and ranges.key(span) in self.cx.nc_calls:
             sig.c_name = sig.c_name + "__nc"
+        # set by `own_call` for this call only, not for calls in its arguments
+        let own_arg = self.cx.own_arg
+        let own_slot = self.cx.own_slot
+        self.cx.own_arg = -1
+        if own_arg >= 0:
+            sig.c_name = own_name(sig.c_name, self.cx.own_mask)
         var items: [(Expr, bool)] = []
         match recv:
             case Some(r):
@@ -4261,7 +4482,9 @@ struct Lower:
             cargs.push(sret)
         let base = len(cargs)
         for i, it in enumerate(items):
-            if late[i]:
+            if i == own_arg:
+                cargs.push(self.ld(own_slot, 0, it.0.ty))
+            elif late[i]:
                 self.pre_index(it.0)
                 cargs.push(-1)
             elif it.1:
@@ -6474,7 +6697,11 @@ fn same_place(a: Expr, b: Expr) -> bool:
 # Is `stmts[j]` the last use of `w`, a variable an earlier `let`/`var` of
 # this block declared, with no `ref` name for it?
 fn last_use(stmts: [Stmt], j: int, w: int) -> bool:
-    var declared = false
+    return last_use_from(stmts, j, w, false)
+
+# The same, where `declared` says w is a parameter (declared before them all).
+fn last_use_from(stmts: [Stmt], j: int, w: int, declared0: bool) -> bool:
+    var declared = declared0
     for i in 0..j:
         match stmts[i].kind:
             case StmtKind.Let(_, pat, _, _, is_ref):
@@ -6513,4 +6740,26 @@ fn ref_alias(s: Stmt, w: int) -> bool:
         for t in b.stmts:
             if ref_alias(t, w):
                 return true
+    return false
+
+fn own_name(c_name: str, mask: int) -> str:
+    return f"{c_name}__own{mask}"
+
+fn owns_param(mask: int, i: int) -> bool:
+    return i < 62 and ((mask >> i) & 1) == 1
+
+# Would a clone of `f` that owns parameter `pi` use it: does the body start
+# a variable with it, as its last use (`var t = p`, or a `mut p` parameter)?
+fn consumes(f: FnDecl, pi: int) -> bool:
+    if pi >= len(f.param_locals):
+        return false
+    let p = f.param_locals[pi]
+    let stmts = f.body.stmts
+    for k in 0..len(stmts):
+        match stmts[k].kind:
+            case StmtKind.Let(_, pat, _, init, is_ref):
+                if not is_ref and is_name(pat) and local_of(init) == Some(p):
+                    return last_use_from(stmts, k, p, true)
+            case _:
+                pass
     return false
