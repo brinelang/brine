@@ -147,6 +147,8 @@ struct FnCx:
     # string variables a loop appends bytes to through an appender
     # (`open_apps`): the appender's address
     apps: {int: int}
+    # index values evaluated ahead of their place (`pre_index`), by span
+    pre_idx: {str: int}
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -195,7 +197,8 @@ fn new_cx(f: Func) -> FnCx:
         hit_key=-1,
         hit_e=-1,
         reset={},
-        apps={}
+        apps={},
+        pre_idx={}
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -3190,8 +3193,20 @@ struct Lower:
                         if op.is_none():
                             # `m[k] = v` inserts
                             let vks = self.owned_all([value, i0])
-                            let vs = self.addr_of(vks[0], ty)
-                            let ks = self.addr_of(vks[1], i0.ty)
+                            # the map may grow: copy plain data read from it
+                            var vv = vks[0]
+                            var kv = vks[1]
+                            match place_path(b0):
+                                case Some(pp):
+                                    if reaches(value, [pp]):
+                                        vv = self.snapshot(vv, ty)
+                                    if reaches(i0, [pp]):
+                                        kv = self.snapshot(kv, i0.ty)
+                                case None:
+                                    vv = self.snapshot(vv, ty)
+                                    kv = self.snapshot(kv, i0.ty)
+                            let vs = self.addr_of(vv, ty)
+                            let ks = self.addr_of(kv, i0.ty)
                             let b = self.lvalue(b0)
                             self.cx.fb.call_void("brine_map_set", [b, ks, vs])
                             return
@@ -3407,7 +3422,7 @@ struct Lower:
             case ExprKind.Index(base, idx):
                 match base.ty:
                     case Ty.Map(_, _):
-                        let k = self.expr(idx)
+                        let k = self.index_val(idx)
                         let kp = self.addr_of(k, idx.ty)
                         let b = self.lvalue(base)
                         let loc = self.loc(e.span)
@@ -3420,7 +3435,7 @@ struct Lower:
                         return self.cx.fb.rt(K.Ptr, "brine_map_val_mut", [b, en, kp, vsz, loc])
                     case _:
                         pass
-                let i = self.expr(idx)
+                let i = self.index_val(idx)
                 let et = self.elem_ty(base, e.ty)
                 match self.cached_arr(base):
                     case Some(c):
@@ -3981,32 +3996,51 @@ struct Lower:
         var sig = self.info.fns[id]
         if len(self.cx.nc_calls) > 0 and ranges.key(span) in self.cx.nc_calls:
             sig.c_name = sig.c_name + "__nc"
-        # With a `ref` parameter, by-value arguments may read the variable the call
-        # changes; holding a reference of their own makes copy-on-write protect them.
-        let has_ref = any(p.by_ref for p in sig.params)
+        var items: [(Expr, bool)] = []
+        match recv:
+            case Some(r):
+                items.push((r, sig.params[0].by_ref))
+            case None:
+                pass
+        let pi = len(items)
+        for i, a in enumerate(args):
+            if pi + i >= len(sig.params):
+                break
+            items.push((a.expr, sig.params[pi + i].by_ref))
+        let hold = self.held_args(items)
+        # A `ref` to an array element made before a held argument would point
+        # into the array that argument then shares: make it after them all.
+        var late: [bool] = []
+        for i, it in enumerate(items):
+            var lt = false
+            if it.1:
+                match place_path(it.0):
+                    case Some(pp):
+                        if -1 in pp.1:
+                            for j in i + 1..len(items):
+                                if hold[j] and reaches(items[j].0, [pp]):
+                                    lt = true
+                    case None:
+                        pass
+            late.push(lt)
         var cargs: [int] = []
         var sret = -1
         if self.agg(sig.ret):
             let lay = self.lay(sig.ret)
             sret = self.cx.fb.temp_mem(lay.size, lay.align)
             cargs.push(sret)
-        var pi = 0
-        match recv:
-            case Some(r):
-                if sig.params[0].by_ref:
-                    cargs.push(self.lvalue(r))
-                else:
-                    cargs.push(self.value_arg(r, has_ref))
-                pi = 1
-            case None:
-                pass
-        for i, a in enumerate(args):
-            if pi + i >= len(sig.params):
-                break
-            if sig.params[pi + i].by_ref:
-                cargs.push(self.lvalue(a.expr))
+        let base = len(cargs)
+        for i, it in enumerate(items):
+            if late[i]:
+                self.pre_index(it.0)
+                cargs.push(-1)
+            elif it.1:
+                cargs.push(self.lvalue(it.0))
             else:
-                cargs.push(self.value_arg(a.expr, has_ref))
+                cargs.push(self.value_arg(it.0, hold[i]))
+        for i, it in enumerate(items):
+            if late[i]:
+                cargs[base + i] = self.lvalue(it.0)
         if self.tracks_caller(id):
             cargs.push(self.loc(span))
         if sret >= 0:
@@ -4065,13 +4099,75 @@ struct Lower:
         self.cx.fb.place(ok)
         return self.ld(v, self.vfield_off(xe, ok_v, 0), e.ty)
 
-    # A by-value argument; `hold` keeps a reference until the end of the statement.
+    # By-value arguments are snapshots taken before the call. With a `ref`
+    # argument the callee could change or free the memory they were read from:
+    # they are held (a shared array or string is copied before a write), or
+    # copied when they are plain data.
+    fn held_args(self, items: [(Expr, bool)]) -> [bool]:
+        let any_ref = any(it.1 for it in items)
+        return [any_ref and not it.1 for it in items]
+
+    # A by-value argument; `hold` keeps a reference until the end of the
+    # statement, or for plain data in memory, a copy.
     fn value_arg(ref self, e: Expr, hold: bool) -> int:
-        if not hold or not self.managed(e.ty):
+        if not hold:
             return self.expr(e)
+        if self.managed(e.ty):
+            let v = self.owned(e)
+            self.register(v, e.ty)
+            return v
+        let v = self.expr(e)
+        return self.snapshot(v, e.ty)
+
+    # A copy of the plain data in memory at `v` (other values are returned as is).
+    fn snapshot(ref self, v: int, ty: Ty) -> int:
+        if not self.agg(ty) or self.managed(ty):
+            return v
+        let lay = self.lay(ty)
+        let t = self.cx.fb.temp_mem(lay.size, lay.align)
+        self.cx.fb.copy(t, v, lay.size)
+        return t
+
+    # The owned value of `e`, to be stored into the place `dest`, which may
+    # move (an array or map that grows): plain data read from it is copied.
+    fn owned_for(ref self, e: Expr, dest: Expr) -> int:
         let v = self.owned(e)
-        self.register(v, e.ty)
-        return v
+        match place_path(dest):
+            case Some(pp):
+                if not reaches(e, [pp]):
+                    return v
+            case None:
+                pass
+        return self.snapshot(v, e.ty)
+
+    # Evaluate the indexes in the place `e` now, for an `lvalue(e)` later.
+    fn pre_index(ref self, e: Expr):
+        match e.kind:
+            case ExprKind.Field(b, _, _):
+                self.pre_index(b)
+            case ExprKind.Index(b, i):
+                # in `lvalue`'s order: a map's key before its base
+                match b.ty:
+                    case Ty.Map(_, _):
+                        self.cx.pre_idx[ranges.key(i.span)] = self.expr(i)
+                        self.pre_index(b)
+                    case _:
+                        self.pre_index(b)
+                        self.cx.pre_idx[ranges.key(i.span)] = self.expr(i)
+            case _:
+                pass
+
+    # The value of an index in a place, unless `pre_index` has it.
+    fn index_val(ref self, i: Expr) -> int:
+        if len(self.cx.pre_idx) > 0:
+            let k = ranges.key(i.span)
+            match self.cx.pre_idx.get(k):
+                case Some(v):
+                    self.cx.pre_idx.remove(k)
+                    return v
+                case None:
+                    pass
+        return self.expr(i)
 
     # The positions of named arguments among `fields`.
     fn arg_slots(self, args: [Arg], fields: [(str, Ty)]) -> [int]:
@@ -4320,7 +4416,7 @@ struct Lower:
             case Builtin.Push:
                 let r = recv.unwrap()
                 let el = r.ty.elem()
-                let v = self.owned(args[0].expr)
+                let v = self.owned_for(args[0].expr, r)
                 let tp = self.addr_of(v, el)
                 let lp = self.lvalue(r)
                 self.cx.fb.call_void("brine_arr_push", [lp, tp])
@@ -4345,7 +4441,7 @@ struct Lower:
                 let r = recv.unwrap()
                 let i0 = self.expr(args[0].expr)
                 let i = self.cx.fb.conv(K.I64, i0)
-                let v = self.owned(args[1].expr)
+                let v = self.owned_for(args[1].expr, r)
                 let tp = self.addr_of(v, r.ty.elem())
                 let lp = self.lvalue(r)
                 let loc = self.loc(e.span)
@@ -5895,3 +5991,66 @@ fn dtypedef(name: str, to: int) -> DType:
 
 fn dfield(name: str, ty: int, off: int) -> DField:
     return DField(name=name, ty=ty, off=off)
+
+# A place (`x`, `x.f`, `x[i].g`) as its root local and the steps to it: a
+# field index, or -1 for an element (of an array or a map).
+fn place_path(e: Expr) -> Option[(int, [int])]:
+    match e.kind:
+        case ExprKind.Ident(_):
+            match local_of(e):
+                case Some(l):
+                    return Some((l, []))
+                case None:
+                    return None
+        case ExprKind.Field(b, _, _):
+            match place_path(b):
+                case Some((l, p)):
+                    var q = p
+                    q.push(e.idx)
+                    return Some((l, q))
+                case None:
+                    return None
+        case ExprKind.Index(b, _):
+            match place_path(b):
+                case Some((l, p)):
+                    var q = p
+                    q.push(-1)
+                    return Some((l, q))
+                case None:
+                    return None
+        case _:
+            return None
+
+# Can two places with the same root share memory? Only when neither leaves
+# the other through a different field (elements may be the same one).
+fn steps_overlap(a: [int], b: [int]) -> bool:
+    let n = min(len(a), len(b))
+    for i in 0..n:
+        if a[i] >= 0 and b[i] >= 0 and a[i] != b[i]:
+            return false
+    return true
+
+fn mentions_local(e: Expr, id: int) -> bool:
+    if local_of(e) == Some(id):
+        return true
+    for c in children(e):
+        if mentions_local(c, id):
+            return true
+    return false
+
+# Can the value of `e` (a by-value argument, evaluated before the call) be
+# memory one of the places `refs` reaches? Then the callee could change or
+# free it through the `ref`. Different variables never share memory a `ref`
+# can change in place: a shared array or string is copied before a write.
+fn reaches(e: Expr, refs: [(int, [int])]) -> bool:
+    match place_path(e):
+        case Some((l, p)):
+            for r in refs:
+                if r.0 == l and steps_overlap(r.1, p):
+                    return true
+            return false
+        case None:
+            for r in refs:
+                if mentions_local(e, r.0):
+                    return true
+            return false
