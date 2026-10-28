@@ -521,6 +521,8 @@ test "clamp keeps values in range":
     assert clamp(15, 0, 10) == 10
     assert clamp(-5, 0, 10) == 0
 ```
+`test` is a keyword only at the start of a top-level line (and `case` only at
+the start of a line in a `match`), so both are fine as names elsewhere.
 `brine test` runs each test in its own process, in parallel. `$BRINE` is set to the
 `brine` running the tests, so a test can run the compiler. A test that runs longer
 than 300 seconds is stopped and fails (`brine test --timeout <seconds>`; 0: no limit).
