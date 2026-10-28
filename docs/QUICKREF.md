@@ -189,6 +189,9 @@ enum Expr:                           # recursive enums are fine
 
 let s = Shape.Rect(w=2.0, h=3.0)     # positional or keyword fields
 print(s, s.area(), s == Shape.Empty) # Shape.Rect(w=2.0, h=3.0) 6.0 false
+
+print(int(Color.Green))              # 1: an enum without data converts to its position
+print(Color.from_int(0), Color.from_int(7))   # Some(Color.Red) None
 ```
 
 Patterns: `_`, a name (captures), int/str/bool literals, tuples `(a, 0)`,

@@ -4296,8 +4296,26 @@ struct Checker:
                     return target
                 var ok = false
                 match target:
-                    case Ty.Int(_):
+                    case Ty.Int(k):
                         ok = at.is_numeric() or at == Ty.Bool or at == Ty.Str
+                        match at:
+                            # an enum without data: its variant's position, from 0
+                            case Ty.Enum(eid):
+                                let en = self.info.enums[eid]
+                                if not en.has_payload():
+                                    ok = true
+                                    let top = i128(len(en.variants) - 1)
+                                    if top > k.max():
+                                        self.err(
+                                            diag.error(
+                                                "E0301",
+                                                f"`{en.name}` has {len(en.variants)} variants, more than `{k.name()}` holds"
+                                            )
+                                            .label(args[0].expr.span, "too many variants")
+                                            .with_help("convert to `int` instead")
+                                        )
+                            case _:
+                                pass
                     case Ty.Float(_):
                         ok = at.is_numeric() or at == Ty.Str
                     case Ty.Str:
@@ -5061,6 +5079,8 @@ struct Checker:
         match static_ty:
             case Some(st):
                 self.inst_method(st, name, span)
+                if name == "from_int":
+                    self.enum_from_int(st)
                 let (tname, methods, _) = self.members(st)
                 if name not in methods:
                     match self.generic_method(st, name):
@@ -6246,6 +6266,81 @@ struct Checker:
         self.info.fns[id].has_self = has_self
         self.pending.push(Pending(module=module, env=env, decl=decl, what=what))
         return Some(id)
+
+    # `Color.from_int(i)` on an enum without data: made on first use, as
+    # `match i: case 0: return Some(Color.Red) ... case _: return None`.
+    fn enum_from_int(ref self, t: Ty):
+        var eid = 0
+        match t:
+            case Ty.Enum(e):
+                eid = e
+            case _:
+                return
+        let en = self.info.enums[eid]
+        if "from_int" in en.methods or en.has_payload() or en.origin.is_some():
+            return
+        let sp = en.span
+        var cases: [Case] = []
+        for vi, v in enumerate(en.variants):
+            let val = mk(ExprKind.Field(mk(ExprKind.Ident(en.name), sp), v.name, sp), sp)
+            let some = mk(
+                ExprKind.Call(
+                    mk(ExprKind.Ident("Some"), sp),
+                    [Arg(by_ref=false, name=None, expr=val)]
+                ),
+                sp
+            )
+            let body = Block(stmts=[stmt(StmtKind.Return(Some(some)), sp)], span=sp)
+            cases.push(Case(pat=pattern(PatKind.Int(i128(vi)), sp), guard=None, body=body, span=sp))
+        let none = stmt(StmtKind.Return(Some(mk(ExprKind.Ident("None"), sp))), sp)
+        cases.push(
+            Case(
+                pat=pattern(PatKind.Wild, sp),
+                guard=None,
+                body=Block(stmts=[none], span=sp),
+                span=sp
+            )
+        )
+        let m = stmt(StmtKind.Match(mk(ExprKind.Ident("i"), sp), cases), sp)
+        let id = len(self.info.fns)
+        let decl = FnDecl(
+            name="from_int",
+            name_span=sp,
+            params=[Param(name="i", span=sp, ty=None, by_ref=false, mutable=false)],
+            ret=None,
+            requires=[],
+            ensures=[],
+            body=Block(stmts=[m], span=sp),
+            span=sp,
+            is_extern=false,
+            method_of=Some(en.name),
+            tparams=[],
+            test_name=None,
+            id=id,
+            locals=[],
+            param_locals=[],
+            result_local=None
+        )
+        let ret = self.option_of(t, sp)
+        let mm = mangle_module(self.info.module_names[en.module])
+        self.info.fns.push(
+            FnSig(
+                name="from_int",
+                module=en.module,
+                idx=0,
+                params=[ParamSig(name="i", ty=Ty.Int(IntTy.I64), by_ref=false)],
+                ret=ret,
+                c_name=f"{mm}__{en.name}__from_int",
+                is_extern=false,
+                method_of=Some(t),
+                has_self=false,
+                span=sp
+            )
+        )
+        self.info.enums[eid].methods["from_int"] = id
+        self.pending.push(
+            Pending(module=en.module, env={}, decl=decl, what=f"`{en.name}.from_int`")
+        )
 
     # Checks the bodies of all instances made so far (which may make more).
     fn check_pending(ref self, ref prog: Program):
