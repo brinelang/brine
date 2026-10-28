@@ -193,6 +193,9 @@ print(s, s.area(), s == Shape.Empty) # Shape.Rect(w=2.0, h=3.0) 6.0 false
 Patterns: `_`, a name (captures), int/str/bool literals, tuples `(a, 0)`,
 alternatives `1 | 2 | 3`, and variants `Shape.Rect(w, _)` / `Expr.Add(left=l)`
 (nested to any depth). A guard adds a condition: `case x if x < 0:`.
+Alternatives may bind names when each binds the same ones with the same types:
+`case Shape.Circle(n) | Shape.Square(n):` (E0321 otherwise). With a guard,
+each alternative is tried in turn: `case (x, _) | (_, x) if x > 5:` matches `(1, 9)`.
 Every `match` must handle every value (error E0320 shows one it misses);
 end with `case _:` when listing values isn't possible. Variant data is read with
 `match`, never with `.field`.

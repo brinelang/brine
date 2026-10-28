@@ -206,7 +206,9 @@ fn new_checker() -> Checker:
         failed=false,
         src_dirs={},
         embedded={},
-        expand=[]
+        expand=[],
+        or_names=None,
+        or_seen=[]
     )
 
 struct Checker:
@@ -247,6 +249,10 @@ struct Checker:
     embedded: {Span: str}
     # statements that replace the one just checked (`a, b = b, a`)
     expand: [Stmt]
+    # inside a later alternative of `A(c) | B(c)`: the names the first one bound
+    or_names: Option[{str: int}]
+    # ... and the ones this alternative has bound so far
+    or_seen: [str]
 
     fn err(ref self, d: Diag):
         self.diags.push(d)
@@ -1808,7 +1814,18 @@ struct Checker:
                 let pattern_errors = self.error_count() > before
                 if not st.is_error() and st != Ty.Unit and not pattern_errors:
                     self.check_match_cases(scrut2, cases2, st)
-                s.kind = StmtKind.Match(scrut2, cases2)
+                # `case A(c) | B(c):` runs as `case A(c):` and `case B(c):` with
+                # the same body, so later passes never see names bound inside `|`
+                var split: [Case] = []
+                for c in cases2:
+                    if binds_in_or(c.pat, false):
+                        for q in or_split(c.pat):
+                            var c2 = c
+                            c2.pat = q
+                            split.push(c2)
+                    else:
+                        split.push(c)
+                s.kind = StmtKind.Match(scrut2, split)
             case StmtKind.Contract(_, _):
                 pass
 
@@ -1863,6 +1880,12 @@ struct Checker:
                         )
                     case _:
                         pass
+                match self.or_names:
+                    case Some(names):
+                        self.or_bind(ref p, name, names, ty)
+                        return
+                    case None:
+                        pass
                 p.local = self.declare(name, span, ty, LocalKind.Let)
             case PatKind.Int(v):
                 match ty:
@@ -1900,19 +1923,7 @@ struct Checker:
                 p.kind = PatKind.Tuple(ps2)
             case PatKind.Or(alts):
                 var alts2 = alts
-                for i in 0..len(alts2):
-                    self.check_pattern(ref alts2[i], ty)
-                    match first_binding(alts2[i]):
-                        case Some(sp):
-                            self.err(
-                                diag.error("E0321", "patterns joined with `|` can't bind names")
-                                .label(sp, "binds a name")
-                                .with_help(
-                                    "use `_` inside `|` patterns, or write a separate `case` for each alternative"
-                                )
-                            )
-                        case None:
-                            pass
+                self.check_or_pattern(ref alts2, ty)
                 p.kind = PatKind.Or(alts2)
             case PatKind.Variant(path, args):
                 match self.resolve_variant_path(path, span, ty):
@@ -1928,6 +1939,101 @@ struct Checker:
                         return
                     case Some((eid, vi)):
                         self.check_variant_pattern(ref p, path, args, eid, vi, ty)
+
+    # `A(c) | B(c)`: every alternative binds the same names with the same
+    # types. The first alternative declares them and the others reuse them.
+    fn check_or_pattern(ref self, ref alts: [Pattern], ty: Ty):
+        match self.or_names:
+            case Some(_):
+                # inside a later alternative of an outer `|`
+                let outer = self.or_seen
+                var first: [str] = []
+                for i in 0..len(alts):
+                    self.or_seen = []
+                    self.check_pattern(ref alts[i], ty)
+                    if i == 0:
+                        first = self.or_seen
+                    else:
+                        self.same_names(first, self.or_seen, alts[i].span)
+                self.or_seen = outer
+                self.or_seen.extend(first)
+                return
+            case None:
+                pass
+        let n0 = len(self.locals)
+        self.check_pattern(ref alts[0], ty)
+        var names: {str: int} = {}
+        var first: [str] = []
+        for id in n0..len(self.locals):
+            let n = self.locals[id].name
+            if n != "_" and n not in names:
+                names[n] = id
+                first.push(n)
+        for i in 1..len(alts):
+            self.or_names = Some(names)
+            self.or_seen = []
+            self.check_pattern(ref alts[i], ty)
+            let seen = self.or_seen
+            self.or_names = None
+            self.or_seen = []
+            self.same_names(first, seen, alts[i].span)
+
+    # A name in a later alternative of `|`: the first alternative's variable.
+    fn or_bind(ref self, ref p: Pattern, name: str, names: {str: int}, ty: Ty):
+        match names.get(name):
+            case Some(id):
+                p.local = id
+                if name in self.or_seen:
+                    self.err(
+                        diag.error("E0207", f"`{name}` is bound twice in this pattern")
+                        .label(p.span, "bound again here")
+                        .with_help("use a different name, or `_` to ignore a value")
+                    )
+                    return
+                self.or_seen.push(name)
+                let t0 = self.locals[id].ty
+                if not t0.is_error() and not ty.is_error() and t0 != ty:
+                    let tn = self.tn(ty)
+                    let tn0 = self.tn(t0)
+                    self.err(
+                        diag.error(
+                            "E0321",
+                            f"`{name}` has type {tn} here but {tn0} in the first alternative"
+                        )
+                        .label(p.span, f"has type {tn}")
+                        .label(self.locals[id].span, f"has type {tn0}")
+                        .with_help("write a separate `case` for each alternative")
+                    )
+            case None:
+                self.err(
+                    diag.error("E0321", f"`{name}` is bound here but not in the first alternative")
+                    .label(p.span, "only bound in this alternative")
+                    .with_help(
+                        "every alternative of `|` must bind the same names; use `_` for values you don't need"
+                    )
+                )
+                if self.lookup_local(name).is_none():
+                    p.local = self.declare(name, p.span, ty, LocalKind.Let)
+
+    fn same_names(ref self, first: [str], seen: [str], span: Span):
+        for n in first:
+            if n not in seen:
+                self.err(
+                    diag.error("E0321", f"`{n}` must be bound in every alternative of `|`")
+                    .label(span, f"doesn't bind `{n}`")
+                    .with_help(
+                        "bind the same names in each alternative, or write a separate `case` for each"
+                    )
+                )
+        for n in seen:
+            if n not in first:
+                self.err(
+                    diag.error("E0321", f"`{n}` is bound here but not in the first alternative")
+                    .label(span, f"binds `{n}`")
+                    .with_help(
+                        "every alternative of `|` must bind the same names; use `_` for values you don't need"
+                    )
+                )
 
     fn check_variant_pattern(
         ref self,
@@ -6999,46 +7105,57 @@ fn scan_bad_uses_block(b: Block, w: int, lv: int, ref bad: [Span]):
         for blk in stmt_blocks(s):
             scan_bad_uses_block(blk, w, lv, ref bad)
 
-fn first_binding(p: Pattern) -> Option[Span]:
+# Does `p` bind a name inside a `|`?
+fn binds_in_or(p: Pattern, in_or: bool) -> bool:
     match p.kind:
         case PatKind.Bind(_):
-            return Some(p.span)
-        case PatKind.Tuple(ps):
-            for q in ps:
-                match first_binding(q):
-                    case Some(s):
-                        return Some(s)
-                    case None:
-                        pass
-            return None
+            return in_or
         case PatKind.Or(ps):
-            for q in ps:
-                match first_binding(q):
-                    case Some(s):
-                        return Some(s)
-                    case None:
-                        pass
-            return None
-        case PatKind.Variant(_, args):
-            for q in p.fields:
-                match first_binding(q):
-                    case Some(s):
-                        return Some(s)
-                    case None:
-                        pass
-            match args:
-                case Some(list):
-                    for _, q in list:
-                        match first_binding(q):
-                            case Some(s):
-                                return Some(s)
-                            case None:
-                                pass
-                case None:
-                    pass
-            return None
+            return any(binds_in_or(q, true) for q in ps)
+        case PatKind.Tuple(ps):
+            return any(binds_in_or(q, in_or) for q in ps)
+        case PatKind.Variant(_, _):
+            return any(binds_in_or(q, in_or) for q in p.fields)
         case _:
-            return None
+            return false
+
+# The patterns without `|` that together match what `p` matches, in order.
+fn or_split(p: Pattern) -> [Pattern]:
+    match p.kind:
+        case PatKind.Or(alts):
+            var out: [Pattern] = []
+            for a in alts:
+                out.extend(or_split(a))
+            return out
+        case PatKind.Tuple(ps):
+            var out: [Pattern] = []
+            for elems in or_product(ps):
+                var q = p
+                q.kind = PatKind.Tuple(elems)
+                out.push(q)
+            return out
+        case PatKind.Variant(_, _):
+            var out: [Pattern] = []
+            for fields in or_product(p.fields):
+                var q = p
+                q.fields = fields
+                out.push(q)
+            return out
+        case _:
+            return [p]
+
+fn or_product(ps: [Pattern]) -> [[Pattern]]:
+    var acc: [[Pattern]] = [[]]
+    for q in ps:
+        let qs = or_split(q)
+        var next: [[Pattern]] = []
+        for pre in acc:
+            for x in qs:
+                var c = pre
+                c.push(x)
+                next.push(c)
+        acc = next
+    return acc
 
 # `_` or a plain name: matches every value.
 fn is_catch_all(p: Pattern) -> bool:
