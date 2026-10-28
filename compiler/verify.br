@@ -593,6 +593,10 @@ fn in_range(l: Lin, k: IntTy) -> F:
 fn int_range(k: IntTy) -> Option[(i128, i128)]:
     return Some((k.min(), k.max()))
 
+# No array, string or map is longer than 2^60: every element takes at least a
+# bit (a `[bool]`; anything else a byte), and no address space has 2^57 bytes.
+const LEN_MAX: i128 = 1152921504606846976
+
 fn nonneg_range() -> Option[(i128, i128)]:
     let z: i128 = 0
     return Some((z, I64_BOUND))
@@ -784,6 +788,14 @@ struct Vf:
     fn fresh_nonneg(ref self, name: str) -> Lin:
         return Lin.atom(self.new_atom(name, nonneg_range()))
 
+    fn fresh_len(ref self, name: str) -> Lin:
+        let z: i128 = 0
+        return Lin.atom(self.new_atom(name, Some((z, LEN_MAX))))
+
+    # A length an operation just produced: the memory for it was allocated.
+    fn cap_len(ref self, l: Lin):
+        self.assume(F.le(l, Lin.konst(LEN_MAX)))
+
     fn fresh_bool(ref self, name: str) -> F:
         return F.B(self.new_atom(name, None), true)
 
@@ -852,9 +864,9 @@ struct Vf:
                 return V.Bool(self.fresh_bool(name))
             case Ty.Array(_):
                 let c = self.fresh_content(name)
-                return V.Arr(c, self.fresh_nonneg("len(" + name + ")"))
+                return V.Arr(c, self.fresh_len("len(" + name + ")"))
             case Ty.Str:
-                return V.Str(self.fresh_nonneg("len(" + name + ")"))
+                return V.Str(self.fresh_len("len(" + name + ")"))
             case Ty.Tuple(ts):
                 var vs: [V] = []
                 for i, t in enumerate(ts):
@@ -2017,7 +2029,7 @@ struct Vf:
                             self.eval(x)
                         case _:
                             pass
-                return V.Str(self.fresh_nonneg("len(f-string)"))
+                return V.Str(self.fresh_len("len(f-string)"))
             case ExprKind.Ident(_):
                 match e.res:
                     case Res.Local(id):
@@ -2263,6 +2275,7 @@ struct Vf:
                 let nv = self.eval(count)
                 let n = self.as_int(nv, count.ty)
                 self.kept(e.span, F.ge(n), "array length check")
+                self.cap_len(n)
                 return V.Arr(self.fresh_content("[...]"), n)
             case ExprKind.Tuple(es):
                 return self.agg(es)
@@ -2313,9 +2326,11 @@ struct Vf:
             case Ty.Str:
                 match (av, bv):
                     case (V.Str(x), V.Str(y)):
-                        return V.Str(self.lin(x.add(y), "len(?)"))
+                        let n = self.lin(x.add(y), "len(?)")
+                        self.cap_len(n)
+                        return V.Str(n)
                     case _:
-                        return V.Str(self.fresh_nonneg("len(?)"))
+                        return V.Str(self.fresh_len("len(?)"))
             case _:
                 return V.Opaque
 
@@ -2569,6 +2584,7 @@ struct Vf:
                             var out = V.Opaque
                             if b == Builtin.Push:
                                 nlen = self.lin(l.add_c(1), "len(?)")
+                                self.cap_len(nlen)
                             else:
                                 self.kept(
                                     e.span,
@@ -2607,7 +2623,7 @@ struct Vf:
                             return V.Int(l)
                         case _:
                             pass
-                return V.Int(self.fresh_nonneg("len(?)"))
+                return V.Int(self.fresh_len("len(?)"))
             case Builtin.Abs:
                 match e.ty:
                     case Ty.Int(k):
@@ -2648,7 +2664,7 @@ struct Vf:
                 return vals[0] if len(vals) > 0 else V.Opaque
             case Builtin.Args:
                 let c = self.fresh_content("args()")
-                return V.Arr(c, self.fresh_nonneg("len(args())"))
+                return V.Arr(c, self.fresh_len("len(args())"))
             case Builtin.Chr:
                 if len(vals) > 0:
                     let n = self.as_int(vals[0], args[0].expr.ty)
@@ -2740,7 +2756,8 @@ struct Vf:
                             case Some(x):
                                 n = x
                             case None:
-                                n = self.fresh_nonneg("len(" + name + ")")
+                                n = self.fresh_len("len(" + name + ")")
+                        self.cap_len(n)
                         nv = V.Arr(self.fresh_content(name), n)
                     case _:
                         nv = self.fresh_val(r.ty, self.name_of(r))
