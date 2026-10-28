@@ -102,7 +102,8 @@ fn verify_program(ref prog: Program, info: ProgramInfo, sm: SourceMap) -> Report
     for m in prog.modules:
         fns.extend(m.fns)
         fns.extend(m.tests)
-    let done = par [verify_fn(info, specs, sm, f) for f in fns]
+    let fps = footprints(prog, info)
+    let done = par [verify_fn(info, specs, fps, sm, f) for f in fns]
     # let go of the bodies, so rewriting them below doesn't copy them
     fns = []
     var report = Report(diags=[], remaining=[], proven=0)
@@ -150,11 +151,17 @@ struct FnResult:
     proven: {(int, int, int, int): bool}
     time: float
 
-fn verify_fn(info: ProgramInfo, specs: [Option[FnSpec]], sm: SourceMap, f: FnDecl) -> FnResult:
+fn verify_fn(
+    info: ProgramInfo,
+    specs: [Option[FnSpec]],
+    fps: [[[[int]]]],
+    sm: SourceMap,
+    f: FnDecl
+) -> FnResult:
     let t0 = clock()
     if f.is_extern:
         return FnResult(name=f.name, diags=[], remaining=[], proven={}, time=0.0)
-    var v = new_vf(info, specs, sm, f)
+    var v = new_vf(info, specs, fps, sm, f)
     v.run(f)
     var proven: {(int, int, int, int): bool} = {}
     for p in v.proven.keys():
@@ -423,93 +430,215 @@ fn apply_expr(ref e: Expr, p: {(int, int, int, int): bool}):
 
 # ================================================================ modification analysis
 
-# Whole: the variable is reassigned. Content: only elements were assigned
-# (`xs[i] = ...`), so the length is unchanged.
+# What a statement may change in a local: a path of field indices from the
+# local down, ending in CONTENT at the first index (the elements of the array
+# there, not its length). [] is the whole local.
+const CONTENT = -1
+# a longer path is cut short: changing its start covers the rest
+const PATH_MAX = 8
+
+# A change found in code: `root` at `path`, directly (callee < 0) or as the
+# `ref` parameter `param` of the function `callee`, which may change what its
+# footprint says.
+struct Eff:
+    root: int
+    path: [int]
+    callee: int
+    param: int
+
+# Whole: the variable may change. (For analyses that only ask whether.)
 const MOD_WHOLE = 0
-const MOD_CONTENT = 1
 
 fn note_mod(ref out: {int: int}, id: int, m: int):
-    if id not in out:
-        out[id] = m
-    if m == MOD_WHOLE:
-        out[id] = MOD_WHOLE
+    out[id] = m
 
-fn first_step_is_index(e: Expr) -> bool:
-    # walk down to the step right above the root identifier
-    var cur = e
-    var last_index = false
-    while true:
-        match cur.kind:
-            case ExprKind.Index(x, _):
-                last_index = true
-                cur = x
-            case ExprKind.Field(x, _, _):
-                last_index = false
-                cur = x
-            case _:
-                return last_index
-    return last_index
+# The path from an lvalue's root local down to it.
+fn lvalue_steps(e: Expr) -> [int]:
+    var p: [int] = []
+    match e.kind:
+        case ExprKind.Field(x, _, _):
+            p = lvalue_steps(x)
+            if not ends_in_content(p) and e.idx >= 0:
+                p.push(e.idx)
+        case ExprKind.Index(x, _):
+            p = lvalue_steps(x)
+            if not ends_in_content(p):
+                p.push(CONTENT)
+        case _:
+            pass
+    if len(p) > PATH_MAX:
+        return p[:PATH_MAX]
+    return p
 
-fn mods_expr(e: Expr, info: ProgramInfo, ref out: {int: int}):
+fn ends_in_content(p: [int]) -> bool:
+    return len(p) > 0 and p[len(p) - 1] == CONTENT
+
+# `p` then, below it, `q` (below an array's elements everything is content).
+fn join_path(p: [int], q: [int]) -> [int]:
+    if ends_in_content(p):
+        return p
+    var out = p
+    out.extend(q)
+    if len(out) > PATH_MAX:
+        return out[:PATH_MAX]
+    return out
+
+fn is_prefix(p: [int], q: [int]) -> bool:
+    if len(p) > len(q):
+        return false
+    for i in 0..len(p):
+        if p[i] != q[i]:
+            return false
+    return true
+
+# Add `p` to the paths of `id` that may change, keeping only the shortest.
+fn note_path(ref out: {int: [[int]]}, id: int, p: [int]):
+    let ps = out.get(id).unwrap_or([])
+    for q in ps:
+        if is_prefix(q, p):
+            return
+    var keep: [[int]] = [q2 for q2 in ps if not is_prefix(p, q2)]
+    keep.push(p)
+    out[id] = keep
+
+fn same_paths(a: [[int]], b: [[int]]) -> bool:
+    return len(a) == len(b) and all(p in b for p in a)
+
+fn arg_eff(e: Expr, callee: int, param: int, ref out: [Eff]):
+    match lvalue_root(e):
+        case Some(r):
+            out.push(Eff(root=r, path=lvalue_steps(e), callee=callee, param=param))
+        case None:
+            pass
+
+fn effs_expr(e: Expr, info: ProgramInfo, ref out: [Eff]):
     match e.kind:
         case ExprKind.MethodCall(recv, _, _, args):
-            var recv_mut = false
+            var callee = -1
             match e.cres:
                 case CallRes.Builtin(b):
-                    recv_mut = b.mutates_recv()
+                    if b.mutates_recv():
+                        arg_eff(recv, -1, 0, ref out)
                 case CallRes.Method(id):
                     if 0 <= id < len(info.fns) and len(info.fns[id].params) > 0:
-                        recv_mut = info.fns[id].params[0].by_ref
+                        callee = id
+                        if info.fns[id].params[0].by_ref:
+                            arg_eff(recv, id, 0, ref out)
                 case _:
                     pass
-            if recv_mut:
-                match lvalue_root(recv):
-                    case Some(r):
-                        note_mod(ref out, r, MOD_WHOLE)
-                    case None:
-                        pass
-            for a in args:
+            for i, a in enumerate(args):
                 if a.by_ref:
-                    match lvalue_root(a.expr):
-                        case Some(r):
-                            note_mod(ref out, r, MOD_WHOLE)
-                        case None:
-                            pass
+                    arg_eff(a.expr, callee, i + 1 if callee >= 0 else 0, ref out)
         case ExprKind.Call(_, args):
-            for a in args:
+            var callee = -1
+            match e.cres:
+                case CallRes.Fn(id):
+                    callee = id
+                case _:
+                    pass
+            for i, a in enumerate(args):
                 if a.by_ref:
-                    match lvalue_root(a.expr):
-                        case Some(r):
-                            note_mod(ref out, r, MOD_WHOLE)
-                        case None:
-                            pass
+                    arg_eff(a.expr, callee, i, ref out)
         case _:
             pass
     for c in children(e):
-        mods_expr(c, info, ref out)
+        effs_expr(c, info, ref out)
 
-fn mods_block(b: Block, info: ProgramInfo, ref out: {int: int}):
+fn effs_block(b: Block, info: ProgramInfo, ref out: [Eff]):
     for s in b.stmts:
         match s.kind:
             case StmtKind.Assign(target, _, _):
-                match lvalue_root(target):
-                    case Some(r):
-                        var m = MOD_CONTENT
-                        match target.kind:
-                            case ExprKind.Ident(_):
-                                m = MOD_WHOLE
-                            case _:
-                                if not first_step_is_index(target):
-                                    m = MOD_WHOLE
-                        note_mod(ref out, r, m)
-                    case None:
-                        pass
+                arg_eff(target, -1, 0, ref out)
             case _:
                 pass
         for e in stmt_exprs(s):
-            mods_expr(e, info, ref out)
+            effs_expr(e, info, ref out)
         for blk in stmt_blocks(s):
-            mods_block(blk, info, ref out)
+            effs_block(blk, info, ref out)
+
+# The locals a block may change (for analyses that only ask which).
+fn mods_block(b: Block, info: ProgramInfo, ref out: {int: int}):
+    var effs: [Eff] = []
+    effs_block(b, info, ref effs)
+    for f in effs:
+        note_mod(ref out, f.root, MOD_WHOLE)
+
+# The locals `e` may change (for analyses that only ask which).
+fn mods_expr(e: Expr, info: ProgramInfo, ref out: {int: int}):
+    var effs: [Eff] = []
+    effs_expr(e, info, ref effs)
+    for f in effs:
+        note_mod(ref out, f.root, MOD_WHOLE)
+
+# What the parameter `param` of `id` may change in the caller's variable
+# (everything, unless its body was looked at).
+fn footprint(fps: [[[[int]]]], id: int, param: int) -> [[int]]:
+    if 0 <= id < len(fps) and 0 <= param < len(fps[id]):
+        return fps[id][param]
+    return [[]]
+
+# The paths `effs` may change, by local.
+fn resolve_effs(effs: [Eff], fps: [[[[int]]]]) -> {int: [[int]]}:
+    var out: {int: [[int]]} = {}
+    for f in effs:
+        if f.callee < 0:
+            note_path(ref out, f.root, f.path)
+        else:
+            for q in footprint(fps, f.callee, f.param):
+                note_path(ref out, f.root, join_path(f.path, q))
+    return out
+
+# Each function's footprint: for each `ref` parameter, what the function may
+# change in it, directly or through the functions it calls. The least
+# solution, found by iterating from nothing: every change happens through a
+# finite chain of calls, and the paths are finitely many (field indices,
+# cut at PATH_MAX). Functions without a body change all of their `ref`
+# parameters.
+fn footprints(prog: Program, info: ProgramInfo) -> [[[[int]]]]:
+    let n = len(info.fns)
+    var fps: [[[[int]]]] = []
+    for i in 0..n:
+        var ps: [[[int]]] = []
+        for p in info.fns[i].params:
+            ps.push([[]])
+        fps.push(ps)
+    var ids: [int] = []
+    var locals: [[int]] = []
+    var effs: [[Eff]] = []
+    for m in prog.modules:
+        for f in m.fns:
+            if f.is_extern or not (
+                0 <= f.id < n
+            ) or len(f.param_locals) != len(info.fns[f.id].params):
+                continue
+            var es: [Eff] = []
+            effs_block(f.body, info, ref es)
+            for j, p in enumerate(info.fns[f.id].params):
+                if p.by_ref:
+                    fps[f.id][j] = []
+            ids.push(f.id)
+            locals.push(f.param_locals)
+            effs.push(es)
+    var changed = true
+    var rounds = 0
+    while changed:
+        changed = false
+        rounds += 1
+        if rounds > 100:
+            # not expected (the paths are finitely many); stay safe
+            for id in ids:
+                for j in 0..len(fps[id]):
+                    fps[id][j] = [[]]
+            break
+        for k, id in enumerate(ids):
+            let got = resolve_effs(effs[k], fps)
+            for j, p in enumerate(info.fns[id].params):
+                if p.by_ref:
+                    let ps = got.get(locals[k][j]).unwrap_or([])
+                    if not same_paths(ps, fps[id][j]):
+                        fps[id][j] = ps
+                        changed = true
+    return fps
 
 # Counters: the locals a loop body changes only by one `x += 1` outside its
 # inner loops. Each iteration adds at most 1 to them, so at the start of the
@@ -686,10 +815,17 @@ enum D:
 
 # ================================================================ the symbolic executor
 
-fn new_vf(info: ProgramInfo, specs: [Option[FnSpec]], sm: SourceMap, f: FnDecl) -> Vf:
+fn new_vf(
+    info: ProgramInfo,
+    specs: [Option[FnSpec]],
+    fps: [[[[int]]]],
+    sm: SourceMap,
+    f: FnDecl
+) -> Vf:
     return Vf(
         info=info,
         specs=specs,
+        fps=fps,
         sm=sm,
         locals=f.locals,
         fn_name=f.name,
@@ -715,6 +851,8 @@ fn new_vf(info: ProgramInfo, specs: [Option[FnSpec]], sm: SourceMap, f: FnDecl) 
 struct Vf:
     info: ProgramInfo
     specs: [Option[FnSpec]]
+    # what each function may change in its `ref` parameters (see `footprints`)
+    fps: [[[[int]]]]
     sm: SourceMap
     locals: [LocalInfo]
     fn_name: str
@@ -1666,12 +1804,12 @@ struct Vf:
                 pass
 
     fn havoc(ref self, body: Block):
-        var mods: {int: int} = {}
-        mods_block(body, self.info, ref mods)
-        self.havoc_mods(mods)
+        var effs: [Eff] = []
+        effs_block(body, self.info, ref effs)
+        self.havoc_mods(resolve_effs(effs, self.fps))
 
     # Forget what code that runs an unknown number of times may change.
-    fn havoc_mods(ref self, mods: {int: int}):
+    fn havoc_mods(ref self, mods: {int: [[int]]}):
         var ids = mods.keys()
         ids.sort()
         for id in ids:
@@ -1679,20 +1817,45 @@ struct Vf:
                 continue
             match self.st.env.get(id):
                 case Some(cur):
-                    let name = self.local_name(id)
-                    let ty = self.local_ty(id)
-                    var nv = V.Opaque
-                    match cur:
-                        case V.Arr(_, len_):
-                            if mods[id] == MOD_CONTENT:
-                                nv = V.Arr(self.fresh_content(name), len_)
-                            else:
-                                nv = self.fresh_val(ty, name)
-                        case _:
-                            nv = self.fresh_val(ty, name)
+                    var nv = cur
+                    for p in mods[id]:
+                        nv = self.havoc_at(nv, p, self.local_ty(id), self.local_name(id))
                     self.bind(id, nv)
                 case None:
                     pass
+
+    # `v` (of type `ty`) with the part at `path` forgotten.
+    fn havoc_at(ref self, v: V, path: [int], ty: Ty, name: str) -> V:
+        if len(path) == 0:
+            return self.fresh_val(ty, name)
+        if path[0] == CONTENT:
+            match v:
+                case V.Arr(_, l):
+                    return V.Arr(self.fresh_content(name), l)
+                case _:
+                    return self.fresh_val(ty, name)
+        match (v, self.field_of(ty, path[0])):
+            case (V.Agg(vs0), Some((fname, fty))):
+                if path[0] < len(vs0):
+                    var vs = vs0
+                    vs[path[0]] = self.havoc_at(vs0[path[0]], path[1:], fty, name + "." + fname)
+                    return V.Agg(vs)
+            case _:
+                pass
+        return self.fresh_val(ty, name)
+
+    # The part of `v` at a path of fields (None past an index).
+    fn at_path(self, v: V, path: [int], ty: Ty) -> Option[V]:
+        if len(path) == 0:
+            return Some(v)
+        let (_, fty) = self.field_of(ty, path[0])?
+        match v:
+            case V.Agg(vs):
+                if 0 <= path[0] < len(vs):
+                    return self.at_path(vs[path[0]], path[1:], fty)
+            case _:
+                pass
+        return None
 
     fn check_entry_invs(ref self, invs: [Expr], extra: F):
         for inv in invs:
@@ -1759,11 +1922,11 @@ struct Vf:
             return
         let k = len(self.st.facts)
         # the condition runs before every iteration too
-        var mods: {int: int} = {}
-        mods_block(body, self.info, ref mods)
-        mods_expr(cond, self.info, ref mods)
+        var effs: [Eff] = []
+        effs_block(body, self.info, ref effs)
+        effs_expr(cond, self.info, ref effs)
         let starts = self.mono_starts(body, Some(cond))
-        self.havoc_mods(mods)
+        self.havoc_mods(resolve_effs(effs, self.fps))
         self.mono_facts(starts)
         for inv in invs:
             let f = self.spec_cond(inv)
@@ -2816,14 +2979,14 @@ struct Vf:
                     v = self.fresh_val(vty, vname)
         # the body and filter run once per element, like a loop body: what
         # they change is unknown in each run and after the last
-        var mods: {int: int} = {}
-        mods_expr(c.body, self.info, ref mods)
+        var effs: [Eff] = []
+        effs_expr(c.body, self.info, ref effs)
         match c.filter:
             case Some(fl):
-                mods_expr(fl, self.info, ref mods)
+                effs_expr(fl, self.info, ref effs)
             case None:
                 pass
-        self.havoc_mods(mods)
+        self.havoc_mods(resolve_effs(effs, self.fps))
         let head = self.cur()
         let s = self.begin_assume(F.and_(extra))
         self.bind(local, v)
@@ -2836,7 +2999,7 @@ struct Vf:
             case None:
                 self.eval(c.body)
         self.end_assume(s)
-        if len(mods) > 0 and head.is_some():
+        if len(effs) > 0 and head.is_some():
             self.put(head)
         match count:
             case Some(n):
@@ -3152,20 +3315,24 @@ struct Vf:
                         self.fail(d, f)
             case None:
                 pass
-        # mutable arguments may change arbitrarily (subject to the callee's `ensures`)
+        # mutable arguments may change what the callee's footprint says,
+        # arbitrarily (subject to its `ensures`)
         for i, p in enumerate(sig.params):
             if p.by_ref and i < len(exprs):
                 match lvalue_root(exprs[i]):
                     case Some(root):
                         let name = self.local_name(root)
-                        let nv = self.fresh_val(p.ty, name)
-                        match exprs[i].kind:
-                            case ExprKind.Ident(_):
-                                self.bind(root, nv)
-                            case _:
-                                let whole = self.fresh_val(self.local_ty(root), name)
-                                self.bind(root, whole)
-                        vals[i] = nv
+                        let rty = self.local_ty(root)
+                        let pre = lvalue_steps(exprs[i])
+                        var nr = self.lookup(root, rty)
+                        for q in footprint(self.fps, id, i):
+                            nr = self.havoc_at(nr, join_path(pre, q), rty, name)
+                        self.bind(root, nr)
+                        match self.at_path(nr, pre, rty):
+                            case Some(nv):
+                                vals[i] = nv
+                            case None:
+                                vals[i] = self.fresh_val(p.ty, name)
                     case None:
                         pass
         let nm = self.name_of(e)
