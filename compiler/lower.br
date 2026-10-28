@@ -136,6 +136,11 @@ struct FnCx:
     twin_out: {str: int}
     twin_slots: {int: int}
     twin_ptrs: [(int, int)]
+    # `if k in m:` lowered by `map_hit`: the entry it found, for the
+    # `m[k] op= v` that starts the block (hit_e -1: none)
+    hit_map: int
+    hit_key: int
+    hit_e: int
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -179,7 +184,10 @@ fn new_cx(f: Func) -> FnCx:
         twin=0,
         twin_out={},
         twin_slots={},
-        twin_ptrs=[]
+        twin_ptrs=[],
+        hit_map=-1,
+        hit_key=-1,
+        hit_e=-1
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -2100,6 +2108,7 @@ struct Lower:
             case StmtKind.Assign(target, op, value):
                 self.push_frame()
                 self.assign(target, op, value, self.op_checked(op, target.ty, not s.proven), s.span)
+                self.cx.hit_e = -1
                 self.pop_frame()
             case StmtKind.ExprStmt(e):
                 self.push_frame()
@@ -2109,11 +2118,13 @@ struct Lower:
                 let end = self.cx.fb.label()
                 for br_ in branches:
                     self.push_frame()
-                    let c = self.expr(br_.0)
+                    let hit = self.map_hit(br_.0, br_.1)
+                    let c = self.map_hit_test(br_.0) if hit else self.expr(br_.0)
                     self.pop_frame()
                     let next = self.cx.fb.label()
                     self.cx.fb.brnot(c, next)
                     self.block(br_.1)
+                    self.cx.hit_e = -1
                     if not self.cx.fb.ends():
                         self.cx.fb.jmp(end)
                     self.cx.fb.place(next)
@@ -2933,6 +2944,84 @@ struct Lower:
             ix = self.cx.fb.chk(Op.IdxChk, K.I64, ix, c.len, loc)
         return self.cx.fb.elem(c.data, ix, self.lay(et).size)
 
+    # Evaluating `e` changes no variable and no value: no calls (and so no
+    # `ref` arguments), only operators on literals, variables and fields.
+    fn plain_expr(self, e: Expr) -> bool:
+        match e.kind:
+            case ExprKind.Int(_) | ExprKind.UInt(_) | ExprKind.Float(_):
+                return true
+            case ExprKind.Bool(_) | ExprKind.Str(_):
+                return true
+            case ExprKind.Ident(_):
+                return true
+            case ExprKind.Unary(_, x):
+                return self.plain_expr(x)
+            case ExprKind.Binary(_, l, r):
+                return self.plain_expr(l) and self.plain_expr(r)
+            case ExprKind.Field(x, _, _):
+                return self.plain_expr(x)
+            case _:
+                return false
+
+    # `if k in m:` (variables) whose block starts with `m[k] op= v`, v plain:
+    # nothing between the test and the update can change m or k, so the
+    # update can use the entry the test found instead of looking k up again.
+    fn map_hit(self, cond: Expr, b: Block) -> bool:
+        if len(b.stmts) == 0:
+            return false
+        match cond.kind:
+            case ExprKind.Contains(item, coll, neg):
+                let mid = local_of(coll).unwrap_or(-1)
+                let kid = local_of(item).unwrap_or(-1)
+                if neg or mid < 0 or kid < 0:
+                    return false
+                match coll.ty:
+                    case Ty.Map(_, _):
+                        pass
+                    case _:
+                        return false
+                match b.stmts[0].kind:
+                    case StmtKind.Assign(target, op, value):
+                        if op.is_none() or not self.plain_expr(value):
+                            return false
+                        match target.kind:
+                            case ExprKind.Index(base, idx):
+                                let bid = local_of(base).unwrap_or(-1)
+                                return bid == mid and local_of(idx).unwrap_or(-1) == kid
+                            case _:
+                                pass
+                    case _:
+                        pass
+            case _:
+                pass
+        return false
+
+    # Bool: `k in m` for a `map_hit`, leaving the entry for the update.
+    fn map_hit_test(ref self, cond: Expr) -> int:
+        match cond.kind:
+            case ExprKind.Contains(item, coll, _):
+                let c = self.expr(coll)
+                let x = self.expr(item)
+                let kp = self.addr_of(x, item.ty)
+                let mf = self.map_find(coll.ty)
+                let en = self.cx.fb.call(K.I64, mf, [c, kp])
+                self.cx.hit_map = local_of(coll).unwrap_or(-1)
+                self.cx.hit_key = local_of(item).unwrap_or(-1)
+                self.cx.hit_e = en
+                let zero = self.cx.fb.konst(K.I64, 0)
+                return self.cx.fb.cmp(Op.Ge, en, zero)
+            case _:
+                return self.expr(cond)
+
+    # The entry `map_hit_test` found, when `m[k]` is the update it was for, or -1.
+    fn take_hit(ref self, m: Expr, k: Expr) -> int:
+        let e = self.cx.hit_e
+        self.cx.hit_e = -1
+        let mid = local_of(m).unwrap_or(-1)
+        if e >= 0 and mid == self.cx.hit_map and local_of(k).unwrap_or(-1) == self.cx.hit_key:
+            return e
+        return -1
+
     # U8: the byte `v` appends to a string when it is `t[i]` or a one-byte
     # literal (`s += t[i]` then appends a byte), or -1. Index checks as in
     # brine_str_at.
@@ -3203,9 +3292,11 @@ struct Lower:
                         let kp = self.addr_of(k, idx.ty)
                         let b = self.lvalue(base)
                         let loc = self.loc(e.span)
-                        let m = self.cx.fb.load(K.Ptr, b, 0)
-                        let mf = self.map_find(base.ty)
-                        let en = self.cx.fb.call(K.I64, mf, [m, kp])
+                        var en = self.take_hit(base, idx)
+                        if en < 0:
+                            let m = self.cx.fb.load(K.Ptr, b, 0)
+                            let mf = self.map_find(base.ty)
+                            en = self.cx.fb.call(K.I64, mf, [m, kp])
                         let vsz = self.cx.fb.konst(K.I64, self.lay(e.ty).size)
                         return self.cx.fb.rt(K.Ptr, "brine_map_val_mut", [b, en, kp, vsz, loc])
                     case _:
