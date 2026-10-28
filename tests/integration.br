@@ -236,7 +236,9 @@ fn features() -> [str]:
         "tests/programs/take_put.br",
         "tests/programs/own_update.br",
         "tests/programs/borrow_let.br",
-        "tests/programs/stdlib.br"
+        "tests/programs/stdlib.br",
+        "tests/programs/par_small.br",
+        "tests/programs/first.br"
     ]
 
 test "language features":
@@ -344,8 +346,13 @@ test "parallel results don't depend on the thread count":
         let o = brine(["run", "tests/programs/parallel_det.br", "-q", "--threads", t])
         assert o.code == 0, o.err
         runs.push(o.out)
-        let r = brine(["run", "tests/programs/reductions.br", "-q", "--threads", t])
-        assert r.out == expected("tests/programs/reductions.br"), r.all()
+        for f in [
+            "tests/programs/reductions.br",
+            "tests/programs/par_small.br",
+            "tests/programs/first.br"
+        ]:
+            let r = brine(["run", f, "-q", "--threads", t])
+            assert r.out == expected(f), r.all()
     assert runs[0] == runs[1] and runs[0] == runs[2]
 
 # GPU offload (brine_rt.c, "GPU"). BRINE_GPU=on runs every construct that can
@@ -386,9 +393,28 @@ test "par constructs give the same results on a GPU":
                     cpu.push(l[len(mine):].split(":")[0])
             elif " -> gpu " in l:
                 gpu += 1
-        assert cpu == (["109", "113"] if metal else ["109", "111", "113"]), o.err
+        assert cpu == (["109", "113", "135"] if metal else ["109", "111", "113", "135"]), o.err
+        # and says why
+        for why in ["its results are strings", "it reads `m`, a map", "its results are arrays"]:
+            assert f"(not GPU-eligible: {why})" in o.err, o.err
         if gpu_ready(o.err):
-            assert gpu == (23 if metal else 50), o.err
+            assert gpu == (27 if metal else 59), o.err
+
+test "128-bit integers give the same results on a GPU":
+    let f = "tests/programs/gpu_u128.br"
+    for backend in ["native", "c"]:
+        let o = brine_env(
+            ["run", f, "-q"],
+            {"BRINE_GPU": "on", "BRINE_GPU_LOG": "1", "BRINE_BACKEND": backend}
+        )
+        assert o.code == 0, o.all()
+        assert o.out == expected(f), f"{backend}: unexpected output on the GPU:\n{o.out}"
+        # everything but the reduction can run on a GPU (on Apple's, nothing)
+        let metal = os.name() == "macos"
+        let why = "uses 128-bit integers" if metal else "reduces 128-bit integers"
+        assert f"(not GPU-eligible: {why})" in o.err, o.err
+        if gpu_ready(o.err) and not metal:
+            assert o.err.count(" -> gpu ") == 25, o.err
 
 test "a check that fails on a GPU panics as on the CPU":
     let f = "tests/programs/gpu_panic.br"
@@ -399,7 +425,11 @@ test "a check that fails on a GPU panics as on the CPU":
         ("overflow", "integer overflow in multiplication"),
         ("combine", "integer overflow in addition"),
         ("convert", "float to integer conversion out of range (or NaN) for i32"),
-        ("shift", "shift amount out of range")
+        ("shift", "shift amount out of range"),
+        ("mul128", "integer overflow in multiplication"),
+        ("smul128", "integer overflow in multiplication"),
+        ("div128", "division by zero"),
+        ("convert128", "integer conversion out of range for u64")
     ]:
         let off = brine_env(["run", f, "-q", "--", which], {"BRINE_GPU": "off"})
         let on = brine_env(["run", f, "-q", "--", which], {"BRINE_GPU": "on", "BRINE_GPU_LOG": "1"})
@@ -407,6 +437,17 @@ test "a check that fails on a GPU panics as on the CPU":
         assert on.code == 101 and without_gpu_log(on.err) == off.err, f"{which}: {on.all()}"
         if gpu_ready(on.err):
             assert "a check failed on the GPU, running it on the CPU" in on.err, on.err
+
+test "ranks take one GPU each":
+    # with BRINE_GPU=auto, a second rank on a one-GPU machine stays on the CPU
+    let f = "tests/programs/gpu_ranks.br"
+    let off = brine_env(["run", "--ranks", "2", f, "-q"], {"BRINE_GPU": "off"})
+    let o = brine_env(["run", "--ranks", "2", f, "-q"], {"BRINE_GPU_LOG": "1"})
+    assert off.code == 0 and o.code == 0 and o.out == off.out, o.all()
+    if gpu_ready(o.err):
+        assert "brine gpu: rank 0: " in o.err, o.err
+        let shared = "brine gpu: rank 1: not used: 1 lower rank on this machine uses its 1 GPU"
+        assert shared in o.err or o.err.count(" ready in ") == 2, o.err
 
 test "panics are clear":
     for f, msg in [
@@ -670,6 +711,18 @@ test "deadlocks are rejected":
         if "# E05" in l:
             want.push(l[l.find("# E05").unwrap() + 2:].strip() + "@" + str(i + 1))
     assert error_codes(file) == want
+
+test "par bodies that could race are rejected":
+    # every line marked `# E05..` in the file, and nothing else
+    let file = "tests/programs/par_errors.br"
+    var want: [str] = []
+    for i, l in enumerate(read_file(file).unwrap().lines()):
+        if "# E05" in l:
+            want.push(l[l.find("# E05").unwrap() + 2:].strip() + "@" + str(i + 1))
+    assert error_codes(file) == want
+
+test "first needs options":
+    assert error_codes("tests/programs/first_errors.br") == ["E0301@2", "E0301@3", "E0302@4"]
 
 test "the deadlock checker iterates to a fixpoint":
     # a rank-dependent value passed along 120 functions...

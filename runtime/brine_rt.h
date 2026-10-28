@@ -981,6 +981,12 @@ static inline int64_t brine_par_plan(int64_t n) { return n <= 0 ? 0 : (n < 256 ?
 void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, void *ctx);
 void brine_par_tasks(int64_t k, brine_task_fn fn, void *ctx);
 
+/* `par first(...)`: chunk c of brine_par_run stops once a lower chunk found a
+ * value. *stop (INT64_MAX at first) is the lowest chunk that did. */
+int64_t brine_par_chunks(int64_t n);
+bool brine_first_stopped(const int64_t *stop, int64_t chunk);
+void brine_first_found(int64_t *stop, int64_t chunk);
+
 /* Parallel reductions (`par sum(...)` etc.) have one combination order, which
  * depends only on the element count n: elements are split into leaves of
  * BRINE_LEAF consecutive elements, each folded left to right by the leaf
@@ -1010,7 +1016,8 @@ typedef struct brine_kernel {
     int64_t ctx_size;
     /* the arrays in the context: [nfields, (offset, flags, node)*, nodes...],
      * a node [element size, n, (offset in an element, node)*], nodes numbered
-     * from the first; flags 1: written by the body, 2: not read */
+     * from the first; flags BRINE_GA_*, and (flags >> 8) - 1 the context
+     * offset of `first` (a u64; 0 when flags >> 8 is 0) */
     BR_P(const int64_t *, ptrs);
     int64_t cost, cost64;       /* estimated instructions per element (f64 ones) */
     BR_P(const char *, comb);   /* reductions: the combine kernel */
@@ -1018,10 +1025,15 @@ typedef struct brine_kernel {
     BR_P(const char *, why);    /* why it can't run on a GPU */
 } brine_kernel;
 
+/* written by the body; iteration k writes exactly element first + k and
+ * nothing reads the array (so its old elements needn't go to the device) */
+enum { BRINE_GA_WRITTEN = 1, BRINE_GA_DENSE = 2 };
+
 /* Runs fn over [0, n) on the thread pool, or on a GPU when that pays. */
 void brine_par_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn fn);
-/* *val and *has: the accumulator (the reducer's start value, false); set when an element had a value */
-void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, void *val, bool *has, const char *loc);
+/* *val and *has: the accumulator (the reducer's start value, false); set when an element had a value.
+ * efn is like fn, but called for one element: it stores the element's own value. */
+void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *ctx, void *val, bool *has, const char *loc);
 
 /* ------------------------------------------------------------ world (multi-process) */
 int64_t brine_world_rank(void);

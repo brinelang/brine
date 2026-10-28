@@ -6023,6 +6023,10 @@ struct Lower:
     fn reduce(ref self, r: Reducer, arg: Expr, e: Expr) -> int:
         match arg.kind:
             case ExprKind.Comp(c):
+                if r == Reducer.First:
+                    if c.par:
+                        return self.par_first(c, e, arg.local, arg.caps)
+                    return self.seq_first(c, e, arg.local)
                 if c.par:
                     return self.par_reduce(r, c, e, arg.local, arg.caps)
                 let (acc, has) = self.reduce_init(r, e.ty)
@@ -6047,6 +6051,9 @@ struct Lower:
                 acc = self.cx.fb.konst(K.Bool, 0)
             case Reducer.All:
                 acc = self.cx.fb.konst(K.Bool, 1)
+            case Reducer.First:
+                # lowered by `seq_first` / `par_first`
+                acc = self.cx.fb.konst(K.Ptr, 0)
         let has = self.cx.fb.konst(K.Bool, 0)
         return (acc, has)
 
@@ -6116,6 +6123,115 @@ struct Lower:
                 self.cx.fb.mov(has, t)
                 self.cx.fb.jmp(brk)
                 self.cx.fb.place(skip)
+            case Reducer.First:
+                pass
+
+    # `first(...)`: the first `Some` of the generator, or `None`.
+    fn seq_first(ref self, c: Comp, e: Expr, local: int) -> int:
+        let out = self.cx.fb.vreg(K.Ptr)
+        let none = self.variant_const(e.ty, self.variant_index(cg_enum_id(e.ty), "None", 1))
+        self.cx.fb.mov(out, none)
+        let dom = self.domain(c.iter, false)
+        let lc = self.loop_open(dom, local)
+        self.first_step(c, e.ty, out, lc, -1)
+        self.loop_close(dom, lc)
+        return self.temp(out, e.ty)
+
+    # One element of `first`: evaluate it and, when it is `Some`, move it to
+    # `out` and leave the loop (after telling the runtime, for `par first`,
+    # with `stopp` the context's stop word).
+    fn first_step(ref self, c: Comp, ty: Ty, out: int, lc: LoopCtl, stopp: int):
+        match c.filter:
+            case Some(f):
+                self.emit_filter(f, lc.cont)
+            case None:
+                pass
+        self.push_frame()
+        let v = self.owned(c.body)
+        self.pop_frame()
+        let some = self.variant_index(cg_enum_id(ty), "Some", 0)
+        let tag = self.cx.fb.load(K.I64, v, 8)
+        let sv = self.cx.fb.konst(K.I64, some)
+        let is = self.cx.fb.cmp(Op.Eq, tag, sv)
+        let miss = self.cx.fb.label()
+        self.cx.fb.brnot(is, miss)
+        self.cx.fb.mov(out, v)
+        if stopp >= 0:
+            self.cx.fb.call_void("brine_first_found", [stopp, 1])
+        self.cx.fb.jmp(lc.brk)
+        self.cx.fb.place(miss)
+        self.release(v, ty)
+
+    # `par first(...)`: the elements are split into chunks like a `par for`;
+    # each chunk stores its first `Some` (or `None`) in its slot of an array,
+    # and the lowest slot with a value is the result, whatever the thread
+    # count. Chunks after one that found a value stop early.
+    fn par_first(ref self, c: Comp, e: Expr, local: int, captures: [int]) -> int:
+        let loc = self.loc(e.span)
+        let dom = self.domain(c.iter, false)
+        let n = self.dom_count(dom, e.span)
+        let k = self.cx.fb.call(K.I64, "brine_par_chunks", [n])
+        let res = self.new_arr(e.ty, k, loc)
+        self.register(res, Ty.Array(e.ty))
+        var extra = self.dom_fields(dom)
+        extra.push(("res", Ty.Str, res))
+        extra.push(("stop", Ty.Int(IntTy.I64), self.cx.fb.konst(K.I64, 9223372036854775807)))
+        let pc = self.par_ctx(captures, extra)
+        let fp = self.cx.fb.global(f"br_par_{pc.id}")
+        let zero = self.cx.fb.konst(K.I64, 0)
+        self.cx.fb.call_void("brine_par_run", [zero, n, k, fp, pc.ctx])
+
+        # the lowest slot holding a value
+        let out = self.cx.fb.vreg(K.Ptr)
+        let eid = cg_enum_id(e.ty)
+        let none = self.variant_const(e.ty, self.variant_index(eid, "None", 1))
+        self.cx.fb.mov(out, none)
+        let some = self.cx.fb.konst(K.I64, self.variant_index(eid, "Some", 0))
+        let data = self.cx.fb.load(K.Ptr, res, 48)
+        let i = self.cx.fb.copy_of(zero)
+        let one = self.cx.fb.konst(K.I64, 1)
+        let head = self.cx.fb.label()
+        let done = self.cx.fb.label()
+        let next = self.cx.fb.label()
+        self.cx.fb.place(head)
+        let more = self.cx.fb.cmp(Op.Lt, i, k)
+        self.cx.fb.brnot(more, done)
+        let p = self.cx.fb.elem(data, i, 8)
+        let v = self.cx.fb.load(K.Ptr, p, 0)
+        let tag = self.cx.fb.load(K.I64, v, 8)
+        let hit = self.cx.fb.cmp(Op.Eq, tag, some)
+        self.cx.fb.brnot(hit, next)
+        self.retain(v, e.ty)
+        self.cx.fb.mov(out, v)
+        self.cx.fb.jmp(done)
+        self.cx.fb.place(next)
+        let i2 = self.cx.fb.bin(Op.Add, K.I64, i, one)
+        self.cx.fb.mov(i, i2)
+        self.cx.fb.jmp(head)
+        self.cx.fb.place(done)
+
+        let saved = self.lift_enter(
+            f"br_par_{pc.id}",
+            [K.Ptr, K.I64, K.I64, K.I64],
+            pc,
+            captures,
+            []
+        )
+        let found = self.cx.fb.vreg(K.Ptr)
+        let none2 = self.variant_const(e.ty, self.variant_index(eid, "None", 1))
+        self.cx.fb.mov(found, none2)
+        let stopp = self.cx.fb.offset(0, pc.off("stop"))
+        let lc = self.chunk_open(dom, pc, local)
+        let stopped = self.cx.fb.call(K.Bool, "brine_first_stopped", [stopp, 1])
+        self.cx.fb.br(stopped, lc.brk)
+        self.first_step(c, e.ty, found, lc, stopp)
+        self.chunk_close(lc)
+        let r = self.cx.fb.load(K.Ptr, 0, pc.off("res"))
+        let rdata = self.cx.fb.load(K.Ptr, r, 48)
+        let slot = self.cx.fb.elem(rdata, 1, 8)
+        self.cx.fb.store(slot, 0, found)
+        self.lift_exit(saved)
+        return self.temp(out, e.ty)
 
     fn reduce_finish(ref self, r: Reducer, has: int, span: Span):
         if r == Reducer.Min or r == Reducer.Max:
@@ -6230,7 +6346,10 @@ struct Lower:
 
     # The descriptor `br_gk_<id>` of a parallel construct, for the runtime to
     # run it on a GPU (`gpu_emit` fills it in). `real` overrides context field
-    # types, with flags: 1 written by the body, 2 only written (not read).
+    # types, with flags (BRINE_GA_* in brine_rt.h): 1 written by the body,
+    # 2 iteration k writes exactly element `first + k` and nothing reads the
+    # array (`first` is 0, or the u64 at offset (flags >> 8) - 1 in the
+    # context).
     fn gpu_site(
         ref self,
         pc: ParCtx,
@@ -6240,10 +6359,19 @@ struct Lower:
         real: [(str, Ty, int)],
         span: Span
     ) -> int:
-        let ptrs = self.gpu_ptrs(pc, real)
+        let (ptrs, why) = self.gpu_ptrs(pc, real)
         let wh = self.cstr_sym(self.sm.loc(span))
         self.gsites.push(
-            GpuSite(id=pc.id, kind=kind, op=op, vk=vk, where_sym=wh, ctx_size=pc.size, ptrs=ptrs)
+            GpuSite(
+                id=pc.id,
+                kind=kind,
+                op=op,
+                vk=vk,
+                where_sym=wh,
+                ctx_size=pc.size,
+                ptrs=ptrs,
+                why=why
+            )
         )
         return self.cx.fb.global(f"br_gk_{pc.id}")
 
@@ -6251,8 +6379,9 @@ struct Lower:
     # device: [nfields, (offset, flags, node)*, nodes...]. A node describes an
     # array: [element size, n, (offset in the element, node)*] for the arrays
     # inside each element; nodes are numbered from the first node's position.
-    # Empty: something in the context can't be copied (strings, maps, boxes).
-    fn gpu_ptrs(self, pc: ParCtx, real: [(str, Ty, int)]) -> [int]:
+    # Empty, with the reason: something in the context can't be copied
+    # (strings, maps, boxes).
+    fn gpu_ptrs(self, pc: ParCtx, real: [(str, Ty, int)]) -> ([int], str):
         var fields: [int] = []
         var nodes: [int] = []
         var nf = 0
@@ -6264,16 +6393,18 @@ struct Lower:
                     ty = x.1
                     flags = x.2
             var subs: [(int, Ty)] = []
-            if not self.gpu_plain(ty, pc.offs[i], ref subs):
-                return []
+            let what = self.gpu_what(ty, pc.offs[i], ref subs)
+            if what != "":
+                return ([], self.gpu_field(name, ty, what))
             for sub in subs:
-                let node = self.gpu_node(sub.1, ref nodes, 0)
+                var why = ""
+                let node = self.gpu_node(sub.1, ref nodes, 0, ref why)
                 if node < 0:
-                    return []
+                    return ([], self.gpu_field(name, ty, why))
                 let top = sub.0 == pc.offs[i]
                 # arrays written on the device are copied back: no pointers in them
                 if flags != 0 and (not top or nodes[node + 1] != 0):
-                    return []
+                    return ([], self.gpu_field(name, ty, "arrays"))
                 fields.push(sub.0)
                 fields.push(flags if top else 0)
                 fields.push(node)
@@ -6281,11 +6412,49 @@ struct Lower:
         var out = [nf]
         out.extend(fields)
         out.extend(nodes)
-        return out
+        return (out, "")
 
-    fn gpu_node(self, elem: Ty, ref nodes: [int], depth: int) -> int:
+    # Why a construct whose context field `name` (of type `ty`) holds `what`
+    # can't run on a GPU.
+    fn gpu_field(self, name: str, ty: Ty, what: str) -> str:
+        if name == "res":
+            match ty:
+                case Ty.Array(e):
+                    var subs: [(int, Ty)] = []
+                    if (
+                        self.gpu_what(e, 0, ref subs) == what
+                        or (what == "arrays" and len(subs) == 1 and subs[0].0 == 0)
+                    ):
+                        return f"its results are {what}"
+                case _:
+                    pass
+            return f"its results hold {what}"
+        if name == "darr":
+            return f"it loops over an array that holds {what}"
+        if name.starts_with("c"):
+            let n = self.flocals[int(name[1:])].name
+            if what == "arrays":
+                return f"it writes `{n}`, whose elements hold arrays"
+            let tn = self.info.ty_name(ty)
+            var subs: [(int, Ty)] = []
+            match ty:
+                case Ty.Str:
+                    return f"it reads `{n}`, a string"
+                case Ty.Map(_, _):
+                    return f"it reads `{n}`, a map"
+                case Ty.Array(_) | Ty.Tuple(_) | Ty.Struct(_):
+                    return f"it reads `{n}`, whose type `{tn}` holds {what}"
+                case _:
+                    return f"it reads `{n}`, a `{tn}`"
+        return f"its context holds {what}"
+
+    fn gpu_node(self, elem: Ty, ref nodes: [int], depth: int, ref why: str) -> int:
         var subs: [(int, Ty)] = []
-        if depth > 8 or not self.gpu_plain(elem, 0, ref subs):
+        if depth > 8:
+            why = "arrays nested too deeply"
+            return -1
+        why = self.gpu_what(elem, 0, ref subs)
+        if why != "":
             return -1
         let at = len(nodes)
         nodes.push(self.lay(elem).size)
@@ -6294,31 +6463,39 @@ struct Lower:
             nodes.push(0)
             nodes.push(0)
         for j, sub in enumerate(subs):
-            let child = self.gpu_node(sub.1, ref nodes, depth + 1)
+            let child = self.gpu_node(sub.1, ref nodes, depth + 1, ref why)
             if child < 0:
                 return -1
             nodes[at + 2 + 2 * j] = sub.0
             nodes[at + 3 + 2 * j] = child
         return at
 
-    # Is a value of type t plain data and arrays of it? `subs` gets the
-    # offsets (from `base`) and element types of the arrays in it.
-    fn gpu_plain(self, t: Ty, base: int, ref subs: [(int, Ty)]) -> bool:
+    # "" if a value of type t is plain data and arrays of it, otherwise what
+    # it holds that isn't. `subs` gets the offsets (from `base`) and element
+    # types of the arrays in it.
+    fn gpu_what(self, t: Ty, base: int, ref subs: [(int, Ty)]) -> str:
         match t:
             case Ty.Int(_) | Ty.Float(_) | Ty.Bool | Ty.Unit:
-                return true
+                return ""
+            case Ty.Str:
+                return "strings"
+            case Ty.Map(_, _):
+                return "maps"
             case Ty.Enum(eid):
-                return not self.info.enums[eid].has_payload()
+                if self.info.enums[eid].has_payload():
+                    return "enums with payloads"
+                return ""
             case Ty.Array(e):
                 subs.push((base, e))
-                return true
+                return ""
             case Ty.Tuple(_) | Ty.Struct(_):
                 for i, x in enumerate(self.field_tys(t)):
-                    if not self.gpu_plain(x, base + self.field_off(t, i), ref subs):
-                        return false
-                return true
+                    let w = self.gpu_what(x, base + self.field_off(t, i), ref subs)
+                    if w != "":
+                        return w
+                return ""
             case _:
-                return false
+                return self.info.ty_name(t) + " values"
 
     # The GPU code of the program's parallel constructs, and their descriptors
     # (`brine_kernel` in brine_rt.h).
@@ -6371,7 +6548,7 @@ struct Lower:
             if not ok:
                 var w = code.why[i]
                 if len(g.ptrs) == 0:
-                    w = "its context holds strings, maps or enums with payloads"
+                    w = g.why
                 rel.push(Reloc(off=96, sym=self.cstr_sym(w), add=0))
             if len(g.ptrs) > 0:
                 var pb: [u8] = []
@@ -6446,7 +6623,16 @@ struct Lower:
         let pc = self.par_ctx(captures, extra)
         var real = self.dom_tys(dom)
         for w in par_writes:
-            real.push((f"c{w}", self.flocals[w].ty, 1))
+            var flags = 1
+            match dom:
+                case Dom.Range(IntTy.I64, _, _, _, step):
+                    # iteration k writes element lo + k, and nothing reads it:
+                    # the device needn't get the array's old elements
+                    if step < 0 and write_only(body, w, local):
+                        flags = 3 | ((pc.off("dlo") + 1) << 8)
+                case _:
+                    pass
+            real.push((f"c{w}", self.flocals[w].ty, flags))
         self.par_launch(pc, 0, n, real, span)
         self.pop_scope()
 
@@ -6508,9 +6694,10 @@ struct Lower:
         let extra = self.dom_fields(dom)
         let pc = self.par_ctx(captures, extra)
         let fp = self.cx.fb.global(f"br_par_{pc.id}")
+        let efp = self.cx.fb.global(f"br_pel_{pc.id}")
         let kd = self.gpu_site(pc, 2, reducer_code(r), self.kind(ty), self.dom_tys(dom), e.span)
         let loc = self.loc(e.span)
-        self.cx.fb.call_void("brine_par_reduce", [kd, n, fp, pc.ctx, accp, hasp, loc])
+        self.cx.fb.call_void("brine_par_reduce", [kd, n, fp, efp, pc.ctx, accp, hasp, loc])
         self.cx.fb.load_to(acc, accp, 0)
         self.cx.fb.load_to(has, hasp, 0)
         self.reduce_finish(r, has, e.span)
@@ -6529,6 +6716,33 @@ struct Lower:
         self.cx.fb.store(4, 0, a2)
         self.cx.fb.store(5, 0, h2)
         self.lift_exit(saved)
+
+        # the same for one element, giving its own value: with few leaves, the
+        # runtime runs the elements in parallel and folds the leaves itself
+        let saved2 = self.lift_enter(
+            f"br_pel_{pc.id}",
+            [K.Ptr, K.I64, K.I64, K.I64, K.Ptr, K.Ptr],
+            pc,
+            captures,
+            []
+        )
+        let (a3, h3) = self.reduce_init(r, ty)
+        let lc2 = self.chunk_open(dom, pc, local)
+        match c.filter:
+            case Some(f):
+                self.emit_filter(f, lc2.cont)
+            case None:
+                pass
+        self.push_frame()
+        let v = self.expr(c.body)
+        self.pop_frame()
+        self.cx.fb.mov(a3, v)
+        let t = self.cx.fb.konst(K.Bool, 1)
+        self.cx.fb.mov(h3, t)
+        self.chunk_close(lc2)
+        self.cx.fb.store(4, 0, a3)
+        self.cx.fb.store(5, 0, h3)
+        self.lift_exit(saved2)
         return acc
 
     fn par_tuple(ref self, elems: [Expr], captures: [int], e: Expr) -> int:
@@ -6563,6 +6777,64 @@ struct Lower:
         self.lift_exit(saved)
         return res
 
+# Does a `par for` body (loop variable `lv`) write `w[lv]` in every iteration
+# and never read `w`?
+fn write_only(body: Block, w: int, lv: int) -> bool:
+    var found = false
+    for s in body.stmts:
+        if not found:
+            match s.kind:
+                case StmtKind.Assign(t, op, _):
+                    found = op.is_none() and whole_elem(t, w, lv)
+                case _:
+                    pass
+            # an earlier `continue` may skip the write
+            if not found and stmt_continues(s):
+                return false
+        if not only_writes(s, w, lv):
+            return false
+    return found
+
+fn whole_elem(t: Expr, w: int, lv: int) -> bool:
+    match t.kind:
+        case ExprKind.Index(base, idx):
+            return local_of(base) == Some(w) and local_of(idx) == Some(lv)
+        case _:
+            return false
+
+# Is `w` used in `s` only as the target of `w[lv] = ...`?
+fn only_writes(s: Stmt, w: int, lv: int) -> bool:
+    match s.kind:
+        case StmtKind.Assign(t, op, v):
+            if op.is_none() and whole_elem(t, w, lv):
+                return not mentions(v, w)
+        case _:
+            pass
+    for e in stmt_exprs(s):
+        if mentions(e, w):
+            return false
+    for b in stmt_blocks(s):
+        for x in b.stmts:
+            if not only_writes(x, w, lv):
+                return false
+    return true
+
+fn mentions(e: Expr, w: int) -> bool:
+    if local_of(e) == Some(w):
+        return true
+    return any(mentions(c, w) for c in children(e))
+
+fn stmt_continues(s: Stmt) -> bool:
+    match s.kind:
+        case StmtKind.Continue:
+            return true
+        case _:
+            pass
+    for b in stmt_blocks(s):
+        if any(stmt_continues(x) for x in b.stmts):
+            return true
+    return false
+
 struct LoopCtl:
     head: int
     cont: int
@@ -6582,6 +6854,8 @@ struct GpuSite:
     where_sym: str
     ctx_size: int
     ptrs: [int]
+    # why the context can't be copied to a device (`ptrs` is empty)
+    why: str
 
 # A lifted parallel body's context: its fields' names and offsets.
 struct ParCtx:
@@ -6614,6 +6888,8 @@ fn reducer_code(r: Reducer) -> int:
             return 4
         case Reducer.All:
             return 5
+        case Reducer.First:
+            return 6
 
 fn kind_code(k: K) -> int:
     match k:

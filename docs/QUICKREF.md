@@ -446,24 +446,41 @@ compiled (path: a string literal, relative to the file containing the call;
 `\r\n` becomes `\n`). It works in `const`s too: `const HELP = embed("help.txt")`.
 Reductions over generators: `sum(x * x for x in xs)`, `product`, `min`, `max`,
 `any(x < 0 for x in xs)`, `all(...)`. `min`/`max` of an empty sequence panic.
+`first(Some(x) if p(x) else None for x in xs)` is the first `Some` of a generator
+of options (or of an array of them), or `None`; it stops at that element.
 
 ## Parallelism (data-race free by construction)
 
 ```python
 let ys = par [f(x) for x in xs]              # parallel map
 let total = par sum(x * x for x in xs)        # parallel reduction
+let at = par first(Some(i) if ok(i) else None for i in 0..n)  # parallel search
 var out = [0.0] * n
 par for i in 0..n:                            # parallel loop
-    out[i] = xs[i] * 2.0                      # only out[i] of outer arrays may be written
+    out[i] = xs[i] * 2.0                      # outer arrays: only out[i] (or out[k*i + c])
 let (a, b) = par(work(1), work(2))            # fork-join
 ```
 Rules: inside a `par` body, outer variables are read-only, except that
-`par for i` may write `arr[i]` (exactly the loop variable) of an outer array.
+`par for i in lo..hi` (over a range) may write `arr[i]` (exactly the loop
+variable) of an outer array, or `arr[k * i + c]` with integer constants
+`k >= 1` and `c`: every write of `arr` in the loop uses the same `k`, and its
+offsets `c` aren't a multiple of `k` apart, so no two iterations write the same
+element. The loop may also read `arr[k * i + c]` at an element it writes, or at
+one no iteration writes. So in-place red-black sweeps work:
+```python
+par for i in 0..n:
+    a[2 * i + 1] = 0.5 * (a[2 * i] + a[2 * i + 2])   # odd from even
+```
 Reductions are deterministic: same result bits on any machine and thread count.
 They fold leaves of 16 consecutive elements left to right, then combine the leaves
 in a balanced pairwise tree (so `par sum` of floats can differ in the last bits from
 a sequential `sum`, usually by being more accurate). Integer overflow of any partial
-result in that order traps.
+result in that order traps. Only the scheduling adapts: a reduction over a few
+expensive elements still uses all the threads. `par any`/`par all` stop
+starting new work once an element decides the result; the elements before it
+always run, so a panic the sequential loop would reach still happens.
+`par first(...)` is the lowest-index `Some`, like `first`, on any thread count;
+the elements before it all run, those after it may not.
 `BRINE_THREADS=n` or `brine run --threads n` sets the thread count.
 
 **GPUs.** `par for`, `par [...]` and `par` reductions also run on a GPU (NVIDIA
@@ -474,10 +491,13 @@ the CPU (they have no f64).
 Nothing to write or install beyond the driver: the compiler makes a kernel of every
 body that only uses int/float arithmetic, comparisons, branches, loops, structs,
 tuples, reads of outer arrays and scalars, `out[i]` writes, `sqrt`, `abs`, `floor`,
-`ceil`, `round`, `min`, `max`, and calls to functions that do the same. Strings,
-maps, new arrays, printing, `sin`/`exp`/`log`/`pow` and the like keep a body on the
-CPU. `BRINE_GPU=off|on|auto` (default `auto`; `on` uses the GPU whenever it can),
-`BRINE_GPU_LOG=1` prints where each construct ran and why.
+`ceil`, `round`, `min`, `max`, and calls to functions that do the same; on NVIDIA
+GPUs also `i128`/`u128` arithmetic (except reductions of them, conversions to and
+from floats, and passing them to functions). Strings, maps, new arrays, printing,
+`sin`/`exp`/`log`/`pow` and the like keep a body on the CPU. `BRINE_GPU=off|on|auto` (default `auto`; `on` uses the GPU whenever it can),
+`BRINE_GPU_LOG=1` prints where each construct ran and why. With `--ranks`, the
+k-th rank on a machine uses its k-th GPU and the ranks beyond its GPUs stay on the
+CPU (ranks sharing a GPU queue for it); `on` shares the GPUs out instead.
 
 ## Multiple processes and machines: `world`
 

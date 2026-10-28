@@ -222,6 +222,8 @@ static br_mutex br_io_mu;
 static int br_argc;
 static char **br_argv;
 static int64_t br_rank = 0, br_size = 1;
+/* how many lower ranks run on this rank's machine (GPUs go one per rank) */
+static int64_t br_local_rank = 0;
 
 /* ============================================================ panics */
 static void br_flush(void) { fflush(stdout); }
@@ -2630,6 +2632,18 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
     br_unlock(&br_pool.job_lock);
 }
 
+int64_t brine_par_chunks(int64_t n) { return brine_par_plan(n); }
+
+bool brine_first_stopped(const int64_t *stop, int64_t chunk) {
+    return __atomic_load_n(stop, __ATOMIC_RELAXED) < chunk;
+}
+
+void brine_first_found(int64_t *stop, int64_t chunk) {
+    int64_t cur = __atomic_load_n(stop, __ATOMIC_RELAXED);
+    while (chunk < cur && !__atomic_compare_exchange_n(stop, &cur, chunk, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
+
 typedef struct {
     brine_task_fn fn;
     void *ctx;
@@ -2831,7 +2845,25 @@ typedef struct {
     const char *loc;
     char *vals; /* per task: the node of its subtree */
     bool *has;
+    /* any/all: the value that decides the result (else -1), and the lowest
+     * leaf (or element) known to have it */
+    int decide;
+    int64_t stop;
 } br_reduce_job;
+
+/* `any` and `all` are decided by the first element that is true (false):
+ * leaves after one that has it needn't run. The ones before it still do, so
+ * a panic the sequential loop would reach still happens. */
+static int br_decided(br_reduce_job *j, int64_t at) {
+    return j->decide >= 0 && __atomic_load_n(&j->stop, __ATOMIC_RELAXED) < at;
+}
+
+static void br_decide(br_reduce_job *j, int64_t at, const void *v, bool h) {
+    if (j->decide < 0 || !h || *(const bool *)v != (bool)j->decide) return;
+    int64_t cur = __atomic_load_n(&j->stop, __ATOMIC_RELAXED);
+    while (at < cur && !__atomic_compare_exchange_n(&j->stop, &cur, at, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
 
 static void br_reduce_task(void *ctx, int64_t chunk, int64_t lo, int64_t hi) {
     (void)chunk;
@@ -2842,18 +2874,54 @@ static void br_reduce_task(void *ctx, int64_t chunk, int64_t lo, int64_t hi) {
         br_fold_init(&f, j->comb, j->size, j->loc);
         int64_t l0 = t * j->task_leaves;
         int64_t l1 = l0 + j->task_leaves < j->nleaves ? l0 + j->task_leaves : j->nleaves;
-        for (int64_t l = l0; l < l1; l++) {
+        for (int64_t l = l0; l < l1 && !br_decided(j, l); l++) {
             int64_t a = l * BRINE_LEAF;
             int64_t b = a + BRINE_LEAF < j->n ? a + BRINE_LEAF : j->n;
             bool h = false;
             j->fn(j->ctx, l, a, b, v, &h);
+            br_decide(j, l, v, h);
             br_fold_push(&f, 0, v, h);
         }
         j->has[t] = br_fold_finish(&f, j->vals + t * 16);
     }
 }
 
-static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, void *ctx, int64_t op, int64_t vk, void *val, bool *has, const char *loc) {
+/* Few leaves for the threads: each element is a task of its own (`efn`
+ * gives its value, unfolded), and the leaves are folded from those values
+ * afterwards, in the same order as the leaf function would. */
+static void br_reduce_elem(void *ctx, int64_t chunk, int64_t lo, int64_t hi) {
+    (void)chunk;
+    br_reduce_job *j = (br_reduce_job *)ctx;
+    for (int64_t e = lo; e < hi; e++) {
+        j->has[e] = false;
+        if (br_decided(j, e)) continue;
+        j->fn(j->ctx, e / BRINE_LEAF, e, e + 1, j->vals + e * 16, &j->has[e]);
+        br_decide(j, e, j->vals + e * 16, j->has[e]);
+    }
+}
+
+static void br_reduce_elems(br_reduce_job *j, br_fold *f, int64_t op, const void *start) {
+    brine_par_run(0, j->n, j->n, br_reduce_elem, j);
+    /* sum and product start from 0 (1) like the leaf function: 0.0 + -0.0 is 0.0 */
+    int from_start = op != BRINE_RED_MIN && op != BRINE_RED_MAX;
+    for (int64_t l = 0; l < j->nleaves; l++) {
+        _Alignas(16) char acc[16];
+        memcpy(acc, start, (size_t)j->size);
+        bool h = false;
+        int64_t b = (l + 1) * BRINE_LEAF < j->n ? (l + 1) * BRINE_LEAF : j->n;
+        for (int64_t e = l * BRINE_LEAF; e < b; e++) {
+            if (!j->has[e]) continue;
+            if (h || from_start)
+                j->comb(acc, j->vals + e * 16, j->loc);
+            else
+                memcpy(acc, j->vals + e * 16, (size_t)j->size);
+            h = true;
+        }
+        br_fold_push(f, 0, acc, h);
+    }
+}
+
+static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *ctx, int64_t op, int64_t vk, void *val, bool *has, const char *loc) {
     if (n <= 0) return;
     br_reduce_job j;
     j.fn = fn;
@@ -2863,6 +2931,20 @@ static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, void *ctx, int64_t op, in
     j.comb = br_comb_pick(op, vk);
     j.size = br_vk_size[vk];
     j.loc = loc;
+    j.decide = op == BRINE_RED_ANY ? 1 : (op == BRINE_RED_ALL ? 0 : -1);
+    j.stop = INT64_MAX;
+    if (efn && n > 1 && j.nleaves < 4 * (int64_t)br_threads() && br_threads() > 1 && !br_in_par_get()) {
+        j.fn = efn;
+        j.vals = (char *)brine_alloc(n * 16);
+        j.has = (bool *)brine_alloc(n);
+        br_fold f;
+        br_fold_init(&f, j.comb, j.size, loc);
+        br_reduce_elems(&j, &f, op, val);
+        if (br_fold_finish(&f, val)) *has = true;
+        free(j.vals);
+        free(j.has);
+        return;
+    }
     /* tasks of 2^h leaves, several per thread for balance; the result doesn't
      * depend on the split, since every task is a whole subtree */
     int64_t want = (int64_t)br_threads() * 8;
@@ -2967,6 +3049,7 @@ static void br_gpu_logf(const char *fmt, ...) {
     va_start(ap, fmt);
     br_lock(&br_io_mu);
     fputs("brine gpu: ", stderr);
+    if (br_size > 1) fprintf(stderr, "rank %lld: ", (long long)br_rank);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     fflush(stderr);
@@ -2988,6 +3071,19 @@ static const char *br_gpu_cpu_est(char *buf, double cpu_s) {
  * as they are. */
 static int br_dev_open(const char *code, char *why, size_t nwhy);
 static const char *br_dev_err(br_gpu_res r);
+
+/* Which of the machine's n GPUs this rank uses, or -1. Ranks sharing a GPU
+ * would queue for it and each run slower than the CPU it gave up, so in
+ * auto mode the k-th rank on a machine gets GPU k, and the ranks beyond the
+ * GPUs stay on the CPU; BRINE_GPU=on shares them out round-robin. */
+static int br_gpu_ordinal(int n, char *why, size_t nwhy) {
+    if (n <= 0) return -1;
+    if (br_local_rank < n) return (int)br_local_rank;
+    if (br_gpu.mode == BR_GPU_ON) return (int)(br_local_rank % n);
+    snprintf(why, nwhy, "%d lower rank%s on this machine use%s its %d GPU%s (one rank per GPU; BRINE_GPU=on shares them)",
+             (int)br_local_rank, br_local_rank == 1 ? "" : "s", br_local_rank == 1 ? "s" : "", n, n == 1 ? "" : "s");
+    return -1;
+}
 /* makes the device current on this thread */
 static br_gpu_res br_dev_bind(void);
 static br_gpu_res br_dev_alloc(br_gpu_ptr *p, size_t n);
@@ -3075,6 +3171,7 @@ static int br_dev_open(const char *code, char *why, size_t nwhy) {
         return 0;
     }
     br_mtl.stack = strtoull(code + 24, NULL, 10);
+    if (br_gpu_ordinal(1, why, nwhy) < 0) return 0;
     void *objc = dlopen("/usr/lib/libobjc.A.dylib", RTLD_NOW | RTLD_LOCAL);
     void *fnd = dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_NOW | RTLD_LOCAL);
     void *mtl = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_NOW | RTLD_LOCAL);
@@ -3424,8 +3521,14 @@ static int br_dev_open(const char *ptx, char *why, size_t nwhy) {
         snprintf(why, nwhy, "cuInit: %s", br_dev_err(r));
         return 0;
     }
-    if (n <= 0 || c->DeviceGet(&dev, 0) != 0) {
+    if (n <= 0) {
         snprintf(why, nwhy, "no CUDA device");
+        return 0;
+    }
+    int ord = br_gpu_ordinal(n, why, nwhy);
+    if (ord < 0) return 0;
+    if (c->DeviceGet(&dev, ord) != 0) {
+        snprintf(why, nwhy, "no CUDA device %d", ord);
         return 0;
     }
     int major = 0, minor = 0;
@@ -3561,6 +3664,9 @@ typedef struct {
     int64_t node;
     uint64_t hoff, doff, bytes;
     int written, read, staged;
+    /* BRINE_GA_DENSE: iteration k writes element first + k only */
+    int dense;
+    int64_t first;
 } br_garr;
 
 typedef struct {
@@ -3571,6 +3677,8 @@ typedef struct {
     int64_t *tab; /* open addressing, index + 1 */
     int64_t tcap;
     uint64_t stage, direct;
+    /* the iterations the device runs */
+    int64_t lo, hi;
     int ok;
 } br_gplan;
 
@@ -3607,7 +3715,7 @@ static void br_gplan_grow(br_gplan *p) {
     }
 }
 
-static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int written, int read, int depth) {
+static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int written, int read, int dense, int64_t first, int depth) {
     if (!p->ok || !a) return;
     if (depth > 16) {
         p->ok = 0;
@@ -3622,6 +3730,10 @@ static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int writ
     if (i >= 0) {
         p->a[i].written |= written;
         p->a[i].read |= read;
+        if (p->a[i].dense != dense || p->a[i].first != first) {
+            p->a[i].dense = 0;
+            p->a[i].read = 1;
+        }
         return;
     }
     if (p->na == p->acap) {
@@ -3645,6 +3757,8 @@ static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int writ
     g->bytes = (uint64_t)a->len * (uint64_t)esz;
     g->written = written;
     g->read = read;
+    g->dense = dense;
+    g->first = first;
     g->hoff = p->stage;
     p->stage += 64;
     g->staged = nsub > 0 || g->bytes <= BR_GPU_SMALL;
@@ -3659,7 +3773,7 @@ static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int writ
     for (int64_t e = 0; e < a->len && nsub > 0; e++)
         for (int64_t s = 0; s < nsub; s++) {
             const brine_arr *c = *(brine_arr *const *)(a->data + e * esz + nd[2 + 2 * s]);
-            br_gplan_add(p, c, nd[3 + 2 * s], 0, 1, depth + 1);
+            br_gplan_add(p, c, nd[3 + 2 * s], 0, 1, 0, 0, depth + 1);
         }
 }
 
@@ -3674,7 +3788,10 @@ static int br_gplan_make(br_gplan *p, const brine_kernel *k, const void *ctx) {
     for (int64_t f = 0; f < nf; f++) {
         const int64_t *fd = k->ptrs + 1 + 3 * f;
         const brine_arr *a = *(brine_arr *const *)((const char *)ctx + fd[0]);
-        br_gplan_add(p, a, fd[2], (fd[1] & 1) != 0, (fd[1] & 2) == 0, 0);
+        int64_t fl = fd[1], first = 0;
+        if (fl >> 8) memcpy(&first, (const char *)ctx + (fl >> 8) - 1, 8);
+        int dense = (fl & BRINE_GA_DENSE) != 0;
+        br_gplan_add(p, a, fd[2], (fl & BRINE_GA_WRITTEN) != 0, !dense, dense, first, 0);
     }
     for (int64_t i = 0; i < p->na; i++)
         if (!p->a[i].staged) p->a[i].doff += BR_ALIGN(p->stage, 256);
@@ -3688,10 +3805,30 @@ static void br_gplan_free(br_gplan *p) {
 
 static uint64_t br_gplan_size(const br_gplan *p) { return BR_ALIGN(p->stage, 256) + p->direct; }
 
+/* The bytes of g that go back: all of them, or the elements the device's
+ * iterations write. */
+static void br_garr_out(const br_gplan *p, const br_garr *g, uint64_t *off, uint64_t *bytes) {
+    *off = 0;
+    *bytes = g->bytes;
+    if (!g->dense) return;
+    int64_t esz = p->nodes[g->node], len = g->host->len;
+    int64_t a = g->first + p->lo, b = g->first + p->hi;
+    if (a < 0) a = 0;
+    if (b > len) b = len;
+    if (b < a) b = a;
+    *off = (uint64_t)(a * esz);
+    *bytes = (uint64_t)((b - a) * esz);
+}
+
 static uint64_t br_gplan_bytes(const br_gplan *p) {
     uint64_t b = p->stage;
-    for (int64_t i = 0; i < p->na; i++)
-        if (!p->a[i].staged) b += (p->a[i].read ? p->a[i].bytes : 0) + (p->a[i].written ? p->a[i].bytes : 0);
+    for (int64_t i = 0; i < p->na; i++) {
+        const br_garr *g = &p->a[i];
+        uint64_t off = 0, out = 0;
+        br_garr_out(p, g, &off, &out);
+        if (!g->staged && g->read) b += g->bytes;
+        if (g->written) b += out;
+    }
     return b;
 }
 
@@ -3782,7 +3919,9 @@ static br_gpu_res br_gpu_copy_out(br_gplan *p) {
     br_gpu_res r = 0;
     for (int64_t i = 0; i < p->na && r == 0; i++) {
         br_garr *g = &p->a[i];
-        if (g->written && g->bytes > 0) r = br_dev_dtoh(g->host->data, br_gpu.buf + g->doff, (size_t)g->bytes);
+        uint64_t off = 0, n = 0;
+        br_garr_out(p, g, &off, &n);
+        if (g->written && n > 0) r = br_dev_dtoh(g->host->data + off, br_gpu.buf + g->doff + off, (size_t)n);
     }
     return r;
 }
@@ -3948,11 +4087,13 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
         *why = "out of memory";
         return done;
     }
-    /* the arrays go back whole, so the elements the probe wrote must be on
-     * the device too */
+    /* arrays that go back whole need the elements the probe wrote on the
+     * device too */
+    p.lo = done;
+    p.hi = n;
     if (done > 0)
         for (int64_t i = 0; i < p.na; i++)
-            if (p.a[i].written) p.a[i].read = 1;
+            if (p.a[i].written && !p.a[i].dense) p.a[i].read = 1;
     br_lock(&br_gpu.mu);
     br_gpu_choice c = br_gpu_choose(k, st, n - done, br_gplan_bytes(&p), 1 + (int64_t)((n - done) / ((int64_t)1 << 22)));
     br_unlock(&br_gpu.mu);
@@ -4186,7 +4327,7 @@ static int br_gpu_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx
     return 1;
 }
 
-void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, void *val, bool *has, const char *loc) {
+void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *ctx, void *val, bool *has, const char *loc) {
     if (n <= 0) return;
     br_fold f;
     br_fold_init(&f, br_comb_pick(k->op, k->vk), br_vk_size[k->vk], loc);
@@ -4197,7 +4338,7 @@ void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, v
         return;
     }
     double t0 = brine_clock();
-    br_reduce_cpu(n, fn, ctx, k->op, k->vk, val, has, loc);
+    br_reduce_cpu(n, fn, efn, ctx, k->op, k->vk, val, has, loc);
     double dt = brine_clock() - t0;
     if (k->ptx && !br_in_par_get() && n >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n, dt);
     if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt);
@@ -4545,6 +4686,10 @@ static void br_abort_flush(int sig) {
     fflush(stderr);
 }
 
+static bool br_loopback(const char *h) { return strncmp(h, "127.", 4) == 0 || strcmp(h, "localhost") == 0; }
+
+static bool br_same_host(const char *a, const char *b) { return strcmp(a, b) == 0 || (br_loopback(a) && br_loopback(b)); }
+
 /* Processes this rank starts (`run`, `os.spawn`) are not part of its world. */
 static void br_unsetenv(const char *name) {
 #ifdef _WIN32
@@ -4598,6 +4743,8 @@ static void br_world_init(void) {
         ports[i] = colon + 1;
         p = comma ? comma + 1 : p + strlen(p);
     }
+    for (int64_t i = 0; i < br_rank; i++)
+        if (br_same_host(hosts[i], hosts[br_rank])) br_local_rank++;
     for (int64_t i = 0; i < br_size; i++) {
         br_mutex_init(&br_peers[i].mu);
         br_mutex_init(&br_peers[i].send_mu);
@@ -4613,7 +4760,7 @@ static void br_world_init(void) {
        outside can reach it, and firewalls don't ask about it */
     bool local = true;
     for (int64_t i = 0; i < br_size; i++)
-        if (strncmp(hosts[i], "127.", 4) != 0 && strcmp(hosts[i], "localhost") != 0) local = false;
+        if (!br_loopback(hosts[i])) local = false;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;

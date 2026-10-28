@@ -157,6 +157,9 @@ fn plan(funcs: [Func], ks: [KReq], metal: bool) -> Plan:
             case Some(i):
                 good = i not in bad and len(funcs[i].vk) >= nparams_of(k.kind)
                 w = bad.get(i).unwrap_or("")
+                if good and k.kind == 2 and wide(k.vk):
+                    good = false
+                    w = "reduces 128-bit integers"
             case None:
                 pass
         ok.push(good)
@@ -238,7 +241,8 @@ fn comb_name(op: int, vk: K) -> str:
 # ================================================================ eligibility
 
 # Register class of a kind: 0 b64, 1 b32 (narrow integers are kept sign- or
-# zero-extended to 32 bits), 2 predicate, 3 f32, 4 f64; -1 can't run here.
+# zero-extended to 32 bits), 2 predicate, 3 f32, 4 f64, 5 two b64 (128-bit
+# integers, see `inst128`); -1 can't run here.
 fn cls(k: K) -> int:
     match k:
         case K.I64 | K.U64 | K.Ptr:
@@ -251,6 +255,8 @@ fn cls(k: K) -> int:
             return 3
         case K.F64:
             return 4
+        case K.I128 | K.U128:
+            return 5
         case _:
             return -1
 
@@ -288,9 +294,14 @@ fn int_helper(s: str) -> bool:
             return suffix_kind(s[len(p):]).is_some()
     if s.starts_with("brine_conv_"):
         let rest = s[11:]
-        for src in ["_from_i64", "_from_u64", "_from_f64"]:
+        for src in ["_from_i64", "_from_u64", "_from_f64", "_from_i128", "_from_u128"]:
             if rest.ends_with(src):
-                return suffix_kind(rest[:len(rest) - len(src)]).is_some()
+                match suffix_kind(rest[:len(rest) - len(src)]):
+                    case Some(k):
+                        # no 128-bit floats conversions
+                        return not (wide(k) and src == "_from_f64")
+                    case None:
+                        return false
     return false
 
 fn float_helper(s: str) -> bool:
@@ -317,6 +328,10 @@ fn suffix_kind(s: str) -> Option[K]:
             return Some(K.U32)
         case "u64":
             return Some(K.U64)
+        case "i128":
+            return Some(K.I128)
+        case "u128":
+            return Some(K.U128)
         case _:
             return None
 
@@ -325,12 +340,15 @@ fn suffix_kind(s: str) -> Option[K]:
 fn local_check(f: Func, index: {str: int}, metal: bool) -> (str, [str]):
     var callees: [str] = []
     for k in f.vk:
-        if cls(k) < 0:
+        if cls(k) < 0 or (metal and wide(k)):
             return ("uses 128-bit integers", callees)
         if metal and k == K.F64:
             return ("uses f64 (Apple GPUs have none)", callees)
-    if f.has_ret and cls(f.ret) < 0:
-        return ("uses 128-bit integers", callees)
+    if f.has_ret and (cls(f.ret) < 0 or wide(f.ret)):
+        return ("returns a 128-bit integer", callees)
+    for i in 0..f.nparams:
+        if wide(f.vk[i]):
+            return ("takes a 128-bit integer", callees)
     # vregs holding the address of a symbol: only error locations, which
     # kernels don't need, may use them
     var glob: {int: bool} = {}
@@ -342,10 +360,15 @@ fn local_check(f: Func, index: {str: int}, metal: bool) -> (str, [str]):
         # Apple GPUs flush subnormal f32 values to zero
         if metal and x.op == Op.FConst and (x.n & 0x7F800000) == 0 and (x.n & 0x7FFFFF) != 0:
             return ("uses a subnormal float", callees)
+        if touches_wide(f, x):
+            let w = wide_why(f, x)
+            if w != "":
+                return (w, callees)
         match x.op:
             case Op.CallInd:
                 return ("calls a function value", callees)
-            case Op.Global:
+            case Op.Global | Op.SlotAddr | Op.Const | Op.FConst:
+                # no vreg operands: `a` of SlotAddr is a slot, `c` of Const the high bits
                 pass
             case Op.Call:
                 if is_panic(x.s) or is_refcount(x.s):
@@ -370,7 +393,7 @@ fn local_check(f: Func, index: {str: int}, metal: bool) -> (str, [str]):
                     return (global_use, callees)
             case _:
                 for v in [x.a, x.b, x.c]:
-                    if v >= 0 and v in glob and x.op != Op.Const:
+                    if v >= 0 and v in glob:
                         return (global_use, callees)
                 if x.op == Op.Rem and f.vk[x.d].is_float():
                     return ("uses float %", callees)
@@ -456,6 +479,14 @@ fn fn_cost(
                     w = 1
             case _:
                 pass
+        if touches_wide(f, x):
+            # division is a loop of up to 128 steps
+            let divides = (
+                x.op == Op.Div
+                or x.op == Op.Rem
+                or (x.op == Op.Call and ("div_" in x.s or "mod_" in x.s))
+            )
+            w = 400 if divides else w * 4
         if x.d >= 0 and f.vk[x.d] == K.F64:
             match x.op:
                 case Op.Add | Op.Sub | Op.Mul | Op.Div | Op.Conv:
@@ -487,6 +518,8 @@ fn reg(k: K, v: int) -> str:
             return f"%p{v}"
         case 3:
             return f"%f{v}"
+        case 5:
+            return f"%xl{v}"
         case _:
             return f"%fd{v}"
 
@@ -807,6 +840,11 @@ fn decls(em: Em) -> [str]:
     o.push("\t.reg .pred %tp<4>;")
     o.push("\t.reg .f64 %tf<4>;")
     o.push("\t.reg .f32 %tg<4>;")
+    if has_wide_kind(em.f):
+        o.push(f"\t.reg .b64 %xl<{n}>;")
+        o.push(f"\t.reg .b64 %xh<{n}>;")
+        o.push("\t.reg .b64 %tw<16>;")
+        o.push("\t.reg .pred %tq<8>;")
     for i, s in enumerate(em.f.slots):
         if i not in em.promo:
             o.push(f"\t.local .align {s.align} .b8 __s{i}[{s.size}];")
@@ -901,6 +939,9 @@ fn body(ref em: Em):
 
 fn inst(ref em: Em, x: Inst):
     let f = em.f
+    if touches_wide(f, x):
+        inst128(ref em, x)
+        return
     match x.op:
         case Op.Const:
             let k = em.k(x.d)
@@ -1737,3 +1778,498 @@ fn checked_flag(ref em: Em, op: str, k: K, l: str, r: str):
             em.e(f"{p} st.global.u32 [brine_gpu_err], %tb11;")
         else:
             em.o.push(line)
+
+# ================================================================ 128-bit integers
+# An I128 or U128 value lives in two b64 registers, %xl<n> (the low half) and
+# %xh<n> (the high half), n its vreg (or, for a slot kept in a register, the
+# number past the vregs). Scratch: %tw0-15 (%tw15 holds 0 where needed) and
+# predicates %tq0-7.
+
+fn wide(k: K) -> bool:
+    return k == K.I128 or k == K.U128
+
+fn xl(n: int) -> str:
+    return f"%xl{n}"
+
+fn xh(n: int) -> str:
+    return f"%xh{n}"
+
+fn has_wide_kind(f: Func) -> bool:
+    return any(wide(k) for k in f.vk)
+
+# Does `x` read or write a 128-bit vreg?
+fn touches_wide(f: Func, x: Inst) -> bool:
+    if x.d >= 0 and wide(f.vk[x.d]):
+        return true
+    match x.op:
+        case Op.Const | Op.FConst | Op.SlotAddr | Op.Global | Op.Label | Op.Jmp | Op.Line | Op.Unreachable:
+            return false
+        case Op.Call | Op.CallInd:
+            return any(wide(f.vk[a]) for a in x.args)
+        case _:
+            for v in [x.a, x.b]:
+                if v >= 0 and wide(f.vk[v]):
+                    return true
+            return false
+
+# Why a GPU can't run `x`, which touches 128-bit integers ("" if it can).
+fn wide_why(f: Func, x: Inst) -> str:
+    match x.op:
+        case Op.Conv:
+            if f.vk[x.d].is_float() or f.vk[x.a].is_float():
+                return "converts between 128-bit integers and floats"
+            return ""
+        case Op.Const | Op.Mov | Op.Add | Op.Sub | Op.Mul | Op.Div | Op.Rem:
+            return ""
+        case Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr | Op.Neg | Op.Not:
+            return ""
+        case Op.Eq | Op.Ne | Op.Lt | Op.Le | Op.Gt | Op.Ge:
+            return ""
+        case Op.AddO | Op.SubO | Op.MulO | Op.Load | Op.Store:
+            return ""
+        case Op.Call:
+            # runtime helpers are checked with the others
+            if x.b == 1:
+                return ""
+            return "passes a 128-bit integer to a function"
+        case _:
+            return "uses 128-bit integers"
+
+fn inst128(ref em: Em, x: Inst):
+    let f = em.f
+    match x.op:
+        case Op.Const:
+            em.e(f"mov.b64 {xl(x.d)}, {hex64(x.n)};")
+            em.e(f"mov.b64 {xh(x.d)}, {hex64(x.c)};")
+        case Op.Mov:
+            set2(ref em, x.d, xl(x.a), xh(x.a))
+        case Op.Add | Op.Sub:
+            let o = "add" if x.op == Op.Add else "sub"
+            em.e(f"{o}.cc.u64 %tw0, {xl(x.a)}, {xl(x.b)};")
+            em.e(f"{o}c.u64 %tw1, {xh(x.a)}, {xh(x.b)};")
+            set2(ref em, x.d, "%tw0", "%tw1")
+        case Op.Mul:
+            em.e(f"mul.lo.u64 %tw0, {xl(x.a)}, {xl(x.b)};")
+            em.e(f"mul.hi.u64 %tw1, {xl(x.a)}, {xl(x.b)};")
+            em.e(f"mad.lo.u64 %tw1, {xl(x.a)}, {xh(x.b)}, %tw1;")
+            em.e(f"mad.lo.u64 %tw1, {xh(x.a)}, {xl(x.b)}, %tw1;")
+            set2(ref em, x.d, "%tw0", "%tw1")
+        case Op.Div | Op.Rem:
+            let (al, ah, bl, bh) = (xl(x.a), xh(x.a), xl(x.b), xh(x.b))
+            if f.vk[x.d].is_signed():
+                sdivmod128(ref em, al, ah, bl, bh, false)
+            else:
+                udivmod128(ref em, al, ah, bl, bh)
+            if x.op == Op.Div:
+                set2(ref em, x.d, "%tw0", "%tw1")
+            else:
+                set2(ref em, x.d, "%tw2", "%tw3")
+        case Op.And | Op.Or | Op.Xor:
+            let nm = "and" if x.op == Op.And else ("or" if x.op == Op.Or else "xor")
+            em.e(f"{nm}.b64 %tw0, {xl(x.a)}, {xl(x.b)};")
+            em.e(f"{nm}.b64 %tw1, {xh(x.a)}, {xh(x.b)};")
+            set2(ref em, x.d, "%tw0", "%tw1")
+        case Op.Not:
+            em.e(f"not.b64 %tw0, {xl(x.a)};")
+            em.e(f"not.b64 %tw1, {xh(x.a)};")
+            set2(ref em, x.d, "%tw0", "%tw1")
+        case Op.Neg:
+            em.e("mov.b64 %tw15, 0;")
+            em.e(f"sub.cc.u64 %tw0, %tw15, {xl(x.a)};")
+            em.e(f"subc.u64 %tw1, %tw15, {xh(x.a)};")
+            set2(ref em, x.d, "%tw0", "%tw1")
+        case Op.Shl | Op.Shr:
+            var amt = ""
+            if wide(f.vk[x.b]):
+                em.e(f"cvt.u32.u64 %tb7, {xl(x.b)};")
+                amt = "%tb7"
+            else:
+                amt = shift_amount(ref em, x.b)
+            let k = f.vk[x.d]
+            shift128(ref em, x.op == Op.Shl, k.is_signed(), xl(x.a), xh(x.a), amt)
+            set2(ref em, x.d, "%tw0", "%tw1")
+        case Op.Eq | Op.Ne | Op.Lt | Op.Le | Op.Gt | Op.Ge:
+            let s = f.vk[x.a].is_signed()
+            cmp128(ref em, x.op, s, xl(x.a), xh(x.a), xl(x.b), xh(x.b), em.r(x.d))
+        case Op.Conv:
+            conv128(ref em, x.d, x.a)
+        case Op.AddO | Op.SubO | Op.MulO:
+            let nm = "add" if x.op == Op.AddO else ("sub" if x.op == Op.SubO else "mul")
+            let k = f.vk[x.d]
+            checked128(ref em, nm, k.is_signed(), xl(x.a), xh(x.a), xl(x.b), xh(x.b))
+            set2(ref em, x.d, "%tw0", "%tw1")
+        case Op.Load:
+            match em.base.get(x.a):
+                case Some(la):
+                    if la.slot in em.promo:
+                        let n = len(f.vk) + la.slot
+                        set2(ref em, x.d, xl(n), xh(n))
+                        return
+                case None:
+                    pass
+            let (sp, lo) = em.addr(x.a, x.n)
+            let (_, hi) = em.addr(x.a, x.n + 8)
+            em.e(f"ld{sp}.u64 {xl(x.d)}, {lo};")
+            em.e(f"ld{sp}.u64 {xh(x.d)}, {hi};")
+        case Op.Store:
+            match em.base.get(x.a):
+                case Some(la):
+                    if la.slot in em.promo:
+                        let n = len(f.vk) + la.slot
+                        set2(ref em, n, xl(x.b), xh(x.b))
+                        return
+                case None:
+                    pass
+            let (sp, lo) = em.addr(x.a, x.n)
+            let (_, hi) = em.addr(x.a, x.n + 8)
+            em.e(f"st{sp}.u64 {lo}, {xl(x.b)};")
+            em.e(f"st{sp}.u64 {hi}, {xh(x.b)};")
+        case Op.Call:
+            rt_int128(ref em, x)
+        case _:
+            pass
+
+fn set2(ref em: Em, d: int, lo: str, hi: str):
+    em.e(f"mov.b64 {xl(d)}, {lo};")
+    em.e(f"mov.b64 {xh(d)}, {hi};")
+
+# (lo, hi) = -(lo, hi) when p holds. Needs %tw15 = 0.
+fn neg_if(ref em: Em, lo: str, hi: str, p: str):
+    em.e(f"sub.cc.u64 %tw9, %tw15, {lo};")
+    em.e(f"subc.u64 %tw10, %tw15, {hi};")
+    em.e(f"selp.b64 {lo}, %tw9, {lo}, {p};")
+    em.e(f"selp.b64 {hi}, %tw10, {hi}, {p};")
+
+# %tw0, %tw1 = (al, ah) shifted by amt (a b32 register, 0..128); shifts by
+# 64 or more are clamped to 64 by PTX, which gives the right halves here.
+fn shift128(ref em: Em, left: bool, signed: bool, al: str, ah: str, amt: str):
+    em.e("mov.u32 %tb6, 64;")
+    em.e(f"sub.u32 %tb6, %tb6, {amt};")
+    em.e(f"sub.u32 %tb5, {amt}, 64;")
+    em.e(f"setp.ge.u32 %tq0, {amt}, 64;")
+    if left:
+        em.e(f"shl.b64 %tw1, {ah}, {amt};")
+        em.e(f"shr.b64 %tw2, {al}, %tb6;")
+        em.e("or.b64 %tw1, %tw1, %tw2;")
+        em.e(f"shl.b64 %tw2, {al}, %tb5;")
+        em.e(f"shl.b64 %tw0, {al}, {amt};")
+        em.e("@%tq0 mov.b64 %tw1, %tw2;")
+        return
+    let sr = "shr.s64" if signed else "shr.b64"
+    em.e(f"shr.b64 %tw0, {al}, {amt};")
+    em.e(f"shl.b64 %tw2, {ah}, %tb6;")
+    em.e("or.b64 %tw0, %tw0, %tw2;")
+    em.e(f"{sr} %tw2, {ah}, %tb5;")
+    em.e(f"{sr} %tw1, {ah}, {amt};")
+    em.e("@%tq0 mov.b64 %tw0, %tw2;")
+
+fn cmp128(ref em: Em, op: Op, signed: bool, al: str, ah: str, bl: str, bh: str, d: str):
+    match op:
+        case Op.Eq | Op.Ne:
+            let c = cmp_name(op, false)
+            em.e(f"setp.{c}.u64 %tq0, {al}, {bl};")
+            em.e(f"setp.{c}.u64 %tq1, {ah}, {bh};")
+            let j = "and" if op == Op.Eq else "or"
+            em.e(f"{j}.pred {d}, %tq0, %tq1;")
+        case _:
+            # the high halves decide, or they are equal and the low ones do
+            let strict = "lt" if op == Op.Lt or op == Op.Le else "gt"
+            let t = "s64" if signed else "u64"
+            em.e(f"setp.{strict}.{t} %tq0, {ah}, {bh};")
+            em.e(f"setp.eq.u64 %tq1, {ah}, {bh};")
+            em.e(f"setp.{cmp_name(op, false)}.u64 %tq2, {al}, {bl};")
+            em.e("and.pred %tq1, %tq1, %tq2;")
+            em.e(f"or.pred {d}, %tq0, %tq1;")
+
+# A C cast to or from a 128-bit kind (not floats: `local_check` keeps those off).
+fn conv128(ref em: Em, d: int, a: int):
+    let dk = em.k(d)
+    let ak = em.k(a)
+    if wide(dk) and wide(ak):
+        set2(ref em, d, xl(a), xh(a))
+        return
+    if wide(dk):
+        let ar = em.r(a)
+        match cls(ak):
+            case 2:
+                em.e(f"selp.b64 {xl(d)}, 1, 0, {ar};")
+                em.e(f"mov.b64 {xh(d)}, 0;")
+                return
+            case 0:
+                em.e(f"mov.b64 {xl(d)}, {ar};")
+            case _:
+                let s = "s" if ak.is_signed() else "u"
+                em.e(f"cvt.{s}64.{s}32 {xl(d)}, {ar};")
+        if ak.is_signed():
+            em.e(f"shr.s64 {xh(d)}, {xl(d)}, 63;")
+        else:
+            em.e(f"mov.b64 {xh(d)}, 0;")
+        return
+    # truncate to the low half
+    let dr = em.r(d)
+    match cls(dk):
+        case 0:
+            em.e(f"mov.b64 {dr}, {xl(a)};")
+        case 2:
+            em.e(f"or.b64 %tw0, {xl(a)}, {xh(a)};")
+            em.e(f"setp.ne.u64 {dr}, %tw0, 0;")
+        case _:
+            em.e(f"cvt.u32.u64 {dr}, {xl(a)};")
+            em.norm(dk, dr)
+
+# %tw0, %tw1 = a op b, ending the thread with an error on overflow.
+fn checked128(ref em: Em, op: str, signed: bool, al: str, ah: str, bl: str, bh: str):
+    em.e("mov.b64 %tw15, 0;")
+    if op == "add" or op == "sub":
+        em.e(f"{op}.cc.u64 %tw0, {al}, {bl};")
+        em.e(f"{op}c.cc.u64 %tw1, {ah}, {bh};")
+        em.e(f"{op}c.u64 %tw2, %tw15, %tw15;")
+        if not signed:
+            # the carry (borrow) out
+            em.e("setp.ne.u64 %tq0, %tw2, 0;")
+        elif op == "add":
+            em.e(f"xor.b64 %tw3, {ah}, %tw1;")
+            em.e(f"xor.b64 %tw4, {bh}, %tw1;")
+            em.e("and.b64 %tw3, %tw3, %tw4;")
+            em.e("setp.lt.s64 %tq0, %tw3, 0;")
+        else:
+            em.e(f"xor.b64 %tw3, {ah}, {bh};")
+            em.e(f"xor.b64 %tw4, {ah}, %tw1;")
+            em.e("and.b64 %tw3, %tw3, %tw4;")
+            em.e("setp.lt.s64 %tq0, %tw3, 0;")
+        em.err_if("%tq0")
+        return
+    if not signed:
+        umul128(ref em, al, ah, bl, bh)
+        em.err_if("%tq3")
+        return
+    # signed: multiply the magnitudes, then the product must fit the sign
+    em.e(f"mov.b64 %tw4, {al};")
+    em.e(f"mov.b64 %tw5, {ah};")
+    em.e(f"setp.lt.s64 %tq0, {ah}, 0;")
+    neg_if(ref em, "%tw4", "%tw5", "%tq0")
+    em.e(f"mov.b64 %tw6, {bl};")
+    em.e(f"mov.b64 %tw7, {bh};")
+    em.e(f"setp.lt.s64 %tq0, {bh}, 0;")
+    neg_if(ref em, "%tw6", "%tw7", "%tq0")
+    umul128(ref em, "%tw4", "%tw5", "%tw6", "%tw7")
+    em.e(f"xor.b64 %tw8, {ah}, {bh};")
+    em.e("setp.lt.s64 %tq0, %tw8, 0;")
+    # fits: below 2^127, or exactly 2^127 when negative
+    em.e("setp.lt.u64 %tq4, %tw1, 0x8000000000000000;")
+    em.e("setp.eq.u64 %tq5, %tw1, 0x8000000000000000;")
+    em.e("setp.eq.u64 %tq6, %tw0, 0;")
+    em.e("and.pred %tq5, %tq5, %tq6;")
+    em.e("and.pred %tq5, %tq5, %tq0;")
+    em.e("or.pred %tq4, %tq4, %tq5;")
+    em.e("not.pred %tq4, %tq4;")
+    em.e("or.pred %tq3, %tq3, %tq4;")
+    em.err_if("%tq3")
+    neg_if(ref em, "%tw0", "%tw1", "%tq0")
+
+# %tw0, %tw1 = the low 128 bits of a * b (unsigned); %tq3: they aren't all of
+# it. Needs %tw15 = 0.
+fn umul128(ref em: Em, al: str, ah: str, bl: str, bh: str):
+    em.e(f"setp.ne.u64 %tq1, {ah}, 0;")
+    em.e(f"setp.ne.u64 %tq2, {bh}, 0;")
+    em.e("and.pred %tq3, %tq1, %tq2;")
+    em.e(f"mul.hi.u64 %tw2, {al}, {bh};")
+    em.e("setp.ne.u64 %tq1, %tw2, 0;")
+    em.e("or.pred %tq3, %tq3, %tq1;")
+    em.e(f"mul.hi.u64 %tw2, {ah}, {bl};")
+    em.e("setp.ne.u64 %tq1, %tw2, 0;")
+    em.e("or.pred %tq3, %tq3, %tq1;")
+    em.e(f"mul.lo.u64 %tw2, {al}, {bh};")
+    em.e(f"mad.lo.u64 %tw2, {ah}, {bl}, %tw2;")
+    em.e(f"mul.lo.u64 %tw0, {al}, {bl};")
+    em.e(f"mul.hi.u64 %tw1, {al}, {bl};")
+    em.e("add.cc.u64 %tw1, %tw1, %tw2;")
+    em.e("addc.u64 %tw3, %tw15, %tw15;")
+    em.e("setp.ne.u64 %tq1, %tw3, 0;")
+    em.e("or.pred %tq3, %tq3, %tq1;")
+
+# Unsigned n / d: quotient in %tw0, %tw1, remainder in %tw2, %tw3 (d != 0).
+# Bit by bit, from the dividend's highest set bit. d must not be in
+# %tw0-3 or %tw8-15. Sets %tw15 = 0.
+fn udivmod128(ref em: Em, nl: str, nh: str, dl: str, dh: str):
+    let head = em.label()
+    let done = em.label()
+    # z = leading zeros of n; shift them out of the way
+    em.e(f"clz.b64 %tb4, {nh};")
+    em.e(f"clz.b64 %tb5, {nl};")
+    em.e("add.u32 %tb5, %tb5, 64;")
+    em.e(f"setp.eq.u64 %tq0, {nh}, 0;")
+    em.e("@%tq0 mov.b32 %tb4, %tb5;")
+    shift128(ref em, true, false, nl, nh, "%tb4")
+    em.e("mov.u32 %tb3, 128;")
+    em.e("sub.u32 %tb4, %tb3, %tb4;")
+    em.e("mov.b64 %tw2, 0;")
+    em.e("mov.b64 %tw3, 0;")
+    em.e("mov.b64 %tw15, 0;")
+    em.o.push(f"{head}:")
+    em.e("setp.eq.u32 %tq0, %tb4, 0;")
+    em.e(f"@%tq0 bra {done};")
+    # (r, q) <<= 1, keeping the bit shifted out of r
+    em.e("shr.b64 %tw8, %tw3, 63;")
+    em.e("shl.b64 %tw3, %tw3, 1;")
+    em.e("shr.b64 %tw12, %tw2, 63;")
+    em.e("or.b64 %tw3, %tw3, %tw12;")
+    em.e("shl.b64 %tw2, %tw2, 1;")
+    em.e("shr.b64 %tw12, %tw1, 63;")
+    em.e("or.b64 %tw2, %tw2, %tw12;")
+    em.e("shl.b64 %tw1, %tw1, 1;")
+    em.e("shr.b64 %tw12, %tw0, 63;")
+    em.e("or.b64 %tw1, %tw1, %tw12;")
+    em.e("shl.b64 %tw0, %tw0, 1;")
+    # r >= d (with the bit out): r -= d and set the quotient bit
+    em.e(f"sub.cc.u64 %tw9, %tw2, {dl};")
+    em.e(f"subc.cc.u64 %tw10, %tw3, {dh};")
+    em.e("subc.u64 %tw12, %tw8, %tw15;")
+    em.e("setp.ge.s64 %tq1, %tw12, 0;")
+    em.e("@%tq1 mov.b64 %tw2, %tw9;")
+    em.e("@%tq1 mov.b64 %tw3, %tw10;")
+    em.e("@%tq1 or.b64 %tw0, %tw0, 1;")
+    em.e("sub.u32 %tb4, %tb4, 1;")
+    em.e(f"bra {head};")
+    em.o.push(f"{done}:")
+
+# Signed a / b and a % b: truncating like C (`floor` false), or rounding the
+# quotient down, the remainder taking b's sign. b != 0, not MIN / -1.
+fn sdivmod128(ref em: Em, al: str, ah: str, bl: str, bh: str, floor: bool):
+    em.e("mov.b64 %tw15, 0;")
+    em.e(f"mov.b64 %tw4, {al};")
+    em.e(f"mov.b64 %tw5, {ah};")
+    em.e(f"setp.lt.s64 %tq2, {ah}, 0;")
+    neg_if(ref em, "%tw4", "%tw5", "%tq2")
+    em.e(f"mov.b64 %tw6, {bl};")
+    em.e(f"mov.b64 %tw7, {bh};")
+    em.e(f"setp.lt.s64 %tq3, {bh}, 0;")
+    neg_if(ref em, "%tw6", "%tw7", "%tq3")
+    udivmod128(ref em, "%tw4", "%tw5", "%tw6", "%tw7")
+    em.e("xor.pred %tq4, %tq2, %tq3;")
+    neg_if(ref em, "%tw0", "%tw1", "%tq4")
+    neg_if(ref em, "%tw2", "%tw3", "%tq2")
+    if floor:
+        em.e("or.b64 %tw8, %tw2, %tw3;")
+        em.e("setp.ne.u64 %tq5, %tw8, 0;")
+        em.e("and.pred %tq5, %tq5, %tq4;")
+        em.e("mov.b64 %tw14, 1;")
+        em.e("@%tq5 sub.cc.u64 %tw0, %tw0, %tw14;")
+        em.e("@%tq5 subc.u64 %tw1, %tw1, %tw15;")
+        em.e(f"@%tq5 add.cc.u64 %tw2, %tw2, {bl};")
+        em.e(f"@%tq5 addc.u64 %tw3, %tw3, {bh};")
+
+# %tq0: (lo, hi) is the kind's minimum, -2^127
+fn is_min128(ref em: Em, lo: str, hi: str):
+    em.e(f"setp.eq.u64 %tq0, {hi}, 0x8000000000000000;")
+    em.e(f"setp.eq.u64 %tq1, {lo}, 0;")
+    em.e("and.pred %tq0, %tq0, %tq1;")
+
+# The integer helpers of brine_rt.h on 128-bit integers, with the same checks.
+fn rt_int128(ref em: Em, x: Inst):
+    let s = x.s[6:]
+    if s.starts_with("conv_"):
+        let rest = s[5:]
+        let at = rest.find("_from_").unwrap_or(0)
+        conv128_checked(ref em, x.d, rest[at + 6:], x.args[0])
+        return
+    var i = 0
+    while s[i] != "_":
+        i += 1
+    let name = s[:i]
+    let k = suffix_kind(s[i + 1:]).unwrap_or(K.I128)
+    let signed = k.is_signed()
+    let a = x.args[0]
+    match name:
+        case "add" | "sub" | "mul":
+            let b = x.args[1]
+            checked128(ref em, name, signed, xl(a), xh(a), xl(b), xh(b))
+            set2(ref em, x.d, "%tw0", "%tw1")
+        case "div" | "mod" | "fdiv" | "fmod":
+            let b = x.args[1]
+            if name == "div" or name == "mod":
+                em.e(f"or.b64 %tw8, {xl(b)}, {xh(b)};")
+                em.e("setp.eq.u64 %tq0, %tw8, 0;")
+                em.err_if("%tq0")
+            if name == "div" and signed:
+                em.e(f"and.b64 %tw8, {xl(b)}, {xh(b)};")
+                em.e("setp.eq.s64 %tq2, %tw8, -1;")
+                is_min128(ref em, xl(a), xh(a))
+                em.e("and.pred %tq0, %tq0, %tq2;")
+                em.err_if("%tq0")
+            if signed:
+                sdivmod128(ref em, xl(a), xh(a), xl(b), xh(b), true)
+            else:
+                udivmod128(ref em, xl(a), xh(a), xl(b), xh(b))
+            if name == "div" or name == "fdiv":
+                set2(ref em, x.d, "%tw0", "%tw1")
+            else:
+                set2(ref em, x.d, "%tw2", "%tw3")
+        case "neg" | "abs":
+            em.e("mov.b64 %tw15, 0;")
+            em.e(f"mov.b64 %tw0, {xl(a)};")
+            em.e(f"mov.b64 %tw1, {xh(a)};")
+            if signed:
+                is_min128(ref em, xl(a), xh(a))
+                em.err_if("%tq0")
+                if name == "neg":
+                    em.e("setp.eq.u64 %tq2, %tw15, 0;")
+                else:
+                    em.e(f"setp.lt.s64 %tq2, {xh(a)}, 0;")
+                neg_if(ref em, "%tw0", "%tw1", "%tq2")
+            set2(ref em, x.d, "%tw0", "%tw1")
+        case "shl" | "shr":
+            let b = em.r(x.args[1])
+            em.e(f"setp.ge.u64 %tq0, {b}, 128;")
+            em.err_if("%tq0")
+            em.e(f"cvt.u32.u64 %tb7, {b};")
+            shift128(ref em, name == "shl", signed, xl(a), xh(a), "%tb7")
+            set2(ref em, x.d, "%tw0", "%tw1")
+        case _:
+            pass
+
+# `brine_conv_<k>_from_<src>` where k or src has 128 bits: the value must fit.
+fn conv128_checked(ref em: Em, d: int, src: str, a: int):
+    let dk = em.k(d)
+    if wide(dk):
+        if src == "i64" or src == "u64":
+            let ar = em.r(a)
+            if src == "i64" and not dk.is_signed():
+                em.e(f"setp.lt.s64 %tq0, {ar}, 0;")
+                em.err_if("%tq0")
+            em.e(f"mov.b64 {xl(d)}, {ar};")
+            if src == "i64":
+                em.e(f"shr.s64 {xh(d)}, {ar}, 63;")
+            else:
+                em.e(f"mov.b64 {xh(d)}, 0;")
+            return
+        # i128 <-> u128: the top bit must be clear
+        em.e(f"setp.lt.s64 %tq0, {xh(a)}, 0;")
+        em.err_if("%tq0")
+        set2(ref em, d, xl(a), xh(a))
+        return
+    let lo = xl(a)
+    let hi = xh(a)
+    if src == "u128" or not dk.is_signed():
+        # 0 <= value <= max: no high half (u64 needs no more)
+        em.e(f"setp.ne.u64 %tq0, {hi}, 0;")
+        em.err_if("%tq0")
+        if dk != K.U64:
+            em.e(f"setp.gt.u64 %tq0, {lo}, {kmax(dk)};")
+            em.err_if("%tq0")
+    else:
+        # fits an i64 (the high half is the low half's sign), then the kind
+        em.e(f"shr.s64 %tw0, {lo}, 63;")
+        em.e(f"setp.ne.u64 %tq0, {hi}, %tw0;")
+        em.err_if("%tq0")
+        if dk != K.I64:
+            em.e(f"setp.lt.s64 %tq0, {lo}, {kmin(dk)};")
+            em.e(f"setp.gt.s64 %tq1, {lo}, {kmax(dk)};")
+            em.e("or.pred %tq0, %tq0, %tq1;")
+            em.err_if("%tq0")
+    let dr = em.r(d)
+    if cls(dk) == 0:
+        em.e(f"mov.b64 {dr}, {lo};")
+    else:
+        em.e(f"cvt.u32.u64 {dr}, {lo};")
+        em.norm(dk, dr)
