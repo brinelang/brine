@@ -345,6 +345,16 @@ struct Summary:
             exit_dep=self.exit_dep.join(o.exit_dep)
         )
 
+# Does place `e` have an index in it (`xs[i].f`)?
+fn has_index(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Index(_, _):
+            return true
+        case ExprKind.Field(b, _, _):
+            return has_index(b)
+        case _:
+            return false
+
 # Does any expression in `b` communicate (a `world` call other than rank/size)?
 fn block_comm(b: Block) -> bool:
     for s in b.stmts:
@@ -518,7 +528,8 @@ fn new_fa(info: ProgramInfo, sums: [Summary], slots: [ParamSlots], f: FnDecl, re
         need=u64(0),
         exits=false,
         exit_dep=none(),
-        par=0
+        par=0,
+        idx_seen={}
     )
 
 # Analysis of one function.
@@ -553,6 +564,9 @@ struct Fa:
     exits: bool
     exit_dep: Dep
     par: int
+    # the dependence of each index expression where it was last evaluated:
+    # storing into `xs[g()]` after reading it doesn't run `g()` again
+    idx_seen: {Span: Dep}
 
     fn run(ref self, f: FnDecl):
         self.block(f.body, none())
@@ -641,7 +655,7 @@ struct Fa:
                 var v = self.expr(value, ctx)
                 if op.is_some():
                     v = v.join(self.expr(target, ctx))
-                self.store(target, v.spread(self.eff(ctx)), ctx)
+                self.store(target, v.spread(self.eff(ctx)), ctx, op.is_some())
             case StmtKind.ExprStmt(e):
                 self.expr(e, ctx)
             case StmtKind.If(branches, els):
@@ -847,7 +861,8 @@ struct Fa:
                 return atom(none())
 
     # `e = v`, where `v` already includes the control dependence.
-    fn store(ref self, e: Expr, v: Val, ctx: Dep):
+    # `read`: `e` was just evaluated, so its indexes aren't evaluated again.
+    fn store(ref self, e: Expr, v: Val, ctx: Dep, read: bool):
         match e.kind:
             case ExprKind.Ident(_):
                 match e.res:
@@ -864,19 +879,24 @@ struct Fa:
                     while len(o.parts) < n:
                         o.parts.push(atom(none()))
                     o.parts[e.idx] = v
-                    self.store(b, o, ctx)
+                    self.store(b, o, ctx, read)
                 else:
-                    self.store(b, o.join(v), ctx)
+                    self.store(b, o.join(v), ctx, read)
             case ExprKind.Index(b, idx):
-                let i = self.expr(idx, ctx).flat()
+                var i = none()
+                match self.idx_seen.get(idx.span):
+                    case Some(d) if read:
+                        i = d
+                    case _:
+                        i = self.expr(idx, ctx).flat()
                 let o = self.peek(b)
                 match b.ty:
                     case Ty.Array(_):
                         # one element changes: the others keep their values
                         let el = o.part(0).join(v).spread(i)
-                        self.store(b, Val(d=o.d, parts=[el]), ctx)
+                        self.store(b, Val(d=o.d, parts=[el]), ctx, read)
                     case _:
-                        self.store(b, atom(o.flat().join(v.flat()).join(i)), ctx)
+                        self.store(b, atom(o.flat().join(v.flat()).join(i)), ctx, read)
             case _:
                 self.expr(e, ctx)
 
@@ -914,6 +934,7 @@ struct Fa:
             case ExprKind.Index(b, i):
                 let bv = self.expr(b, ctx)
                 let iv = self.expr(i, ctx).flat()
+                self.idx_seen[i.span] = iv
                 match b.ty:
                     case Ty.Array(_):
                         return bv.part(0).spread(iv)
@@ -1270,7 +1291,7 @@ struct Fa:
         match recv:
             case Some(r):
                 if lvalue_root(r).is_some():
-                    self.store(r, v, ctx)
+                    self.store(r, v, ctx, true)
             case None:
                 pass
 
@@ -1293,7 +1314,8 @@ struct Fa:
                 ae = Some(args[i].expr)
             match ae:
                 case Some(x):
-                    if lvalue_root(x).is_some() and i < len(vs):
+                    # (an indexed place can't change: E0405)
+                    if lvalue_root(x).is_some() and not has_index(x) and i < len(vs):
                         vs[i] = self.expr(x, ctx)
                 case None:
                     pass
@@ -1341,7 +1363,7 @@ struct Fa:
                 case Some(x):
                     if lvalue_root(x).is_some():
                         let out = s.outs[i] if i < len(s.outs) else atom(none())
-                        self.store(x, self.subst_val(out, vs, slots, e.span).spread(ef), ctx)
+                        self.store(x, self.subst_val(out, vs, slots, e.span).spread(ef), ctx, true)
                 case None:
                     pass
         if s.exits:
