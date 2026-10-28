@@ -2702,7 +2702,25 @@ typedef struct {
     const char *loc;
     char *vals; /* per task: the node of its subtree */
     bool *has;
+    /* any/all: the value that decides the result (else -1), and the lowest
+     * leaf (or element) known to have it */
+    int decide;
+    int64_t stop;
 } br_reduce_job;
+
+/* `any` and `all` are decided by the first element that is true (false):
+ * leaves after one that has it needn't run. The ones before it still do, so
+ * a panic the sequential loop would reach still happens. */
+static int br_decided(br_reduce_job *j, int64_t at) {
+    return j->decide >= 0 && __atomic_load_n(&j->stop, __ATOMIC_RELAXED) < at;
+}
+
+static void br_decide(br_reduce_job *j, int64_t at, const void *v, bool h) {
+    if (j->decide < 0 || !h || *(const bool *)v != (bool)j->decide) return;
+    int64_t cur = __atomic_load_n(&j->stop, __ATOMIC_RELAXED);
+    while (at < cur && !__atomic_compare_exchange_n(&j->stop, &cur, at, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
 
 static void br_reduce_task(void *ctx, int64_t chunk, int64_t lo, int64_t hi) {
     (void)chunk;
@@ -2713,18 +2731,54 @@ static void br_reduce_task(void *ctx, int64_t chunk, int64_t lo, int64_t hi) {
         br_fold_init(&f, j->comb, j->size, j->loc);
         int64_t l0 = t * j->task_leaves;
         int64_t l1 = l0 + j->task_leaves < j->nleaves ? l0 + j->task_leaves : j->nleaves;
-        for (int64_t l = l0; l < l1; l++) {
+        for (int64_t l = l0; l < l1 && !br_decided(j, l); l++) {
             int64_t a = l * BRINE_LEAF;
             int64_t b = a + BRINE_LEAF < j->n ? a + BRINE_LEAF : j->n;
             bool h = false;
             j->fn(j->ctx, l, a, b, v, &h);
+            br_decide(j, l, v, h);
             br_fold_push(&f, 0, v, h);
         }
         j->has[t] = br_fold_finish(&f, j->vals + t * 16);
     }
 }
 
-static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, void *ctx, int64_t op, int64_t vk, void *val, bool *has, const char *loc) {
+/* Few leaves for the threads: each element is a task of its own (`efn`
+ * gives its value, unfolded), and the leaves are folded from those values
+ * afterwards, in the same order as the leaf function would. */
+static void br_reduce_elem(void *ctx, int64_t chunk, int64_t lo, int64_t hi) {
+    (void)chunk;
+    br_reduce_job *j = (br_reduce_job *)ctx;
+    for (int64_t e = lo; e < hi; e++) {
+        j->has[e] = false;
+        if (br_decided(j, e)) continue;
+        j->fn(j->ctx, e / BRINE_LEAF, e, e + 1, j->vals + e * 16, &j->has[e]);
+        br_decide(j, e, j->vals + e * 16, j->has[e]);
+    }
+}
+
+static void br_reduce_elems(br_reduce_job *j, br_fold *f, int64_t op, const void *start) {
+    brine_par_run(0, j->n, j->n, br_reduce_elem, j);
+    /* sum and product start from 0 (1) like the leaf function: 0.0 + -0.0 is 0.0 */
+    int from_start = op != BRINE_RED_MIN && op != BRINE_RED_MAX;
+    for (int64_t l = 0; l < j->nleaves; l++) {
+        _Alignas(16) char acc[16];
+        memcpy(acc, start, (size_t)j->size);
+        bool h = false;
+        int64_t b = (l + 1) * BRINE_LEAF < j->n ? (l + 1) * BRINE_LEAF : j->n;
+        for (int64_t e = l * BRINE_LEAF; e < b; e++) {
+            if (!j->has[e]) continue;
+            if (h || from_start)
+                j->comb(acc, j->vals + e * 16, j->loc);
+            else
+                memcpy(acc, j->vals + e * 16, (size_t)j->size);
+            h = true;
+        }
+        br_fold_push(f, 0, acc, h);
+    }
+}
+
+static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *ctx, int64_t op, int64_t vk, void *val, bool *has, const char *loc) {
     if (n <= 0) return;
     br_reduce_job j;
     j.fn = fn;
@@ -2734,6 +2788,20 @@ static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, void *ctx, int64_t op, in
     j.comb = br_comb_pick(op, vk);
     j.size = br_vk_size[vk];
     j.loc = loc;
+    j.decide = op == BRINE_RED_ANY ? 1 : (op == BRINE_RED_ALL ? 0 : -1);
+    j.stop = INT64_MAX;
+    if (efn && n > 1 && j.nleaves < 4 * (int64_t)br_threads() && br_threads() > 1 && !br_in_par_get()) {
+        j.fn = efn;
+        j.vals = (char *)brine_alloc(n * 16);
+        j.has = (bool *)brine_alloc(n);
+        br_fold f;
+        br_fold_init(&f, j.comb, j.size, loc);
+        br_reduce_elems(&j, &f, op, val);
+        if (br_fold_finish(&f, val)) *has = true;
+        free(j.vals);
+        free(j.has);
+        return;
+    }
     /* tasks of 2^h leaves, several per thread for balance; the result doesn't
      * depend on the split, since every task is a whole subtree */
     int64_t want = (int64_t)br_threads() * 8;
@@ -4095,7 +4163,7 @@ static int br_gpu_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx
     return 1;
 }
 
-void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, void *val, bool *has, const char *loc) {
+void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *ctx, void *val, bool *has, const char *loc) {
     if (n <= 0) return;
     br_fold f;
     br_fold_init(&f, br_comb_pick(k->op, k->vk), br_vk_size[k->vk], loc);
@@ -4106,7 +4174,7 @@ void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, v
         return;
     }
     double t0 = brine_clock();
-    br_reduce_cpu(n, fn, ctx, k->op, k->vk, val, has, loc);
+    br_reduce_cpu(n, fn, efn, ctx, k->op, k->vk, val, has, loc);
     double dt = brine_clock() - t0;
     if (k->ptx && !br_in_par_get() && n >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n, dt);
     if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt);

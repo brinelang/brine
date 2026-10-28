@@ -138,7 +138,11 @@ binary tree, level by level: leaves 0 and 1, 2 and 3, ..., then those results in
 and so on (a node without a partner moves up a level unchanged; a leaf whose elements
 were all filtered out doesn't take part). Integer `sum` and `product` trap on overflow
 of any partial result in this order. Besides being parallel, the tree loses less
-precision than a left-to-right sum.
+precision than a left-to-right sum. Only the scheduling depends on the machine: when
+there are few leaves for the threads (a `par sum` of a few expensive calls), each
+element runs as a task of its own and the leaves are folded from their values
+afterwards, in the same order. `any` and `all` stop starting elements once one
+decides the result, like their sequential loop; every element before it still runs.
 
 Threads: `BRINE_THREADS=n` or `brine run --threads n` (default: all cores).
 

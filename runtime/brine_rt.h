@@ -984,8 +984,9 @@ enum { BRINE_GA_WRITTEN = 1, BRINE_GA_DENSE = 2 };
 
 /* Runs fn over [0, n) on the thread pool, or on a GPU when that pays. */
 void brine_par_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn fn);
-/* *val and *has: the accumulator (the reducer's start value, false); set when an element had a value */
-void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, void *val, bool *has, const char *loc);
+/* *val and *has: the accumulator (the reducer's start value, false); set when an element had a value.
+ * efn is like fn, but called for one element: it stores the element's own value. */
+void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *ctx, void *val, bool *has, const char *loc);
 
 /* ------------------------------------------------------------ world (multi-process) */
 int64_t brine_world_rank(void);

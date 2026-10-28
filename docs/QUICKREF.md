@@ -419,7 +419,10 @@ Reductions are deterministic: same result bits on any machine and thread count.
 They fold leaves of 16 consecutive elements left to right, then combine the leaves
 in a balanced pairwise tree (so `par sum` of floats can differ in the last bits from
 a sequential `sum`, usually by being more accurate). Integer overflow of any partial
-result in that order traps.
+result in that order traps. Only the scheduling adapts: a reduction over a few
+expensive elements still uses all the threads. `par any`/`par all` stop
+starting new work once an element decides the result; the elements before it
+always run, so a panic the sequential loop would reach still happens.
 `BRINE_THREADS=n` or `brine run --threads n` sets the thread count.
 
 **GPUs.** `par for`, `par [...]` and `par` reductions also run on a GPU (NVIDIA
