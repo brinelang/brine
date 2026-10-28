@@ -15,6 +15,7 @@ const I64_BOUND: i128 = 9223372036854775807
 const ATOM_UNKNOWN = 4294967295
 const MAX_NODES = 4096
 const MAX_CONSTRAINTS = 3000
+const ROOT_PROBES = 16
 
 # ------------------------------------------------------------ i128 arithmetic
 # Checked operations: None instead of overflowing.
@@ -412,14 +413,22 @@ fn atoms_of(f: F) -> AtomSet:
 # range of integer atom `a` (type bounds), which are always valid; atoms past the end of
 # `ranges` have none.
 fn prove_(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> bool:
+    return prove_full(facts, goal, ranges) == PROVED
+
+const PROVED = 1
+const NOT_PROVED = 0
+# the search ran out of budget: the claim may still be true
+const GAVE_UP = 2
+
+fn prove_full(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> int:
     let neg = goal.not_()
     var rel = atoms_of(neg)
     if rel.contains(ATOM_UNKNOWN):
-        return false
+        return NOT_PROVED
     var fs: [F] = []
     for f in facts:
         if f == F.False:
-            return true  # unreachable code: anything holds
+            return PROVED  # unreachable code: anything holds
         if f != F.True:
             fs.push(f)
     if rel.is_empty():
@@ -439,7 +448,7 @@ fn prove_(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> bool:
     for f4 in fs:
         let w = weaken(f4, rel)
         if w == F.False:
-            return true
+            return PROVED
         if w != F.True:
             used.push(w)
     for x in rel.xs:
@@ -457,7 +466,19 @@ fn prove_(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> bool:
                     pass
     var budget = MAX_NODES
     var b = Branch.new()
-    return refute(ref b, used, ref budget) == Some(true)
+    var r = refute(ref b, used, ref budget, false, 0)
+    if r.is_none() and budget < 0:
+        # out of budget: try once more, splitting where it decides most
+        budget = MAX_NODES
+        var b2 = Branch.new()
+        r = refute(ref b2, used, ref budget, true, 0)
+    match r:
+        case Some(true):
+            return PROVED
+        case Some(false):
+            return NOT_PROVED
+        case None:
+            return GAVE_UP if budget < 0 else NOT_PROVED
 
 # Does literal `f` mention an atom in `rel`?
 fn touches(f: F, rel: AtomSet) -> bool:
@@ -564,33 +585,30 @@ struct Branch:
     fn new() -> Branch:
         return Branch(eqs=[], ges=[], pos={}, neg={})
 
-# Stable sort, longest first.
-fn sort_longest_first(ors: [[F]]) -> [[F]]:
-    var lens: [int] = []
-    for o in ors:
-        if len(o) not in lens:
-            lens.push(len(o))
-    lens.sort()
-    var out: [[F]] = []
-    var k = len(lens)
-    while k > 0:
-        k -= 1
-        for o2 in ors:
-            if len(o2) == lens[k]:
-                out.push(o2)
-    return out
-
 # Some(true) if every case is contradictory, Some(false) if some case may be
 # satisfiable, None if the budget (a number of search nodes) ran out.
-fn refute(ref b: Branch, mut todo: [F], ref budget: int) -> Option[bool]:
+# `thorough`: probe every node and split on cases that fix values first (a
+# second try, after the plain search ran out of budget); else probe the
+# first node only and split on the smallest disjunction.
+fn refute(
+    ref b: Branch,
+    mut todo: [F],
+    ref budget: int,
+    thorough: bool,
+    depth: int
+) -> Option[bool]:
     budget -= 1
     if budget < 0:
         return None
     # flatten conjunctions and literals first; collect disjunctions for later
     var ors: [[F]] = []
     var nes: [Lin] = []
+    # at the first node, the disjunctions the negated goal (todo[0]) brings
+    var goal_from = -1
     while len(todo) > 0:
         let f = todo.pop()
+        if depth == 0 and len(todo) == 0 and goal_from < 0:
+            goal_from = len(ors)
         match f:
             case F.True:
                 pass
@@ -613,6 +631,7 @@ fn refute(ref b: Branch, mut todo: [F], ref budget: int) -> Option[bool]:
                 todo.extend(xs)
             case F.Or(ys):
                 ors.push(ys)
+    let goal_to = len(ors) if goal_from >= 0 else -1
     for l in nes:
         # l != 0  ⇔  l >= 1  ∨  -l >= 1
         let la = l.add_c(-1)?
@@ -622,18 +641,221 @@ fn refute(ref b: Branch, mut todo: [F], ref budget: int) -> Option[bool]:
         return Some(true)
     if len(ors) == 0:
         return Some(false)
-    # split on the smallest disjunction
-    var sorted = sort_longest_first(ors)
-    let first = sorted.pop()
-    let rest: [F] = [F.Or(o) for o in sorted]
-    for alt in first:
+    # With the values this branch fixes, drop the alternatives that are false
+    # and the disjunctions that hold (they add nothing here).
+    let known = fixed_atoms(b)
+    var live: [[F]] = []
+    var from_goal: [bool] = []
+    for oi, o in enumerate(ors):
+        var alts: [F] = []
+        var holds = false
+        for alt in o:
+            match eval_known(alt, known, b):
+                case Some(true):
+                    holds = true
+                case Some(false):
+                    pass
+                case None:
+                    alts.push(alt)
+        if holds:
+            continue
+        if len(alts) == 0:
+            return Some(true)
+        live.push(alts)
+        from_goal.push(goal_from <= oi and oi < goal_to)
+    if len(live) == 0:
+        return Some(false)
+    # Probe: an alternative that contradicts the branch's literals on its own
+    # goes; a disjunction left without any closes the branch, one left with a
+    # single alternative is taken without splitting.
+    # (a plain search probes only the negated goal's cases, at its first node)
+    var probes = MAX_NODES if thorough else ROOT_PROBES
+    var probed: [[F]] = []
+    var n = len(live)
+    while n > 0:
+        n -= 1
+        let o2 = live[n]
+        var alts2: [F] = []
+        for alt2 in o2:
+            if probes > 0 and len(o2) > 1 and budget > 0 and (thorough or from_goal[n]):
+                probes -= 1
+                if contradicts(b, alt2, ref budget):
+                    continue
+            alts2.push(alt2)
+        if len(alts2) == 0:
+            return Some(true)
+        probed.push(alts2)
+    probed.reverse()
+    var units: [F] = []
+    var rest: [[F]] = []
+    for o3 in probed:
+        if len(o3) == 1:
+            units.push(o3[0])
+        else:
+            rest.push(o3)
+    if len(units) > 0:
+        var t: [F] = [F.Or(o) for o in rest]
+        t.extend(units)
         var nb = b
-        var t = rest
-        t.push(alt)
-        let r = refute(ref nb, t, ref budget)
+        return refute(ref nb, t, ref budget, thorough, depth + 1)
+    # split on a disjunction whose cases fix values first (each case then
+    # decides many others), else on the smallest
+    var pick = 0
+    for i in 0..len(rest):
+        if better_split(rest[i], rest[pick], thorough):
+            pick = i
+    let first = rest[pick]
+    var others: [F] = []
+    for j in 0..len(rest):
+        if j != pick:
+            others.push(F.Or(rest[j]))
+    for alt3 in first:
+        var nb2 = b
+        var t2 = others
+        t2.push(alt3)
+        let r = refute(ref nb2, t2, ref budget, thorough, depth + 1)
         if r != Some(true):
             return r
     return Some(true)
+
+# Is `a` the better disjunction to split on? Thorough: one whose cases fix
+# values (have an equality) where `b`'s don't; then the smaller.
+fn better_split(a: [F], b: [F], thorough: bool) -> bool:
+    let ea = any(has_eq(x) for x in a)
+    let eb = any(has_eq(x) for x in b)
+    if thorough and ea != eb:
+        return ea
+    # the last of the smallest, as a plain search always did
+    return len(a) < len(b) if thorough else len(a) <= len(b)
+
+fn has_eq(f: F) -> bool:
+    match f:
+        case F.Eq(_):
+            return true
+        case F.And(xs):
+            return any(has_eq(x) for x in xs)
+        case _:
+            return false
+
+# The atoms the branch's literals fix to one value.
+fn fixed_atoms(b: Branch) -> {int: i128}:
+    var lo: {int: i128} = {}
+    var hi: {int: i128} = {}
+    var out: {int: i128} = {}
+    for e in b.eqs:
+        if len(e.t) == 1:
+            let k = e.t[0].1
+            if k == 1 or k == -1:
+                # k*x + c == 0
+                match neg_i128(e.c):
+                    case Some(nc):
+                        out[e.t[0].0] = nc if k == 1 else e.c
+                    case None:
+                        pass
+    for g in b.ges:
+        if len(g.t) == 1:
+            let a = g.t[0].0
+            let k = g.t[0].1
+            # k*x + c >= 0
+            if k == 1:
+                match neg_i128(g.c):
+                    case Some(v):
+                        if a not in lo or v > lo[a]:
+                            lo[a] = v
+                    case None:
+                        pass
+            elif k == -1:
+                if a not in hi or g.c < hi[a]:
+                    hi[a] = g.c
+    for a in lo:
+        if a in hi and lo[a] == hi[a] and a not in out:
+            out[a] = lo[a]
+    return out
+
+fn eval_lin(l: Lin, known: {int: i128}) -> Option[i128]:
+    var v = l.c
+    for a, k in l.t:
+        match known.get(a):
+            case Some(x):
+                v = add_i128(v, mul_i128(k, x)?)?
+            case None:
+                return None
+    return Some(v)
+
+# `f`'s truth value in a branch where the atoms in `known` have those values
+# (None: it depends on others).
+fn eval_known(f: F, known: {int: i128}, b: Branch) -> Option[bool]:
+    match f:
+        case F.True:
+            return Some(true)
+        case F.False:
+            return Some(false)
+        case F.Ge(l):
+            return Some(eval_lin(l, known)? >= 0)
+        case F.Eq(l):
+            return Some(eval_lin(l, known)? == 0)
+        case F.Ne(l):
+            return Some(eval_lin(l, known)? != 0)
+        case F.B(a, p):
+            if a in b.pos:
+                return Some(p)
+            if a in b.neg:
+                return Some(not p)
+            return None
+        case F.And(xs):
+            var all_true = true
+            for x in xs:
+                match eval_known(x, known, b):
+                    case Some(false):
+                        return Some(false)
+                    case Some(true):
+                        pass
+                    case None:
+                        all_true = false
+            return Some(true) if all_true else None
+        case F.Or(ys):
+            var all_false = true
+            for y in ys:
+                match eval_known(y, known, b):
+                    case Some(true):
+                        return Some(true)
+                    case Some(false):
+                        pass
+                    case None:
+                        all_false = false
+            return Some(false) if all_false else None
+
+# Does `alt` (a literal or a conjunction of them) contradict the branch's
+# literals? Each test is one search node.
+fn contradicts(b: Branch, alt: F, ref budget: int) -> bool:
+    var eqs = b.eqs
+    var ges = b.ges
+    if not literals(alt, b, ref eqs, ref ges):
+        return false
+    if len(eqs) == len(b.eqs) and len(ges) == len(b.ges):
+        return false
+    budget -= 1
+    return fm_unsat(eqs, ges) == Some(true)
+
+# Add `f`'s equalities and inequalities; false if it has anything else (an
+# `or`, a `!=`, or a boolean the branch doesn't decide).
+fn literals(f: F, b: Branch, ref eqs: [Lin], ref ges: [Lin]) -> bool:
+    match f:
+        case F.Ge(l):
+            ges.push(l)
+            return true
+        case F.Eq(l):
+            eqs.push(l)
+            return true
+        case F.True:
+            return true
+        case F.And(xs):
+            for x in xs:
+                if not literals(x, b, ref eqs, ref ges):
+                    return false
+            return true
+        case _:
+            return false
 
 # Some(true) if the conjunction of `eqs == 0` and `ges >= 0` has no integer
 # solution (definitely), Some(false) if we couldn't show that.
