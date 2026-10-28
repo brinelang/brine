@@ -3294,6 +3294,16 @@ struct Lower:
 
     fn assign(ref self, target: Expr, op: Option[BinOp], value: Expr, checked: bool, span: Span):
         let ty = target.ty
+        # `s = s + a + b`: append in place, as `s += a` then `s += b`, when
+        # the parts don't read `s` (else rebuilding the string is quadratic)
+        if op.is_none() and ty == Ty.Str:
+            match self_append(target, value):
+                case Some(parts):
+                    for p in parts:
+                        self.assign(target, Some(BinOp.Add), p, checked, span)
+                    return
+                case None:
+                    pass
         match target.kind:
             case ExprKind.Index(b0, i0):
                 if self.is_bits(b0):
@@ -6242,3 +6252,39 @@ fn field_path(e: Expr) -> Option[(int, [int])]:
 
 fn path_key(l: int, p: [int]) -> str:
     return f"{l}:" + ".".join([str(x) for x in p])
+
+# `s = s + a + b` with `s` a variable or a field of one: the parts appended
+# (`[a, b]`), if none reads `s` or can leave the function midway (`?`).
+fn self_append(target: Expr, value: Expr) -> Option[[Expr]]:
+    let tp = place_path(target)
+    match tp:
+        case Some((l, p)):
+            if -1 in p:
+                return None
+            var parts: [Expr] = []
+            var v = value
+            while true:
+                match v.kind:
+                    case ExprKind.Binary(BinOp.Add, a, b):
+                        if mentions_local(b, l) or has_try(b):
+                            return None
+                        parts.insert(0, b)
+                        if place_path(a) == tp:
+                            return Some(parts)
+                        v = a
+                    case _:
+                        return None
+            return None
+        case None:
+            return None
+
+fn has_try(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Try(_):
+            return true
+        case _:
+            pass
+    for c in children(e):
+        if has_try(c):
+            return true
+    return false
