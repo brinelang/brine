@@ -39,6 +39,34 @@ fn err_text(s: str):
 fn plural(n: int) -> str:
     return "" if n == 1 else "s"
 
+# Why a program stopped, when its exit code is not one it could return:
+# Windows reports a crash as an NTSTATUS code (0xC00000FD, ...), negative
+# as a 32-bit number.
+fn crash_reason(code: int) -> Option[str]:
+    if 0 <= code <= 255:
+        return None
+    let c = code & 0xFFFFFFFF
+    let names = [
+        (0xC0000005, "access violation: a bad pointer or a native stack overflow"),
+        (0xC00000FD, "stack overflow: recursion too deep?"),
+        (0xC0000094, "integer division by zero"),
+        (0xC0000095, "integer overflow"),
+        (0xC000001D, "illegal instruction: built for a newer CPU?"),
+        (0xC0000409, "the C runtime aborted"),
+        (0xC0000374, "heap corruption"),
+        (0xC000013A, "interrupted (Ctrl+C)"),
+        (0x80000003, "breakpoint")
+    ]
+    for k, what in names:
+        if c == k:
+            return Some(f"exit code 0x{c:08x}, {what}")
+    return Some(f"exit code 0x{c:08x}")
+
+# The exit code `brine` returns for a program's: a crash is a failure, as
+# on Unix, where a program killed by a signal reports 101.
+fn exit_status(code: int) -> int:
+    return code if 0 <= code <= 255 else 101
+
 # ================================================================ output
 
 struct G:
@@ -234,7 +262,7 @@ fn main() -> int:
         r = Err(f"unknown command `{cmd}`{hint} (see `brine help`)")
     match r:
         case Ok(code):
-            return max(0, min(code, 255))
+            return exit_status(code)
         case Err(e):
             g.error(e)
             return 2
@@ -594,7 +622,13 @@ fn cmd_run(g: G, a: Args) -> Result[int, str]:
         let extra = f" ({ranks} ranks)" if ranks > 1 else ""
         let verb = "Running"
         eprint(f"{c.bold()}{c.green()}{verb:>10}{c.reset()} {display_path(exe)}{extra}")
-    return run_exe(launch, argv, a.val("--threads"), ranks)
+    let code = run_exe(launch, argv, a.val("--threads"), ranks)?
+    match crash_reason(code):
+        case Some(why):
+            g.error(f"the program crashed ({why})")
+        case None:
+            pass
+    return Ok(code)
 
 # A plain unsigned decimal number (no sign, no spaces).
 fn parse_int(s: str) -> Option[int]:
@@ -695,6 +729,24 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
         )
     return Ok(0)
 
+# What a failed test's output doesn't say: that it crashed, or that it
+# stopped without a word.
+fn exit_note(code: int, out: str) -> str:
+    match crash_reason(code):
+        case Some(why):
+            return f"the test crashed ({why})"
+        case None:
+            pass
+    if code != 0 and out.strip() == "":
+        return f"the test exited with code {code} and printed nothing"
+    return ""
+
+fn with_note(out: str, note: str) -> str:
+    if note == "":
+        return out
+    let o = out.rstrip()
+    return note if o == "" else o + "\n" + note
+
 struct Running:
     k: int
     name: str
@@ -790,9 +842,10 @@ fn cmd_test(g: G, a: Args) -> Result[int, str]:
             match os.poll(r.handle):
                 case Some(code):
                     let (o, e) = os.output(r.handle)
+                    let text = with_note(o + e, exit_note(code, o + e))
                     results[
                         r.k
-                    ] = TestResult(k=r.k, name=r.name, ok=code == 0, text=o + e, secs=clock() - r.start)
+                    ] = TestResult(k=r.k, name=r.name, ok=code == 0, text=text, secs=clock() - r.start)
                     finished = true
                 case None:
                     still.push(r)
