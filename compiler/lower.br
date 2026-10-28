@@ -29,6 +29,8 @@ import pack
 import ranges
 import idiom
 import narrow
+import kernel
+import slp
 
 struct Options:
     # generate a test-runner `main` instead of the program's `main`
@@ -39,6 +41,8 @@ struct Options:
     gpu: bool
     # optimizations that make more code (release builds): interleaved loops
     fast: bool
+    # release builds through C: small fixed-size kernels as vector code (kernel.br)
+    vec: bool
 
 struct Temp:
     v: int
@@ -228,6 +232,8 @@ fn int_kind(k: IntTy) -> K:
 struct Lowered:
     m: Module
     externs: [Func]
+    # C functions the C backend writes before the others (kernel.br)
+    kernels: [str]
 
 fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowered:
     var g = Lower(
@@ -256,7 +262,9 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         fdecls={},
         clones=[],
         cloned={},
-        nc_body=false
+        nc_body=false,
+        khints={},
+        kernels=[]
     )
     return g.run()
 
@@ -295,6 +303,9 @@ struct Lower:
     cloned: {int: bool}
     # the body being lowered is such a clone
     nc_body: bool
+    # the array lengths callers pass (kernel.br), and the kernels made
+    khints: {int: [int]}
+    kernels: [str]
 
     # ============================================================ driver
     fn run(ref self) -> Lowered:
@@ -305,6 +316,8 @@ struct Lower:
                 for f in m.fns:
                     if not f.is_extern:
                         self.fdecls[f.id] = f
+        if self.opts.vec:
+            self.khints = kernel.hints(prog, self.info)
         for m in prog.modules:
             for f in m.fns:
                 if not f.is_extern:
@@ -331,7 +344,8 @@ struct Lower:
         self.gpu_emit()
         return Lowered(
             m=Module(funcs=self.funcs, data=self.data, dtypes=self.dtypes),
-            externs=externs
+            externs=externs,
+            kernels=self.kernels
         )
 
     # The IR parameters of brine function `id`: an sret pointer first for an
@@ -389,6 +403,8 @@ struct Lower:
                     self.cx.fb.store(a, 0, v)
             if self.tracks_caller(f.id):
                 self.cx.loc = len(ks) - 1
+            elif f.id in self.khints and not self.nc_body:
+                self.kernel_entry(f, name)
         var nw = narrow.Narrow(arrs={}, guards=[])
         if self.opts.fast and not self.opts.debug:
             nw = narrow.find(f.body, f.locals)
@@ -417,6 +433,62 @@ struct Lower:
                 self.cx.fb.unreachable()
             else:
                 self.cx.fb.ret(-1)
+
+    # A function kernel.br found a kernel for: when its arrays have the
+    # lengths the kernel was made for, call it and return; else go on to
+    # the body as written.
+    fn kernel_entry(ref self, f: FnDecl, name: str):
+        let sig = self.info.fns[f.id]
+        var lays: [(int, [int])] = []
+        for p in sig.params:
+            match p.ty:
+                case Ty.Array(et):
+                    var offs = [0]
+                    match et:
+                        case Ty.Struct(sid):
+                            offs = [
+                                self.field_off(et, j) for j in 0..len(self.info.structs[sid].fields)
+                            ]
+                        case _:
+                            pass
+                    lays.push((self.lay(et).size, offs))
+                case _:
+                    lays.push((0, []))
+        var k = kernel.Kernel(name="", c="", arrays=[], floats=[], has_ret=false)
+        match kernel.plan(f, self.info, self.fdecls, self.khints[f.id], lays, name):
+            case Some(x):
+                k = x
+            case None:
+                return
+        self.kernels.push(k.c)
+        let slow = self.cx.fb.label()
+        for pi, n, _ in k.arrays:
+            let arr = self.param_arr(pi, sig.params[pi].by_ref)
+            let len = self.cx.fb.load(K.I64, arr, 8)
+            let want = self.cx.fb.konst(K.I64, n)
+            let ok = self.cx.fb.cmp(Op.Eq, len, want)
+            self.cx.fb.brnot(ok, slow)
+        for pi, _, written in k.arrays:
+            if written:
+                self.cx.fb.call_void("brine_arr_unique", [pi])
+        var args: [int] = []
+        for pi, _, _ in k.arrays:
+            let arr = self.param_arr(pi, sig.params[pi].by_ref)
+            args.push(self.cx.fb.load(K.Ptr, arr, 48))
+        args.extend(k.floats)
+        if k.has_ret:
+            let r = self.cx.fb.call(K.F64, k.name, args)
+            self.cx.fb.ret(r)
+        else:
+            self.cx.fb.call_void(k.name, args)
+            self.cx.fb.ret(-1)
+        self.cx.fb.place(slow)
+
+    # The array parameter `i` (by value: its vreg; `ref`: behind its pointer).
+    fn param_arr(ref self, i: int, by_ref: bool) -> int:
+        if by_ref:
+            return self.cx.fb.load(K.Ptr, i, 0)
+        return i
 
     fn main_sym(self) -> Option[int]:
         let prog = self.prog

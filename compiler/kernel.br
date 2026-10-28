@@ -1,0 +1,1102 @@
+# Small fixed-size kernels (release builds through C). A function like
+#
+#     fn advance(ref bs: [Body], dt: float):
+#         for i in 0..len(bs):
+#             for j in i + 1..len(bs):
+#                 ...float math on bs[i] and bs[j]...
+#
+# that its callers always pass a five-body array spends its time in loops of
+# a handful of iterations, each waiting on the last one's square root and
+# division. With the length known, the loops unroll completely: the body is
+# straight-line float math from the array's fields and the float parameters
+# to the fields it writes back, which slp.br computes on vectors, several
+# pairs at a time, with the array in registers.
+#
+# The length comes from the callers: an array literal, `[x] * 5`, a function
+# that returns one, a variable made from one that is never grown or
+# replaced. That is only a hint: the function tests the length when it
+# starts, and runs the kernel only if it holds (else the code as written).
+#
+# Running the body here, with the length known, gives the kernel: integers
+# are all known (loop counters, lengths, indexes), floats are DAG nodes, the
+# array is a map from (element, field) to the node it holds now. Anything
+# else (a float condition, a call that isn't math or a small function,
+# printing, an index out of bounds, an integer overflow) gives up, and the
+# function stays as it is: the kernel can't panic, so the program panics
+# where and how it would have.
+from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, LocalInfo, LocalKind
+from ast import BinOp, CmpOp, UnOp, Arg, Expr, ExprKind, LetPat, Stmt, StmtKind, Block, FnDecl, Program
+from ast import children, stmt_exprs, stmt_blocks, local_of
+from info import ProgramInfo, ConstVal
+from ir import f64_bits
+import slp
+
+# the longest array a kernel unrolls
+const MAX_LEN = 16
+# the most statements a kernel runs, and nodes it makes
+const MAX_STEPS = 20000
+const MAX_NODES = 3000
+# how deep calls are followed
+const MAX_DEPTH = 6
+
+# ================================================================ length hints
+
+# The length each function's array parameters have at every call, where the
+# callers show one (-1 where they don't, or disagree); functions with none
+# are left out.
+fn hints(prog: Program, info: ProgramInfo) -> {int: [int]}:
+    var h = Hints(info=info, fns={}, sites={}, escapes={}, rets={}, plens={}, busy={})
+    for m in prog.modules:
+        for f in m.fns:
+            if not f.is_extern:
+                h.fns[f.id] = f
+    for m in prog.modules:
+        for f in m.fns:
+            if not f.is_extern:
+                h.scan_block(f, f.body)
+        for t in m.tests:
+            h.scan_block(t, t.body)
+    var out: {int: [int]} = {}
+    for id in h.fns:
+        let sig = info.fns[id]
+        var ls: [int] = []
+        var any = false
+        for p, ps in enumerate(sig.params):
+            var k = -1
+            match ps.ty:
+                case Ty.Array(_):
+                    k = h.param_len(id, p)
+                case _:
+                    pass
+            if k < 1 or k > MAX_LEN:
+                k = -1
+            else:
+                any = true
+            ls.push(k)
+        if any:
+            out[id] = ls
+    return out
+
+struct Hints:
+    info: ProgramInfo
+    fns: {int: FnDecl}
+    # the calls of each function, with the function they are in
+    sites: {int: [(FnDecl, Expr)]}
+    # functions used as values: some of their calls can't be seen
+    escapes: {int: bool}
+    rets: {int: int}
+    plens: {str: int}
+    busy: {str: bool}
+
+    fn scan_block(ref self, f: FnDecl, b: Block):
+        for s in b.stmts:
+            for e in stmt_exprs(s):
+                self.scan(f, e)
+            for sb in stmt_blocks(s):
+                self.scan_block(f, sb)
+
+    fn scan(ref self, f: FnDecl, e: Expr):
+        match e.kind:
+            case ExprKind.Call(callee, args):
+                self.site(f, e)
+                match callee.kind:
+                    case ExprKind.Ident(_):
+                        pass
+                    case _:
+                        self.scan(f, callee)
+                for a in args:
+                    self.scan(f, a.expr)
+                return
+            case ExprKind.MethodCall(_, _, _, _):
+                self.site(f, e)
+            case ExprKind.Ident(_):
+                match e.res:
+                    case Res.Fn(id):
+                        self.escapes[id] = true
+                    case _:
+                        pass
+            case _:
+                pass
+        for c in children(e):
+            self.scan(f, c)
+
+    fn site(ref self, f: FnDecl, e: Expr):
+        match e.cres:
+            case CallRes.Fn(id):
+                self.add_site(id, f, e)
+            case CallRes.Method(id):
+                self.add_site(id, f, e)
+            case _:
+                pass
+
+    fn add_site(ref self, id: int, f: FnDecl, e: Expr):
+        if id not in self.sites:
+            self.sites[id] = []
+        self.sites[id].push((f, e))
+
+    # The length every call of `id` passes as parameter `p`.
+    fn param_len(ref self, id: int, p: int) -> int:
+        let key = f"{id}:{p}"
+        match self.plens.get(key):
+            case Some(k):
+                return k
+            case None:
+                pass
+        if key in self.busy or id in self.escapes or id not in self.sites:
+            return -1
+        self.busy[key] = true
+        var k = -2
+        let sites = self.sites[id]
+        for site in sites:
+            let (caller, call) = site
+            var n = -1
+            match arg_expr(self.info, id, call, p):
+                case Some(a):
+                    n = self.len_of(caller, a)
+                case None:
+                    pass
+            if n < 0 or (k >= 0 and n != k):
+                k = -1
+                break
+            k = n
+        self.busy.remove(key)
+        let r = k if k >= 0 else -1
+        self.plens[key] = r
+        return r
+
+    # The length of array expression `e` in function `f`, or -1.
+    fn len_of(ref self, f: FnDecl, e: Expr) -> int:
+        match e.kind:
+            case ExprKind.Array(es):
+                return len(es)
+            case ExprKind.Repeat(_, count):
+                match count.kind:
+                    case ExprKind.Int(v):
+                        if 0 <= v <= 1000000:
+                            return int(v)
+                    case _:
+                        pass
+                return -1
+            case ExprKind.Call(_, _):
+                match e.cres:
+                    case CallRes.Fn(id):
+                        return self.ret_len(id)
+                    case _:
+                        return -1
+            case ExprKind.Ident(_):
+                match local_of(e):
+                    case Some(l):
+                        return self.var_len(f, l)
+                    case None:
+                        return -1
+            case _:
+                return -1
+
+    fn ret_len(ref self, id: int) -> int:
+        match self.rets.get(id):
+            case Some(k):
+                return k
+            case None:
+                pass
+        let key = f"r{id}"
+        if key in self.busy or id not in self.fns:
+            return -1
+        self.busy[key] = true
+        let f = self.fns[id]
+        var rs: [Expr] = []
+        returns(f.body, ref rs)
+        var k = -2
+        for r in rs:
+            let n = self.len_of(f, r)
+            if n < 0 or (k >= 0 and n != k):
+                k = -1
+                break
+            k = n
+        if len(rs) == 0:
+            k = -1
+        self.busy.remove(key)
+        self.rets[id] = k
+        return k
+
+    # The length of local `l` of `f`: a parameter's from the callers, a
+    # variable's from its initial value if nothing grows, shrinks, replaces
+    # or aliases it.
+    fn var_len(ref self, f: FnDecl, l: int) -> int:
+        if l >= len(f.locals):
+            return -1
+        match f.locals[l].kind:
+            case LocalKind.Param | LocalKind.RefParam:
+                for i, pl in enumerate(f.param_locals):
+                    if pl == l:
+                        return self.param_len(f.id, i)
+                return -1
+            case LocalKind.Let | LocalKind.Var:
+                pass
+            case _:
+                return -1
+        var u = Uses(local=l, init=[], bad=false)
+        u.block(f.body)
+        if u.bad or len(u.init) != 1:
+            return -1
+        let key = f"v{f.id}:{l}"
+        if key in self.busy:
+            return -1
+        self.busy[key] = true
+        let n = self.len_of(f, u.init[0])
+        self.busy.remove(key)
+        return n
+
+# The argument a call passes as parameter `p` of function `id`.
+fn arg_expr(info: ProgramInfo, id: int, call: Expr, p: int) -> Option[Expr]:
+    let sig = info.fns[id]
+    var args: [Arg] = []
+    var shift = 0
+    match call.kind:
+        case ExprKind.Call(_, a):
+            args = a
+        case ExprKind.MethodCall(recv, _, _, a):
+            args = a
+            match call.cres:
+                case CallRes.Method(_):
+                    if p == 0:
+                        return Some(recv)
+                    shift = 1
+                case _:
+                    pass
+        case _:
+            return None
+    for i, a in enumerate(args):
+        match a.name:
+            case Some(nm):
+                if p < len(sig.params) and nm.0 == sig.params[p].name:
+                    return Some(a.expr)
+            case None:
+                if i + shift == p:
+                    return Some(a.expr)
+    return None
+
+fn returns(b: Block, ref out: [Expr]):
+    for s in b.stmts:
+        match s.kind:
+            case StmtKind.Return(v):
+                match v:
+                    case Some(e):
+                        out.push(e)
+                    case None:
+                        pass
+            case _:
+                pass
+        for sb in stmt_blocks(s):
+            returns(sb, ref out)
+
+# How a function uses a local array: its initial value, and anything that
+# could change its length (or make another name for it).
+struct Uses:
+    local: int
+    init: [Expr]
+    bad: bool
+
+    fn block(ref self, b: Block):
+        for s in b.stmts:
+            match s.kind:
+                case StmtKind.Let(_, _, _, init, is_ref):
+                    if self.local in s.locals:
+                        self.init.push(init)
+                    if is_ref and local_of(init) == Some(self.local):
+                        self.bad = true
+                case StmtKind.Assign(t, _, _):
+                    if local_of(t) == Some(self.local):
+                        self.bad = true
+                case _:
+                    pass
+            for e in stmt_exprs(s):
+                self.expr(e)
+            for sb in stmt_blocks(s):
+                self.block(sb)
+
+    fn expr(ref self, e: Expr):
+        match e.kind:
+            case ExprKind.MethodCall(recv, _, _, _):
+                if local_of(recv) == Some(self.local):
+                    match e.cres:
+                        case CallRes.Builtin(b):
+                            if b.mutates_recv() and b != Builtin.Sort and b != Builtin.Reverse:
+                                self.bad = true
+                        case CallRes.Method(_):
+                            self.bad = true
+                        case _:
+                            pass
+            case _:
+                pass
+        for c in children(e):
+            self.expr(c)
+
+# ================================================================ kernels
+
+# A kernel the lowering calls instead of a function's body when the lengths hold.
+struct Kernel:
+    # the C function
+    name: str
+    c: str
+    # the array parameters it uses: parameter index, length, written
+    arrays: [(int, int, bool)]
+    # the float parameters it takes, by index
+    floats: [int]
+    has_ret: bool
+
+# An array parameter of the kernel: its length and its elements' layout
+# (the byte offset of each field; [0] for floats).
+struct ArrIn:
+    param: int
+    len: int
+    elem: Ty
+    size: int
+    offs: [int]
+    by_ref: bool
+    used: bool
+    written: bool
+
+# A value while running the body.
+enum Val:
+    # can't be represented: using it gives up
+    Bad
+    Unit
+    # a float: a DAG node
+    F(n: int)
+    I(v: i128)
+    B(v: bool)
+    S(fields: [Val])
+    # a kernel array, by index in `Exec.arrs`
+    A(arr: int)
+
+fn is_f64(t: Ty) -> bool:
+    return t == Ty.Float(FloatTy.F64)
+
+# The kernel for function `f`, if it has one. `lens` are the length hints
+# of its parameters, `lays` the element size and field offsets of each.
+fn plan(
+    f: FnDecl,
+    info: ProgramInfo,
+    fns: {int: FnDecl},
+    lens: [int],
+    lays: [(int, [int])],
+    name: str
+) -> Option[Kernel]:
+    let sig = info.fns[f.id]
+    if sig.ret != Ty.Unit and not is_f64(sig.ret):
+        return None
+    if len(f.param_locals) != len(sig.params):
+        return None
+    var ex = Exec(
+        info=info,
+        fns=fns,
+        dag=slp.new_dag([]),
+        arrs=[],
+        env={},
+        locals=f.locals,
+        mem={},
+        written=[],
+        ok=true,
+        steps=0,
+        depth=0,
+        ret=Val.Unit,
+        returned=false,
+        brk=false,
+        cont=false
+    )
+    var floats: [int] = []
+    var sizes: [int] = []
+    for i, p in enumerate(sig.params):
+        let l = f.param_locals[i]
+        match p.ty:
+            case Ty.Array(et):
+                if i < len(lens) and lens[i] > 0:
+                    let (size, offs) = lays[i]
+                    ex.env[l] = Val.A(len(ex.arrs))
+                    ex.arrs.push(
+                        ArrIn(param=i, len=lens[i], elem=et, size=size, offs=offs, by_ref=p.by_ref, used=false, written=false)
+                    )
+                    sizes.push(size)
+                else:
+                    ex.env[l] = Val.Bad
+            case _:
+                if is_f64(p.ty) and not p.by_ref:
+                    ex.env[l] = Val.F(ex.dag.param(len(floats)))
+                    floats.push(i)
+                else:
+                    ex.env[l] = Val.Bad
+    ex.dag.sizes = sizes
+    ex.block(f.body)
+    if not ex.ok:
+        return None
+    var d = ex.dag
+    if sig.ret != Ty.Unit:
+        match ex.ret:
+            case Val.F(n):
+                d.ret = n
+            case _:
+                return None
+    for w in ex.written:
+        let (a, k, off) = w
+        let n = ex.mem[f"{a}:{k}:{off}"]
+        if n != d.load(a, k, off):
+            d.stores.push((n, a, k, off))
+    if len(d.nodes) > MAX_NODES:
+        return None
+    var arrays: [(int, int, bool)] = []
+    var ps: [str] = []
+    for i, a in enumerate(ex.arrs):
+        if a.used:
+            if a.written and not a.by_ref:
+                return None
+            arrays.push((a.param, a.len, a.written))
+            ps.push(f"char *a{i}")
+    if len(arrays) == 0:
+        return None
+    for j in 0..len(floats):
+        ps.push(f"double f{j}")
+    let has_ret = sig.ret != Ty.Unit
+    let rt = "double" if has_ret else "void"
+    let kname = "brk_" + name
+    let csig = f"static {rt} {kname}(" + ", ".join(ps) + ")"
+    match slp.kernel_c(d, csig):
+        case Some(c):
+            return Some(Kernel(name=kname, c=c, arrays=arrays, floats=floats, has_ret=has_ret))
+        case None:
+            return None
+
+# Runs a function body with every integer known.
+struct Exec:
+    info: ProgramInfo
+    fns: {int: FnDecl}
+    dag: slp.Dag
+    arrs: [ArrIn]
+    # the current function's locals
+    env: {int: Val}
+    locals: [LocalInfo]
+    # what each array element's field holds now, by "array:element:offset"
+    mem: {str: int}
+    # the fields written, in order
+    written: [(int, int, int)]
+    ok: bool
+    steps: int
+    depth: int
+    # the current function returned (this value), or a loop broke or continued
+    ret: Val
+    returned: bool
+    brk: bool
+    cont: bool
+
+    fn fail(ref self):
+        self.ok = false
+
+    fn stopped(self) -> bool:
+        return not self.ok or self.returned or self.brk or self.cont
+
+    fn fnode(ref self, v: Val) -> int:
+        match v:
+            case Val.F(n):
+                return n
+            case _:
+                self.fail()
+                return 0
+
+    fn ival(ref self, v: Val) -> i128:
+        match v:
+            case Val.I(x):
+                return x
+            case _:
+                self.fail()
+                return 0
+
+    fn bval(ref self, v: Val) -> bool:
+        match v:
+            case Val.B(x):
+                return x
+            case _:
+                self.fail()
+                return false
+
+    fn arr(ref self, v: Val) -> int:
+        match v:
+            case Val.A(a):
+                self.arrs[a].used = true
+                return a
+            case _:
+                self.fail()
+                return 0
+
+    # ------------------------------------------------------------ memory
+    fn read(ref self, a: int, k: int, off: int) -> int:
+        match self.mem.get(f"{a}:{k}:{off}"):
+            case Some(n):
+                return n
+            case None:
+                return self.dag.load(a, k, off)
+
+    fn write(ref self, a: int, k: int, off: int, n: int):
+        let key = f"{a}:{k}:{off}"
+        if key not in self.mem:
+            # remember what was there, for `read`
+            let old = self.dag.load(a, k, off)
+            self.mem[key] = old
+            self.written.push((a, k, off))
+        self.mem[key] = n
+        self.arrs[a].written = true
+
+    # Element `k` of array `a` as a value.
+    fn elem_val(ref self, a: int, k: int) -> Val:
+        let ai = self.arrs[a]
+        if is_f64(ai.elem):
+            return Val.F(self.read(a, k, 0))
+        match ai.elem:
+            case Ty.Struct(sid):
+                var fs: [Val] = []
+                for j, fld in enumerate(self.info.structs[sid].fields):
+                    if is_f64(fld.1):
+                        fs.push(Val.F(self.read(a, k, ai.offs[j])))
+                    else:
+                        fs.push(Val.Bad)
+                return Val.S(fs)
+            case _:
+                return Val.Bad
+
+    # `base[idx]`: the array and the element.
+    fn at(ref self, base: Expr, idx: Expr) -> (int, int):
+        let bv = self.expr(base)
+        let a = self.arr(bv)
+        let iv = self.expr(idx)
+        let i = self.ival(iv)
+        if not self.ok:
+            return (0, 0)
+        if i < 0 or i >= i128(self.arrs[a].len):
+            self.fail()
+            return (0, 0)
+        return (a, int(i))
+
+    fn field_off(ref self, a: int, idx: int) -> int:
+        let ai = self.arrs[a]
+        match ai.elem:
+            case Ty.Struct(sid):
+                if is_f64(self.info.structs[sid].fields[idx].1):
+                    return ai.offs[idx]
+            case _:
+                pass
+        self.fail()
+        return 0
+
+    # ------------------------------------------------------------ statements
+    fn block(ref self, b: Block):
+        for s in b.stmts:
+            if self.stopped():
+                return
+            self.stmt(s)
+
+    fn stmt(ref self, s: Stmt):
+        self.steps += 1
+        if self.steps > MAX_STEPS or len(self.dag.nodes) > MAX_NODES:
+            self.fail()
+            return
+        match s.kind:
+            case StmtKind.Let(_, pat, _, init, is_ref):
+                match pat:
+                    case LetPat.Name(_, _):
+                        pass
+                    case _:
+                        self.fail()
+                        return
+                let v = self.expr(init)
+                match v:
+                    case Val.A(_):
+                        # a copy of an array the kernel may change: not followed
+                        if not is_ref:
+                            self.fail()
+                    case _:
+                        if is_ref:
+                            self.fail()
+                self.env[s.locals[0]] = v
+            case StmtKind.Assign(target, op, value):
+                var v = self.expr(value)
+                match op:
+                    case Some(o):
+                        let cur = self.expr(target)
+                        v = self.arith(o, cur, v, target.ty)
+                    case None:
+                        pass
+                self.assign(target, v)
+            case StmtKind.ExprStmt(e):
+                self.expr(e)
+            case StmtKind.If(branches, els):
+                for c, b in branches:
+                    let cv = self.expr(c)
+                    if self.bval(cv):
+                        self.block(b)
+                        return
+                    if not self.ok:
+                        return
+                match els:
+                    case Some(b):
+                        self.block(b)
+                    case None:
+                        pass
+            case StmtKind.While(cond, _, body):
+                while self.ok:
+                    let cv = self.expr(cond)
+                    if not self.bval(cv):
+                        return
+                    self.block(body)
+                    if self.end_iteration():
+                        return
+                    self.steps += 1
+                    if self.steps > MAX_STEPS:
+                        self.fail()
+            case StmtKind.For(_, _, _, iter, _, body, is_par):
+                if is_par:
+                    self.fail()
+                    return
+                var items: [Val] = []
+                match iter.kind:
+                    case ExprKind.Range(lo, hi, incl):
+                        let lv = self.expr(lo)
+                        let a = self.ival(lv)
+                        let hv = self.expr(hi)
+                        var b = self.ival(hv)
+                        if incl:
+                            b += 1
+                        if b - a > i128(MAX_STEPS):
+                            self.fail()
+                            return
+                        var i = a
+                        while i < b:
+                            items.push(Val.I(i))
+                            i += 1
+                    case _:
+                        # the elements as they are when the loop starts
+                        let av = self.expr(iter)
+                        let a = self.arr(av)
+                        if not self.ok:
+                            return
+                        for k in 0..self.arrs[a].len:
+                            items.push(self.elem_val(a, k))
+                for it in items:
+                    if not self.ok:
+                        return
+                    self.env[s.local] = it
+                    self.block(body)
+                    if self.end_iteration():
+                        return
+            case StmtKind.Return(value):
+                match value:
+                    case Some(e):
+                        self.ret = self.expr(e)
+                    case None:
+                        self.ret = Val.Unit
+                self.returned = true
+            case StmtKind.Break:
+                self.brk = true
+            case StmtKind.Continue:
+                self.cont = true
+            case StmtKind.Pass | StmtKind.Prove(_) | StmtKind.Contract(_, _):
+                pass
+            case StmtKind.Assert(cond, _):
+                if not s.proven:
+                    let cv = self.expr(cond)
+                    if not self.bval(cv):
+                        self.fail()
+            case _:
+                self.fail()
+
+    # After a loop body: true when the loop is over.
+    fn end_iteration(ref self) -> bool:
+        if not self.ok or self.returned:
+            return true
+        if self.brk:
+            self.brk = false
+            return true
+        self.cont = false
+        return false
+
+    fn assign(ref self, target: Expr, v: Val):
+        if not self.ok:
+            return
+        match target.kind:
+            case ExprKind.Ident(_):
+                match target.res:
+                    case Res.Local(id):
+                        # a `ref` parameter's changes would be the caller's
+                        if self.locals[id].kind == LocalKind.RefParam:
+                            self.fail()
+                            return
+                        self.env[id] = v
+                        return
+                    case _:
+                        pass
+            case ExprKind.Field(base, _, _):
+                match base.kind:
+                    case ExprKind.Index(b, i):
+                        let (a, k) = self.at(b, i)
+                        if not self.ok:
+                            return
+                        let off = self.field_off(a, target.idx)
+                        let n = self.fnode(v)
+                        self.write(a, k, off, n)
+                        return
+                    case _:
+                        pass
+                match self.expr(base):
+                    case Val.S(fs):
+                        var nf = fs
+                        nf[target.idx] = v
+                        self.assign(base, Val.S(nf))
+                        return
+                    case _:
+                        pass
+            case ExprKind.Index(b, i):
+                let (a, k) = self.at(b, i)
+                if not self.ok:
+                    return
+                let ai = self.arrs[a]
+                if is_f64(ai.elem):
+                    let n = self.fnode(v)
+                    self.write(a, k, 0, n)
+                    return
+                match v:
+                    case Val.S(fs):
+                        for j, x in enumerate(fs):
+                            let off = self.field_off(a, j)
+                            let n = self.fnode(x)
+                            self.write(a, k, off, n)
+                        return
+                    case _:
+                        pass
+            case _:
+                pass
+        self.fail()
+
+    # ------------------------------------------------------------ expressions
+    fn expr(ref self, e: Expr) -> Val:
+        if not self.ok:
+            return Val.Bad
+        match e.kind:
+            case ExprKind.Int(v):
+                if is_f64(e.ty):
+                    return Val.F(self.dag.konst(f64_bits(float(v))))
+                match e.ty:
+                    case Ty.Int(_):
+                        return Val.I(v)
+                    case _:
+                        pass
+            case ExprKind.Float(v):
+                if is_f64(e.ty):
+                    return Val.F(self.dag.konst(f64_bits(v)))
+            case ExprKind.Bool(v):
+                return Val.B(v)
+            case ExprKind.Ident(_):
+                match e.res:
+                    case Res.Local(id):
+                        match self.env.get(id):
+                            case Some(v):
+                                return v
+                            case None:
+                                pass
+                    case Res.Const(id):
+                        return self.const_val(id, e.ty)
+                    case _:
+                        pass
+            case ExprKind.Unary(op, x):
+                let v = self.expr(x)
+                match op:
+                    case UnOp.Neg:
+                        match v:
+                            case Val.F(n):
+                                return Val.F(self.dag.un(slp.NEG, n))
+                            case Val.I(i):
+                                return self.int_res(-i, e.ty)
+                            case _:
+                                pass
+                    case UnOp.Not:
+                        match v:
+                            case Val.B(b):
+                                return Val.B(not b)
+                            case _:
+                                pass
+                    case _:
+                        pass
+            case ExprKind.Binary(op, l, r):
+                if op == BinOp.And or op == BinOp.Or:
+                    let lv = self.expr(l)
+                    let a = self.bval(lv)
+                    if op == BinOp.And and not a:
+                        return Val.B(false)
+                    if op == BinOp.Or and a:
+                        return Val.B(true)
+                    let rv = self.expr(r)
+                    return Val.B(self.bval(rv))
+                let a = self.expr(l)
+                let b = self.expr(r)
+                return self.arith(op, a, b, e.ty)
+            case ExprKind.Compare(first, rest):
+                var a = self.expr(first)
+                for op, x in rest:
+                    let b = self.expr(x)
+                    if not self.compare(op, a, b):
+                        return Val.B(false)
+                    a = b
+                return Val.B(self.ok)
+            case ExprKind.IfElse(c, t, f):
+                let cv = self.expr(c)
+                if self.bval(cv):
+                    return self.expr(t)
+                return self.expr(f)
+            case ExprKind.Call(_, args):
+                return self.call(e, None, args)
+            case ExprKind.MethodCall(recv, _, _, args):
+                return self.call(e, Some(recv), args)
+            case ExprKind.Field(x, _, _):
+                match x.kind:
+                    case ExprKind.Index(b, i):
+                        let (a, k) = self.at(b, i)
+                        if not self.ok:
+                            return Val.Bad
+                        let off = self.field_off(a, e.idx)
+                        return Val.F(self.read(a, k, off))
+                    case _:
+                        pass
+                match self.expr(x):
+                    case Val.S(fs):
+                        return fs[e.idx]
+                    case _:
+                        pass
+            case ExprKind.Index(b, i):
+                let (a, k) = self.at(b, i)
+                if not self.ok:
+                    return Val.Bad
+                return self.elem_val(a, k)
+            case _:
+                pass
+        self.fail()
+        return Val.Bad
+
+    fn const_val(ref self, id: int, t: Ty) -> Val:
+        match self.info.consts[id].value:
+            case ConstVal.Int(v):
+                if is_f64(t):
+                    return Val.F(self.dag.konst(f64_bits(float(v))))
+                return Val.I(v)
+            case ConstVal.Float(v):
+                if is_f64(t):
+                    return Val.F(self.dag.konst(f64_bits(v)))
+            case ConstVal.Bool(b):
+                return Val.B(b)
+            case _:
+                pass
+        self.fail()
+        return Val.Bad
+
+    # An integer result of type `t`, if it fits.
+    fn int_res(ref self, v: i128, t: Ty) -> Val:
+        match t:
+            case Ty.Int(k):
+                if k.bits() <= 64 and k.min() <= v <= k.max():
+                    return Val.I(v)
+            case _:
+                pass
+        self.fail()
+        return Val.Bad
+
+    fn arith(ref self, op: BinOp, a: Val, b: Val, t: Ty) -> Val:
+        if not self.ok:
+            return Val.Bad
+        match (a, b):
+            case (Val.F(x), Val.F(y)):
+                if not is_f64(t):
+                    pass
+                elif op == BinOp.Add:
+                    return Val.F(self.dag.bin(slp.ADD, x, y, false))
+                elif op == BinOp.Sub:
+                    return Val.F(self.dag.bin(slp.ADD, x, y, true))
+                elif op == BinOp.Mul:
+                    return Val.F(self.dag.bin(slp.MUL, x, y, false))
+                elif op == BinOp.Div:
+                    return Val.F(self.dag.bin(slp.DIV, x, y, false))
+            case (Val.I(x), Val.I(y)):
+                match t:
+                    case Ty.Int(k):
+                        if k.bits() > 64:
+                            pass
+                        elif op == BinOp.Add:
+                            return self.int_res(x + y, t)
+                        elif op == BinOp.Sub:
+                            return self.int_res(x - y, t)
+                        elif op == BinOp.Mul:
+                            return self.int_res(x * y, t)
+                        elif (op == BinOp.Div or op == BinOp.Mod) and y != 0:
+                            # brine's division rounds down, like the compiler's own
+                            if op == BinOp.Div:
+                                return self.int_res(x / y, t)
+                            return self.int_res(x % y, t)
+                    case _:
+                        pass
+            case _:
+                pass
+        self.fail()
+        return Val.Bad
+
+    fn compare(ref self, op: CmpOp, a: Val, b: Val) -> bool:
+        match (a, b):
+            case (Val.I(x), Val.I(y)):
+                match op:
+                    case CmpOp.Eq:
+                        return x == y
+                    case CmpOp.Ne:
+                        return x != y
+                    case CmpOp.Lt:
+                        return x < y
+                    case CmpOp.Le:
+                        return x <= y
+                    case CmpOp.Gt:
+                        return x > y
+                    case CmpOp.Ge:
+                        return x >= y
+            case (Val.B(x), Val.B(y)):
+                match op:
+                    case CmpOp.Eq:
+                        return x == y
+                    case CmpOp.Ne:
+                        return x != y
+                    case _:
+                        pass
+            case _:
+                pass
+        self.fail()
+        return false
+
+    fn call(ref self, e: Expr, recv: Option[Expr], args: [Arg]) -> Val:
+        match e.cres:
+            case CallRes.Builtin(b):
+                var xs: [Expr] = []
+                match recv:
+                    case Some(r):
+                        xs.push(r)
+                    case None:
+                        pass
+                for a in args:
+                    xs.push(a.expr)
+                if len(xs) != 1:
+                    self.fail()
+                    return Val.Bad
+                if b == Builtin.Len:
+                    let av = self.expr(xs[0])
+                    let a = self.arr(av)
+                    if not self.ok:
+                        return Val.Bad
+                    return Val.I(i128(self.arrs[a].len))
+                if b == Builtin.Sqrt and is_f64(e.ty):
+                    let xv = self.expr(xs[0])
+                    let x = self.fnode(xv)
+                    return Val.F(self.dag.un(slp.SQRT, x))
+            case CallRes.Convert(t):
+                if len(args) == 1 and recv.is_none():
+                    let v = self.expr(args[0].expr)
+                    if is_f64(t):
+                        match v:
+                            case Val.F(_):
+                                return v
+                            case Val.I(i):
+                                if is_f64(e.ty):
+                                    return Val.F(self.dag.konst(f64_bits(float(i))))
+                            case _:
+                                pass
+                    match t:
+                        case Ty.Int(_):
+                            match v:
+                                case Val.I(i):
+                                    return self.int_res(i, t)
+                                case _:
+                                    pass
+                        case _:
+                            pass
+            case CallRes.Ctor(sid):
+                if recv.is_none():
+                    let fields = self.info.structs[sid].fields
+                    var fs: [Val] = [Val.Bad for _ in fields]
+                    for i, a in enumerate(args):
+                        var at = i
+                        match a.name:
+                            case Some(nm):
+                                for j, fld in enumerate(fields):
+                                    if fld.0 == nm.0:
+                                        at = j
+                            case None:
+                                pass
+                        if at < len(fs):
+                            fs[at] = self.expr(a.expr)
+                    return Val.S(fs)
+            case CallRes.Fn(id):
+                return self.inline(id, None, args)
+            case CallRes.Method(id):
+                return self.inline(id, recv, args)
+            case _:
+                pass
+        self.fail()
+        return Val.Bad
+
+    # A call of brine function `id`, run here.
+    fn inline(ref self, id: int, recv: Option[Expr], args: [Arg]) -> Val:
+        if self.depth >= MAX_DEPTH or id not in self.fns:
+            self.fail()
+            return Val.Bad
+        let f = self.fns[id]
+        let sig = self.info.fns[id]
+        if len(f.param_locals) != len(sig.params):
+            self.fail()
+            return Val.Bad
+        var vals: [Val] = [Val.Bad for _ in sig.params]
+        var shift = 0
+        match recv:
+            case Some(r):
+                vals[0] = self.expr(r)
+                shift = 1
+            case None:
+                pass
+        for i, a in enumerate(args):
+            var at = i + shift
+            match a.name:
+                case Some(nm):
+                    for j, ps in enumerate(sig.params):
+                        if ps.name == nm.0:
+                            at = j
+                case None:
+                    pass
+            if at < len(vals):
+                vals[at] = self.expr(a.expr)
+        # a `ref` parameter is only followed for a kernel array
+        for i, ps in enumerate(sig.params):
+            if ps.by_ref:
+                match vals[i]:
+                    case Val.A(_):
+                        pass
+                    case _:
+                        self.fail()
+        if not self.ok:
+            return Val.Bad
+        var env: {int: Val} = {}
+        for i, l in enumerate(f.param_locals):
+            env[l] = vals[i]
+        let saved_env = self.env
+        let saved_locals = self.locals
+        self.env = env
+        self.locals = f.locals
+        self.depth += 1
+        self.returned = false
+        self.ret = Val.Unit
+        self.block(f.body)
+        self.depth -= 1
+        let r = self.ret
+        self.env = saved_env
+        self.locals = saved_locals
+        self.returned = false
+        self.ret = Val.Unit
+        if self.brk or self.cont:
+            self.fail()
+        return r
