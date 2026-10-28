@@ -4824,6 +4824,10 @@ struct Checker:
             match rt:
                 case Ty.Struct(_) | Ty.Enum(_) | Ty.Error:
                     pass
+                case Ty.Str:
+                    # `s.to_int[u8]()`
+                    if name != "to_int" and name != "to_float":
+                        self.no_targs(name, span)
                 case _:
                     self.no_targs(name, span)
         match rt:
@@ -4835,7 +4839,7 @@ struct Checker:
             case Ty.Array(el):
                 return self.array_method(recv, el, name, name_span, ref args, ref res, span)
             case Ty.Str:
-                return self.str_method(name, name_span, ref args, ref res, span)
+                return self.str_method(name, name_span, ref args, ref res, span, targs)
             case Ty.Int(_) | Ty.Float(_):
                 return self.num_method(rt, name, name_span, ref args, ref res, span)
             case Ty.Struct(_) | Ty.Enum(_):
@@ -5347,7 +5351,8 @@ struct Checker:
         name_span: Span,
         ref args: [Arg],
         ref res: CallRes,
-        span: Span
+        span: Span,
+        targs: Option[[Ty]]
     ) -> Ty:
         let strs = Ty.Array(Ty.Str)
         var m = StrM.Find
@@ -5357,7 +5362,12 @@ struct Checker:
             case "find":
                 m = StrM.Find
                 params = [Ty.Str]
+                if len(args) == 2:
+                    m = StrM.FindFrom
+                    params = [Ty.Str, int_ty()]
                 ret = self.option_of(int_ty(), span)
+            case "to_int" | "to_float":
+                return self.parse_method(name, ref args, ref res, span, targs)
             case "split":
                 if len(args) == 0:
                     m = StrM.SplitWs
@@ -5439,7 +5449,7 @@ struct Checker:
                             d = d.with_help("use an f-string: f\"x = {x}\"")
                         case _:
                             d = d.note(
-                                "string methods: find, contains, split, join, starts_with, ends_with, strip, lstrip, rstrip, replace, upper, lower, lines, is_digit, is_alpha, is_space, is_alnum, count, bytes, chars, repeat"
+                                "string methods: find, contains, split, join, starts_with, ends_with, strip, lstrip, rstrip, replace, upper, lower, lines, is_digit, is_alpha, is_space, is_alnum, count, bytes, chars, repeat, to_int, to_float"
                             )
                 self.err(d)
                 self.check_all(ref args)
@@ -5449,6 +5459,40 @@ struct Checker:
         res = CallRes.Builtin(Builtin.Str(m))
         self.typed_args(name, ref args, params, span)
         return ret
+
+    # `s.to_int()` / `s.to_float()`: `Some(n)` or `None`; `s.to_int[u8]()` picks the type.
+    fn parse_method(
+        ref self,
+        name: str,
+        ref args: [Arg],
+        ref res: CallRes,
+        span: Span,
+        targs: Option[[Ty]]
+    ) -> Ty:
+        let want_int = name == "to_int"
+        var t = int_ty() if want_int else float_ty()
+        match targs:
+            case Some(ts):
+                var ok = len(ts) == 1
+                if ok:
+                    ok = ts[0].is_int() if want_int else ts[0].is_float()
+                    if ok:
+                        t = ts[0]
+                if not ok:
+                    let what = "an integer type" if want_int else "`float` or `f32`"
+                    let eg = "s.to_int[u8]()" if want_int else "s.to_float[f32]()"
+                    self.err(
+                        diag.error("E0334", f"`{name}` takes one type argument: {what}")
+                        .label(span, "wrong type arguments")
+                        .with_help(f"e.g. `{eg}`")
+                    )
+            case None:
+                pass
+        if self.in_spec:
+            self.spec_err(span)
+        res = CallRes.Builtin(Builtin.ToInt if want_int else Builtin.ToFloat)
+        self.typed_args(name, ref args, [], span)
+        return self.option_of(t, span)
 
     # Methods of numbers: wrapping arithmetic and bit counts on integers, `to_bits` on floats.
     fn num_method(
@@ -5551,7 +5595,7 @@ struct Checker:
         ).label(name_span, "unknown")
         if name == "parse" or name == "from_str":
             d = d.with_help(
-                "to read a number from text use `int(s)` or `float(s)`, which panic if it isn't one; check it with `is_digit` first"
+                "to read a number from text use `s.to_int()` or `s.to_float()` (`None` if it isn't one), or `int(s)` (panics if it isn't)"
             )
         else:
             d = d.note(
@@ -5635,6 +5679,9 @@ struct Checker:
             case "index":
                 b = Builtin.IndexOf
                 params = [el]
+                if len(args) == 2:
+                    b = Builtin.IndexFrom
+                    params = [el, int_ty()]
                 ret = self.option_of(int_ty(), span)
             case _:
                 var d = diag.error(
@@ -5658,7 +5705,7 @@ struct Checker:
                         d = d.with_help("use `xs.sort()` on a `var` copy")
                     case _:
                         d = d.note(
-                            "array methods: push(x), pop(), pop(i), insert(i, x), extend(ys), index(x), contains(x), sort(), reverse(), clear()"
+                            "array methods: push(x), pop(), pop(i), insert(i, x), extend(ys), index(x), index(x, start), contains(x), sort(), reverse(), clear()"
                         )
                 self.err(d)
                 self.check_all(ref args)
@@ -5674,7 +5721,7 @@ struct Checker:
                     "arrays of " + self.tn(el) + " can't be sorted"
                 ).label(span, "only numbers and strings can be ordered")
             )
-        if b == Builtin.IndexOf and not equatable(el):
+        if (b == Builtin.IndexOf or b == Builtin.IndexFrom) and not equatable(el):
             self.err(
                 diag.error(
                     "E0305",

@@ -886,6 +886,16 @@ int64_t brine_s_find(brine_str *s, brine_str *sub, const char *loc) {
     (void)loc;
     return br_find(s, sub, 0);
 }
+int64_t brine_s_find_from(brine_str *s, brine_str *sub, int64_t start, const char *loc) {
+    if (start < 0 || start > s->len)
+        br_panicf(loc, "find() start %lld is out of range for a string of %lld bytes", (long long)start, (long long)s->len);
+    return br_find(s, sub, start);
+}
+int64_t brine_start_chk(int64_t start, int64_t len, const char *loc) {
+    if (start < 0 || start > len)
+        br_panicf(loc, "index() start %lld is out of range for an array of length %lld", (long long)start, (long long)len);
+    return start;
+}
 /* a `[str]`: its elements are pointer slots (BR_PSLOT, brine_rt.h) */
 static brine_arr *br_strs(void) { return brine_arr_new(0, BR_PSLOT, brine_rt_str, brine_rl_str, ""); }
 static void br_push_str(brine_arr **a, brine_str *s) {
@@ -1520,16 +1530,10 @@ int brine_str_cmp(brine_str *a, brine_str *b) {
     if (c) return c;
     return a->len < b->len ? -1 : (a->len > b->len ? 1 : 0);
 }
-int64_t brine_parse_i64(brine_str *s, const char *loc) {
-    char *end;
-    errno = 0;
-    long long v = strtoll(s->data, &end, 10);
-    while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
-    if (s->len == 0 || errno || end != s->data + s->len)
-        br_panicf(loc, "invalid integer: \"%.*s\"", (int)s->len, s->data);
-    return (int64_t)v;
-}
-/* 128-bit parsing by hand: the C library stops at 64 bits */
+/* Integer text as `int()` reads it: blanks around it, a sign, decimal digits,
+ * and `_` between two digits, as in literals (`1_000`). By hand: the C
+ * library stops at 64 bits and knows no `_`. False if it isn't one or
+ * doesn't fit in 128 bits. */
 static bool br_parse_128(brine_str *s, bool *neg, brine_u128 *out) {
     const char *p = (const char *)s->data, *e = p + s->len;
     while (p < e && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++;
@@ -1537,14 +1541,51 @@ static bool br_parse_128(brine_str *s, bool *neg, brine_u128 *out) {
     *neg = false;
     if (p < e && (*p == '+' || *p == '-')) *neg = *p++ == '-';
     if (p == e) return false;
-    brine_u128 v = 0;
+    const char *first = p;
+    uint64_t v = 0;
     for (; p < e; p++) {
+        if (*p == '_' && p > first && p + 1 < e && p[1] >= '0' && p[1] <= '9') continue;
+        if (*p < '0' || *p > '9') return false;
+        if (v > (UINT64_MAX - 9) / 10) break;
+        v = v * 10 + (uint64_t)(*p - '0');
+    }
+    brine_u128 w = v;
+    for (; p < e; p++) {
+        if (*p == '_' && p + 1 < e && p[1] >= '0' && p[1] <= '9') continue;
         if (*p < '0' || *p > '9') return false;
         unsigned d = (unsigned)(*p - '0');
-        if (v > (BR_U128_MAX - d) / 10) return false;
-        v = v * 10 + d;
+        if (w > (BR_U128_MAX - d) / 10) return false;
+        w = w * 10 + d;
     }
-    *out = v;
+    *out = w;
+    return true;
+}
+int64_t brine_parse_i64(brine_str *s, const char *loc) {
+    bool neg;
+    brine_u128 u;
+    if (!br_parse_128(s, &neg, &u) || u > (brine_u128)INT64_MAX + (neg ? 1 : 0))
+        br_panicf(loc, "invalid integer: \"%.*s\"", (int)s->len, s->data);
+    return neg ? (int64_t)(0 - (uint64_t)u) : (int64_t)u;
+}
+bool brine_try_parse_int(brine_str *s, int64_t bits, bool sgn, void *out) {
+    bool neg;
+    brine_u128 u;
+    if (!br_parse_128(s, &neg, &u)) return false;
+    brine_u128 max = bits >= 128 ? BR_U128_MAX : ((brine_u128)1 << bits) - 1;
+    if (sgn) max >>= 1;
+    if (neg ? (sgn ? u > max + 1 : u != 0) : u > max) return false;
+    brine_u128 v = neg ? 0 - u : u;
+    uint8_t b8 = (uint8_t)v;
+    uint16_t b16 = (uint16_t)v;
+    uint32_t b32 = (uint32_t)v;
+    uint64_t b64 = (uint64_t)v;
+    switch (bits) {
+    case 8: memcpy(out, &b8, 1); break;
+    case 16: memcpy(out, &b16, 2); break;
+    case 32: memcpy(out, &b32, 4); break;
+    case 64: memcpy(out, &b64, 8); break;
+    default: memcpy(out, &v, 16); break;
+    }
     return true;
 }
 brine_i128 brine_parse_i128(brine_str *s, const char *loc) {
@@ -1624,15 +1665,55 @@ static bool br_parse_f64_fast(const char *p, const char *end, double *out) {
     *out = neg ? -v : v;
     return true;
 }
+static bool br_is_digit(char c) { return c >= '0' && c <= '9'; }
+/* Float text as `float()` reads it (`_` between digits too); false if it isn't one. */
+static bool br_parse_float(brine_str *s, double *out) {
+    const char *p = s->data;
+    int64_t n = s->len;
+    char *tmp = NULL;
+    if (n && memchr(p, '_', (size_t)n)) {
+        tmp = (char *)brine_alloc(n + 1);
+        int64_t m = 0;
+        for (int64_t i = 0; i < n; i++) {
+            if (p[i] != '_') {
+                tmp[m++] = p[i];
+                continue;
+            }
+            if (i == 0 || i + 1 == n || !br_is_digit(p[i - 1]) || !br_is_digit(p[i + 1])) {
+                free(tmp);
+                return false;
+            }
+        }
+        tmp[m] = 0;
+        p = tmp;
+        n = m;
+    }
+    double v = 0;
+    bool ok = br_parse_f64_fast(p, p + n, &v);
+    if (!ok) {
+        char *end;
+        v = strtod(p, &end);
+        while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
+        ok = n != 0 && end == p + n;
+    }
+    free(tmp);
+    *out = v;
+    return ok;
+}
 double brine_parse_f64(brine_str *s, const char *loc) {
-    double fast;
-    if (br_parse_f64_fast(s->data, s->data + s->len, &fast)) return fast;
-    char *end;
-    errno = 0;
-    double v = strtod(s->data, &end);
-    while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
-    if (s->len == 0 || end != s->data + s->len) br_panicf(loc, "invalid float: \"%.*s\"", (int)s->len, s->data);
+    double v;
+    if (!br_parse_float(s, &v)) br_panicf(loc, "invalid float: \"%.*s\"", (int)s->len, s->data);
     return v;
+}
+bool brine_try_parse_float(brine_str *s, bool f32, void *out) {
+    double v;
+    if (!br_parse_float(s, &v)) return false;
+    if (f32) {
+        float f = (float)v;
+        memcpy(out, &f, 4);
+    } else
+        memcpy(out, &v, 8);
+    return true;
 }
 
 /* ============================================================ arrays */

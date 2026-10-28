@@ -280,6 +280,7 @@ xs.sort()               # numbers and strings; stable
 xs.reverse()
 xs.clear()
 print(len(xs), xs == [3, 1, 2], 3 in xs, xs.index(3))  # index: Option[int]
+print([3, 1, 3].index(3, 1))    # Some(2): searching from index 1 (0 to len, else a panic)
 print(xs.contains(3))   # the same as `3 in xs`
 print(xs[1:3], xs[:2], xs[2:])   # slices are copies; out of range panics
 ```
@@ -299,6 +300,7 @@ compare with ASCII (`s[i] == " "`). A slice must not cut a character in two:
 let s = "hello, brine"
 print(s[0], s[7:], s + "!", "ri" in s, s.contains("ri"), f"{s} has {len(s)} bytes")
 print(s.find("brine"))                    # Some(7); None if absent
+print(s.find("e", 2))                     # Some(11): searching from byte 2 (0 to len(s))
 print(s.split(", "), "a b  c".split())    # ["hello", "brine"], ["a", "b", "c"]
 print("-".join(["a", "b"]), "ab".repeat(3), s.replace("l", "L"))
 print(s.starts_with("he"), s.ends_with("!"), s.count("l"))
@@ -310,8 +312,19 @@ print(ord("a"), chr(97))                   # 97 "a"
 Case conversion and `is_alpha`/`is_space` follow Unicode, as in Python
 (`"straße".upper()` is `"STRASSE"`); `is_digit` is `0`-`9`, the digits `int()`
 reads. `str(x)` converts any
-printable value; `int("42")` and `float("2.5")` parse (and panic on bad input, so
-check with `is_digit` first when the text comes from outside).
+printable value; `int("42")` and `float("2.5")` parse (and panic on bad input).
+For text from outside, `s.to_int()` and `s.to_float()` give `None` instead:
+
+```python
+match line.to_int():                      # Option[int]; blanks around it are fine
+    case Some(n):
+        print(n + 1)
+    case None:
+        print("not a number")
+"200".to_int[u8]()                        # Some(200): other types; None if out of range
+"2.5".to_float[f32]()                     # Some(2.5)
+```
+Both accept `_` between digits (`"1_000"`), as `int()` and `float()` do.
 
 ## Maps
 

@@ -382,11 +382,18 @@ int64_t brine_s_count(brine_str *s, brine_str *sub, const char *loc);
 brine_arr *brine_s_bytes(brine_str *s, const char *loc);
 brine_arr *brine_s_chars(brine_str *s, const char *loc);
 brine_str *brine_s_repeat(brine_str *s, int64_t n, const char *loc);
+int64_t brine_s_find_from(brine_str *s, brine_str *sub, int64_t start, const char *loc);
 int brine_str_cmp(brine_str *a, brine_str *b);
 int64_t brine_parse_i64(brine_str *s, const char *loc);
 brine_i128 brine_parse_i128(brine_str *s, const char *loc);
 brine_u128 brine_parse_u128(brine_str *s, const char *loc);
 double brine_parse_f64(brine_str *s, const char *loc);
+/* `s.to_int()` / `s.to_float()`: false for text that isn't a number of the
+ * type; otherwise the value (`bits` wide; an f32 if `f32`) goes to *out */
+bool brine_try_parse_int(brine_str *s, int64_t bits, bool sgn, void *out);
+bool brine_try_parse_float(brine_str *s, bool f32, void *out);
+/* `xs.index(x, start)`: start, when 0 <= start <= len */
+int64_t brine_start_chk(int64_t start, int64_t len, const char *loc);
 
 /* ------------------------------------------------------------ arrays */
 brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_fn rl, const char *loc);

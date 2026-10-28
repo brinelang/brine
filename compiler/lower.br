@@ -4407,7 +4407,8 @@ struct Lower:
                     case Ty.Str:
                         tst = self.cx.fb.call(K.Bool, "brine_str_contains", [c, x])
                     case _:
-                        let ix = self.find_elem(c, x, coll.ty.elem())
+                        let z0 = self.cx.fb.konst(K.I64, 0)
+                        let ix = self.find_elem(c, x, coll.ty.elem(), z0)
                         let zero = self.cx.fb.konst(K.I64, 0)
                         tst = self.cx.fb.cmp(Op.Ge, ix, zero)
                 if neg:
@@ -4507,9 +4508,9 @@ struct Lower:
         return self.temp(r, Ty.Str)
 
     # I64: the index of the first element of array `a` equal to `x`, or -1.
-    fn find_elem(ref self, a: int, x: int, el: Ty) -> int:
+    fn find_elem(ref self, a: int, x: int, el: Ty, start: int) -> int:
         let r = self.cx.fb.konst(K.I64, -1)
-        let i = self.cx.fb.konst(K.I64, 0)
+        let i = self.cx.fb.copy_of(start)
         let one = self.cx.fb.konst(K.I64, 1)
         let n = self.cx.fb.load(K.I64, a, 8)
         let data = self.cx.fb.load(K.Ptr, a, 48)
@@ -5093,6 +5094,27 @@ struct Lower:
                 let p = self.cx.fb.temp_mem(k.size(), k.size())
                 self.cx.fb.store(p, 0, u)
                 return self.cx.fb.load(k, p, 0)
+            case Builtin.ToInt | Builtin.ToFloat:
+                let s = self.expr(recv.unwrap())
+                var vt = int_ty()
+                match try_kind(self.info, e.ty):
+                    case Some(TryKind.Opt(_, _, inner)):
+                        vt = inner
+                    case _:
+                        pass
+                let lay = self.lay(vt)
+                let p = self.cx.fb.temp_mem(lay.size, lay.align)
+                var ok = -1
+                match vt:
+                    case Ty.Int(k):
+                        let bits = self.cx.fb.konst(K.I64, k.bits())
+                        let sg = self.cx.fb.konst(K.Bool, 1 if k.signed() else 0)
+                        ok = self.cx.fb.call(K.Bool, "brine_try_parse_int", [s, bits, sg, p])
+                    case _:
+                        let small = 1 if vt == Ty.Float(FloatTy.F32) else 0
+                        let f32 = self.cx.fb.konst(K.Bool, small)
+                        ok = self.cx.fb.call(K.Bool, "brine_try_parse_float", [s, f32, p])
+                return self.make_option(e.ty, ok, p, vt)
             case Builtin.Clock:
                 return self.cx.fb.call(K.F64, "brine_clock", [])
             case Builtin.Flush:
@@ -5165,11 +5187,18 @@ struct Lower:
                     let fp = self.cx.fb.global(c)
                     self.cx.fb.call_void("brine_arr_sort", [lp, fp])
                 return self.unit()
-            case Builtin.IndexOf:
+            case Builtin.IndexOf | Builtin.IndexFrom:
                 let r = recv.unwrap()
                 let a = self.expr(r)
                 let x = self.expr(args[0].expr)
-                let ix = self.find_elem(a, x, r.ty.elem())
+                var start = self.cx.fb.konst(K.I64, 0)
+                if b == Builtin.IndexFrom:
+                    let s0 = self.expr(args[1].expr)
+                    let s = self.cx.fb.conv(K.I64, s0)
+                    let n = self.cx.fb.load(K.I64, a, 8)
+                    let loc = self.loc(e.span)
+                    start = self.cx.fb.call(K.I64, "brine_start_chk", [s, n, loc])
+                let ix = self.find_elem(a, x, r.ty.elem(), start)
                 let zero = self.cx.fb.konst(K.I64, 0)
                 let present = self.cx.fb.cmp(Op.Ge, ix, zero)
                 let ip = self.addr_of(ix, int_ty())
@@ -5180,7 +5209,7 @@ struct Lower:
                 for a in args:
                     vals.push(self.expr(a.expr))
                 vals.push(self.loc(e.span))
-                if m == StrM.Find:
+                if m == StrM.Find or m == StrM.FindFrom:
                     let ix = self.cx.fb.call(K.I64, m.c_name(), vals)
                     let zero = self.cx.fb.konst(K.I64, 0)
                     let present = self.cx.fb.cmp(Op.Ge, ix, zero)
