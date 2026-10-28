@@ -6026,6 +6026,9 @@ void brine_x_box_retain(void *p) { brine_box_retain(p); }
 bool brine_x_box_dec(void *p) { return brine_box_dec(p); }
 void brine_x_map_retain(brine_map *m) { brine_map_retain(m); }
 void brine_x_map_release(brine_map *m) { brine_map_release(m); }
+void brine_x_arr_push_in(brine_arr **pa, const void *elem, int64_t esz) { brine_arr_push_in(pa, elem, esz); }
+void brine_x_arr_pop_in(brine_arr **pa, void *out, int64_t esz, const char *loc) { brine_arr_pop_in(pa, out, esz, loc); }
+void brine_x_arr_clear_in(brine_arr **pa) { brine_arr_clear_in(pa); }
 brine_str *brine_x_str_at(brine_str *s, int64_t i, const char *loc) { return brine_str_at(s, i, loc); }
 brine_str *brine_x_str_byte(brine_str *s, int64_t i) { return brine_str_byte(s, i); }
 void brine_x_str_add(brine_str **ps, brine_str *b) { brine_str_add(ps, b); }
