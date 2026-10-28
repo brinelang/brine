@@ -8,9 +8,9 @@ import { WASI } from "node:wasi";
 import process from "node:process";
 
 const [file, ...args] = process.argv.slice(2);
-// paths relative to the current folder work as they do natively
+// paths relative to the current folder work as they do natively. Only that
+// folder: with "/" also open, wasi-libc resolves relative paths under "/".
 const preopens = { ".": "." };
-if (process.platform !== "win32") preopens["/"] = "/";
 const wasi = new WASI({
   version: "preview1",
   args: [file, ...args],
