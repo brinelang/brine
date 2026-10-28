@@ -329,8 +329,8 @@ evaluation order never matters. A call in another call's arguments runs first
 (`both(ref self.a, ref self.b)`, `self.items[self.rng.below(n)]`).
 
 In release builds, a `for j in lo..hi` loop that indexes arrays at `j`, `j + x`,
-`x + j` or `j - x` (`x` a literal or a variable the loop doesn't change) and
-doesn't change those arrays' lengths checks the first and last index once,
+`x + j` or `j - x` (`x` a literal or a variable the loop doesn't change), calls
+no functions of the program and doesn't change those arrays' lengths checks the first and last index once,
 before the loop, and then runs without per-element checks, so the C compiler can
 vectorize it. If that test fails the loop runs checked as written, panicking at
 the same element it always would.
@@ -593,7 +593,8 @@ API: `rank()`, `size()`, `barrier()`, `broadcast(root, v)`, `sum(v)`, `min(v)`,
 `max(v)` (on `int`, `float`, `[int]`, `[float]`), `any(b)`, `all(b)`,
 `gather_all(v) -> [T]`, `shift(v, by)`, `shift(v, by, edge)`, `exchange(xs) -> [T]`.
 Message types: integers and floats of any width (`[u8]` travels as bytes), `bool`,
-`str`, and arrays of those (`[[float]]`, ...).
+`str`, and arrays of those (`[[float]]`, ...). A float `sum` adds the ranks'
+values in a fixed tree: the same result on every rank and every run.
 Run with `brine run --ranks N` (each rank gets cores / N `par` threads unless
 `--threads` says otherwise). Without it, `world.size() == 1`. If a rank fails,
 `brine run` stops the others and exits with that rank's exit code.
