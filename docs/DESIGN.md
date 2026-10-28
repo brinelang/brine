@@ -67,7 +67,7 @@ fn main():
 | Integers | `int` = 64-bit signed. `i8..i128`, `u8..u128`. Overflow **traps** (checked arithmetic). Narrowing conversions are checked. 128-bit types need a 64-bit target, and their overflow checks are never proved away (the prover's arithmetic is itself 128-bit). |
 | Floats | `float` = f64, `f32`. IEEE semantics. |
 | Values | Everything has **value semantics**: `let b = a` copies and arguments are passed by value. Arrays and strings are copy-on-write and reference counted, so copies are O(1) until mutated. |
-| References | Explicit at both ends: `fn fill(ref xs: [int])` is called as `fill(ref xs)`; methods that change their receiver take `ref self`. `let r = ref x` makes `r` a second name for the variable `x`. References are *second-class*: they can't be stored in structs or arrays or returned, so they can never dangle, and the compiler always knows what they point to (exclusive access is enforced: a `ref` argument cannot alias another argument). `mut x: T` on a parameter means a local copy the function may change. |
+| References | Explicit at both ends: `fn fill(ref xs: [int])` is called as `fill(ref xs)`; methods that change their receiver take `ref self`. `let r = ref x` makes `r` a second name for the variable `x` (or for a field path: `let b = ref self.board`). References are *second-class*: they can't be stored in structs or arrays or returned, so they can never dangle, and the compiler always knows what they point to (exclusive access is enforced: a `ref` argument cannot alias another argument). `mut x: T` on a parameter means a local copy the function may change. |
 | Maps | `{K: V}` hash maps that remember insertion order. Values, like arrays (copy-on-write). Reading a missing key panics; `m.get(k)` returns `Option[V]`. Keys must have a total `==` (no floats). `par` bodies may read maps but not change them. |
 | Strings | Immutable UTF-8. `len`, `s[i]` and slices count bytes (`s[i]` is a one-character `str`); `for c in s` walks characters. Case conversion and character classes follow Unicode (`is_digit` is `0`-`9`). |
 | Slices | `xs[a:b]`, `s[a:b]` copy; out-of-range bounds panic (or are proven in range). No negative indexes. |
@@ -76,7 +76,7 @@ fn main():
 | Enums | Tagged unions with named fields per variant; values are immutable and may be recursive. `match` must be exhaustive (checked at compile time, with an example of a missed value). |
 | Memory | Deterministic: reference counting (atomic), freed at scope exit. No GC pauses. |
 | Generics | `fn f[T](x: T)`, `struct Pair[A, B]`, `enum Option[T]`. Monomorphized: every use with new type arguments is a specialized copy, checked and proven like ordinary code. Type arguments are inferred from arguments and the expected type. |
-| Errors | `Result[T, E]` and `Option[T]` from the prelude for expected failures; runtime traps with a source location (`panic`) for bugs. `x?` returns a `None`/`Err` to the caller (no implicit error conversions). `main` may return `Result[(), E]`. |
+| Errors | `Result[T, E]` and `Option[T]` from the prelude for expected failures; runtime traps with a source location (`panic`) for bugs. `x?` returns a `None`/`Err` to the caller (no implicit error conversions). `main` may return `Result[(), E]` or `Result[int, E]` (`Ok(n)`: exit code `n`). |
 
 ### 2.2 Proofs ("rules cannot be broken")
 

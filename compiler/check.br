@@ -7,7 +7,7 @@ from types import int_ty, float_ty, builtins, world_ops, os_ops, NumM, num_metho
 from ast import TypeExpr, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Expr, ExprKind, mk
 from ast import LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, stmt, pattern
 from ast import children, stmt_exprs, stmt_blocks, local_of, lvalue_root, parse_fmt_spec
-from ast import Param, FnDecl, FieldDecl, StructDecl, EnumDecl, Module, Program
+from ast import Param, FnDecl, FieldDecl, StructDecl, EnumDecl, Module, Program, Import, module_name
 from info import StructInfo, VariantInfo, EnumInfo, ParamSig, FnSig, ConstVal, ConstInfo, ProgramInfo
 from info import TryKind, try_kind, new_info, mangle_module, PRELUDE
 import num
@@ -220,7 +220,13 @@ fn new_checker() -> Checker:
         key_checks=[],
         failed=false,
         src_dirs={},
-        embedded={}
+        embedded={},
+        expand=[],
+        or_names=None,
+        or_seen=[],
+        const_exprs={},
+        ref_paths=[],
+        failed_imports={}
     )
 
 struct Checker:
@@ -259,6 +265,20 @@ struct Checker:
     src_dirs: {int: str}
     # file contents already embedded, by the span of the path literal (calls can be checked twice)
     embedded: {Span: str}
+    # statements that replace the one just checked (`a, b = b, a`)
+    expand: [Stmt]
+    # inside a later alternative of `A(c) | B(c)`: the names the first one bound
+    or_names: Option[{str: int}]
+    # ... and the ones this alternative has bound so far
+    or_seen: [str]
+    # array constants: the literal each use stands for, every element folded
+    const_exprs: {int: Expr}
+    # `let t = ref self.t`: the variable and the fields each alias stands for.
+    # Its scope entry has id `-2 - k` for alias k.
+    ref_paths: [(str, [str], Span)]
+    # `"<module> <name>"` for each `from m import name` that failed, already
+    # reported: its uses aren't reported again
+    failed_imports: {str: bool}
 
     fn err(ref self, d: Diag):
         self.diags.push(d)
@@ -501,16 +521,22 @@ struct Checker:
                                 self.info.consts[id].value = v
                                 self.info.consts[id].ty = ty
                             case None:
-                                self.err(
-                                    diag.error(
-                                        "E0317",
-                                        "constant value must be computable at compile time"
-                                    )
-                                    .label(c.value.span, "not a constant expression")
-                                    .with_help(
-                                        "constants can use literals, arithmetic, and other constants"
-                                    )
-                                )
+                                match self.const_array(c.value):
+                                    case Some(lit):
+                                        self.const_exprs[id] = lit
+                                        self.info.consts[id].ty = ty
+                                    case None:
+                                        if not t.is_error():
+                                            self.err(
+                                                diag.error(
+                                                    "E0317",
+                                                    "constant value must be computable at compile time"
+                                                )
+                                                .label(c.value.span, "not a constant expression")
+                                                .with_help(
+                                                    "constants can use literals, arithmetic, other constants, and arrays of these"
+                                                )
+                                            )
                         prog.modules[mi].consts[ci] = c
                     case _:
                         pass
@@ -664,55 +690,80 @@ struct Checker:
                     return None
         return None
 
-    # `from a import x, y`: bind each name to the item defined in `a`.
-    # Only items defined in `a` itself can be imported (not `a`'s own imports).
+    # `from a import x, y`: bind each name to the item `a` defines, or itself
+    # imports with `from` (a re-export), so `from a import x` finds what `a.x` does.
     fn from_imports(ref self, prog: Program, ref spans: [{str: Span}]):
-        var own: [{str: Item}] = []
-        for its in self.items:
-            var o: {str: Item} = {}
-            for k, v in its.items():
+        # (module, import, name) left to bind. A re-exported name is only there
+        # once its own import is bound, so go round until nothing changes.
+        var todo: [(int, int, int)] = []
+        for mi, m in enumerate(prog.modules):
+            for ii, imp in enumerate(m.imports):
+                for ni in 0..len(imp.names):
+                    todo.push((mi, ii, ni))
+        var progress = true
+        while progress:
+            progress = false
+            var left: [(int, int, int)] = []
+            for mi, ii, ni in todo:
+                let imp = prog.modules[mi].imports[ii]
+                let target = prog.import_targets[mi][ii]
+                let (name, sp) = imp.names[ni]
+                match self.items[target].get(name):
+                    case Some(Item.Module(_)) | None:
+                        left.push((mi, ii, ni))
+                    case Some(it):
+                        progress = true
+                        self.bind_from(mi, imp, name, sp, it, ref spans)
+            todo = left
+        for mi, ii, ni in todo:
+            let imp = prog.modules[mi].imports[ii]
+            let target = prog.import_targets[mi][ii]
+            let (name, sp) = imp.names[ni]
+            self.failed_imports[f"{mi} {name}"] = true
+            var names: [str] = []
+            for k, v in self.items[target].items():
                 match v:
                     case Item.Module(_):
                         pass
                     case _:
-                        o[k] = v
-            own.push(o)
-        for mi, m in enumerate(prog.modules):
-            for ii, imp in enumerate(m.imports):
-                let target = prog.import_targets[mi][ii]
-                for name, sp in imp.names:
-                    match own[target].get(name):
-                        case None:
-                            let mname = ".".join(imp.path)
-                            var d = diag.error(
-                                "E0201",
-                                f"module `{mname}` has no item `{name}`"
-                            ).label(sp, "not found")
-                            match best_match(name, own[target].keys()):
-                                case Some(b):
-                                    d = d.with_help(f"did you mean `{b}`?").fix(sp, b, "replace")
-                                case None:
-                                    pass
-                            self.err(d)
-                        case Some(it):
-                            match spans[mi].get(name):
-                                case Some(prev):
-                                    let p = ".".join(imp.path)
-                                    let last = imp.path[len(imp.path) - 1]
-                                    self.err(
-                                        diag.error(
-                                            "E0202",
-                                            f"`{name}` is imported but this module already has that name"
-                                        )
-                                        .label(sp, "imported here")
-                                        .label(prev, "also defined here")
-                                        .with_help(
-                                            f"rename one of them, or use `import {p}` and write `{last}.{name}`"
-                                        )
-                                    )
-                                case None:
-                                    spans[mi][name] = sp
-                                    self.items[mi][name] = it
+                        names.push(k)
+            let mname = module_name(imp.path)
+            var d = diag.error(
+                "E0201",
+                f"module `{mname}` has no item `{name}`"
+            ).label(sp, "not found")
+            match best_match(name, names):
+                case Some(b):
+                    d = d.with_help(f"did you mean `{b}`?").fix(sp, b, "replace")
+                case None:
+                    pass
+            self.err(d)
+
+    fn bind_from(
+        ref self,
+        mi: int,
+        imp: Import,
+        name: str,
+        sp: Span,
+        it: Item,
+        ref spans: [{str: Span}]
+    ):
+        match spans[mi].get(name):
+            case Some(prev):
+                let p = module_name(imp.path)
+                let last = imp.path[len(imp.path) - 1]
+                self.err(
+                    diag.error(
+                        "E0202",
+                        f"`{name}` is imported but this module already has that name"
+                    )
+                    .label(sp, "imported here")
+                    .label(prev, "also defined here")
+                    .with_help(f"rename one of them, or use `import {p}` and write `{last}.{name}`")
+                )
+            case None:
+                spans[mi][name] = sp
+                self.items[mi][name] = it
 
     fn dup(ref self, name: str, span: Span, prev: Span):
         self.err(
@@ -798,6 +849,8 @@ struct Checker:
                         return t
                     case None:
                         pass
+                if f"{self.cur_mod} {name}" in self.failed_imports:
+                    return Ty.Error
                 var d = diag.error(
                     "E0203",
                     f"unknown type `{name}`"
@@ -832,6 +885,50 @@ struct Checker:
                 self.err(d)
                 return Ty.Error
 
+    # `[3, 4, 5]`, `[0] * 256` or `[[1, 2], [3, 4]]` with every element known
+    # now: the same literal with each element folded to a literal.
+    fn const_array(self, e: Expr) -> Option[Expr]:
+        var out: [Expr] = []
+        match e.kind:
+            case ExprKind.Array(xs):
+                for x in xs:
+                    out.push(self.const_elem(x)?)
+            case ExprKind.Repeat(x, n):
+                let v = self.const_elem(x)?
+                match self.eval_const(n)?:
+                    case ConstVal.Int(k):
+                        if k < 0 or k > 1 << 20:
+                            return None
+                        for _ in 0..int(k):
+                            out.push(v)
+                    case _:
+                        return None
+            case _:
+                return None
+        var r = e
+        r.kind = ExprKind.Array(out)
+        return Some(r)
+
+    fn const_elem(self, x: Expr) -> Option[Expr]:
+        match self.eval_const(x):
+            case Some(v):
+                var lit = x
+                match v:
+                    case ConstVal.Int(n):
+                        lit.kind = ExprKind.Int(n)
+                    case ConstVal.UInt(n):
+                        lit.kind = ExprKind.UInt(n)
+                    case ConstVal.Float(f):
+                        lit.kind = ExprKind.Float(f)
+                    case ConstVal.Bool(b):
+                        lit.kind = ExprKind.Bool(b)
+                    case ConstVal.Str(t):
+                        lit.kind = ExprKind.Str(t)
+                lit.res = Res.Unresolved
+                return Some(lit)
+            case None:
+                return self.const_array(x)
+
     fn eval_const(self, e: Expr) -> Option[ConstVal]:
         match e.kind:
             case ExprKind.Int(v):
@@ -858,6 +955,19 @@ struct Checker:
                         if len(args) == 0:
                             return None
                         return self.eval_const(args[0].expr)
+                    # `len(TABLE)` of an array constant
+                    case CallRes.Builtin(Builtin.Len):
+                        if len(args) != 1:
+                            return None
+                        match args[0].expr.res:
+                            case Res.Const(_):
+                                match args[0].expr.kind:
+                                    case ExprKind.Array(xs):
+                                        return Some(ConstVal.Int(i128(len(xs))))
+                                    case _:
+                                        return None
+                            case _:
+                                return None
                     case _:
                         return None
             case ExprKind.Unary(op, x):
@@ -1031,9 +1141,8 @@ struct Checker:
                 LocalInfo(name=name, ty=ty, kind=kind, par_level=self.cur_level(), span=span)
             )
             return id
-        match self.lookup_local(name):
-            case Some(prev):
-                let pspan = self.locals[prev].span
+        match self.defined_at(name):
+            case Some(pspan):
                 if kind != LocalKind.Result:
                     self.err(
                         diag.error("E0207", f"`{name}` is already defined in this function")
@@ -1059,10 +1168,40 @@ struct Checker:
             var j = len(s) - 1
             while j >= 0:
                 if s[j].0 == name:
+                    if s[j].1 < 0:
+                        return None
                     return Some(s[j].1)
                 j -= 1
             si -= 1
         return None
+
+    # The alias `name` stands for, when it's `let name = ref x.field`.
+    fn lookup_path(self, name: str) -> Option[int]:
+        var si = len(self.scopes) - 1
+        while si >= 0:
+            let s = self.scopes[si]
+            var j = len(s) - 1
+            while j >= 0:
+                if s[j].0 == name:
+                    if s[j].1 < 0:
+                        return Some(-2 - s[j].1)
+                    return None
+                j -= 1
+            si -= 1
+        return None
+
+    # The span where `name` was defined in this function, if it was.
+    fn defined_at(self, name: str) -> Option[Span]:
+        match self.lookup_local(name):
+            case Some(id):
+                return Some(self.locals[id].span)
+            case None:
+                pass
+        match self.lookup_path(name):
+            case Some(k):
+                return Some(self.ref_paths[k].2)
+            case None:
+                return None
 
     fn use_local(ref self, id: int):
         let pl = self.locals[id].par_level
@@ -1082,6 +1221,8 @@ struct Checker:
         return v
 
     fn undefined(ref self, name: str, span: Span, what: str):
+        if f"{self.cur_mod} {name}" in self.failed_imports:
+            return
         var d = diag.error(
             "E0201",
             f"cannot find {what} `{name}`"
@@ -1110,10 +1251,27 @@ struct Checker:
     # ============================================================ statements
     fn check_block(ref self, ref b: Block):
         self.scopes.push([])
+        # a statement may be replaced by several (`a, b = b, a`)
+        var out: [Stmt] = []
+        var expanded = false
         for i in 0..len(b.stmts):
             self.check_stmt(ref b.stmts[i])
+            if len(self.expand) > 0:
+                if not expanded:
+                    out = b.stmts[:i]
+                    expanded = true
+                for x in self.expand:
+                    for e in stmt_exprs(x):
+                        self.check_mut_conflicts(e)
+                    out.push(x)
+                self.expand = []
+                continue
             for e in stmt_exprs(b.stmts[i]):
                 self.check_mut_conflicts(e)
+            if expanded:
+                out.push(b.stmts[i])
+        if expanded:
+            b.stmts = out
         self.scopes.pop()
 
     # Value semantics inside one expression: a variable changed in place by a
@@ -1122,13 +1280,15 @@ struct Checker:
     # depend on the order of evaluation. Reads in the call's own receiver and
     # arguments are fine (they happen before the change, as in Rust and Swift),
     # and so are uses on different sides of `and`/`or`/`if-else`, which run in order.
+    # A call in another call's arguments runs first, so `t.f(t.g(x))` is fine
+    # when `t` is a variable or a field path; and different fields of a variable
+    # (`self.a`, `self.b`) are separate places.
     fn check_mut_conflicts(ref self, e: Expr):
-        var sites: [(int, Span)] = []
-        var reads: [(int, Span)] = []
-        var seq: [(Span, Span)] = []
-        mut_sites(e, self.info, ref sites, ref reads, ref seq)
+        var m = MutScan(sites=[], reads=[], seq=[], places=[])
+        mut_sites(e, self.info, ref m)
         var done: [int] = []
-        for root, _ in sites:
+        for st in m.sites:
+            let root = st.root
             if root in done:
                 continue
             done.push(root)
@@ -1142,18 +1302,24 @@ struct Checker:
             if reported:
                 continue
             let n = self.locals[root].name
-            var mine: [Span] = []
-            for r, s in sites:
-                if r == root:
+            var mine: [MutSite] = []
+            for s in m.sites:
+                if s.root == root:
                     mine.push(s)
-            # a second change: `xs.push(xs.pop())`, `f(xs.pop(), xs.pop())`
+            # a second change: `xs.push(xs.pop()[0])`, `f(xs.pop(), xs.pop())`
             var twice: Option[(Span, Span)] = None
             for i in 0..len(mine):
                 let a = mine[i]
                 for j in i + 1..len(mine):
                     let b = mine[j]
-                    if b != a and not ordered(seq, a, b):
-                        twice = Some((a, b))
+                    if (
+                        b.span != a.span
+                        and paths_overlap(a.path, b.path)
+                        and not ordered(m.seq, a.span, b.span)
+                        and not runs_first(a, b)
+                        and not runs_first(b, a)
+                    ):
+                        twice = Some((a.span, b.span))
                         break
                 if twice.is_some():
                     break
@@ -1163,6 +1329,7 @@ struct Checker:
                         diag.error("E0405", f"`{n}` is changed twice in the same expression")
                         .label(again, "changed here")
                         .label(first, "and changed here")
+                        .note("brine doesn't define which of the two runs first")
                         .with_help(
                             "make one change in its own statement first, e.g. `let v = ...`, then use `v`"
                         )
@@ -1173,9 +1340,15 @@ struct Checker:
             # a read outside the changing call
             var conflict: Option[(Span, Span)] = None
             for s in mine:
-                for r, x in reads:
-                    if r == root and not within(x, s) and not ordered(seq, x, s):
-                        conflict = Some((s, x))
+                for r in m.reads:
+                    if (
+                        r.root == root
+                        and paths_overlap(r.path, s.path)
+                        and not within(r.span, s.span)
+                        and not ordered(m.seq, r.span, s.span)
+                        and not read_later(m.places, r.span, s.span)
+                    ):
+                        conflict = Some((s.span, r.span))
                         break
                 if conflict.is_some():
                     break
@@ -1231,25 +1404,27 @@ struct Checker:
             case None:
                 pass
         var target = -1
-        match init.kind:
-            case ExprKind.Ident(_):
-                match init.res:
-                    case Res.Local(id):
-                        target = id
-                    case _:
-                        pass
-            case _:
-                pass
-        if target < 0:
-            if not init.ty.is_error():
-                self.err(
-                    diag.error("E0404", "`ref` needs a variable")
-                    .label(init.span, "not a variable")
-                    .with_help(
-                        "write `let r = ref total` to make `r` another name for the variable `total`"
-                    )
-                )
-            return
+        var fields: [str] = []
+        var root = ""
+        var at = init
+        var walking = true
+        while walking:
+            walking = false
+            match at.kind:
+                case ExprKind.Ident(n):
+                    match at.res:
+                        case Res.Local(id):
+                            target = id
+                            root = n
+                        case _:
+                            pass
+                case ExprKind.Field(b, f, _):
+                    if field_base(b.ty):
+                        fields.insert(0, f)
+                        at = b
+                        walking = true
+                case _:
+                    pass
         var name = ""
         var nsp = span
         match pat:
@@ -1264,9 +1439,20 @@ struct Checker:
                     ).label(span, "use a single name: `let r = ref x`")
                 )
                 return
-        match self.lookup_local(name):
-            case Some(prev):
-                let pspan = self.locals[prev].span
+        if target < 0:
+            if not init.ty.is_error():
+                self.err(
+                    diag.error("E0404", "`ref` needs a variable or a field of one")
+                    .label(init.span, "not a variable or a field")
+                    .with_help(
+                        "write `let r = ref total` or `let r = ref self.total`; for an element, keep its index: `xs[i]`"
+                    )
+                )
+            # declare it anyway, so its uses don't report it as undefined
+            self.declare(name, nsp, Ty.Error, LocalKind.Let)
+            return
+        match self.defined_at(name):
+            case Some(pspan):
                 self.err(
                     diag.error("E0207", f"`{name}` is already defined in this function")
                     .label(nsp, "defined again here")
@@ -1275,7 +1461,168 @@ struct Checker:
                 )
             case None:
                 pass
+        if len(fields) > 0:
+            self.ref_paths.push((root, fields, nsp))
+            self.scopes[len(self.scopes) - 1].push((name, -1 - len(self.ref_paths)))
+            return
         self.scopes[len(self.scopes) - 1].push((name, target))
+
+    # The place left of `=`: checks that it can be assigned and gives its type.
+    # None: an undefined name, already reported.
+    fn assign_target(ref self, ref target: Expr) -> Option[Ty]:
+        match target.kind:
+            case ExprKind.Ident(name):
+                if (
+                    self.lookup_local(name).is_none()
+                    and self.lookup_path(name).is_none()
+                    and not self.has_item(name)
+                ):
+                    let d = diag.error(
+                        "E0201",
+                        f"cannot assign to undefined variable `{name}`"
+                    ).label(target.span, "not declared")
+                    self.err(
+                        d.with_help(f"declare it first: `var {name} = ...`").fix(
+                            Span(file=target.span.file, lo=target.span.lo, hi=target.span.lo),
+                            "var ",
+                            "declare with `var`"
+                        )
+                    )
+                    return None
+            case _:
+                pass
+        let tt = self.check_expr(ref target, None)
+        var is_const = false
+        match target.kind:
+            case ExprKind.Ident(n):
+                match target.res:
+                    case Res.Const(_):
+                        is_const = true
+                        self.err(
+                            diag.error(
+                                "E0401",
+                                f"cannot assign to constant `{n}`"
+                            ).label(target.span, "constants never change")
+                        )
+                    case _:
+                        pass
+            case _:
+                pass
+        if not is_const and not tt.is_error():
+            self.check_mutation_target(target, "assign to")
+        return Some(tt)
+
+    # `a, b = b, a`: every value is computed first, then stored left to right.
+    # It becomes `let t = (b, a)`, `a = t.0`, `b = t.1`.
+    fn tuple_assign(ref self, span: Span, target: Expr, op: Option[BinOp], value: Expr):
+        var value2 = value
+        match op:
+            case Some(_):
+                self.err(
+                    diag.error("E0404", "a compound assignment needs a single place")
+                    .label(target.span, "several places")
+                    .with_help("write one `+=` for each place")
+                )
+                self.check_expr(ref value2, None)
+                self.expand = [stmt(StmtKind.ExprStmt(value2), span)]
+                return
+            case None:
+                pass
+        var leaves: [(Expr, [int])] = []
+        place_leaves(target, [], ref leaves)
+        var tys: [Ty] = []
+        for i in 0..len(leaves):
+            if is_wild(leaves[i].0):
+                tys.push(Ty.Unknown)
+                continue
+            match self.assign_target(ref leaves[i].0):
+                case Some(t):
+                    tys.push(t)
+                case None:
+                    tys.push(Ty.Error)
+        var k = 0
+        let vt = self.check_expr(ref value2, Some(shape_ty(target, tys, ref k)))
+        let tmp = f"tup'{span.lo}"
+        let id = self.declare(tmp, value2.span, vt, LocalKind.Let)
+        var first = stmt(
+            StmtKind.Let(false, LetPat.Name(tmp, value2.span), None, value2, false),
+            span
+        )
+        first.locals = [id]
+        var out = [first]
+        if vt.is_error():
+            self.expand = out
+            return
+        if not fits_shape(target, vt):
+            let tn = self.tn(vt)
+            self.err(
+                diag.error("E0301", f"cannot assign {tn} to {len(leaves)} places")
+                .label(value2.span, f"has type {tn}")
+                .label(target.span, "the places")
+                .with_help("give one value for each place, e.g. `a, b = b, a`")
+            )
+            self.expand = out
+            return
+        self.place_conflicts(leaves)
+        for i, leaf in enumerate(leaves):
+            if is_wild(leaf.0):
+                continue
+            let vspan = elem_span(value2, leaf.1)
+            var src = mk(ExprKind.Ident(tmp), vspan)
+            for j in leaf.1:
+                src = mk(ExprKind.Field(src, str(j), vspan), vspan)
+            self.check_expr(ref src, Some(tys[i]))
+            if not tys[i].is_error():
+                self.expect_ty(tys[i], src)
+            out.push(stmt(StmtKind.Assign(leaf.0, None, src), span))
+        self.expand = out
+
+    # Places in one tuple assignment must not overlap, and an index in one
+    # must not read a variable another changes: the result would depend on
+    # the order of the stores.
+    fn place_conflicts(ref self, leaves: [(Expr, [int])]):
+        for i in 0..len(leaves):
+            let a = leaves[i].0
+            if is_wild(a):
+                continue
+            match lvalue_root(a):
+                case Some(root):
+                    for j in 0..len(leaves):
+                        let b = leaves[j].0
+                        if j == i or is_wild(b):
+                            continue
+                        match index_reading(b, root):
+                            case Some(sp):
+                                let n = self.locals[root].name
+                                self.err(
+                                    diag.error(
+                                        "E0405",
+                                        f"this index reads `{n}`, which the same assignment changes"
+                                    )
+                                    .label(sp, f"reads `{n}`")
+                                    .label(a.span, f"`{n}` changes here")
+                                    .with_help(
+                                        "assign in two steps, so the order is visible: first the index's variable, then the element"
+                                    )
+                                )
+                                return
+                            case None:
+                                pass
+                case None:
+                    pass
+            for j in i + 1..len(leaves):
+                match (place_key(a), place_key(leaves[j].0)):
+                    case (Some(x), Some(y)):
+                        if x == y or x.starts_with(y + ".") or y.starts_with(x + "."):
+                            self.err(
+                                diag.error("E0405", "the same place is assigned twice")
+                                .label(leaves[j].0.span, "assigned again here")
+                                .label(a.span, "first assigned here")
+                                .with_help("assign each place once")
+                            )
+                            return
+                    case _:
+                        pass
 
     fn check_stmt(ref self, ref s: Stmt):
         let span = s.span
@@ -1380,50 +1727,22 @@ struct Checker:
                 s.kind = StmtKind.Let(mutable, pat, ty, init2, is_ref)
                 s.locals = locals
             case StmtKind.Assign(target, op, value):
+                match target.kind:
+                    case ExprKind.Tuple(_):
+                        self.tuple_assign(s.span, target, op, value)
+                        return
+                    case _:
+                        pass
                 var target2 = target
                 var value2 = value
-                match target.kind:
-                    case ExprKind.Ident(name):
-                        if self.lookup_local(name).is_none() and not self.has_item(name):
-                            let d = diag.error(
-                                "E0201",
-                                f"cannot assign to undefined variable `{name}`"
-                            ).label(target.span, "not declared")
-                            self.err(
-                                d.with_help(f"declare it first: `var {name} = ...`").fix(
-                                    Span(
-                                        file=target.span.file,
-                                        lo=target.span.lo,
-                                        hi=target.span.lo
-                                    ),
-                                    "var ",
-                                    "declare with `var`"
-                                )
-                            )
-                            self.check_expr(ref value2, None)
-                            s.kind = StmtKind.Assign(target2, op, value2)
-                            return
-                    case _:
-                        pass
-                let tt = self.check_expr(ref target2, None)
-                var is_const = false
-                match target2.kind:
-                    case ExprKind.Ident(n):
-                        match target2.res:
-                            case Res.Const(_):
-                                is_const = true
-                                self.err(
-                                    diag.error(
-                                        "E0401",
-                                        f"cannot assign to constant `{n}`"
-                                    ).label(target2.span, "constants never change")
-                                )
-                            case _:
-                                pass
-                    case _:
-                        pass
-                if not is_const and not tt.is_error():
-                    self.check_mutation_target(target2, "assign to")
+                var tt = Ty.Error
+                match self.assign_target(ref target2):
+                    case Some(t):
+                        tt = t
+                    case None:
+                        self.check_expr(ref value2, None)
+                        s.kind = StmtKind.Assign(target2, op, value2)
+                        return
                 match op:
                     case None:
                         self.check_expr(ref value2, Some(tt))
@@ -1709,9 +2028,33 @@ struct Checker:
                 let pattern_errors = self.error_count() > before
                 if not st.is_error() and st != Ty.Unit and not pattern_errors:
                     self.check_match_cases(scrut2, cases2, st)
-                s.kind = StmtKind.Match(scrut2, cases2)
+                # `case A(c) | B(c):` runs as `case A(c):` and `case B(c):` with
+                # the same body, so later passes never see names bound inside `|`
+                var split: [Case] = []
+                for c in cases2:
+                    if binds_in_or(c.pat, false):
+                        for q in or_split(c.pat):
+                            var c2 = c
+                            c2.pat = q
+                            split.push(c2)
+                    else:
+                        split.push(c)
+                s.kind = StmtKind.Match(scrut2, split)
             case StmtKind.Contract(_, _):
                 pass
+
+    fn not_orderable(ref self, t: Ty, span: Span, msg: str):
+        var d = diag.error("E0305", msg).label(
+            span,
+            "only numbers, strings, enums without data, and tuples and structs of these support `<`"
+        )
+        match unordered_part(self.info, t):
+            case Some((what, pt)):
+                if pt != t:
+                    d = d.note(f"{what} has type " + self.tn(pt))
+            case None:
+                pass
+        self.err(d)
 
     fn error_count(self) -> int:
         var n = 0
@@ -1753,16 +2096,17 @@ struct Checker:
                     self.check_pattern(ref p, ty)
                     return
                 match self.item(name):
-                    case Some(Item.Const(_)):
-                        self.err(
-                            diag.error(
-                                "E0322",
-                                f"`{name}` is a constant; a plain name in a pattern captures the value instead"
-                            )
-                            .label(span, "this would bind a new name")
-                            .with_help(f"compare with a guard: `case x if x == {name}:`")
-                        )
+                    case Some(Item.Const(id)):
+                        if self.lookup_local(name).is_none():
+                            self.const_pattern(ref p, name, id, ty)
+                            return
                     case _:
+                        pass
+                match self.or_names:
+                    case Some(names):
+                        self.or_bind(ref p, name, names, ty)
+                        return
+                    case None:
                         pass
                 p.local = self.declare(name, span, ty, LocalKind.Let)
             case PatKind.Int(v):
@@ -1801,19 +2145,7 @@ struct Checker:
                 p.kind = PatKind.Tuple(ps2)
             case PatKind.Or(alts):
                 var alts2 = alts
-                for i in 0..len(alts2):
-                    self.check_pattern(ref alts2[i], ty)
-                    match first_binding(alts2[i]):
-                        case Some(sp):
-                            self.err(
-                                diag.error("E0321", "patterns joined with `|` can't bind names")
-                                .label(sp, "binds a name")
-                                .with_help(
-                                    "use `_` inside `|` patterns, or write a separate `case` for each alternative"
-                                )
-                            )
-                        case None:
-                            pass
+                self.check_or_pattern(ref alts2, ty)
                 p.kind = PatKind.Or(alts2)
             case PatKind.Variant(path, args):
                 match self.resolve_variant_path(path, span, ty):
@@ -1829,6 +2161,141 @@ struct Checker:
                         return
                     case Some((eid, vi)):
                         self.check_variant_pattern(ref p, path, args, eid, vi, ty)
+
+    # `case LIMIT:` compares with the constant, like the literal it stands for.
+    fn const_pattern(ref self, ref p: Pattern, name: str, id: int, ty: Ty):
+        let c = self.info.consts[id]
+        var kind: Option[PatKind] = None
+        match c.value:
+            case ConstVal.Int(v):
+                if c.ty.is_int():
+                    kind = Some(PatKind.Int(v))
+            case ConstVal.Bool(b):
+                kind = Some(PatKind.Bool(b))
+            case ConstVal.Str(v):
+                kind = Some(PatKind.Str(v))
+            case _:
+                pass
+        if c.ty.is_error():
+            return
+        let ctn = self.tn(c.ty)
+        match kind:
+            case Some(k):
+                if not ty.is_error() and c.ty != ty:
+                    let tn = self.tn(ty)
+                    self.err(
+                        diag.error(
+                            "E0301",
+                            f"constant `{name}` has type {ctn}, but the value matched has type {tn}"
+                        ).label(p.span, f"has type {ctn}")
+                    )
+                    return
+                p.kind = k
+                self.check_pattern(ref p, ty)
+            case None:
+                self.err(
+                    diag.error(
+                        "E0322",
+                        f"constant `{name}` has type {ctn}, which can't be a pattern"
+                    )
+                    .label(p.span, "only integer, string and bool constants can")
+                    .with_help(f"compare with a guard: `case x if x == {name}:`")
+                )
+
+    # `A(c) | B(c)`: every alternative binds the same names with the same
+    # types. The first alternative declares them and the others reuse them.
+    fn check_or_pattern(ref self, ref alts: [Pattern], ty: Ty):
+        match self.or_names:
+            case Some(_):
+                # inside a later alternative of an outer `|`
+                let outer = self.or_seen
+                var first: [str] = []
+                for i in 0..len(alts):
+                    self.or_seen = []
+                    self.check_pattern(ref alts[i], ty)
+                    if i == 0:
+                        first = self.or_seen
+                    else:
+                        self.same_names(first, self.or_seen, alts[i].span)
+                self.or_seen = outer
+                self.or_seen.extend(first)
+                return
+            case None:
+                pass
+        let n0 = len(self.locals)
+        self.check_pattern(ref alts[0], ty)
+        var names: {str: int} = {}
+        var first: [str] = []
+        for id in n0..len(self.locals):
+            let n = self.locals[id].name
+            if n != "_" and n not in names:
+                names[n] = id
+                first.push(n)
+        for i in 1..len(alts):
+            self.or_names = Some(names)
+            self.or_seen = []
+            self.check_pattern(ref alts[i], ty)
+            let seen = self.or_seen
+            self.or_names = None
+            self.or_seen = []
+            self.same_names(first, seen, alts[i].span)
+
+    # A name in a later alternative of `|`: the first alternative's variable.
+    fn or_bind(ref self, ref p: Pattern, name: str, names: {str: int}, ty: Ty):
+        match names.get(name):
+            case Some(id):
+                p.local = id
+                if name in self.or_seen:
+                    self.err(
+                        diag.error("E0207", f"`{name}` is bound twice in this pattern")
+                        .label(p.span, "bound again here")
+                        .with_help("use a different name, or `_` to ignore a value")
+                    )
+                    return
+                self.or_seen.push(name)
+                let t0 = self.locals[id].ty
+                if not t0.is_error() and not ty.is_error() and t0 != ty:
+                    let tn = self.tn(ty)
+                    let tn0 = self.tn(t0)
+                    self.err(
+                        diag.error(
+                            "E0321",
+                            f"`{name}` has type {tn} here but {tn0} in the first alternative"
+                        )
+                        .label(p.span, f"has type {tn}")
+                        .label(self.locals[id].span, f"has type {tn0}")
+                        .with_help("write a separate `case` for each alternative")
+                    )
+            case None:
+                self.err(
+                    diag.error("E0321", f"`{name}` is bound here but not in the first alternative")
+                    .label(p.span, "only bound in this alternative")
+                    .with_help(
+                        "every alternative of `|` must bind the same names; use `_` for values you don't need"
+                    )
+                )
+                if self.lookup_local(name).is_none():
+                    p.local = self.declare(name, p.span, ty, LocalKind.Let)
+
+    fn same_names(ref self, first: [str], seen: [str], span: Span):
+        for n in first:
+            if n not in seen:
+                self.err(
+                    diag.error("E0321", f"`{n}` must be bound in every alternative of `|`")
+                    .label(span, f"doesn't bind `{n}`")
+                    .with_help(
+                        "bind the same names in each alternative, or write a separate `case` for each"
+                    )
+                )
+        for n in seen:
+            if n not in first:
+                self.err(
+                    diag.error("E0321", f"`{n}` is bound here but not in the first alternative")
+                    .label(span, f"binds `{n}`")
+                    .with_help(
+                        "every alternative of `|` must bind the same names; use `_` for values you don't need"
+                    )
+                )
 
     fn check_variant_pattern(
         ref self,
@@ -2484,6 +2951,17 @@ struct Checker:
             case Some(r):
                 root = r
             case None:
+                match const_root(e):
+                    case Some(id):
+                        let n = self.info.consts[id].name
+                        self.err(
+                            diag.error("E0401", f"cannot {what} constant `{n}`")
+                            .label(e.span, "constants never change")
+                            .with_help(f"copy it into a variable first: `var t = {n}`")
+                        )
+                        return None
+                    case None:
+                        pass
                 if not e.ty.is_error():
                     self.err(
                         diag.error(
@@ -2856,6 +3334,18 @@ struct Checker:
         # a name unpacked by a comprehension is a field of its hidden loop variable
         match e.kind:
             case ExprKind.Ident(name):
+                match self.lookup_path(name):
+                    case Some(k):
+                        let (root, fields, _) = self.ref_paths[k]
+                        var base = mk(ExprKind.Ident(root), e.span)
+                        for i in 0..len(fields) - 1:
+                            base = mk(ExprKind.Field(base, fields[i], e.span), e.span)
+                        e.kind = ExprKind.Field(base, fields[len(fields) - 1], e.span)
+                        e.idx = 0
+                        e.res = Res.Unresolved
+                        return self.expr_inner(ref e, exp, allow_gen)
+                    case None:
+                        pass
                 var ui = len(self.unpacks) - 1
                 while ui >= 0:
                     let u = self.unpacks[ui]
@@ -3217,12 +3707,11 @@ struct Checker:
                         self.err(d)
                         continue
                     let ord = op == CmpOp.Lt or op == CmpOp.Le or op == CmpOp.Gt or op == CmpOp.Ge
-                    if ord and not (a.is_numeric() or a == Ty.Str):
-                        self.err(
-                            diag.error(
-                                "E0305",
-                                "values of type " + self.tn(a) + " can't be ordered"
-                            ).label(both, "only numbers and strings support `<`")
+                    if ord and not orderable(self.info, a):
+                        self.not_orderable(
+                            a,
+                            both,
+                            "values of type " + self.tn(a) + " can't be ordered"
                         )
                     elif not ord and not equatable(a):
                         self.err(
@@ -3560,6 +4049,17 @@ struct Checker:
                     )
                 return Some(x2)
 
+    # An array constant becomes its literal at each use; `res` still names the
+    # constant, so changing it is reported as changing a constant.
+    fn use_const(ref self, ref e: Expr, id: int):
+        match self.const_exprs.get(id):
+            case Some(lit):
+                e.kind = lit.kind
+                e.ty = lit.ty
+            case None:
+                pass
+        e.res = Res.Const(id)
+
     fn check_ident(ref self, ref e: Expr, name: str, exp: Option[Ty]) -> Ty:
         let span = e.span
         match self.lookup_local(name):
@@ -3571,7 +4071,7 @@ struct Checker:
                 pass
         match self.item(name):
             case Some(Item.Const(id)):
-                e.res = Res.Const(id)
+                self.use_const(ref e, id)
                 return self.info.consts[id].ty
             case Some(Item.Fn(_)) | Some(Item.GenFn(_)):
                 self.err(
@@ -3687,7 +4187,7 @@ struct Checker:
                         case Some(Item.Module(m)):
                             match self.items[m].get(name):
                                 case Some(Item.Const(id)):
-                                    e.res = Res.Const(id)
+                                    self.use_const(ref e, id)
                                     return self.info.consts[id].ty
                                 case Some(_):
                                     self.err(
@@ -3931,6 +4431,38 @@ struct Checker:
             )
         )
 
+    # E0305 for arithmetic on two values of a type that has none (`[1] + [2]`).
+    fn no_arith(self, op: BinOp, t: Ty, span: Span) -> Diag:
+        let sym = op.sym()
+        let tn = self.tn(t)
+        var d = diag.error(
+            "E0305",
+            f"`{sym}` isn't defined for {tn}"
+        ).label(span, f"both operands are {tn}")
+        match t:
+            case Ty.Str:
+                return d.note("`+` joins two strings; strings have no other arithmetic")
+            case Ty.Bool:
+                return d.with_help("use `and`, `or` and `not` on booleans, or `int(b)` for 0 or 1")
+            case Ty.Array(_):
+                if op == BinOp.Add:
+                    return d.with_help(
+                        "to join two arrays, copy one and extend it: `var zs = xs`, then `zs.extend(ys)`"
+                    )
+                return d.with_help(
+                    "arithmetic works on numbers; use a loop or a comprehension over the elements"
+                )
+            case Ty.Struct(_):
+                return d.with_help(
+                    "arithmetic works on numbers; write a function or method that combines the fields"
+                )
+            case Ty.Tuple(_):
+                return d.with_help(
+                    "arithmetic works on numbers; combine the parts: `(a.0 + b.0, a.1 + b.1)`"
+                )
+            case _:
+                return d.note("arithmetic works on numbers (and `+` on strings)")
+
     fn binop_type(ref self, op: BinOp, lt: Ty, rt: Ty, span: Span, ls: Span, rs: Span) -> Ty:
         if lt.is_error() or rt.is_error():
             return Ty.Error
@@ -3958,6 +4490,9 @@ struct Checker:
                         verb = "divide"
                     case _:
                         pass
+                if lt == rt:
+                    self.err(self.no_arith(op, lt, span))
+                    return Ty.Error
                 var d = diag.error(
                     "E0305",
                     f"cannot {verb} " + self.tn(lt) + " and " + self.tn(rt)
@@ -4125,7 +4660,13 @@ struct Checker:
                 return Ty.Error
             case None:
                 pass
+        # `T(x)` in generic code converts to what `T` stands for, like `int(x)`
+        var conv = prim_type(name)
+        if name in self.tenv:
+            conv = Some(self.tenv[name])
         match self.item(name):
+            case Some(_) if name in self.tenv:
+                pass
             case Some(Item.Fn(id)):
                 callee.res = Res.Fn(id)
                 res = CallRes.Fn(id)
@@ -4162,7 +4703,7 @@ struct Checker:
             case None:
                 pass
         # conversions
-        match prim_type(name):
+        match conv:
             case Some(target):
                 res = CallRes.Convert(target)
                 if len(args) != 1:
@@ -4186,8 +4727,26 @@ struct Checker:
                     return target
                 var ok = false
                 match target:
-                    case Ty.Int(_):
+                    case Ty.Int(k):
                         ok = at.is_numeric() or at == Ty.Bool or at == Ty.Str
+                        match at:
+                            # an enum without data: its variant's position, from 0
+                            case Ty.Enum(eid):
+                                let en = self.info.enums[eid]
+                                if not en.has_payload():
+                                    ok = true
+                                    let top = i128(len(en.variants) - 1)
+                                    if top > k.max():
+                                        self.err(
+                                            diag.error(
+                                                "E0301",
+                                                f"`{en.name}` has {len(en.variants)} variants, more than `{k.name()}` holds"
+                                            )
+                                            .label(args[0].expr.span, "too many variants")
+                                            .with_help("convert to `int` instead")
+                                        )
+                            case _:
+                                pass
                     case Ty.Float(_):
                         ok = at.is_numeric() or at == Ty.Str
                     case Ty.Str:
@@ -4195,9 +4754,15 @@ struct Checker:
                     case _:
                         ok = false
                 if not ok:
+                    # a type parameter: say what it stands for
+                    let shown = (
+                        f"`{name}`"
+                        if name not in self.tenv
+                        else f"`{name}` (" + self.tn(target) + ")"
+                    )
                     var d = diag.error(
                         "E0301",
-                        "cannot convert " + self.tn(at) + f" to `{name}`"
+                        "cannot convert " + self.tn(at) + " to " + shown
                     ).label(args[0].expr.span, "unsupported conversion")
                     if target == Ty.Bool:
                         d = d.with_help("compare explicitly instead, e.g. `x != 0`")
@@ -4258,6 +4823,29 @@ struct Checker:
                                         )
                                     )
                             return bt
+                        case Reducer.Min | Reducer.Max:
+                            var in_par = false
+                            match args[0].expr.kind:
+                                case ExprKind.Comp(c):
+                                    in_par = c.par
+                                case _:
+                                    pass
+                            if bt.is_numeric():
+                                return bt
+                            if in_par:
+                                self.err(
+                                    diag.error(
+                                        "E0301",
+                                        f"a parallel `{name}` needs numbers, found " + self.tn(bt)
+                                    ).label(args[0].expr.span, "not numeric")
+                                )
+                            elif not orderable(self.info, bt):
+                                self.not_orderable(
+                                    bt,
+                                    args[0].expr.span,
+                                    f"`{name}` needs values that can be ordered"
+                                )
+                            return bt
                         case _:
                             if not bt.is_numeric():
                                 self.err(
@@ -4315,7 +4903,7 @@ struct Checker:
             )
             self.check_all(ref args)
             return sig.ret
-        var mut_roots: [(int, Span)] = []
+        var mut_roots: [(int, [str], Span)] = []
         for i in 0..len(args):
             let p = params[i]
             match args[i].name:
@@ -4348,7 +4936,13 @@ struct Checker:
                     )
                 match self.check_mutation_target(args[i].expr, "pass as `ref`"):
                     case Some(r):
-                        mut_roots.push((r, args[i].expr.span))
+                        var path: [str] = []
+                        match place_of(args[i].expr):
+                            case Some((_, fp, _)):
+                                path = fp
+                            case None:
+                                pass
+                        mut_roots.push((r, path, args[i].expr.span))
                     case None:
                         pass
             elif args[i].by_ref:
@@ -4361,12 +4955,12 @@ struct Checker:
                 )
         # by-value arguments are evaluated (and kept) before the call, so only a
         # second `ref` to the same variable is a problem
-        for r, rsp in mut_roots:
+        for r, path, rsp in mut_roots:
             for a in args:
                 # each pair once, at the later argument
                 if a.expr.span.lo <= rsp.lo or not a.by_ref:
                     continue
-                if expr_mentions(a.expr, r):
+                if touches(a.expr, r, path):
                     let n = self.locals[r].name
                     self.err(
                         diag.error("E0405", f"`{n}` is passed as `ref` twice")
@@ -4375,7 +4969,9 @@ struct Checker:
                         .note(
                             "a `ref` argument must be the only access to that variable during the call"
                         )
-                        .with_help(f"copy the value first: `let {n}_copy = ...`")
+                        .with_help(
+                            f"pass `{n}` once and reach both parts through it, or pass separate fields (`ref {n}.a, ref {n}.b`)"
+                        )
                     )
         return sig.ret
 
@@ -4428,12 +5024,12 @@ struct Checker:
         var it: Option[Item] = None
         match e.kind:
             case ExprKind.Ident(name):
-                if self.lookup_local(name).is_none():
+                if self.defined_at(name).is_none():
                     it = self.item(name)
             case ExprKind.Field(b, name, _):
                 match b.kind:
                     case ExprKind.Ident(m):
-                        if self.lookup_local(m).is_none():
+                        if self.defined_at(m).is_none():
                             match self.item(m):
                                 case Some(Item.Module(mi)):
                                     it = self.items[mi].get(name)
@@ -4702,16 +5298,19 @@ struct Checker:
                     t0 = self.check_expr(ref args[0].expr, Some(t1))
                 if t0.is_error() or t1.is_error():
                     return Ty.Error
-                if not t0.is_numeric() or t0 != t1:
+                if t0 != t1:
                     self.err(
                         diag.error(
                             "E0301",
-                            f"`{name}` needs two numbers of the same type, found "
+                            f"`{name}` needs two values of the same type, found "
                             + self.tn(t0)
                             + " and "
                             + self.tn(t1)
                         ).label(span, "mismatched arguments")
                     )
+                    return Ty.Error
+                if not orderable(self.info, t0):
+                    self.not_orderable(t0, span, f"`{name}` needs values that can be ordered")
                     return Ty.Error
                 return t0
             case Builtin.Sqrt | Builtin.Sin | Builtin.Cos | Builtin.Tan | Builtin.Exp | Builtin.Log | Builtin.Floor | Builtin.Ceil | Builtin.Round:
@@ -5057,6 +5656,8 @@ struct Checker:
         match static_ty:
             case Some(st):
                 self.inst_method(st, name, span)
+                if name == "from_int":
+                    self.enum_from_int(st)
                 let (tname, methods, _) = self.members(st)
                 if name not in methods:
                     match self.generic_method(st, name):
@@ -5186,10 +5787,10 @@ struct Checker:
                         # by-value arguments are evaluated (and kept) before the call, so they may
                         # read the receiver; another `ref` to it would be a second live alias
                         if sig.params[0].by_ref:
-                            match lvalue_root(recv):
-                                case Some(root):
+                            match place_of(recv):
+                                case Some((root, rpath, _)):
                                     for a in args:
-                                        if a.by_ref and expr_mentions(a.expr, root):
+                                        if a.by_ref and touches(a.expr, root, rpath):
                                             let n = self.locals[root].name
                                             self.err(
                                                 diag.error(
@@ -5201,7 +5802,7 @@ struct Checker:
                                                     "a `ref` must be the only access to that variable during the call"
                                                 )
                                                 .with_help(
-                                                    "copy the value into a new variable first"
+                                                    "pass separate fields of it (`s.a.f(ref s.b)`), or make the change in two steps"
                                                 )
                                             )
                                 case None:
@@ -6024,13 +6625,8 @@ struct Checker:
         if verb != "":
             self.check_mutation_target(recv, verb)
         self.typed_args(name, ref args, params, span)
-        if b == Builtin.Sort and not el.is_error() and not (el.is_numeric() or el == Ty.Str):
-            self.err(
-                diag.error(
-                    "E0305",
-                    "arrays of " + self.tn(el) + " can't be sorted"
-                ).label(span, "only numbers and strings can be ordered")
-            )
+        if b == Builtin.Sort and not el.is_error() and not orderable(self.info, el):
+            self.not_orderable(el, span, "arrays of " + self.tn(el) + " can't be sorted")
         if (b == Builtin.IndexOf or b == Builtin.IndexFrom) and not equatable(el):
             self.err(
                 diag.error(
@@ -6412,6 +7008,81 @@ struct Checker:
         self.pending.push(Pending(module=module, env=env, decl=decl, what=what))
         return Some(id)
 
+    # `Color.from_int(i)` on an enum without data: made on first use, as
+    # `match i: case 0: return Some(Color.Red) ... case _: return None`.
+    fn enum_from_int(ref self, t: Ty):
+        var eid = 0
+        match t:
+            case Ty.Enum(e):
+                eid = e
+            case _:
+                return
+        let en = self.info.enums[eid]
+        if "from_int" in en.methods or en.has_payload() or en.origin.is_some():
+            return
+        let sp = en.span
+        var cases: [Case] = []
+        for vi, v in enumerate(en.variants):
+            let val = mk(ExprKind.Field(mk(ExprKind.Ident(en.name), sp), v.name, sp), sp)
+            let some = mk(
+                ExprKind.Call(
+                    mk(ExprKind.Ident("Some"), sp),
+                    [Arg(by_ref=false, name=None, expr=val)]
+                ),
+                sp
+            )
+            let body = Block(stmts=[stmt(StmtKind.Return(Some(some)), sp)], span=sp)
+            cases.push(Case(pat=pattern(PatKind.Int(i128(vi)), sp), guard=None, body=body, span=sp))
+        let none = stmt(StmtKind.Return(Some(mk(ExprKind.Ident("None"), sp))), sp)
+        cases.push(
+            Case(
+                pat=pattern(PatKind.Wild, sp),
+                guard=None,
+                body=Block(stmts=[none], span=sp),
+                span=sp
+            )
+        )
+        let m = stmt(StmtKind.Match(mk(ExprKind.Ident("i"), sp), cases), sp)
+        let id = len(self.info.fns)
+        let decl = FnDecl(
+            name="from_int",
+            name_span=sp,
+            params=[Param(name="i", span=sp, ty=None, by_ref=false, mutable=false)],
+            ret=None,
+            requires=[],
+            ensures=[],
+            body=Block(stmts=[m], span=sp),
+            span=sp,
+            is_extern=false,
+            method_of=Some(en.name),
+            tparams=[],
+            test_name=None,
+            id=id,
+            locals=[],
+            param_locals=[],
+            result_local=None
+        )
+        let ret = self.option_of(t, sp)
+        let mm = mangle_module(self.info.module_names[en.module])
+        self.info.fns.push(
+            FnSig(
+                name="from_int",
+                module=en.module,
+                idx=0,
+                params=[ParamSig(name="i", ty=Ty.Int(IntTy.I64), by_ref=false)],
+                ret=ret,
+                c_name=f"{mm}__{en.name}__from_int",
+                is_extern=false,
+                method_of=Some(t),
+                has_self=false,
+                span=sp
+            )
+        )
+        self.info.enums[eid].methods["from_int"] = id
+        self.pending.push(
+            Pending(module=en.module, env={}, decl=decl, what=f"`{en.name}.from_int`")
+        )
+
     # Checks the bodies of all instances made so far (which may make more).
     fn check_pending(ref self, ref prog: Program):
         while len(self.pending) > 0:
@@ -6727,12 +7398,12 @@ struct Checker:
         var it: Option[Item] = None
         match e.kind:
             case ExprKind.Ident(name):
-                if self.lookup_local(name).is_none():
+                if self.defined_at(name).is_none():
                     it = self.item(name)
             case ExprKind.Field(b, name, _):
                 match b.kind:
                     case ExprKind.Ident(m):
-                        if self.lookup_local(m).is_none():
+                        if self.defined_at(m).is_none():
                             match self.item(m):
                                 case Some(Item.Module(mi)):
                                     it = self.items[mi].get(name)
@@ -7152,6 +7823,43 @@ fn printable(t: Ty) -> bool:
         case _:
             return true
 
+# Values `<` can order: numbers, strings, enums without data (in declaration
+# order), and tuples and structs of these (compared part by part, first to last).
+fn orderable(info: ProgramInfo, t: Ty) -> bool:
+    return unordered_part(info, t).is_none()
+
+# The first part of `t` that can't be ordered, described, if any.
+fn unordered_part(info: ProgramInfo, t: Ty) -> Option[(str, Ty)]:
+    if t.is_numeric() or t == Ty.Str or t.is_error():
+        return None
+    match t:
+        case Ty.Enum(eid):
+            if not info.enums[eid].has_payload():
+                return None
+        case Ty.Tuple(ts):
+            for i, x in enumerate(ts):
+                match unordered_part(info, x):
+                    case Some(p):
+                        if p.1 == x:
+                            return Some((f"element {i}", x))
+                        return Some(p)
+                    case None:
+                        pass
+            return None
+        case Ty.Struct(sid):
+            for f in info.structs[sid].fields:
+                match unordered_part(info, f.1):
+                    case Some(p):
+                        if p.1 == f.1:
+                            return Some((f"field `{f.0}`", f.1))
+                        return Some(p)
+                    case None:
+                        pass
+            return None
+        case _:
+            pass
+    return Some(("it", t))
+
 fn equatable(t: Ty) -> bool:
     match t:
         case Ty.Unit | Ty.Range | Ty.Never:
@@ -7162,6 +7870,117 @@ fn equatable(t: Ty) -> bool:
             return all(equatable(x) for x in ts)
         case _:
             return true
+
+# The array constant `e` (`TABLE[i]`) is part of, if any.
+fn const_root(e: Expr) -> Option[int]:
+    match e.res:
+        case Res.Const(id):
+            return Some(id)
+        case _:
+            pass
+    match e.kind:
+        # (two cases: the seed compiler can't bind names in `|` patterns)
+        case ExprKind.Index(x, _):
+            return const_root(x)
+        case ExprKind.Field(x, _, _):
+            return const_root(x)
+        case _:
+            return None
+
+# The places of `a, (b, c) = ...`, each with its path into the value.
+fn place_leaves(e: Expr, path: [int], ref out: [(Expr, [int])]):
+    match e.kind:
+        case ExprKind.Tuple(xs):
+            for i, x in enumerate(xs):
+                var p = path
+                p.push(i)
+                place_leaves(x, p, ref out)
+        case _:
+            out.push((e, path))
+
+# A struct or tuple: a value whose fields `let r = ref x.f` can alias.
+fn field_base(t: Ty) -> bool:
+    match t:
+        case Ty.Struct(_) | Ty.Tuple(_):
+            return true
+        case _:
+            return false
+
+fn is_wild(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Ident(n):
+            return n == "_"
+        case _:
+            return false
+
+# The type a tuple of places expects, from the types of its places in order.
+fn shape_ty(e: Expr, tys: [Ty], ref k: int) -> Ty:
+    match e.kind:
+        case ExprKind.Tuple(xs):
+            var ts: [Ty] = []
+            for x in xs:
+                ts.push(shape_ty(x, tys, ref k))
+            return Ty.Tuple(ts)
+        case _:
+            k += 1
+            return tys[k - 1]
+
+fn fits_shape(e: Expr, t: Ty) -> bool:
+    match e.kind:
+        case ExprKind.Tuple(xs):
+            match t:
+                case Ty.Tuple(ts):
+                    if len(ts) != len(xs):
+                        return false
+                    for i, x in enumerate(xs):
+                        if not fits_shape(x, ts[i]):
+                            return false
+                    return true
+                case _:
+                    return false
+        case _:
+            return true
+
+# Where the value for a path comes from, for error labels.
+fn elem_span(v: Expr, path: [int]) -> Span:
+    var e = v
+    for i in path:
+        match e.kind:
+            case ExprKind.Tuple(xs):
+                e = xs[i]
+            case _:
+                return e.span
+    return e.span
+
+# The span of an index in place `e` that mentions local `id`.
+fn index_reading(e: Expr, id: int) -> Option[Span]:
+    match e.kind:
+        case ExprKind.Field(x, _, _):
+            return index_reading(x, id)
+        case ExprKind.Index(x, i):
+            if expr_mentions(i, id):
+                return Some(i.span)
+            return index_reading(x, id)
+        case _:
+            return None
+
+# `a.b.c` as text with the variable's id, or None when the place has an index.
+fn place_key(e: Expr) -> Option[str]:
+    match e.kind:
+        case ExprKind.Ident(_):
+            match local_of(e):
+                case Some(id):
+                    return Some(str(id))
+                case None:
+                    return None
+        case ExprKind.Field(x, name, _):
+            match place_key(x):
+                case Some(k):
+                    return Some(k + "." + name)
+                case None:
+                    return None
+        case _:
+            return None
 
 # The path step applied directly to the root variable.
 fn root_step(e: Expr) -> Option[Expr]:
@@ -7188,39 +8007,124 @@ fn ordered(seq: [(Span, Span)], a: Span, b: Span) -> bool:
             return true
     return false
 
-# Locals changed in place by calls in `e` (`sites`), every mention of a local
-# (`reads`), and pairs of parts that run one after the other (`seq`).
-fn mut_sites(
-    e: Expr,
-    info: ProgramInfo,
-    ref sites: [(int, Span)],
-    ref reads: [(int, Span)],
-    ref seq: [(Span, Span)]
-):
+# A call that changes a variable in place: the variable, the fields of it the
+# call can reach (all of it when empty), whether the place is only fields
+# (`t`, `self.a`, not `xs[i]`), and the call.
+struct MutSite:
+    root: int
+    path: [str]
+    exact: bool
+    span: Span
+
+# A mention of a variable: the fields read (all of it when empty).
+struct MutRead:
+    root: int
+    path: [str]
+    span: Span
+
+struct MutScan:
+    sites: [MutSite]
+    reads: [MutRead]
+    # pairs of parts that run one after the other
+    seq: [(Span, Span)]
+    # the receiver or `ref` argument of a changing call, made only of fields,
+    # and that call: the place is used when the call runs, after its arguments
+    places: [(Span, Span)]
+
+# Does change `a` run before change `b`? It does when `a` is in `b`'s arguments
+# and `b` changes a place that no index leads to (`t.f(t.g(x))`): that place's
+# address stays the same while the arguments run.
+fn runs_first(a: MutSite, b: MutSite) -> bool:
+    return b.exact and within(a.span, b.span) and a.span != b.span
+
+# Is read `r` part of the place a changing call uses, with change `s` in that
+# call's arguments (so the place is used after `s`)?
+fn read_later(places: [(Span, Span)], r: Span, s: Span) -> bool:
+    for p, call in places:
+        if within(r, p) and within(s, call) and s != call:
+            return true
+    return false
+
+# The variable a place starts at, the fields it goes through before any index,
+# and whether it is only fields: `self.a.b` is (self, [a, b], true), `xs[i].b`
+# is (xs, [], false).
+fn place_of(e: Expr) -> Option[(int, [str], bool)]:
     match e.kind:
         case ExprKind.Ident(_):
-            match e.res:
-                case Res.Local(l):
-                    reads.push((l, e.span))
+            match local_of(e):
+                case Some(l):
+                    return Some((l, [], true))
+                case None:
+                    return None
+        case ExprKind.Field(x, f, _):
+            match place_of(x):
+                case Some((l, p, exact)):
+                    if not exact:
+                        return Some((l, p, false))
+                    var q = p
+                    q.push(f)
+                    return Some((l, q, true))
+                case None:
+                    return None
+        case ExprKind.Index(x, _):
+            match place_of(x):
+                case Some((l, p, _)):
+                    return Some((l, p, false))
+                case None:
+                    return None
+        case _:
+            return None
+
+# Do two field paths of one variable share memory (is one a prefix of the other)?
+fn paths_overlap(a: [str], b: [str]) -> bool:
+    for i in 0..min(len(a), len(b)):
+        if a[i] != b[i]:
+            return false
+    return true
+
+# Does `e` use variable `r` in a part that overlaps its fields `path`?
+fn touches(e: Expr, r: int, path: [str]) -> bool:
+    match e.kind:
+        case ExprKind.Ident(_) | ExprKind.Field(_, _, _):
+            match place_of(e):
+                case Some((l, p, true)):
+                    return l == r and paths_overlap(p, path)
                 case _:
                     pass
-            return
+        case _:
+            pass
+    for c in children(e):
+        if touches(c, r, path):
+            return true
+    return false
+
+# Records in `m` the variables changed in place by calls in `e`, every mention
+# of a variable, and the parts that run one after the other.
+fn mut_sites(e: Expr, info: ProgramInfo, ref m: MutScan):
+    match e.kind:
+        case ExprKind.Ident(_) | ExprKind.Field(_, _, _):
+            match place_of(e):
+                case Some((l, p, true)):
+                    m.reads.push(MutRead(root=l, path=p, span=e.span))
+                    return
+                case _:
+                    pass
         # a nested comprehension or `par` body runs as its own code
         case ExprKind.Comp(_) | ExprKind.ParTuple(_):
             return
         case ExprKind.Binary(op, l, r):
             if op == BinOp.And or op == BinOp.Or:
-                seq.push((l.span, r.span))
-                mut_sites(l, info, ref sites, ref reads, ref seq)
-                mut_sites(r, info, ref sites, ref reads, ref seq)
+                m.seq.push((l.span, r.span))
+                mut_sites(l, info, ref m)
+                mut_sites(r, info, ref m)
                 return
         case ExprKind.IfElse(c, t, f):
-            seq.push((c.span, t.span))
-            seq.push((c.span, f.span))
-            seq.push((t.span, f.span))
-            mut_sites(c, info, ref sites, ref reads, ref seq)
-            mut_sites(t, info, ref sites, ref reads, ref seq)
-            mut_sites(f, info, ref sites, ref reads, ref seq)
+            m.seq.push((c.span, t.span))
+            m.seq.push((c.span, f.span))
+            m.seq.push((t.span, f.span))
+            mut_sites(c, info, ref m)
+            mut_sites(t, info, ref m)
+            mut_sites(f, info, ref m)
             return
         case _:
             pass
@@ -7247,26 +8151,27 @@ fn mut_sites(
                     recv_mut = info.fns[id].params[0].by_ref
             case _:
                 pass
+    # the change happens when the call runs, after all its arguments are read
+    var changed: [Expr] = []
     if recv_mut:
         match recv:
             case Some(r):
-                match lvalue_root(r):
-                    case Some(root):
-                        sites.push((root, e.span))
-                    case None:
-                        pass
+                changed.push(r)
             case None:
                 pass
-    # the change happens when the call runs, after all its arguments are read
     for a in args:
         if a.by_ref:
-            match lvalue_root(a.expr):
-                case Some(root):
-                    sites.push((root, e.span))
-                case None:
-                    pass
+            changed.push(a.expr)
+    for x in changed:
+        match place_of(x):
+            case Some((root, p, exact)):
+                m.sites.push(MutSite(root=root, path=p, exact=exact, span=e.span))
+                if exact:
+                    m.places.push((x.span, e.span))
+            case None:
+                pass
     for c in children(e):
-        mut_sites(c, info, ref sites, ref reads, ref seq)
+        mut_sites(c, info, ref m)
 
 fn expr_mentions(e: Expr, id: int) -> bool:
     match e.kind:
@@ -7288,46 +8193,57 @@ fn affine_str(k: int, c: int, lv: str) -> str:
         t += f" - {-c}"
     return t
 
-fn first_binding(p: Pattern) -> Option[Span]:
+# Does `p` bind a name inside a `|`?
+fn binds_in_or(p: Pattern, in_or: bool) -> bool:
     match p.kind:
         case PatKind.Bind(_):
-            return Some(p.span)
-        case PatKind.Tuple(ps):
-            for q in ps:
-                match first_binding(q):
-                    case Some(s):
-                        return Some(s)
-                    case None:
-                        pass
-            return None
+            return in_or
         case PatKind.Or(ps):
-            for q in ps:
-                match first_binding(q):
-                    case Some(s):
-                        return Some(s)
-                    case None:
-                        pass
-            return None
-        case PatKind.Variant(_, args):
-            for q in p.fields:
-                match first_binding(q):
-                    case Some(s):
-                        return Some(s)
-                    case None:
-                        pass
-            match args:
-                case Some(list):
-                    for _, q in list:
-                        match first_binding(q):
-                            case Some(s):
-                                return Some(s)
-                            case None:
-                                pass
-                case None:
-                    pass
-            return None
+            return any(binds_in_or(q, true) for q in ps)
+        case PatKind.Tuple(ps):
+            return any(binds_in_or(q, in_or) for q in ps)
+        case PatKind.Variant(_, _):
+            return any(binds_in_or(q, in_or) for q in p.fields)
         case _:
-            return None
+            return false
+
+# The patterns without `|` that together match what `p` matches, in order.
+fn or_split(p: Pattern) -> [Pattern]:
+    match p.kind:
+        case PatKind.Or(alts):
+            var out: [Pattern] = []
+            for a in alts:
+                out.extend(or_split(a))
+            return out
+        case PatKind.Tuple(ps):
+            var out: [Pattern] = []
+            for elems in or_product(ps):
+                var q = p
+                q.kind = PatKind.Tuple(elems)
+                out.push(q)
+            return out
+        case PatKind.Variant(_, _):
+            var out: [Pattern] = []
+            for fields in or_product(p.fields):
+                var q = p
+                q.fields = fields
+                out.push(q)
+            return out
+        case _:
+            return [p]
+
+fn or_product(ps: [Pattern]) -> [[Pattern]]:
+    var acc: [[Pattern]] = [[]]
+    for q in ps:
+        let qs = or_split(q)
+        var next: [[Pattern]] = []
+        for pre in acc:
+            for x in qs:
+                var c = pre
+                c.push(x)
+                next.push(c)
+        acc = next
+    return acc
 
 # `_` or a plain name: matches every value.
 fn is_catch_all(p: Pattern) -> bool:

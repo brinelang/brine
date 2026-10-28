@@ -12,7 +12,6 @@ enum Kw:
     Struct
     Enum
     Match
-    Case
     If
     Elif
     Else
@@ -33,7 +32,6 @@ enum Kw:
     Assert
     Prove
     Par
-    Test
     Import
     As
     Extern
@@ -50,7 +48,6 @@ fn keyword_list() -> [(str, Kw)]:
         ("struct", Kw.Struct),
         ("enum", Kw.Enum),
         ("match", Kw.Match),
-        ("case", Kw.Case),
         ("if", Kw.If),
         ("elif", Kw.Elif),
         ("else", Kw.Else),
@@ -71,7 +68,6 @@ fn keyword_list() -> [(str, Kw)]:
         ("assert", Kw.Assert),
         ("prove", Kw.Prove),
         ("par", Kw.Par),
-        ("test", Kw.Test),
         ("import", Kw.Import),
         ("as", Kw.As),
         ("extern", Kw.Extern),
@@ -583,56 +579,245 @@ struct Lexer:
     fn char_here(self) -> str:
         return self.text[self.pos:self.pos + utf8_len(int(self.bytes[self.pos]))]
 
-    fn string(ref self):
-        let lo = self.pos
-        let q = self.peek()
-        self.pos += 1
-        var out = ""
-        while true:
-            if self.done() or self.peek() == "\n":
+    # The index just after the string literal starting with the quote at `i`
+    # (inside an f-string field), or -1 if it isn't closed on its line.
+    fn skip_str(self, i: int) -> int:
+        let q = self.text[i]
+        var j = i + 1
+        while j < len(self.text):
+            let c = self.text[j]
+            if c == "\n":
+                return -1
+            if c == "\\":
+                j += 2
+                continue
+            if c == q:
+                return j + 1
+            j += 1
+        return -1
+
+    # Where the text of a string ends (its closing quotes start) and how many
+    # closing quotes there are, 0 if it isn't closed. `s` is just after the
+    # opening quotes; `fmt`: braces hold expressions, which may hold strings.
+    fn str_end(self, s: int, q: str, triple: bool, fmt: bool) -> (int, int):
+        var i = s
+        var depth = 0
+        let n = len(self.text)
+        while i < n:
+            let c = self.text[i]
+            if c == "\n":
+                if not triple:
+                    return (i, 0)
+                # a field can't span lines; the expression parser reports it
+                depth = 0
+            elif c == "\\":
+                i += 2
+                continue
+            elif fmt and depth == 0 and (c == "{" or c == "}") and self.at(i + 1) == c:
+                i += 2
+                continue
+            elif fmt and c == "{":
+                depth += 1
+            elif fmt and c == "}" and depth > 0:
+                depth -= 1
+            elif depth > 0 and (c == "\"" or c == "'"):
+                let j = self.skip_str(i)
+                if j >= 0:
+                    i = j
+                    continue
+                # not closed on this line: it closes the f-string instead
+                if c == q and not triple:
+                    return (i, 1)
+            elif c == q and depth == 0:
+                if not triple:
+                    return (i, 1)
+                if self.at(i + 1) == q and self.at(i + 2) == q:
+                    return (i, 3)
+            i += 1
+        return (n, 0)
+
+    # A `"` left open at the end of line `eol` that a lone `"` ending a later
+    # line seems to close (the text was meant to span lines): that quote, or -1.
+    fn closing_quote_below(self, eol: int, q: str) -> int:
+        let n = len(self.text)
+        var i = eol
+        while i < n and self.text[i] != q:
+            if self.text[i] == "\\":
+                i += 1
+            i += 1
+        if i >= n:
+            return -1
+        var j = i
+        while j > 0 and self.text[j - 1] != "\n":
+            j -= 1
+        var count = 0
+        while j < n and self.text[j] != "\n":
+            if self.text[j] == "\\":
+                j += 2
+                continue
+            if self.text[j] == q:
+                count += 1
+            j += 1
+        if count % 2 == 0 or self.at(i - 1) == "f":
+            return -1
+        # only closing brackets, commas or a comment may follow a closing quote
+        var k = i + 1
+        while k < n and self.text[k] != "\n" and self.text[k] != "#":
+            let c = self.text[k]
+            if c != " " and c != "\r" and c != ")" and c != "]" and c != "}" and c != ",":
+                return -1
+            k += 1
+        return i
+
+    # Opens a string's text: `end` and `close` as from `str_end`, with the
+    # errors for an unclosed string. Returns the end, the number of closing
+    # quotes and the indentation to remove from each line (`"""` only).
+    fn open_str(ref self, lo: int, q: str, triple: bool, fmt: bool) -> (int, int, int):
+        var (end, close) = self.str_end(self.pos, q, triple, fmt)
+        let what = "f-string" if fmt else "string literal"
+        if close == 0 and triple:
+            self.error(
+                "E0102",
+                f"unterminated {what}",
+                lo,
+                self.pos,
+                "string starts here",
+                f"close it with `{q}{q}{q}`"
+            )
+        elif close == 0:
+            let below = self.closing_quote_below(end, q)
+            if below >= 0:
                 self.error(
                     "E0102",
-                    "unterminated string literal",
+                    f"a {what} in `{q}` can't span lines",
                     lo,
-                    self.pos,
+                    end,
+                    "string starts here",
+                    f"for text over several lines, write `{q}{q}{q}` at both ends"
+                )
+                end = below
+                close = 1
+            else:
+                self.error(
+                    "E0102",
+                    f"unterminated {what}",
+                    lo,
+                    end,
                     "string starts here",
                     "close the string with a matching quote on the same line"
                 )
+                # what follows is probably not code: don't count its brackets
+                self.depth = 0
+        if not triple:
+            return (end, close, 0)
+        return (end, close, self.dedent_width(end))
+
+    # `"""` strings: a line break right after the opening quotes is dropped,
+    # and the indentation all lines share (blank lines aside, the closing
+    # quotes' line included) is removed. Steps over that first line break and
+    # returns the width to remove.
+    fn dedent_width(ref self, end: int) -> int:
+        var i = self.pos
+        while i < end and (self.text[i] == " " or self.text[i] == "\t" or self.text[i] == "\r"):
+            i += 1
+        let first_dropped = i < end and self.text[i] == "\n"
+        if first_dropped:
+            self.pos = i + 1
+        # the lines after the opening quotes' line
+        var ls = self.pos
+        if not first_dropped:
+            var k = self.pos
+            while k < end and self.text[k] != "\n":
+                k += 1
+            if k >= end:
+                return 0
+            ls = k + 1
+        var width = -1
+        while ls <= end:
+            var k = ls
+            while k < end and self.text[k] == " ":
+                k += 1
+            let at_close = k >= end
+            let blank = (
+                not at_close and (
+                    self.text[k] == "\n" or (self.text[k] == "\r" and self.at(k + 1) == "\n")
+                )
+            )
+            if not blank and (width < 0 or k - ls < width):
+                width = k - ls
+            if at_close:
                 break
-            let c = self.peek()
-            if c == q:
+            while k < end and self.text[k] != "\n":
+                k += 1
+            ls = k + 1
+        width = max(width, 0)
+        if first_dropped:
+            var k = 0
+            while k < width and self.pos < end and self.peek() == " ":
                 self.pos += 1
-                break
-            if c == "\\":
+                k += 1
+        return width
+
+    # A line break (or `\` and a line break, which joins the lines) in a
+    # `"""` string: the text it adds, after moving past it and the next
+    # line's indentation.
+    fn str_newline(ref self, width: int, end: int) -> str:
+        var joined = false
+        if self.peek() == "\\":
+            joined = true
+            self.pos += 1
+        if self.peek() == "\r":
+            self.pos += 1
+        self.pos += 1
+        var k = 0
+        while k < width and self.pos < end and self.peek() == " ":
+            self.pos += 1
+            k += 1
+        return "" if joined else "\n"
+
+    # whether a line break (or `\` and a line break) starts at `pos`
+    fn at_str_newline(self) -> bool:
+        var i = self.pos
+        if self.at(i) == "\\":
+            i += 1
+        if self.at(i) == "\r":
+            i += 1
+        return self.at(i) == "\n"
+
+    fn string(ref self):
+        let lo = self.pos
+        let q = self.peek()
+        let triple = self.peek2() == q and self.at(self.pos + 2) == q
+        self.pos += 3 if triple else 1
+        let (end, close, width) = self.open_str(lo, q, triple, false)
+        var out = ""
+        while self.pos < end:
+            if triple and self.at_str_newline():
+                out += self.str_newline(width, end)
+                continue
+            if self.peek() == "\\":
                 self.pos += 1
                 out += self.escape()
                 continue
             let ch = self.char_here()
             out += ch
             self.pos += len(ch)
+        self.pos = min(end + close, len(self.text))
         self.push(Tok.Str(out), lo, self.pos)
 
     fn fstring(ref self, lo: int):
         let q = self.peek()
-        self.pos += 1
+        let triple = self.peek2() == q and self.at(self.pos + 2) == q
+        self.pos += 3 if triple else 1
+        let (end, close, width) = self.open_str(lo, q, triple, true)
         var parts: [FPart] = []
         var lit = ""
-        while true:
-            if self.done() or self.peek() == "\n":
-                self.error(
-                    "E0102",
-                    "unterminated f-string",
-                    lo,
-                    self.pos,
-                    "f-string starts here",
-                    ""
-                )
-                break
+        while self.pos < end:
+            if triple and self.at_str_newline():
+                lit += self.str_newline(width, end)
+                continue
             let c = self.peek()
             let c2 = self.peek2()
-            if c == q:
-                self.pos += 1
-                break
             if c == "\\":
                 self.pos += 1
                 lit += self.escape()
@@ -666,8 +851,15 @@ struct Lexer:
             var depth = 0
             var colon = -1
             var closed = false
-            while not self.done() and self.peek() != "\n":
+            while self.pos < end and self.peek() != "\n":
                 let ch = self.peek()
+                if ch == "\"" or ch == "'":
+                    # a string inside the expression: `{d["k"]}`
+                    let j = self.skip_str(self.pos)
+                    if j >= 0 and j <= end:
+                        self.pos = j
+                        continue
+                    break
                 if ch == "(" or ch == "[" or ch == "{":
                     depth += 1
                 elif ch == "}" and depth <= 0:
@@ -677,8 +869,6 @@ struct Lexer:
                     depth -= 1
                 elif ch == ":" and depth == 0 and colon < 0:
                     colon = self.pos
-                if ch == q:
-                    break
                 self.pos += 1
             let ee = colon if colon >= 0 else self.pos
             let src = self.text[es:ee]
@@ -686,6 +876,9 @@ struct Lexer:
             if colon >= 0:
                 spec = Some(self.text[colon + 1:self.pos])
             if not closed:
+                # an unterminated f-string was reported already
+                if close == 0:
+                    break
                 self.error(
                     "E0102",
                     "unclosed `{` in f-string",
@@ -694,8 +887,12 @@ struct Lexer:
                     "expected `}`",
                     "use `{{` to write a literal brace"
                 )
-            else:
-                self.pos += 1
+                # the rest of the line is part of the broken field
+                while self.pos < end and self.peek() != "\n":
+                    self.pos += 1
+                # parsing what there is would only add errors
+                continue
+            self.pos += 1
             if src.strip() == "":
                 self.error(
                     "E0111",
@@ -708,6 +905,7 @@ struct Lexer:
             parts.push(FPart.Expr(src=src, offset=self.base + es, spec=spec))
         if lit != "":
             parts.push(FPart.Lit(lit))
+        self.pos = min(end + close, len(self.text))
         self.push(Tok.FStr(parts), lo, self.pos)
 
     fn punct(ref self):

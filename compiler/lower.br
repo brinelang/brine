@@ -291,6 +291,7 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         blays=[],
         done={},
         strs={},
+        carrs={},
         cstrs={},
         nlifts={},
         dnames={},
@@ -329,6 +330,8 @@ struct Lower:
     done: {str: bool}
     # string literal objects and plain C strings, by text
     strs: {str: str}
+    # array constants in the data section, by constant
+    carrs: {int: str}
     cstrs: {str: str}
     nlifts: {str: int}
     dnames: {str: bool}
@@ -608,8 +611,9 @@ struct Lower:
                     code = self.cx.fb.konst(K.I32, 0)
                 else:
                     match try_kind(self.info, sig.ret):
-                        case Some(TryKind.Res(_, err_v, _, err)):
-                            # `main() -> Result[(), E]`: an `Err` prints "error: ..." and exits with 1
+                        case Some(TryKind.Res(ok_v, err_v, ok, err)):
+                            # `main() -> Result[(), E]`: an `Err` prints "error: ..." and exits
+                            # with 1; `Result[int, E]`: `Ok(n)` exits with n
                             let r = self.cx.fb.call(K.Ptr, sym, [])
                             code = self.cx.fb.vreg(K.I32)
                             let zero = self.cx.fb.konst(K.I32, 0)
@@ -617,11 +621,18 @@ struct Lower:
                             let tag = self.cx.fb.load(K.I64, r, 8)
                             let ev = self.cx.fb.konst(K.I64, err_v)
                             let is_err = self.cx.fb.cmp(Op.Eq, tag, ev)
+                            let eid = cg_enum_id(sig.ret)
+                            if ok != Ty.Unit:
+                                let after_ok = self.cx.fb.label()
+                                self.cx.fb.br(is_err, after_ok)
+                                let n = self.ld(r, self.vfield_off(eid, ok_v, 0), ok)
+                                let n32 = self.cx.fb.conv(K.I32, n)
+                                self.cx.fb.mov(code, n32)
+                                self.cx.fb.place(after_ok)
                             let skip = self.cx.fb.label()
                             self.cx.fb.brnot(is_err, skip)
                             let sb = self.sb_new()
                             self.sb_lit(sb, "error: ")
-                            let eid = cg_enum_id(sig.ret)
                             let fv = self.ld(r, self.vfield_off(eid, err_v, 0), err)
                             self.fmt_code(sb, fv, err, false)
                             self.cx.fb.call_void("brine_eprint_sb", [sb])
@@ -827,6 +838,67 @@ struct Lower:
                     b.push(u8(0))
                 self.data.push(Data(name=sym, align=8, bytes=b, relocs=[], readonly=false))
         return self.cx.fb.global(sym)
+
+    # An array constant of numbers or bools: one array in the data section,
+    # never freed (its count starts too high to reach 0) and copied before
+    # any change like any shared array. Each use borrows it.
+    fn const_arr(ref self, e: Expr) -> Option[int]:
+        var id = 0
+        match e.res:
+            case Res.Const(c):
+                id = c
+            case _:
+                return None
+        match self.carrs.get(id):
+            case Some(sym):
+                return Some(self.cx.fb.global(sym))
+            case None:
+                pass
+        let el = e.ty.elem()
+        let esz = self.lay(el).size
+        var es: [Expr] = []
+        match e.kind:
+            case ExprKind.Array(xs):
+                es = xs
+            case _:
+                return None
+        var body: [u8] = []
+        for x in es:
+            match (el, x.kind):
+                case (Ty.Int(k), ExprKind.Int(n)):
+                    if k.bits() > 64:
+                        return None
+                    le_bytes(ref body, int(n), esz)
+                case (Ty.Float(FloatTy.F32), ExprKind.Float(f)):
+                    le_bytes(ref body, f32_bits(f), esz)
+                case (Ty.Float(_), ExprKind.Float(f)):
+                    le_bytes(ref body, f64_bits(f), esz)
+                case (Ty.Bool, ExprKind.Bool(b)):
+                    le_bytes(ref body, 1 if b else 0, esz)
+                case _:
+                    return None
+        var b: [u8] = []
+        # the layout of `brine_arr`: rc, len, cap, esz, retain, release, data
+        le_bytes(ref b, 1 << 62, 8)
+        le_bytes(ref b, len(es), 8)
+        le_bytes(ref b, len(es), 8)
+        le_bytes(ref b, esz, 8)
+        le_bytes(ref b, 0, 24)
+        b.extend(body)
+        while len(b) % 8 != 0 or len(b) == 56:
+            b.push(u8(0))
+        let sym = self.data_name("br_ca", self.info.consts[id].name)
+        self.data.push(
+            Data(
+                name=sym,
+                align=8,
+                bytes=b,
+                relocs=[Reloc(off=48, sym=sym, add=56)],
+                readonly=false
+            )
+        )
+        self.carrs[id] = sym
+        return Some(self.cx.fb.global(sym))
 
     fn push_frame(ref self):
         self.cx.frames.push([])
@@ -2020,7 +2092,8 @@ struct Lower:
         self.finish_helper(saved)
         return name
 
-    # `int cmp(const void *, const void *)` ordering values of `t` (for sorting).
+    # `int cmp(const void *, const void *)` ordering values of `t` (for sorting):
+    # tuples and structs part by part, NaN after every number.
     fn need_cmp(ref self, t: Ty) -> str:
         let m = self.mangle(t)
         let name = "br_cmp_" + m
@@ -2030,30 +2103,94 @@ struct Lower:
         let x = self.ld(0, 0, t)
         let y = self.ld(1, 0, t)
         match t:
-            case Ty.Str:
-                let r = self.cx.fb.call(K.I32, "brine_str_cmp", [x, y])
-                self.cx.fb.ret(r)
+            case Ty.Tuple(_) | Ty.Struct(_):
+                let zero = self.cx.fb.konst(K.I32, 0)
+                for i, ft in enumerate(self.field_tys(t)):
+                    let off = self.field_off(t, i)
+                    let xi = self.ld(x, off, ft)
+                    let yi = self.ld(y, off, ft)
+                    let c = self.cmp3(xi, yi, ft)
+                    let same = self.cx.fb.cmp(Op.Eq, c, zero)
+                    let next = self.cx.fb.label()
+                    self.cx.fb.br(same, next)
+                    self.cx.fb.ret(c)
+                    self.cx.fb.place(next)
+                self.cx.fb.ret(zero)
             case _:
-                if t.is_float():
-                    # NaN sorts after every number
-                    let xn = self.cx.fb.cmp(Op.Ne, x, x)
-                    let yn = self.cx.fb.cmp(Op.Ne, y, y)
-                    let any_nan = self.cx.fb.bin(Op.Or, K.Bool, xn, yn)
-                    let plain = self.cx.fb.label()
-                    self.cx.fb.brnot(any_nan, plain)
-                    let a = self.cx.fb.conv(K.I32, xn)
-                    let b = self.cx.fb.conv(K.I32, yn)
-                    let d = self.cx.fb.bin(Op.Sub, K.I32, a, b)
-                    self.cx.fb.ret(d)
-                    self.cx.fb.place(plain)
-                let gt = self.cx.fb.cmp(Op.Gt, x, y)
-                let lt = self.cx.fb.cmp(Op.Lt, x, y)
-                let g = self.cx.fb.conv(K.I32, gt)
-                let l = self.cx.fb.conv(K.I32, lt)
-                let r = self.cx.fb.bin(Op.Sub, K.I32, g, l)
+                let r = self.cmp3(x, y, t)
                 self.cx.fb.ret(r)
         self.finish_helper(saved)
         return name
+
+    # -1, 0 or 1 (an i32) as `x` orders before, like or after `y`.
+    fn cmp3(ref self, x: int, y: int, t: Ty) -> int:
+        match t:
+            case Ty.Str:
+                return self.cx.fb.call(K.I32, "brine_str_cmp", [x, y])
+            case Ty.Tuple(_) | Ty.Struct(_):
+                let f = self.need_cmp(t)
+                return self.cx.fb.call(K.I32, f, [x, y])
+            case _:
+                pass
+        let gt = self.cx.fb.cmp(Op.Gt, x, y)
+        let lt = self.cx.fb.cmp(Op.Lt, x, y)
+        let g = self.cx.fb.conv(K.I32, gt)
+        let l = self.cx.fb.conv(K.I32, lt)
+        let r0 = self.cx.fb.bin(Op.Sub, K.I32, g, l)
+        if not t.is_float():
+            return r0
+        # NaN sorts after every number
+        let r = self.cx.fb.copy_of(r0)
+        let xn = self.cx.fb.cmp(Op.Ne, x, x)
+        let yn = self.cx.fb.cmp(Op.Ne, y, y)
+        let any_nan = self.cx.fb.bin(Op.Or, K.Bool, xn, yn)
+        let done = self.cx.fb.label()
+        self.cx.fb.brnot(any_nan, done)
+        let a = self.cx.fb.conv(K.I32, xn)
+        let b = self.cx.fb.conv(K.I32, yn)
+        let d = self.cx.fb.bin(Op.Sub, K.I32, a, b)
+        self.cx.fb.mov(r, d)
+        self.cx.fb.place(done)
+        return r
+
+    # `a < b` (or `a <= b` with `le`) for tuples and structs, as in Python:
+    # the first part that differs decides, and a NaN there makes it false.
+    fn need_lt(ref self, t: Ty, le: bool) -> str:
+        let name = ("br_le_" if le else "br_lt_") + self.mangle(t)
+        if not self.mark_done(name):
+            return name
+        let saved = self.start_helper(name, [K.Ptr, K.Ptr], true, K.Bool)
+        let yes = self.cx.fb.konst(K.Bool, 1)
+        let no = self.cx.fb.konst(K.Bool, 0)
+        for i, ft in enumerate(self.field_tys(t)):
+            let off = self.field_off(t, i)
+            let x = self.ld(0, off, ft)
+            let y = self.ld(1, off, ft)
+            let lt = self.cmp_code(CmpOp.Lt, x, y, ft)
+            let l1 = self.cx.fb.label()
+            self.cx.fb.brnot(lt, l1)
+            self.cx.fb.ret(yes)
+            self.cx.fb.place(l1)
+            let eq = self.cmp_code(CmpOp.Eq, x, y, ft)
+            let l2 = self.cx.fb.label()
+            self.cx.fb.br(eq, l2)
+            self.cx.fb.ret(no)
+            self.cx.fb.place(l2)
+        self.cx.fb.ret(yes if le else no)
+        self.finish_helper(saved)
+        return name
+
+    # `<`, `<=`, `>` or `>=` on tuples, structs and enums without data.
+    fn order_code(ref self, op: CmpOp, a: int, b: int, t: Ty) -> int:
+        match t:
+            case Ty.Tuple(_) | Ty.Struct(_):
+                let f = self.need_lt(t, op == CmpOp.Le or op == CmpOp.Ge)
+                if op == CmpOp.Lt or op == CmpOp.Le:
+                    return self.cx.fb.call(K.Bool, f, [a, b])
+                return self.cx.fb.call(K.Bool, f, [b, a])
+            case _:
+                # an enum without data is its variant's number
+                return self.cx.fb.cmp(cmp_op(op), a, b)
 
     # The `brine_map_ty` descriptor for map type `t` (its address).
     fn map_ty(ref self, t: Ty) -> int:
@@ -4439,6 +4576,11 @@ struct Lower:
                     return self.cx.fb.un(Op.Not, K.Bool, tst)
                 return tst
             case ExprKind.Array(es):
+                match self.const_arr(e):
+                    case Some(t):
+                        return t
+                    case None:
+                        pass
                 let el = e.ty.elem()
                 let vals = self.owned_all(es)
                 let loc = self.loc(e.span)
@@ -4667,6 +4809,8 @@ struct Lower:
                         let z = self.cx.fb.konst(K.I32, 0)
                         return self.cx.fb.cmp(cmp_op(op), c, z)
             case Ty.Array(_) | Ty.Map(_, _) | Ty.Tuple(_) | Ty.Struct(_) | Ty.Enum(_):
+                if op != CmpOp.Eq and op != CmpOp.Ne:
+                    return self.order_code(op, a, b, t)
                 let q = self.eq_code(a, b, t)
                 if op == CmpOp.Ne:
                     return self.cx.fb.un(Op.Not, K.Bool, q)
@@ -5073,6 +5217,8 @@ struct Lower:
                 let a = self.expr(args[0].expr)
                 let c = self.expr(args[1].expr)
                 let mn = b == Builtin.Min
+                if not e.ty.is_numeric():
+                    return self.pick_ordered(mn, a, c, e.ty)
                 match e.ty:
                     case Ty.Float(fk):
                         let suf = "f" if fk == FloatTy.F32 else ""
@@ -5494,6 +5640,9 @@ struct Lower:
                 let x = self.cx.fb.conv(K.F64, v)
                 return self.cx.fb.rt(int_kind(k), f"brine_conv_{k.suffix()}_from_f64", [x, loc])
             case (Ty.Int(k), Ty.Bool):
+                return self.cx.fb.conv(int_kind(k), v)
+            # an enum without data is its variant's number
+            case (Ty.Int(k), Ty.Enum(_)):
                 return self.cx.fb.conv(int_kind(k), v)
             case (Ty.Int(k), Ty.Str):
                 let loc = self.loc(e.span)
@@ -6029,6 +6178,8 @@ struct Lower:
                     return self.seq_first(c, e, arg.local)
                 if c.par:
                     return self.par_reduce(r, c, e, arg.local, arg.caps)
+                if (r == Reducer.Min or r == Reducer.Max) and not e.ty.is_numeric():
+                    return self.reduce_ordered(r, c, e, arg.local)
                 let (acc, has) = self.reduce_init(r, e.ty)
                 let dom = self.domain(c.iter, false)
                 let lc = self.loop_open(dom, arg.local)
@@ -6038,6 +6189,90 @@ struct Lower:
                 return acc
             case _:
                 return self.cx.fb.konst(K.I64, 0)
+
+    # `min(a, b)` / `max(a, b)` of strings, tuples, structs or enums. The
+    # second wins only when strictly better: ties keep the first, as in Python.
+    fn pick_ordered(ref self, mn: bool, a: int, c: int, t: Ty) -> int:
+        let take = self.cmp_code(CmpOp.Lt if mn else CmpOp.Gt, c, a, t)
+        if not self.managed(t):
+            let res = self.cx.fb.copy_of(a)
+            let skip = self.cx.fb.label()
+            self.cx.fb.brnot(take, skip)
+            self.cx.fb.mov(res, c)
+            self.cx.fb.place(skip)
+            return res
+        let res = self.cx.fb.vreg(self.kind(t))
+        let first = self.cx.fb.label()
+        let end = self.cx.fb.label()
+        self.cx.fb.brnot(take, first)
+        let vc = self.copy_owned(c, t)
+        self.cx.fb.mov(res, vc)
+        self.cx.fb.jmp(end)
+        self.cx.fb.place(first)
+        let va = self.copy_owned(a, t)
+        self.cx.fb.mov(res, va)
+        self.cx.fb.place(end)
+        return self.temp(res, t)
+
+    # A retained copy of value `v` (an aggregate is copied to new memory).
+    fn copy_owned(ref self, v: int, t: Ty) -> int:
+        if self.agg(t):
+            let lay = self.lay(t)
+            let m = self.cx.fb.temp_mem(lay.size, lay.align)
+            self.cx.fb.copy(m, v, lay.size)
+            self.retain(m, t)
+            return m
+        self.retain(v, t)
+        return v
+
+    # `min(... for ...)` / `max(...)` of strings, tuples, structs or enums: the
+    # best value so far is kept as an owned copy.
+    fn reduce_ordered(ref self, r: Reducer, c: Comp, e: Expr, local: int) -> int:
+        let t = e.ty
+        let managed = self.managed(t)
+        let agg = self.agg(t)
+        var acc = -1
+        if agg:
+            let lay = self.lay(t)
+            acc = self.cx.fb.temp_mem(lay.size, lay.align)
+        else:
+            acc = self.zero_of(self.kind(t), 0)
+        let has = self.cx.fb.konst(K.Bool, 0)
+        let dom = self.domain(c.iter, false)
+        let lc = self.loop_open(dom, local)
+        match c.filter:
+            case Some(f):
+                self.emit_filter(f, lc.cont)
+            case None:
+                pass
+        self.push_frame()
+        let v = self.expr(c.body)
+        let take = self.cx.fb.label()
+        let skip = self.cx.fb.label()
+        self.cx.fb.brnot(has, take)
+        let better = self.cmp_code(CmpOp.Lt if r == Reducer.Min else CmpOp.Gt, v, acc, t)
+        self.cx.fb.brnot(better, skip)
+        self.cx.fb.place(take)
+        if managed:
+            let fresh = self.cx.fb.label()
+            self.cx.fb.brnot(has, fresh)
+            self.release(acc, t)
+            self.cx.fb.place(fresh)
+        if agg:
+            self.cx.fb.copy(acc, v, self.lay(t).size)
+        else:
+            self.cx.fb.mov(acc, v)
+        if managed:
+            self.retain(acc, t)
+        let yes = self.cx.fb.konst(K.Bool, 1)
+        self.cx.fb.mov(has, yes)
+        self.cx.fb.place(skip)
+        self.pop_frame()
+        self.loop_close(dom, lc)
+        self.reduce_finish(r, has, e.span)
+        if managed:
+            return self.temp(acc, t)
+        return acc
 
     fn reduce_init(ref self, r: Reducer, ty: Ty) -> (int, int):
         let k = self.kind(ty)

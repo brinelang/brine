@@ -27,7 +27,7 @@
 62 63 punct )
 63 64 punct :
 64 64 newline
-65 69 kw test
+65 69 ident test
 70 74 ident name
 74 75 punct :
 75 75 newline
@@ -35,7 +35,7 @@
 80 84 kw pass
 84 84 newline
 85 85 dedent
-85 89 kw test
+85 89 ident test
 90 94 str "ok"
 94 95 punct :
 95 95 newline

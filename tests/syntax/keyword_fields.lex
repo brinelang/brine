@@ -75,7 +75,7 @@
 168 169 punct :
 169 169 newline
 170 178 indent
-178 182 kw case
+178 182 ident case
 183 184 ident E
 184 185 punct .
 185 186 ident A

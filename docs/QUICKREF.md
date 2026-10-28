@@ -70,6 +70,13 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
   (the width for 0: `u64(0).trailing_zeros() == 64`).
 * Float bits: `x.to_bits()` is the IEEE 754 encoding of a `float` as a `u64` (of
   an `f32` as a `u32`); `float.from_bits(u)` and `f32.from_bits(u)` go back.
+* `<`, `<=`, `>`, `>=` work on numbers, strings (byte order), enums without data
+  (declaration order) and tuples and structs whose parts all support them. Those
+  compare part by part, in field order, like Python: `(1, "b") < (2, "a")`. A NaN
+  makes `<` false, so in a tuple it's false whenever the NaN part decides. The same
+  types work with `sort()` (stable; NaN sorts after every number), `min`/`max` of
+  two (ties keep the first) and `min(... for ...)`/`max(...)`; `par min`/`par max`
+  need numbers.
 * Values are **values**: `let b = a` copies (cheaply, copy-on-write). Changing `b`
   never changes `a`. To share a variable on purpose, use `ref` (see Functions).
 
@@ -81,12 +88,20 @@ var total = 0           # mutable
 total += x
 let (q, r) = (17 / 5, 17 % 5)   # tuple unpacking
 let (a, (b, c)) = (1, (2, 3))   # nests
+u, v = v, u % v         # assign several `var` places at once; parentheses optional
+xs[i], xs[j] = xs[j], xs[i]     # every value is computed first, then stored
+lo, _ = bounds          # `_` drops a value
 var names: [str] = []   # annotate when the type can't be inferred
 let n: i32 = 7          # ...or whenever you like
 for i: int in 0..3:     # loop variables too: `for k: str, v: int in m.items():`
     total += i
 const LIMIT = 100       # compile-time constant (top level)
+const BASE = [3, 4, 5, 6]       # read-only arrays too; `len(BASE)` is a constant
 ```
+In `x, y = ...` the places can't overlap, and an index can't read a variable
+the same line assigns (`i, xs[i] = ...` is error E0405): the result would
+depend on the order of the stores.
+
 Types are optional, Python style. To require them, put `typed = true` under
 `[check]` in brine.toml (or pass `--typed`): then every `let`, `var` and `for`
 variable needs a written type (error E0337 tells you which one to add).
@@ -140,9 +155,12 @@ fn main():
     let d = ref data                 # `d` is another name for `data`
     d[0] = 1                         # changes `data`
 ```
+`let r = ref p.field` names a field the same way (`let b = ref self.board` in a
+method: no copy, and changes go to `self.board`). A reference names a variable or
+a field path, not an element (`ref xs[i]`) or a function's result.
 Arguments are passed by value (cheaply: arrays and strings are copy-on-write).
 References can't be stored in structs or arrays or returned, so they never dangle.
-`main` may return `int` (the exit code). Parameter types are required;
+`main` may return `int` (the exit code) or a `Result` (see below). Parameter types are required;
 local types are inferred.
 
 ## Structs and methods
@@ -193,11 +211,18 @@ enum Expr:                           # recursive enums are fine
 
 let s = Shape.Rect(w=2.0, h=3.0)     # positional or keyword fields
 print(s, s.area(), s == Shape.Empty) # Shape.Rect(w=2.0, h=3.0) 6.0 false
+
+print(int(Color.Green))              # 1: an enum without data converts to its position
+print(Color.from_int(0), Color.from_int(7))   # Some(Color.Red) None
 ```
 
 Patterns: `_`, a name (captures), int/str/bool literals, tuples `(a, 0)`,
 alternatives `1 | 2 | 3`, and variants `Shape.Rect(w, _)` / `Expr.Add(left=l)`
 (nested to any depth). A guard adds a condition: `case x if x < 0:`.
+A constant matches its value: `case OP_ADD:` (integer, string and bool constants).
+Alternatives may bind names when each binds the same ones with the same types:
+`case Shape.Circle(n) | Shape.Square(n):` (E0321 otherwise). With a guard,
+each alternative is tried in turn: `case (x, _) | (_, x) if x > 5:` matches `(1, 9)`.
 Every `match` must handle every value (error E0320 shows one it misses);
 end with `case _:` when listing values isn't possible. Variant data is read with
 `match`, never with `.field`.
@@ -245,6 +270,7 @@ fn main() -> Result[(), str]:           # an Err prints "error: ..." and exits w
     print(load("bit.txt")?)
     return Ok(())
 ```
+`main` may also return `Result[int, E]`: `Ok(n)` exits with code `n`.
 
 `Option[T]` (`Some(value)`, `None`) and `Result[T, E]` (`Ok(value)`, `Err(error)`)
 are always available. Methods: `is_some()`, `is_none()`, `is_ok()`, `is_err()`,
@@ -252,8 +278,9 @@ are always available. Methods: `is_some()`, `is_none()`, `is_ok()`, `is_err()`,
 Each use of a generic function or type with new type arguments makes a
 specialized copy, so generic code is as fast as hand-written code. A generic
 function's body is checked for each set of type arguments it's used with:
-`largest[T]` that compares with `>` works for `int` and `str`, and is an error
-for a struct.
+`largest[T]` that compares with `>` works for `int`, `str` or a tuple, and is an
+error for a struct with an array field. In the same way, `T(x)` converts to what `T` stands for, like
+`int(x)` or `f32(x)`: `fn mean[E](xs: [E]) -> E` can return `total / E(len(xs))`.
 
 Methods can have type parameters of their own, next to their type's:
 
@@ -276,7 +303,7 @@ xs.push(5)              # append
 let last = xs.pop()     # remove and return the last element (xs.pop(i): at i)
 xs.insert(0, 9)         # put 9 at index 0, shifting the rest right
 xs.extend([7, 8])       # append every element
-xs.sort()               # numbers and strings; stable
+xs.sort()               # anything `<` works on; stable
 xs.reverse()
 xs.clear()
 print(len(xs), xs == [3, 1, 2], 3 in xs, xs.index(3))  # index: Option[int]
@@ -287,7 +314,9 @@ let both = xs + [4, 5]  # a new array; `xs += ys` extends xs in place
 ```
 There are no negative indexes: write `xs[len(xs) - 1]`. A statement can't both
 change a variable and read it elsewhere (`print(xs.pop(), xs)` is an error), so
-evaluation order never matters.
+evaluation order never matters. A call in another call's arguments runs first
+(`t.add(t.leaf(1), 2)` is fine), and different fields are different places
+(`both(ref self.a, ref self.b)`, `self.items[self.rng.below(n)]`).
 
 ## Strings
 
@@ -310,6 +339,22 @@ print("a\nb".lines(), s.chars(), s.bytes())  # [str], [str], [u8]
 print("42".is_digit(), "ab".is_alpha(), " ".is_space(), "a1".is_alnum())
 print(ord("a"), chr(97))                   # 97 "a"
 ```
+Text over several lines goes between `"""` quotes (also `f"""..."""`). A line
+break right after the opening quotes is dropped, and so is the indentation all
+the lines share (the closing quotes' line counts, blank lines don't); `\` at the
+end of a line joins it with the next:
+
+```python
+fn usage(name: str) -> str:
+    return f"""
+        usage: {name} [--verbose] FILE
+          --verbose   say more
+        """
+# usage("app") == "usage: app [--verbose] FILE\n  --verbose   say more\n"
+```
+An f-string field holds any expression, strings included: `f"{d["key"]}"`,
+`f"{", ".join(names)}"`.
+
 Case conversion and `is_alpha`/`is_space` follow Unicode, as in Python
 (`"straße".upper()` is `"STRASSE"`); `is_digit` is `0`-`9`, the digits `int()`
 reads. `str(x)` converts any
@@ -579,6 +624,7 @@ fn index_of(xs: [int], target: int) -> int:
 ```python
 import geometry            # loads geometry.br next to the main file
 import util.strings as s   # loads util/strings.br
+import ..common            # loads common.br from the directory above
 
 let a = geometry.area(2.0, 3.0)
 let p = geometry.Point(x=1, y=2)
@@ -587,7 +633,14 @@ from geometry import Point, area   # use these names directly
 let q = Point(x=3, y=4)
 ```
 
-`from m import x` only imports items defined in `m` itself. A name can't be both
+Every module path starts at the main file's directory, in whichever module the
+`import` is written. Each leading `..` goes one directory up: `import ..common`,
+`from ..common import Thing`, `import ....shared.util` (two up), and the module
+is named after its last part (`common`, `util`).
+
+`from m import x` takes an item `m` defines or itself imports with `from`, so
+a module can gather names for others (`m.x` finds the same item). Modules `m`
+loads with `import` aren't passed on. A name can't be both
 imported and defined in the same module.
 
 ## Tests
@@ -597,6 +650,8 @@ test "clamp keeps values in range":
     assert clamp(15, 0, 10) == 10
     assert clamp(-5, 0, 10) == 0
 ```
+`test` is a keyword only at the start of a top-level line (and `case` only at
+the start of a line in a `match`), so both are fine as names elsewhere.
 `brine test` runs each test in its own process, in parallel. `$BRINE` is set to the
 `brine` running the tests, so a test can run the compiler. A test that runs longer
 than 300 seconds is stopped and fails (`brine test --timeout <seconds>`; 0: no limit).

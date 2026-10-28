@@ -209,7 +209,8 @@ struct Parser:
                 m.consts.push(self.const_decl()?)
             case Tok.Keyword(Kw.Import):
                 m.imports.push(self.import_decl()?)
-            case Tok.Keyword(Kw.Test):
+            # `test` is only a keyword here, at the start of a top-level line
+            case Tok.Ident(s) if s == "test":
                 m.tests.push(self.test_decl()?)
             case Tok.Keyword(Kw.Extern):
                 m.fns.push(self.extern_decl()?)
@@ -253,8 +254,12 @@ struct Parser:
         return Ok(())
 
     fn module_path(ref self) -> Result[[str], ()]:
+        # each leading `..` is one directory up from the main file's
+        var path: [str] = []
+        while self.eat(Tok.DotDot):
+            path.push("..")
         let (first, _) = self.expect_ident("module name")?
-        var path = [first]
+        path.push(first)
         while self.eat(Tok.Dot):
             let (n, _) = self.expect_ident("module name")?
             path.push(n)
@@ -738,7 +743,7 @@ struct Parser:
         if not self.eat_kw(Kw.In):
             self.report("E0110", "expected `in` after the loop variable", "expected `in`")
             return Err(())
-        let iter = self.or_expr()?
+        let iter = self.expr()?
         self.expect(Tok.Colon, "`:`")?
         var (body, invs) = self.block([ContractKind.Invariant])?
         lets.extend(body.stmts)
@@ -809,8 +814,16 @@ struct Parser:
         stmts.extend(self.pending)
         self.pending = []
 
+    # `case` is only a keyword at the start of a line in a `match`
+    fn at_case(self) -> bool:
+        match self.peek():
+            case Tok.Ident(s):
+                return s == "case"
+            case _:
+                return false
+
     fn case_clause(ref self) -> Result[Case, ()]:
-        if not self.at_kw(Kw.Case):
+        if not self.at_case():
             self.report(
                 "E0110",
                 f"expected `case`, found {describe(self.peek())}",
@@ -1089,7 +1102,16 @@ struct Parser:
                 )
                 return Err(())
             case _:
-                let e = self.expr()?
+                var e = self.expr()?
+                # `a, b = b, a`: a tuple of places
+                if self.at(Tok.Comma):
+                    e = self.comma_tuple(e)?
+                    if not self.at(Tok.Assign):
+                        self.report("E0110", "expected `=` after a list of places", "expected `=`")
+                        return Err(())
+                    self.bump()
+                    let first = self.expr()?
+                    return Ok(StmtKind.Assign(e, None, self.comma_tuple(first)?))
                 var op: Option[BinOp] = None
                 match self.peek():
                     case Tok.Assign:
@@ -1117,8 +1139,20 @@ struct Parser:
                     case _:
                         return Ok(StmtKind.ExprStmt(e))
                 self.bump()
-                let value = self.expr()?
+                var value = self.expr()?
+                if op.is_none() and self.at(Tok.Comma):
+                    value = self.comma_tuple(value)?
                 return Ok(StmtKind.Assign(e, op, value))
+
+    # `first, b, c` without parentheses, as on either side of `a, b = b, a`
+    fn comma_tuple(ref self, first: Expr) -> Result[Expr, ()]:
+        if not self.at(Tok.Comma):
+            return Ok(first)
+        var elems = [first]
+        while self.eat(Tok.Comma):
+            elems.push(self.expr()?)
+        let span = first.span.to(elems[len(elems) - 1].span)
+        return Ok(mk(ExprKind.Tuple(elems), span))
 
     fn simple_stmt(ref self) -> Result[Stmt, ()]:
         let start = self.span()
@@ -1639,7 +1673,11 @@ struct Parser:
                                 "unexpected"
                             )
                         )
-                    self.diags.extend(sub.diags)
+                    # the expression ends at the field's `}`, not at the end of the file
+                    for d in sub.diags:
+                        var d2 = d
+                        d2.msg = d.msg.replace("found end of file", "found `}`")
+                        self.diags.push(d2)
                     let e = r?
                     var trimmed: Option[str] = None
                     match spec:
@@ -1655,8 +1693,30 @@ fn parse_module(text: str, file: int, name: str) -> (Module, [Diag]):
     let (toks, lex_diags) = lex(text, file, 0, false, true)
     var p = Parser(toks=toks, pos=0, file=file, diags=[], pending=[])
     let m = p.module(name)
+    # after a broken string, the rest of its line is no use to parse: drop
+    # the errors there, which only repeat the string's
+    var quiet: [(int, int)] = []
+    for d in lex_diags:
+        if d.code != "E0102" or len(d.labels) == 0:
+            continue
+        let at = d.labels[0].span.lo
+        for t in toks:
+            if t.lo <= at and at < t.hi:
+                var e = t.hi
+                while e < len(text) and text[e] != "\n":
+                    e += 1
+                quiet.push((t.lo, e))
+                break
     var diags = lex_diags
-    diags.extend(p.diags)
+    for d in p.diags:
+        var keep = true
+        if len(d.labels) > 0:
+            let lo = d.labels[0].span.lo
+            for a, b in quiet:
+                if a <= lo and lo <= b:
+                    keep = false
+        if keep:
+            diags.push(d)
     return (m, diags)
 
 # The names `items` unpack `parent` into, nested tuples flattened: each gets a
