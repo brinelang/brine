@@ -483,13 +483,37 @@ fn make_dirs(d: str) -> Result[(), Diag]:
         case Err(e):
             return Err(diag.error("E0704", f"cannot create `{d}`: {e}"))
 
-fn cc_failed(what: str, e: str) -> Diag:
+fn cc_failed(what: str, e: str, out: str) -> Diag:
     let ls = e.strip().lines()
-    let first = ls[:min(30, len(ls))]
+    let first = "\n".join(ls[:min(30, len(ls))])
+    let low = e.lower()
+    # the linker can't replace an executable that is running (Windows), or
+    # the folder isn't writable
+    let name = project.file_name(out).unwrap_or("")
+    let busy = any(
+        p in low for p in ["permission denied", "text file busy", "device or resource busy"]
+    )
+    if out != "" and ("output file" in low or (busy and name != "" and name in e)):
+        return diag.error(
+            "E0704",
+            f"cannot write `{display_path(out)}`"
+        ).note(first).with_help("is the program still running? Stop it and build again, or build somewhere else with `-o`")
+    if any(
+        p in low for p in ["no space left on device", "out of memory", "cannot allocate memory", "virtual memory exhausted"]
+    ):
+        return diag.error(
+            "E0704",
+            what
+        ).note(first).with_help("the C compiler ran out of disk space or memory")
+    if any(p in low for p in ["undefined reference to", "undefined symbol", "unresolved external"]):
+        return diag.error(
+            "E0705",
+            what
+        ).note(first).note("if the missing name is an `extern fn` of your program, it isn't in the C libraries brine links; otherwise this is a bug in brine — please report it")
     return diag.error(
         "E0705",
         what
-    ).note("this is a bug in the brine compiler, not in your program — please report it").note("\n".join(first))
+    ).note("this is a bug in the brine compiler, not in your program — please report it").note(first)
 
 fn write_or_diag(path: str, text: str) -> Result[(), Diag]:
     match write_file(path, text):
@@ -701,7 +725,7 @@ fn compile_levels(
     if len(units) > 0:
         t = phase_time(t, f"cc ({len(jobs)}/{len(units)})")
     if failure != "":
-        return Err(cc_failed("the C compiler rejected the generated code", failure))
+        return Err(cc_failed("the C compiler rejected the generated code", failure, ""))
     match project.parent(out_exe):
         case Some(d):
             if d != "":
@@ -718,7 +742,7 @@ fn compile_levels(
         case Ok(_):
             pass
         case Err(e):
-            return Err(cc_failed("linking the program failed", e))
+            return Err(cc_failed("linking the program failed", e, out_exe))
     phase_time(t, "link")
     if plat == Platform.Web:
         web_files(dest)?
