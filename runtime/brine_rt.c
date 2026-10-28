@@ -1859,6 +1859,20 @@ void brine_arr_extend(brine_arr **pa, brine_arr *b) {
     a->len += n;
     brine_arr_release(b);
 }
+/* `a + b`: a new array (or a shared one when a side is empty) */
+brine_arr *brine_arr_concat(brine_arr *a, brine_arr *b, const char *loc) {
+    if (a->len == 0 || b->len == 0) {
+        brine_arr *r = a->len == 0 ? b : a;
+        brine_arr_retain(r);
+        return r;
+    }
+    brine_arr *r = brine_arr_new(a->len + b->len, a->esz, a->retain, a->release, loc);
+    memcpy(r->data, a->data, (size_t)(a->len * a->esz));
+    memcpy(r->data + a->len * a->esz, b->data, (size_t)(b->len * b->esz));
+    if (r->retain)
+        for (int64_t i = 0; i < r->len; i++) r->retain(r->data + i * r->esz);
+    return r;
+}
 void brine_arr_reverse(brine_arr **pa) {
     brine_arr_unique(pa);
     brine_arr *a = *pa;

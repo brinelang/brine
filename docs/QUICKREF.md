@@ -283,6 +283,7 @@ print(len(xs), xs == [3, 1, 2], 3 in xs, xs.index(3))  # index: Option[int]
 print([3, 1, 3].index(3, 1))    # Some(2): searching from index 1 (0 to len, else a panic)
 print(xs.contains(3))   # the same as `3 in xs`
 print(xs[1:3], xs[:2], xs[2:])   # slices are copies; out of range panics
+let both = xs + [4, 5]  # a new array; `xs += ys` extends xs in place
 ```
 There are no negative indexes: write `xs[len(xs) - 1]`. A statement can't both
 change a variable and read it elsewhere (`print(xs.pop(), xs)` is an error), so
@@ -302,7 +303,7 @@ print(s[0], s[7:], s + "!", "ri" in s, s.contains("ri"), f"{s} has {len(s)} byte
 print(s.find("brine"))                    # Some(7); None if absent
 print(s.find("e", 2))                     # Some(11): searching from byte 2 (0 to len(s))
 print(s.split(", "), "a b  c".split())    # ["hello", "brine"], ["a", "b", "c"]
-print("-".join(["a", "b"]), "ab".repeat(3), s.replace("l", "L"))
+print("-".join(["a", "b"]), "ab".repeat(3), "ab" * 3, s.replace("l", "L"))
 print(s.starts_with("he"), s.ends_with("!"), s.count("l"))
 print("  x ".strip(), "  x".lstrip(), "x  ".rstrip(), s.upper(), s.lower())
 print("a\nb".lines(), s.chars(), s.bytes())  # [str], [str], [u8]

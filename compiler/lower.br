@@ -3704,7 +3704,7 @@ struct Lower:
         let ty = target.ty
         # `s = s + a + b`: append in place, as `s += a` then `s += b`, when
         # the parts don't read `s` (else rebuilding the string is quadratic)
-        if op.is_none() and ty == Ty.Str:
+        if op.is_none() and (ty == Ty.Str or ty.elem() != Ty.Error):
             match self_append(target, value):
                 case Some(parts):
                     for p in parts:
@@ -3793,7 +3793,7 @@ struct Lower:
                     self.cx.fb.store(lp, 0, v)
                     self.release(old, ty)
             case Some(o2):
-                if ty == Ty.Str:
+                if ty == Ty.Str and o2 == BinOp.Add:
                     let c = self.str_byte(value)
                     if c >= 0:
                         let lp = self.lvalue(target)
@@ -3805,8 +3805,19 @@ struct Lower:
                         return
                 let v = self.expr(value)
                 let lp = self.lvalue(target)
-                if ty == Ty.Str:
+                if ty == Ty.Str and o2 == BinOp.Mul:
+                    # `s *= n`
+                    let n = self.cx.fb.conv(K.I64, v)
+                    let loc = self.loc(span)
+                    let old = self.cx.fb.load(K.Ptr, lp, 0)
+                    let c = self.cx.fb.call(K.Ptr, "brine_s_repeat", [old, n, loc])
+                    self.cx.fb.store(lp, 0, c)
+                    self.release(old, Ty.Str)
+                elif ty == Ty.Str:
                     self.cx.fb.rt_void("brine_str_add", [lp, v])
+                elif ty.elem() != Ty.Error:
+                    # `xs += ys` extends `xs` in place
+                    self.cx.fb.call_void("brine_arr_extend", [lp, v])
                 else:
                     let cur = self.cx.fb.load(self.kind(ty), lp, 0)
                     let c = self.arith(o2, cur, v, ty, checked, span)
@@ -4212,6 +4223,19 @@ struct Lower:
                     let b = self.expr(r)
                     let c = self.cx.fb.call(K.Ptr, "brine_str_concat", [a, b])
                     return self.temp(c, Ty.Str)
+                if op == BinOp.Mul and e.ty == Ty.Str:
+                    let a = self.expr(l)
+                    let n0 = self.expr(r)
+                    let n = self.cx.fb.conv(K.I64, n0)
+                    let loc = self.loc(e.span)
+                    let c = self.cx.fb.call(K.Ptr, "brine_s_repeat", [a, n, loc])
+                    return self.temp(c, Ty.Str)
+                if op == BinOp.Add and e.ty.elem() != Ty.Error:
+                    let a = self.expr(l)
+                    let b = self.expr(r)
+                    let loc = self.loc(e.span)
+                    let c = self.cx.fb.call(K.Ptr, "brine_arr_concat", [a, b, loc])
+                    return self.temp(c, e.ty)
                 let a = self.expr(l)
                 let chk = self.op_checked(Some(op), e.ty, e.checked)
                 let sh = -1 if chk else pow2_shift(op, r, e.ty)

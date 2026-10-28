@@ -117,6 +117,13 @@ fn prim_type(name: str) -> Option[Ty]:
         case _:
             return None
 
+fn is_array_ty(t: Ty) -> bool:
+    match t:
+        case Ty.Array(_):
+            return true
+        case _:
+            return false
+
 fn reducer_by_name(n: str) -> Option[Reducer]:
     match n:
         case "sum":
@@ -2956,15 +2963,29 @@ struct Checker:
                 var oexp: Option[Ty] = None
                 match exp:
                     case Some(t):
-                        if t.is_numeric():
+                        if t.is_numeric() or op == BinOp.Add and is_array_ty(t):
                             oexp = Some(t)
                     case None:
                         pass
-                var lt = self.check_expr(ref l2, oexp)
-                var rexp: Option[Ty] = None
-                if lt.is_numeric():
-                    rexp = Some(lt)
-                let rt = self.check_expr(ref r2, rexp)
+                # `[] + xs`: the empty array takes its type from the right
+                var empty_left = false
+                if op == BinOp.Add and oexp.is_none():
+                    match l2.kind:
+                        case ExprKind.Array(xs):
+                            empty_left = len(xs) == 0
+                        case _:
+                            pass
+                var lt = Ty.Error
+                var rt = Ty.Error
+                if empty_left:
+                    rt = self.check_expr(ref r2, None)
+                    lt = self.check_expr(ref l2, Some(rt) if is_array_ty(rt) else None)
+                else:
+                    lt = self.check_expr(ref l2, oexp)
+                    var rexp: Option[Ty] = None
+                    if lt.is_numeric() or op == BinOp.Add and is_array_ty(lt):
+                        rexp = Some(lt)
+                    rt = self.check_expr(ref r2, rexp)
                 if l2.is_literal() and not r2.is_literal() and rt.is_numeric() and lt != rt:
                     lt = self.check_expr(ref l2, Some(rt))
                 e.kind = ExprKind.Binary(op, l2, r2)
@@ -3717,6 +3738,12 @@ struct Checker:
             case BinOp.Add | BinOp.Sub | BinOp.Mul | BinOp.Div | BinOp.Mod:
                 if op == BinOp.Add and lt == Ty.Str and rt == Ty.Str:
                     return Ty.Str
+                # `xs + ys`: a new array, the elements of `xs` then those of `ys`
+                if op == BinOp.Add and is_array_ty(lt) and lt == rt:
+                    return lt
+                # `"ab" * 3` is "ababab"
+                if op == BinOp.Mul and lt == Ty.Str and rt.is_int():
+                    return Ty.Str
                 if lt.is_numeric() and lt == rt:
                     return lt
                 var verb = "take the remainder of"
@@ -3741,6 +3768,12 @@ struct Checker:
                     )
                 elif (lt == Ty.Str or rt == Ty.Str) and op == BinOp.Add:
                     d = d.with_help("convert with `str(x)`, or use an f-string: f\"{a}{b}\"")
+                elif op == BinOp.Add and is_array_ty(lt) and rt == lt.elem():
+                    d = d.with_help(
+                        "to add one element write `xs + [x]`, or `xs.push(x)` to change `xs`"
+                    )
+                elif op == BinOp.Mul and lt.is_int() and rt == Ty.Str:
+                    d = d.with_help("put the string first: `s * n`")
                 self.err(d)
                 return Ty.Error
             case BinOp.BitAnd | BinOp.BitOr | BinOp.BitXor:
