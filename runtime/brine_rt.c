@@ -2773,6 +2773,14 @@ static void br_gpu_logf(const char *fmt, ...) {
     va_end(ap);
 }
 
+/* "; cpu estimate X ms" for the log, or nothing when the CPU time isn't known
+ * yet (BRINE_GPU=on sends work to the GPU before the CPU has run any) */
+static const char *br_gpu_cpu_est(char *buf, double cpu_s) {
+    if (cpu_s <= 0) return "";
+    snprintf(buf, 48, "; cpu estimate %.3f ms", cpu_s * 1e3);
+    return buf;
+}
+
 /* ------------------------------------------------------------ devices */
 /* What the rest needs from a GPU; CUDA and Metal below. Calls return 0 or an
  * error br_dev_err describes. Device pointers are addresses the kernels use
@@ -3792,9 +3800,11 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
         br_gpu.bw = 0.5 * (br_gpu.bw + (double)bytes / copy);
         br_unlock(&br_gpu.mu);
     }
-    if (br_gpu.log)
-        br_gpu_logf("%s %s n=%lld -> gpu %.3f ms (kernel %.3f ms, copies %.3f ms, %.1f MB; cpu estimate %.3f ms)", k->where,
-                    br_gpu_kind(k), (long long)n, (t3 - t0) * 1e3, kern * 1e3, copy * 1e3, (double)bytes / 1e6, c.cpu_s * 1e3);
+    if (br_gpu.log) {
+        char est[48];
+        br_gpu_logf("%s %s n=%lld -> gpu %.3f ms (kernel %.3f ms, copies %.3f ms, %.1f MB%s)", k->where, br_gpu_kind(k),
+                    (long long)n, (t3 - t0) * 1e3, kern * 1e3, copy * 1e3, (double)bytes / 1e6, br_gpu_cpu_est(est, c.cpu_s));
+    }
     return n;
 }
 
@@ -3966,9 +3976,12 @@ static int br_gpu_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx
         if (bytes > (1 << 20) && t1 > t0) br_gpu.bw = 0.5 * (br_gpu.bw + (double)bytes / (t1 - t0));
         br_unlock(&br_gpu.mu);
     }
-    if (br_gpu.log)
-        br_gpu_logf("%s %s n=%lld -> gpu %.3f ms (kernels %.3f ms, copies %.3f ms, %.1f MB; cpu estimate %.3f ms)", k->where,
-                    br_gpu_kind(k), (long long)n, (t2 - t0) * 1e3, (t2 - t1) * 1e3, (t1 - t0) * 1e3, (double)bytes / 1e6, c.cpu_s * 1e3);
+    if (br_gpu.log) {
+        char est[48];
+        br_gpu_logf("%s %s n=%lld -> gpu %.3f ms (kernels %.3f ms, copies %.3f ms, %.1f MB%s)", k->where, br_gpu_kind(k),
+                    (long long)n, (t2 - t0) * 1e3, (t2 - t1) * 1e3, (t1 - t0) * 1e3, (double)bytes / 1e6,
+                    br_gpu_cpu_est(est, c.cpu_s));
+    }
     return 1;
 }
 
