@@ -271,8 +271,10 @@ evaluation order never matters.
 ## Strings
 
 Strings are immutable UTF-8. `len(s)`, `s[i]` and slices count **bytes**;
-`s[i]` is a one-character string (ASCII text is the common case, and
-`for c in s` / `s.chars()` walk real characters).
+`s[i]` is the byte at `i` as a one-byte string: a character for ASCII text
+(the common case), a piece of one otherwise, so scan text byte by byte and
+compare with ASCII (`s[i] == " "`). A slice must not cut a character in two:
+`"aé"[0:2]` panics. `for c in s` / `s.chars()` walk real characters.
 
 ```python
 let s = "hello, brine"

@@ -760,11 +760,6 @@ static brine_str *br_sub(brine_str *s, int64_t lo, int64_t hi) {
     if (hi - lo == 1) return (brine_str *)&brine_bytes[(unsigned char)s->data[lo]];
     return brine_str_new(s->data + lo, hi - lo);
 }
-brine_str *brine_str_slice(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
-    if (BR_UNLIKELY(lo < 0 || lo > hi || hi > s->len))
-        br_panicf(loc, "slice [%lld:%lld] is out of bounds for a string of length %lld", (long long)lo, (long long)hi, (long long)s->len);
-    return br_sub(s, lo, hi);
-}
 /* length of the UTF-8 character starting at p (1 for invalid bytes) */
 static int64_t br_utf8_len(const unsigned char *p, int64_t avail) {
     int64_t n = p[0] < 0x80 ? 1 : (p[0] >> 5) == 6 ? 2 : (p[0] >> 4) == 14 ? 3 : (p[0] >> 3) == 30 ? 4 : 1;
@@ -772,6 +767,26 @@ static int64_t br_utf8_len(const unsigned char *p, int64_t avail) {
     for (int64_t i = 1; i < n; i++)
         if ((p[i] & 0xc0) != 0x80) return 1;
     return n;
+}
+/* whether byte i of s is inside a character, not at its start */
+static inline bool br_mid_char(const brine_str *s, int64_t i) {
+    return i > 0 && i < s->len && ((unsigned char)s->data[i] & 0xc0) == 0x80;
+}
+static BR_NORETURN BR_COLD void br_slice_splits(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
+    int64_t b = br_mid_char(s, lo) ? lo : hi, a = b;
+    while (a > 0 && b - a < 3 && br_mid_char(s, a)) a--;
+    int64_t n = br_utf8_len((const unsigned char *)s->data + a, s->len - a);
+    if (a + n <= b)
+        br_panicf(loc, "slice [%lld:%lld] starts or ends inside a character (byte %lld)", (long long)lo, (long long)hi, (long long)b);
+    br_panicf(loc, "slice [%lld:%lld] splits the character \"%.*s\" (bytes %lld..%lld)", (long long)lo, (long long)hi, (int)n,
+              s->data + a, (long long)a, (long long)(a + n));
+}
+/* Strings are UTF-8, so a slice must not cut a character in two. */
+brine_str *brine_str_slice(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
+    if (BR_UNLIKELY(lo < 0 || lo > hi || hi > s->len))
+        br_panicf(loc, "slice [%lld:%lld] is out of bounds for a string of length %lld", (long long)lo, (long long)hi, (long long)s->len);
+    if (BR_UNLIKELY(br_mid_char(s, lo) || br_mid_char(s, hi))) br_slice_splits(s, lo, hi, loc);
+    return br_sub(s, lo, hi);
 }
 int64_t brine_ord(brine_str *s, const char *loc) {
     const unsigned char *p = (const unsigned char *)s->data;
