@@ -1459,6 +1459,15 @@ brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_
     a->esz = esz;
     a->retain = rt;
     a->release = rl;
+    if (esz > 0 && len <= BR_SMALL / esz) {
+        /* small: a block of our heap, whose spare room the first pushes use
+           (`[]` then `push` doesn't reallocate) */
+        size_t bytes = (size_t)((len > 0 ? len : 1) * esz);
+        a->data = (char *)br_alloc(bytes);
+        memset(a->data, 0, bytes);
+        if (br_in_heap(a->data)) a->cap = (int64_t)br_class_size(br_class_of(bytes)) / esz;
+        return a;
+    }
     a->data = (char *)calloc(len > 0 ? (size_t)len : 1, (size_t)esz);
     if (!a->data) {
         fprintf(stderr, "out of memory\n");
