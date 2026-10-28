@@ -209,7 +209,8 @@ fn new_checker() -> Checker:
         expand=[],
         or_names=None,
         or_seen=[],
-        const_exprs={}
+        const_exprs={},
+        ref_paths=[]
     )
 
 struct Checker:
@@ -256,6 +257,9 @@ struct Checker:
     or_seen: [str]
     # array constants: the literal each use stands for, every element folded
     const_exprs: {int: Expr}
+    # `let t = ref self.t`: the variable and the fields each alias stands for.
+    # Its scope entry has id `-2 - k` for alias k.
+    ref_paths: [(str, [str], Span)]
 
     fn err(ref self, d: Diag):
         self.diags.push(d)
@@ -1081,9 +1085,8 @@ struct Checker:
                 LocalInfo(name=name, ty=ty, kind=kind, par_level=self.cur_level(), span=span)
             )
             return id
-        match self.lookup_local(name):
-            case Some(prev):
-                let pspan = self.locals[prev].span
+        match self.defined_at(name):
+            case Some(pspan):
                 if kind != LocalKind.Result:
                     self.err(
                         diag.error("E0207", f"`{name}` is already defined in this function")
@@ -1109,10 +1112,40 @@ struct Checker:
             var j = len(s) - 1
             while j >= 0:
                 if s[j].0 == name:
+                    if s[j].1 < 0:
+                        return None
                     return Some(s[j].1)
                 j -= 1
             si -= 1
         return None
+
+    # The alias `name` stands for, when it's `let name = ref x.field`.
+    fn lookup_path(self, name: str) -> Option[int]:
+        var si = len(self.scopes) - 1
+        while si >= 0:
+            let s = self.scopes[si]
+            var j = len(s) - 1
+            while j >= 0:
+                if s[j].0 == name:
+                    if s[j].1 < 0:
+                        return Some(-2 - s[j].1)
+                    return None
+                j -= 1
+            si -= 1
+        return None
+
+    # The span where `name` was defined in this function, if it was.
+    fn defined_at(self, name: str) -> Option[Span]:
+        match self.lookup_local(name):
+            case Some(id):
+                return Some(self.locals[id].span)
+            case None:
+                pass
+        match self.lookup_path(name):
+            case Some(k):
+                return Some(self.ref_paths[k].2)
+            case None:
+                return None
 
     fn use_local(ref self, id: int):
         let pl = self.locals[id].par_level
@@ -1298,25 +1331,27 @@ struct Checker:
             case None:
                 pass
         var target = -1
-        match init.kind:
-            case ExprKind.Ident(_):
-                match init.res:
-                    case Res.Local(id):
-                        target = id
-                    case _:
-                        pass
-            case _:
-                pass
-        if target < 0:
-            if not init.ty.is_error():
-                self.err(
-                    diag.error("E0404", "`ref` needs a variable")
-                    .label(init.span, "not a variable")
-                    .with_help(
-                        "write `let r = ref total` to make `r` another name for the variable `total`"
-                    )
-                )
-            return
+        var fields: [str] = []
+        var root = ""
+        var at = init
+        var walking = true
+        while walking:
+            walking = false
+            match at.kind:
+                case ExprKind.Ident(n):
+                    match at.res:
+                        case Res.Local(id):
+                            target = id
+                            root = n
+                        case _:
+                            pass
+                case ExprKind.Field(b, f, _):
+                    if field_base(b.ty):
+                        fields.insert(0, f)
+                        at = b
+                        walking = true
+                case _:
+                    pass
         var name = ""
         var nsp = span
         match pat:
@@ -1331,9 +1366,20 @@ struct Checker:
                     ).label(span, "use a single name: `let r = ref x`")
                 )
                 return
-        match self.lookup_local(name):
-            case Some(prev):
-                let pspan = self.locals[prev].span
+        if target < 0:
+            if not init.ty.is_error():
+                self.err(
+                    diag.error("E0404", "`ref` needs a variable or a field of one")
+                    .label(init.span, "not a variable or a field")
+                    .with_help(
+                        "write `let r = ref total` or `let r = ref self.total`; for an element, keep its index: `xs[i]`"
+                    )
+                )
+            # declare it anyway, so its uses don't report it as undefined
+            self.declare(name, nsp, Ty.Error, LocalKind.Let)
+            return
+        match self.defined_at(name):
+            case Some(pspan):
                 self.err(
                     diag.error("E0207", f"`{name}` is already defined in this function")
                     .label(nsp, "defined again here")
@@ -1342,6 +1388,10 @@ struct Checker:
                 )
             case None:
                 pass
+        if len(fields) > 0:
+            self.ref_paths.push((root, fields, nsp))
+            self.scopes[len(self.scopes) - 1].push((name, -1 - len(self.ref_paths)))
+            return
         self.scopes[len(self.scopes) - 1].push((name, target))
 
     # The place left of `=`: checks that it can be assigned and gives its type.
@@ -1349,7 +1399,11 @@ struct Checker:
     fn assign_target(ref self, ref target: Expr) -> Option[Ty]:
         match target.kind:
             case ExprKind.Ident(name):
-                if self.lookup_local(name).is_none() and not self.has_item(name):
+                if (
+                    self.lookup_local(name).is_none()
+                    and self.lookup_path(name).is_none()
+                    and not self.has_item(name)
+                ):
                     let d = diag.error(
                         "E0201",
                         f"cannot assign to undefined variable `{name}`"
@@ -3043,6 +3097,18 @@ struct Checker:
         # a name unpacked by a comprehension is a field of its hidden loop variable
         match e.kind:
             case ExprKind.Ident(name):
+                match self.lookup_path(name):
+                    case Some(k):
+                        let (root, fields, _) = self.ref_paths[k]
+                        var base = mk(ExprKind.Ident(root), e.span)
+                        for i in 0..len(fields) - 1:
+                            base = mk(ExprKind.Field(base, fields[i], e.span), e.span)
+                        e.kind = ExprKind.Field(base, fields[len(fields) - 1], e.span)
+                        e.idx = 0
+                        e.res = Res.Unresolved
+                        return self.expr_inner(ref e, exp, allow_gen)
+                    case None:
+                        pass
                 var ui = len(self.unpacks) - 1
                 while ui >= 0:
                     let u = self.unpacks[ui]
@@ -4573,12 +4639,12 @@ struct Checker:
         var it: Option[Item] = None
         match e.kind:
             case ExprKind.Ident(name):
-                if self.lookup_local(name).is_none():
+                if self.defined_at(name).is_none():
                     it = self.item(name)
             case ExprKind.Field(b, name, _):
                 match b.kind:
                     case ExprKind.Ident(m):
-                        if self.lookup_local(m).is_none():
+                        if self.defined_at(m).is_none():
                             match self.item(m):
                                 case Some(Item.Module(mi)):
                                     it = self.items[mi].get(name)
@@ -6690,12 +6756,12 @@ struct Checker:
         var it: Option[Item] = None
         match e.kind:
             case ExprKind.Ident(name):
-                if self.lookup_local(name).is_none():
+                if self.defined_at(name).is_none():
                     it = self.item(name)
             case ExprKind.Field(b, name, _):
                 match b.kind:
                     case ExprKind.Ident(m):
-                        if self.lookup_local(m).is_none():
+                        if self.defined_at(m).is_none():
                             match self.item(m):
                                 case Some(Item.Module(mi)):
                                     it = self.items[mi].get(name)
@@ -7186,6 +7252,14 @@ fn place_leaves(e: Expr, path: [int], ref out: [(Expr, [int])]):
                 place_leaves(x, p, ref out)
         case _:
             out.push((e, path))
+
+# A struct or tuple: a value whose fields `let r = ref x.f` can alias.
+fn field_base(t: Ty) -> bool:
+    match t:
+        case Ty.Struct(_) | Ty.Tuple(_):
+            return true
+        case _:
+            return false
 
 fn is_wild(e: Expr) -> bool:
     match e.kind:

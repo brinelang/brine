@@ -143,6 +143,9 @@ fn main():
     let d = ref data                 # `d` is another name for `data`
     d[0] = 1                         # changes `data`
 ```
+`let r = ref p.field` names a field the same way (`let b = ref self.board` in a
+method: no copy, and changes go to `self.board`). A reference names a variable or
+a field path, not an element (`ref xs[i]`) or a function's result.
 Arguments are passed by value (cheaply: arrays and strings are copy-on-write).
 References can't be stored in structs or arrays or returned, so they never dangle.
 `main` may return `int` (the exit code) or a `Result` (see below). Parameter types are required;
