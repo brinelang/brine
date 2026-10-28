@@ -23,7 +23,17 @@ const instance = await WebAssembly.instantiate(module, wasi.getImportObject());
 try {
   process.exitCode = wasi.start(instance);
 } catch (e) {
-  // a trap: brine panics exit with 101, so this is a crash (or a stack overflow)
-  process.stderr.write(`\nWebAssembly trap: ${e && e.message ? e.message : e}\n`);
-  process.exitCode = 134;
+  // a trap: what the program printed before it is still in its buffer
+  try {
+    instance.exports.brine_flush?.();
+  } catch {}
+  if (e instanceof RangeError) {
+    // the engine's call stack ran out: report it as native code does
+    process.stderr.write("\npanic: stack overflow (recursion too deep)\n");
+    process.exitCode = 101;
+  } else {
+    // brine panics exit with 101, so this is a crash
+    process.stderr.write(`\nWebAssembly trap: ${e && e.message ? e.message : e}\n`);
+    process.exitCode = 134;
+  }
 }

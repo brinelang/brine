@@ -3,8 +3,8 @@
  * picks the newest one the CPU and the OS support. BRINE_CPU=base or v3 caps
  * the choice (to test the other versions on a new machine).
  *
- * Floating-point results are the same in all three: C11 mode keeps gcc and
- * clang from fusing multiplies and adds (-ffp-contract=off). */
+ * Floating-point results are the same in all three: the driver compiles
+ * with -ffp-contract=off, so multiplies and adds are never fused. */
 #include <cpuid.h>
 #include <stdint.h>
 #include <stdlib.h>

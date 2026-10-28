@@ -9,6 +9,13 @@
 #include <stddef.h>
 #include <math.h>
 
+/* a*b+c rounds twice, as written, on every target: no fused multiply-adds
+ * (the driver also passes -ffp-contract=off; this covers a C compiler run by
+ * hand on the output of `brine emit-c`) */
+#ifdef __clang__
+#pragma STDC FP_CONTRACT OFF
+#endif
+
 #if defined(__GNUC__) || defined(__clang__)
 #define BR_NORETURN __attribute__((noreturn))
 #define BR_LIKELY(x) __builtin_expect(!!(x), 1)
@@ -653,6 +660,7 @@ brine_str *brine_os_name(void);
 brine_str *brine_os_arch(void);
 int64_t brine_os_pid(void);
 int64_t brine_os_cpu_count(void);
+int64_t brine_os_thread_count(void);
 void brine_os_sleep(double seconds);
 bool brine_os_is_terminal(int64_t fd);
 void brine_os_enable_ansi(void);
@@ -662,24 +670,49 @@ int64_t brine_os_wait(int64_t handle, const char *loc);
 bool brine_os_poll(int64_t handle, int64_t *code, const char *loc);
 void brine_os_kill(int64_t handle, const char *loc);
 void brine_os_output(int64_t handle, brine_str **out, brine_str **err, const char *loc);
+void brine_flush(void);
 void brine_rt_init(int argc, char **argv);
 void brine_rt_shutdown(void);
 
-/* math wrappers (generated code never calls libm names directly) */
+/* math wrappers (generated code never calls libm names directly). The exact
+ * operations (sqrt, rounding, fabs, fmod) are the C library's: IEEE fixes
+ * their results. The others come from brine_math.c, the same code on every
+ * target, since C libraries round them differently; f32 goes through f64. */
 #define BR_MATH1(name) \
     static inline double brine_f_##name(double x) { return name(x); } \
     static inline float brine_f_##name##f(float x) { return name##f(x); }
 BR_MATH1(sqrt)
-BR_MATH1(sin)
-BR_MATH1(cos)
-BR_MATH1(tan)
-BR_MATH1(exp)
-BR_MATH1(log)
 BR_MATH1(floor)
 BR_MATH1(ceil)
 BR_MATH1(round)
 BR_MATH1(fabs)
-static inline double brine_f_pow(double a, double b) { return pow(a, b); }
+#define BR_MMATH1(name) \
+    double brine_m_##name(double x); \
+    static inline double brine_f_##name(double x) { return brine_m_##name(x); } \
+    static inline float brine_f_##name##f(float x) { return (float)brine_m_##name((double)x); }
+BR_MMATH1(sin)
+BR_MMATH1(cos)
+BR_MMATH1(tan)
+BR_MMATH1(asin)
+BR_MMATH1(acos)
+BR_MMATH1(atan)
+BR_MMATH1(sinh)
+BR_MMATH1(cosh)
+BR_MMATH1(tanh)
+BR_MMATH1(exp)
+BR_MMATH1(exp2)
+BR_MMATH1(expm1)
+BR_MMATH1(log)
+BR_MMATH1(log2)
+BR_MMATH1(log10)
+BR_MMATH1(log1p)
+BR_MMATH1(cbrt)
+double brine_m_pow(double a, double b);
+double brine_m_atan2(double y, double x);
+double brine_m_hypot(double x, double y);
+static inline double brine_f_pow(double a, double b) { return brine_m_pow(a, b); }
+static inline double brine_f_atan2(double y, double x) { return brine_m_atan2(y, x); }
+static inline double brine_f_hypot(double x, double y) { return brine_m_hypot(x, y); }
 /* float `%` also takes the sign of the divisor, like Python */
 static inline double brine_f_fmod(double a, double b) { double r = fmod(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
 static inline float brine_f_fmodf(float a, float b) { float r = fmodf(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }

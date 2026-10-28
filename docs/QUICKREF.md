@@ -45,6 +45,10 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
 * Integer overflow, out-of-range conversions, division by zero and
   out-of-bounds indexing stop the program with a clear message (a *panic*),
   unless the compiler proved they can't happen, in which case the check is removed.
+  Only the first panic is reported, even when many `par` threads fail at once.
+* Every thread, `main` included, has a 64 MB stack; recursion deeper than that
+  panics with "stack overflow (recursion too deep)". WebAssembly engines allow
+  less (about 10,000 to 100,000 calls, depending on the frames).
 * Integer `/` rounds down like Python's `//` (`-7 / 2 == -4`), and `%` takes the sign of
   the right side (`-7 % 2 == 1`). Use `float(a) / float(b)` for a fractional result.
 * Values are **values**: `let b = a` copies (cheaply, copy-on-write). Changing `b`
@@ -225,7 +229,7 @@ fn main() -> Result[(), str]:           # an Err prints "error: ..." and exits w
 
 `Option[T]` (`Some(value)`, `None`) and `Result[T, E]` (`Ok(value)`, `Err(error)`)
 are always available. Methods: `is_some()`, `is_none()`, `is_ok()`, `is_err()`,
-`unwrap()` (panics on `None`/`Err`), `unwrap_or(default)`, `ok()` (Result to Option).
+`unwrap()` (panics on `None`, and on `Err` with the error), `unwrap_or(default)`, `ok()` (Result to Option).
 Each use of a generic function or type with new type arguments makes a
 specialized copy, so generic code is as fast as hand-written code. A generic
 function's body is checked for each set of type arguments it's used with:
@@ -267,8 +271,10 @@ evaluation order never matters.
 ## Strings
 
 Strings are immutable UTF-8. `len(s)`, `s[i]` and slices count **bytes**;
-`s[i]` is a one-character string (ASCII text is the common case, and
-`for c in s` / `s.chars()` walk real characters).
+`s[i]` is the byte at `i` as a one-byte string: a character for ASCII text
+(the common case), a piece of one otherwise, so scan text byte by byte and
+compare with ASCII (`s[i] == " "`). A slice must not cut a character in two:
+`"aé"[0:2]` panics. `for c in s` / `s.chars()` walk real characters.
 
 ```python
 let s = "hello, brine"
@@ -313,7 +319,16 @@ Keys can be integers, `bool`, `str`, enums, or arrays/tuples/structs of those
 them: `print(x, end="")`), `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`, `cos`,
 `tan`, `exp`, `log`, `pow(x, y)`, `floor`, `ceil`, `round`, `clock()` (seconds),
 `args()` (command-line arguments), `exit(code)`, `panic(msg)`, `eprint(...)`
-(print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`.
+(print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`, `flush()`.
+
+The math functions give the same bits on every platform, natively and in
+WebAssembly: brine has its own math library (from musl) rather than the C
+library's, whose last bits differ between systems.
+
+`print` output to a terminal or a pipe is written at the end of each line; to a
+file it is buffered (and written at exit, or when `eprint`, `run` or `flush()`
+needs it out). `flush()` writes out what is buffered, such as a prompt printed
+with `end=""`.
 
 Files and processes (all failures are values, never crashes):
 
@@ -346,6 +361,7 @@ os.exe_path()           # str: the absolute path of the running program
 os.abs_path(path)       # Result[str, str]: canonical; on Windows `\\?\C:\...`
 os.name(), os.arch()    # "windows"/"macos"/"linux"..., "x86_64"/"aarch64"...
 os.pid(), os.cpu_count()                     # int (cpu_count >= 1)
+os.thread_count()       # int: threads `par` uses (BRINE_THREADS / --threads; 1 on wasm)
 os.sleep(0.5)           # seconds
 os.is_terminal(2)       # is fd 1 (stdout) / 2 (stderr) / 0 a terminal?
 os.enable_ansi()        # Windows: let the console show color codes

@@ -145,8 +145,16 @@ export async function run(wasm, options = {}) {
   try {
     instance.exports._start();
   } catch (e) {
-    if (!(e instanceof Exit)) throw e;
-    code = e.code;
+    if (!(e instanceof Exit)) {
+      // a trap: what the program printed before it is still in its buffer
+      try {
+        instance.exports.brine_flush?.();
+      } catch {}
+      if (!(e instanceof RangeError)) throw e;
+      // the engine's call stack ran out: report it as native code does
+      out[1]("\npanic: stack overflow (recursion too deep)\n");
+      code = 101;
+    } else code = e.code;
   }
   for (let fd = 0; fd < 2; fd++) {
     const rest = decoders[fd].decode();

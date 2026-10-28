@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <stddef.h>
+#include <float.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -71,6 +72,7 @@ static void br_ws_start(void) {
 #include <unistd.h>
 #include <time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #else
 #include <pthread.h>
 #include <dlfcn.h>
@@ -78,6 +80,7 @@ static void br_ws_start(void) {
 #include <time.h>
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -86,6 +89,9 @@ static void br_ws_start(void) {
 #include <netdb.h>
 #endif
 
+/* sin, exp, pow, ...: the same bits on every target */
+#include "brine_math.c"
+
 /* generated code hardcodes these (lower.br) */
 _Static_assert(offsetof(brine_arr, data) == 48, "brine_arr layout");
 _Static_assert(offsetof(brine_map, keys) == 48 && sizeof(brine_map) == 88, "brine_map layout");
@@ -93,6 +99,11 @@ _Static_assert(sizeof(brine_map_ty) == 80 && sizeof(brine_sb) == 24, "brine_map_
 
 /* ============================================================ platform layer */
 static void br_heap_exit(void);
+/* Every thread brine code runs on, `main` included, has a stack this big
+ * (reserved, not committed). */
+#define BR_STACK ((size_t)64 << 20)
+static void br_stack_enter(void);
+static void br_stack_leave(void);
 #ifdef _WIN32
 typedef CRITICAL_SECTION br_mutex;
 typedef CONDITION_VARIABLE br_cond;
@@ -108,15 +119,17 @@ typedef struct { void (*fn)(void *); void *arg; } br_tramp;
 static DWORD WINAPI br_thread_main(LPVOID p) {
     br_tramp t = *(br_tramp *)p;
     free(p);
+    br_stack_enter();
     t.fn(t.arg);
     br_heap_exit();
+    br_stack_leave();
     return 0;
 }
 static int br_thread_start(br_thread *th, void (*fn)(void *), void *arg) {
     br_tramp *t = (br_tramp *)malloc(sizeof(br_tramp));
     t->fn = fn;
     t->arg = arg;
-    *th = CreateThread(NULL, 64u << 20, br_thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    *th = CreateThread(NULL, BR_STACK, br_thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     return *th != NULL;
 }
 static void br_thread_join(br_thread th) {
@@ -173,8 +186,10 @@ typedef struct { void (*fn)(void *); void *arg; } br_tramp;
 static void *br_thread_main(void *p) {
     br_tramp t = *(br_tramp *)p;
     free(p);
+    br_stack_enter();
     t.fn(t.arg);
     br_heap_exit();
+    br_stack_leave();
     return NULL;
 }
 static int br_thread_start(br_thread *th, void (*fn)(void *), void *arg) {
@@ -183,7 +198,7 @@ static int br_thread_start(br_thread *th, void (*fn)(void *), void *arg) {
     t->arg = arg;
     pthread_attr_t at;
     pthread_attr_init(&at);
-    pthread_attr_setstacksize(&at, (size_t)64 << 20);
+    pthread_attr_setstacksize(&at, BR_STACK);
     int ok = pthread_create(th, &at, br_thread_main, t) == 0;
     pthread_attr_destroy(&at);
     return ok;
@@ -212,7 +227,19 @@ static int64_t br_rank = 0, br_size = 1;
 static void br_flush(void) { fflush(stdout); }
 static void br_gpu_settle(void);
 
+/* Set by the first panic. Only that one is reported: a thread that fails
+ * (or prints) after it waits for the exit, so a `par` region failing on many
+ * threads prints one clean message. */
+static int br_panicking;
+static BR_NORETURN void br_park(void) {
+    for (;;) br_sleep_ms(1000);
+}
+static void br_panic_claim(void) {
+    if (__atomic_exchange_n(&br_panicking, 1, __ATOMIC_SEQ_CST)) br_park();
+}
+
 void brine_panic_at(const char *loc, const char *msg) {
+    br_panic_claim();
     /* under the output lock, so other threads' output (the GPU log) can't
      * land in the middle */
     br_lock(&br_io_mu);
@@ -246,6 +273,81 @@ void brine_assert_fail(const char *loc, const char *src, brine_str *msg) {
         br_panicf(loc, "assertion failed: %s\n  message: %.*s", src, (int)msg->len, msg->data);
     br_panicf(loc, "assertion failed: %s", src);
 }
+/* ------------------------------------------------------------ stack overflow */
+/* Deep recursion runs into the guard page under the stack. Instead of dying
+ * silently (and losing what is still buffered for stdout), report it like a
+ * panic. The handler runs on a reserve: on Windows the stack guarantee, on
+ * POSIX an alternate signal stack, both set up for each thread. */
+static BR_NORETURN void br_stack_overflow(void) {
+    br_panic_claim();
+    fflush(stdout);
+    char m[128];
+    if (br_size > 1)
+        snprintf(m, sizeof m, "\npanic (rank %lld): stack overflow (recursion too deep)\n", (long long)br_rank);
+    else
+        snprintf(m, sizeof m, "\npanic: stack overflow (recursion too deep)\n");
+    fputs(m, stderr);
+    fflush(stderr);
+    _exit(101);
+}
+#ifdef _WIN32
+static LONG CALLBACK br_on_exception(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) br_stack_overflow();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static void br_stack_setup(void) { AddVectoredExceptionHandler(1, br_on_exception); }
+static void br_stack_enter(void) {
+    ULONG reserve = 64 << 10;
+    SetThreadStackGuarantee(&reserve);
+}
+static void br_stack_leave(void) {}
+#elif defined(BR_WASM)
+/* The engine traps when its call stack runs out; the runner (brine_wasi.mjs,
+ * brine_web.js) then calls this so the output before it isn't lost. */
+__attribute__((export_name("brine_flush"))) void brine_wasm_flush(void) { fflush(stdout); }
+#else
+#define BR_ALT_STACK ((size_t)64 << 10)
+/* the top of this thread's stack, when it is one of ours */
+static __thread char *br_stack_top;
+static void br_on_segv(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    char *a = (char *)si->si_addr, *top = br_stack_top;
+    /* the stack's own pages are mapped: a fault in its range (or just under
+     * it, from a big frame that skipped the guard page) is an overflow */
+    if (top && a < top && a >= top - BR_STACK - ((size_t)1 << 20)) br_stack_overflow();
+    /* anything else crashes as it would without the handler */
+    signal(sig, SIG_DFL);
+}
+static void br_stack_setup(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = br_on_segv;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+static void br_stack_enter(void) {
+    char here;
+    br_stack_top = &here;
+    stack_t ss;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_size = BR_ALT_STACK > (size_t)SIGSTKSZ ? BR_ALT_STACK : (size_t)SIGSTKSZ;
+    ss.ss_sp = malloc(ss.ss_size);
+    if (ss.ss_sp && sigaltstack(&ss, NULL) != 0) {
+        free(ss.ss_sp);
+        br_stack_top = NULL;
+    }
+}
+static void br_stack_leave(void) {
+    stack_t ss, old;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_flags = SS_DISABLE;
+    br_stack_top = NULL;
+    if (sigaltstack(&ss, &old) == 0 && old.ss_sp) free(old.ss_sp);
+}
+#endif
+
 void brine_exit(int64_t code) {
     br_flush();
     br_gpu_settle();
@@ -661,11 +763,6 @@ static brine_str *br_sub(brine_str *s, int64_t lo, int64_t hi) {
     if (hi - lo == 1) return (brine_str *)&brine_bytes[(unsigned char)s->data[lo]];
     return brine_str_new(s->data + lo, hi - lo);
 }
-brine_str *brine_str_slice(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
-    if (BR_UNLIKELY(lo < 0 || lo > hi || hi > s->len))
-        br_panicf(loc, "slice [%lld:%lld] is out of bounds for a string of length %lld", (long long)lo, (long long)hi, (long long)s->len);
-    return br_sub(s, lo, hi);
-}
 /* length of the UTF-8 character starting at p (1 for invalid bytes) */
 static int64_t br_utf8_len(const unsigned char *p, int64_t avail) {
     int64_t n = p[0] < 0x80 ? 1 : (p[0] >> 5) == 6 ? 2 : (p[0] >> 4) == 14 ? 3 : (p[0] >> 3) == 30 ? 4 : 1;
@@ -673,6 +770,26 @@ static int64_t br_utf8_len(const unsigned char *p, int64_t avail) {
     for (int64_t i = 1; i < n; i++)
         if ((p[i] & 0xc0) != 0x80) return 1;
     return n;
+}
+/* whether byte i of s is inside a character, not at its start */
+static inline bool br_mid_char(const brine_str *s, int64_t i) {
+    return i > 0 && i < s->len && ((unsigned char)s->data[i] & 0xc0) == 0x80;
+}
+static BR_NORETURN BR_COLD void br_slice_splits(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
+    int64_t b = br_mid_char(s, lo) ? lo : hi, a = b;
+    while (a > 0 && b - a < 3 && br_mid_char(s, a)) a--;
+    int64_t n = br_utf8_len((const unsigned char *)s->data + a, s->len - a);
+    if (a + n <= b)
+        br_panicf(loc, "slice [%lld:%lld] starts or ends inside a character (byte %lld)", (long long)lo, (long long)hi, (long long)b);
+    br_panicf(loc, "slice [%lld:%lld] splits the character \"%.*s\" (bytes %lld..%lld)", (long long)lo, (long long)hi, (int)n,
+              s->data + a, (long long)a, (long long)(a + n));
+}
+/* Strings are UTF-8, so a slice must not cut a character in two. */
+brine_str *brine_str_slice(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
+    if (BR_UNLIKELY(lo < 0 || lo > hi || hi > s->len))
+        br_panicf(loc, "slice [%lld:%lld] is out of bounds for a string of length %lld", (long long)lo, (long long)hi, (long long)s->len);
+    if (BR_UNLIKELY(br_mid_char(s, lo) || br_mid_char(s, hi))) br_slice_splits(s, lo, hi, loc);
+    return br_sub(s, lo, hi);
 }
 int64_t brine_ord(brine_str *s, const char *loc) {
     const unsigned char *p = (const unsigned char *)s->data;
@@ -1389,7 +1506,73 @@ brine_u128 brine_parse_u128(brine_str *s, const char *loc) {
     if (!br_parse_128(s, &neg, &u) || (neg && u != 0)) br_panicf(loc, "invalid integer: \"%.*s\"", (int)s->len, s->data);
     return u;
 }
+/* Exact powers of ten: a double holds 10^k exactly up to 10^22. */
+static const double br_pow10[23] = {1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
+                                    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+/* m * 10^e when both m and 10^e are exact doubles, so one multiply or divide
+ * rounds once and the result is correctly rounded (Clinger's fast path).
+ * False when that doesn't hold. */
+static bool br_dec_fast(uint64_t m, int e, double *out) {
+    if (m > ((uint64_t)1 << 53)) return false;
+    double d = (double)m;
+    if (e > 22 && e <= 22 + 15) {
+        /* 1234e25 is 1234000e22: move zeros into m while it stays exact */
+        for (; e > 22; e--) {
+            if (m > ((uint64_t)1 << 53) / 10) return false;
+            m *= 10;
+        }
+        d = (double)m;
+    }
+    if (e < -22 || e > 22) return false;
+    *out = e < 0 ? d / br_pow10[-e] : d * br_pow10[e];
+    return true;
+}
+/* Plain decimals (`-12.5`, `3e-7`) with at most 19 significant digits that
+ * the fast path takes, else false: strtod handles the rest. */
+static bool br_parse_f64_fast(const char *p, const char *end, double *out) {
+    bool neg = false;
+    if (p < end && (*p == '-' || *p == '+')) neg = *p++ == '-';
+    uint64_t m = 0;
+    int nd = 0, e = 0;
+    bool any = false;
+    for (; p < end && *p >= '0' && *p <= '9'; p++) {
+        any = true;
+        if (m == 0 && *p == '0') continue;
+        if (++nd > 19) return false;
+        m = m * 10 + (uint64_t)(*p - '0');
+    }
+    if (p < end && *p == '.') {
+        for (p++; p < end && *p >= '0' && *p <= '9'; p++) {
+            any = true;
+            e--;
+            if (m == 0 && *p == '0') continue;
+            if (++nd > 19) return false;
+            m = m * 10 + (uint64_t)(*p - '0');
+        }
+    }
+    if (!any) return false;
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        p++;
+        bool eneg = false;
+        if (p < end && (*p == '-' || *p == '+')) eneg = *p++ == '-';
+        if (p == end || *p < '0' || *p > '9') return false;
+        int x = 0;
+        for (; p < end && *p >= '0' && *p <= '9'; p++) {
+            if (x > 10000) return false;
+            x = x * 10 + (*p - '0');
+        }
+        e += eneg ? -x : x;
+    }
+    while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++;
+    if (p != end) return false;
+    double v = 0;
+    if (m != 0 && !br_dec_fast(m, e, &v)) return false;
+    *out = neg ? -v : v;
+    return true;
+}
 double brine_parse_f64(brine_str *s, const char *loc) {
+    double fast;
+    if (br_parse_f64_fast(s->data, s->data + s->len, &fast)) return fast;
     char *end;
     errno = 0;
     double v = strtod(s->data, &end);
@@ -1882,9 +2065,33 @@ void brine_sb_fmt_i128(brine_sb *sb, brine_i128 v, int kind) {
     else
         brine_sb_i128(sb, v);
 }
-/* shortest round-trip representation, Python style */
-static void br_fmt_float(brine_sb *sb, double v, int maxprec, int is_f32) {
-    char e[64], buf[400];
+/* |v| rounded to p significant digits: the digits go to d, the result is the
+ * decimal exponent. Whether they read back as v is in *back. */
+static int br_digits(double v, int p, char *d, int is_f32, bool *back) {
+    char e[40];
+    snprintf(e, sizeof e, "%.*e", p - 1, v);
+    const char *q = e + (e[0] == '-');
+    uint64_t m = 0;
+    int n = 0;
+    for (; *q != 'e'; q++)
+        if (*q != '.') {
+            d[n++] = *q;
+            m = m * 10 + (uint64_t)(*q - '0');
+        }
+    int x = atoi(q + 1);
+    double r;
+    if (!(p <= 15 && br_dec_fast(m, x - (p - 1), &r))) r = fabs(strtod(e, NULL));
+    double a = fabs(v);
+    *back = is_f32 ? (float)r == (float)a : r == a;
+    return x;
+}
+/* The shortest representation that reads back as v, Python style (repr):
+ * 0.1, 1e+16, 2.5e-08. A decimal of up to 15 digits (6 for an f32) reads
+ * back as a normal double that prints as itself at that precision, so when
+ * the 15 digits read back the shortest is them without their trailing
+ * zeros; otherwise it takes 16 or 17. Subnormals, with fewer bits, search
+ * from 1 digit up. */
+static void br_fmt_float(brine_sb *sb, double v, int is_f32) {
     if (isnan(v)) {
         br_sb_cstr(sb, "nan");
         return;
@@ -1893,28 +2100,48 @@ static void br_fmt_float(brine_sb *sb, double v, int maxprec, int is_f32) {
         br_sb_cstr(sb, v < 0 ? "-inf" : "inf");
         return;
     }
-    int p;
-    for (p = 1; p <= maxprec; p++) {
-        snprintf(e, sizeof e, "%.*e", p - 1, v);
-        double back = strtod(e, NULL);
-        if (is_f32 ? ((float)back == (float)v) : (back == v)) break;
+    char d[24], buf[64];
+    int hi = is_f32 ? 9 : 17, lo = is_f32 ? 6 : 15;
+    double a = fabs(v);
+    if (a == 0 || a < (is_f32 ? (double)FLT_MIN : DBL_MIN)) lo = 1;
+    int p = lo, x = 0;
+    bool back = false;
+    for (; p < hi; p++) {
+        x = br_digits(v, p, d, is_f32, &back);
+        if (back) break;
     }
-    if (p > maxprec) p = maxprec;
-    snprintf(e, sizeof e, "%.*e", p - 1, v);
-    char *ep = strchr(e, 'e');
-    int x = ep ? atoi(ep + 1) : 0;
+    if (!back) x = br_digits(v, p = hi, d, is_f32, &back);
+    while (p > 1 && d[p - 1] == '0') p--;
+    int n = 0;
+    if (signbit(v)) buf[n++] = '-';
     if (x >= -4 && x < 16) {
-        int dec = p - 1 - x;
-        if (dec < 0) dec = 0;
-        snprintf(buf, sizeof buf, "%.*f", dec, v);
-        if (!strchr(buf, '.')) strcat(buf, ".0");
-        br_sb_cstr(sb, buf);
+        if (x < 0) {
+            buf[n++] = '0';
+            buf[n++] = '.';
+            for (int i = 0; i < -x - 1; i++) buf[n++] = '0';
+            for (int i = 0; i < p; i++) buf[n++] = d[i];
+        } else if (is_f32 && p <= x) {
+            /* a big f32 integer prints all its digits: 16777216.0, not 16777220.0
+             * (for a double below 10^16 the two are the same) */
+            n += snprintf(buf + n, sizeof buf - (size_t)n, "%.0f.0", a);
+        } else {
+            for (int i = 0; i <= x; i++) buf[n++] = i < p ? d[i] : '0';
+            buf[n++] = '.';
+            if (p <= x + 1) buf[n++] = '0';
+            for (int i = x + 1; i < p; i++) buf[n++] = d[i];
+        }
     } else {
-        br_sb_cstr(sb, e);
+        buf[n++] = d[0];
+        if (p > 1) {
+            buf[n++] = '.';
+            for (int i = 1; i < p; i++) buf[n++] = d[i];
+        }
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "e%c%02d", x < 0 ? '-' : '+', x < 0 ? -x : x);
     }
+    brine_sb_cat(sb, buf, n);
 }
-void brine_sb_f64(brine_sb *sb, double v) { br_fmt_float(sb, v, 17, 0); }
-void brine_sb_f32(brine_sb *sb, float v) { br_fmt_float(sb, (double)v, 9, 1); }
+void brine_sb_f64(brine_sb *sb, double v) { br_fmt_float(sb, v, 0); }
+void brine_sb_f32(brine_sb *sb, float v) { br_fmt_float(sb, (double)v, 1); }
 void brine_sb_bool(brine_sb *sb, bool v) { br_sb_cstr(sb, v ? "true" : "false"); }
 static void br_sb_bin(brine_sb *sb, uint64_t v) {
     char b[65];
@@ -1957,7 +2184,10 @@ void brine_sb_fmt_u64(brine_sb *sb, uint64_t v, int kind) {
 }
 void brine_sb_fmt_f64(brine_sb *sb, double v, int prec, int kind) {
     char b[400];
-    if (kind == 'f') {
+    /* spelled the same everywhere (C libraries print `-nan(ind)`, `nan`, ...) */
+    if (isnan(v) || isinf(v)) {
+        brine_sb_f64(sb, v);
+    } else if (kind == 'f') {
         snprintf(b, sizeof b, "%.*f", prec < 0 ? 6 : prec, v);
         br_sb_cstr(sb, b);
     } else if (kind == 'e') {
@@ -1987,21 +2217,47 @@ brine_str *brine_sb_finish(brine_sb *sb) {
     sb->p = NULL;
     return s;
 }
+/* stdout going to a terminal or a pipe is flushed at the end of each line,
+ * since something may be reading it as it comes (a person, or a program
+ * talking a line protocol); to a file it's written when the buffer fills.
+ * (C's line buffering would do, but the Windows C library has none.) */
+static int br_out_lines;
+static int br_stdout_streams(void) {
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h == NULL || h == INVALID_HANDLE_VALUE) return 0;
+    DWORD t = GetFileType(h), mode;
+    /* NUL is a character device too, but not a console */
+    return t == FILE_TYPE_PIPE || (t == FILE_TYPE_CHAR && GetConsoleMode(h, &mode));
+#else
+    struct stat st;
+    if (fstat(1, &st) != 0) return 0;
+    return S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) || isatty(1);
+#endif
+}
 /* write a finished builder (and free it); `print` adds its own `end` */
 void brine_out_sb(brine_sb *sb) {
+    if (BR_UNLIKELY(__atomic_load_n(&br_panicking, __ATOMIC_RELAXED))) br_park();
     br_lock(&br_io_mu);
     fwrite(sb->p, 1, (size_t)sb->len, stdout);
+    if (br_out_lines && memchr(sb->p, '\n', (size_t)sb->len)) fflush(stdout);
     br_unlock(&br_io_mu);
     free(sb->p);
     sb->p = NULL;
 }
 void brine_err_sb(brine_sb *sb) {
+    if (BR_UNLIKELY(__atomic_load_n(&br_panicking, __ATOMIC_RELAXED))) br_park();
     br_lock(&br_io_mu);
     fflush(stdout);
     fwrite(sb->p, 1, (size_t)sb->len, stderr);
     br_unlock(&br_io_mu);
     free(sb->p);
     sb->p = NULL;
+}
+void brine_flush(void) {
+    br_lock(&br_io_mu);
+    fflush(stdout);
+    br_unlock(&br_io_mu);
 }
 void brine_print_sb(brine_sb *sb) {
     brine_sb_cat(sb, "\n", 1);
@@ -2515,6 +2771,14 @@ static void br_gpu_logf(const char *fmt, ...) {
     fflush(stderr);
     br_unlock(&br_io_mu);
     va_end(ap);
+}
+
+/* "; cpu estimate X ms" for the log, or nothing when the CPU time isn't known
+ * yet (BRINE_GPU=on sends work to the GPU before the CPU has run any) */
+static const char *br_gpu_cpu_est(char *buf, double cpu_s) {
+    if (cpu_s <= 0) return "";
+    snprintf(buf, 48, "; cpu estimate %.3f ms", cpu_s * 1e3);
+    return buf;
 }
 
 /* ------------------------------------------------------------ devices */
@@ -3536,9 +3800,11 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
         br_gpu.bw = 0.5 * (br_gpu.bw + (double)bytes / copy);
         br_unlock(&br_gpu.mu);
     }
-    if (br_gpu.log)
-        br_gpu_logf("%s %s n=%lld -> gpu %.3f ms (kernel %.3f ms, copies %.3f ms, %.1f MB; cpu estimate %.3f ms)", k->where,
-                    br_gpu_kind(k), (long long)n, (t3 - t0) * 1e3, kern * 1e3, copy * 1e3, (double)bytes / 1e6, c.cpu_s * 1e3);
+    if (br_gpu.log) {
+        char est[48];
+        br_gpu_logf("%s %s n=%lld -> gpu %.3f ms (kernel %.3f ms, copies %.3f ms, %.1f MB%s)", k->where, br_gpu_kind(k),
+                    (long long)n, (t3 - t0) * 1e3, kern * 1e3, copy * 1e3, (double)bytes / 1e6, br_gpu_cpu_est(est, c.cpu_s));
+    }
     return n;
 }
 
@@ -3710,9 +3976,12 @@ static int br_gpu_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx
         if (bytes > (1 << 20) && t1 > t0) br_gpu.bw = 0.5 * (br_gpu.bw + (double)bytes / (t1 - t0));
         br_unlock(&br_gpu.mu);
     }
-    if (br_gpu.log)
-        br_gpu_logf("%s %s n=%lld -> gpu %.3f ms (kernels %.3f ms, copies %.3f ms, %.1f MB; cpu estimate %.3f ms)", k->where,
-                    br_gpu_kind(k), (long long)n, (t2 - t0) * 1e3, (t2 - t1) * 1e3, (t1 - t0) * 1e3, (double)bytes / 1e6, c.cpu_s * 1e3);
+    if (br_gpu.log) {
+        char est[48];
+        br_gpu_logf("%s %s n=%lld -> gpu %.3f ms (kernels %.3f ms, copies %.3f ms, %.1f MB%s)", k->where, br_gpu_kind(k),
+                    (long long)n, (t2 - t0) * 1e3, (t2 - t1) * 1e3, (t1 - t0) * 1e3, (double)bytes / 1e6,
+                    br_gpu_cpu_est(est, c.cpu_s));
+    }
     return 1;
 }
 
@@ -4378,7 +4647,34 @@ static void br_utf8_args(void) {
 }
 #endif
 
+#ifndef BR_WASM
+/* The OS gives the first thread a small stack (1 MB on Windows, 8 MB on
+ * Linux) while `par` threads get BR_STACK: so that code that works in `par`
+ * works outside it too, `main` runs again on a thread of ours. */
+extern int main(int argc, char **argv);
+static int br_main_argc;
+static char **br_main_argv;
+static void br_main_thread(void *p) {
+    (void)p;
+    exit(main(br_main_argc, br_main_argv));
+}
+#endif
+
 void brine_rt_init(int argc, char **argv) {
+#ifndef BR_WASM
+    static int on_our_thread;
+    if (!on_our_thread) {
+        on_our_thread = 1;
+        br_stack_setup();
+        br_main_argc = argc;
+        br_main_argv = argv;
+        br_thread th;
+        if (br_thread_start(&th, br_main_thread, NULL)) {
+            br_thread_join(th);
+            exit(0); /* not reached: the thread exits the process */
+        }
+    }
+#endif
     br_leakcheck = getenv("BRINE_LEAKCHECK") != NULL;
     br_heap_init();
     br_argc = argc;
@@ -4398,6 +4694,7 @@ void brine_rt_init(int argc, char **argv) {
     br_gpu_setup();
     static char outbuf[1 << 16];
     setvbuf(stdout, outbuf, _IOFBF, sizeof outbuf);
+    br_out_lines = br_stdout_streams();
     br_world_init();
 }
 
@@ -4644,6 +4941,8 @@ static void br_quote_arg(brine_sb *sb, const char *a) {
 /* Run a program and wait for it. false (with *err set) if it couldn't be started. */
 bool brine_run(brine_arr *argv, int64_t *code, brine_str **err) {
     *code = 0;
+    /* the child writes to the same stdout: what we printed comes first */
+    brine_flush();
     if (argv->len == 0) {
         *err = br_strf("run() needs a program name, but the command list is empty");
         return false;
@@ -5242,6 +5541,7 @@ int64_t brine_os_cpu_count(void) {
     int n = br_ncpu();
     return n > 0 ? n : 1;
 }
+int64_t brine_os_thread_count(void) { return br_threads(); }
 
 void brine_os_sleep(double seconds) {
     if (!(seconds > 0)) return;
@@ -5792,6 +6092,7 @@ static bool br_start(br_proc *rec, char **cv, int64_t n, char **ek, char **ev, i
 
 bool brine_os_spawn(brine_arr *cmd, brine_map *env, bool capture, bool in, int64_t *handle, brine_str **err) {
     *handle = 0;
+    if (!capture) brine_flush();
     if (!br_proc_mu_ready) {
         br_mutex_init(&br_proc_mu);
         br_proc_mu_ready = 1;
@@ -6010,13 +6311,27 @@ BR_X_MATH1(sqrt)
 BR_X_MATH1(sin)
 BR_X_MATH1(cos)
 BR_X_MATH1(tan)
+BR_X_MATH1(asin)
+BR_X_MATH1(acos)
+BR_X_MATH1(atan)
+BR_X_MATH1(sinh)
+BR_X_MATH1(cosh)
+BR_X_MATH1(tanh)
 BR_X_MATH1(exp)
+BR_X_MATH1(exp2)
+BR_X_MATH1(expm1)
 BR_X_MATH1(log)
+BR_X_MATH1(log2)
+BR_X_MATH1(log10)
+BR_X_MATH1(log1p)
+BR_X_MATH1(cbrt)
 BR_X_MATH1(floor)
 BR_X_MATH1(ceil)
 BR_X_MATH1(round)
 BR_X_MATH1(fabs)
 double brine_x_f_pow(double a, double b) { return brine_f_pow(a, b); }
+double brine_x_f_atan2(double y, double x) { return brine_f_atan2(y, x); }
+double brine_x_f_hypot(double x, double y) { return brine_f_hypot(x, y); }
 double brine_x_f_fmod(double a, double b) { return brine_f_fmod(a, b); }
 float brine_x_f_fmodf(float a, float b) { return brine_f_fmodf(a, b); }
 double brine_x_f_fmin(double a, double b) { return brine_f_fmin(a, b); }
