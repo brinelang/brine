@@ -117,6 +117,7 @@ be a rule that can be broken. Use `assert` explicitly instead.
 | `par for i in lo..hi:` | Data-parallel loop over a thread pool. |
 | `par [e for i in lo..hi]` | Parallel map / comprehension. |
 | `par sum(e for i in lo..hi)` | Parallel reduction (`sum`, `product`, `min`, `max`, `any`, `all`). |
+| `par first(e for i in lo..hi)` | Parallel search: the lowest-index `Some` of `Option` values, or `None`. |
 | `par(f(a), g(b))` | Fork-join of independent expressions; returns a tuple. |
 
 **Race freedom is a compile-time rule.** Inside a `par` body, variables from the
@@ -143,6 +144,9 @@ there are few leaves for the threads (a `par sum` of a few expensive calls), eac
 element runs as a task of its own and the leaves are folded from their values
 afterwards, in the same order. `any` and `all` stop starting elements once one
 decides the result, like their sequential loop; every element before it still runs.
+`par first` is the same search with a deterministic answer: the elements are split
+into chunks, each keeps its first `Some`, and the lowest chunk's wins; chunks after
+one that found a value stop.
 
 Threads: `BRINE_THREADS=n` or `brine run --threads n` (default: all cores).
 

@@ -940,6 +940,12 @@ static inline int64_t brine_par_plan(int64_t n) { return n <= 0 ? 0 : (n < 256 ?
 void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, void *ctx);
 void brine_par_tasks(int64_t k, brine_task_fn fn, void *ctx);
 
+/* `par first(...)`: chunk c of brine_par_run stops once a lower chunk found a
+ * value. *stop (INT64_MAX at first) is the lowest chunk that did. */
+int64_t brine_par_chunks(int64_t n);
+bool brine_first_stopped(const int64_t *stop, int64_t chunk);
+void brine_first_found(int64_t *stop, int64_t chunk);
+
 /* Parallel reductions (`par sum(...)` etc.) have one combination order, which
  * depends only on the element count n: elements are split into leaves of
  * BRINE_LEAF consecutive elements, each folded left to right by the leaf

@@ -5818,6 +5818,10 @@ struct Lower:
     fn reduce(ref self, r: Reducer, arg: Expr, e: Expr) -> int:
         match arg.kind:
             case ExprKind.Comp(c):
+                if r == Reducer.First:
+                    if c.par:
+                        return self.par_first(c, e, arg.local, arg.caps)
+                    return self.seq_first(c, e, arg.local)
                 if c.par:
                     return self.par_reduce(r, c, e, arg.local, arg.caps)
                 let (acc, has) = self.reduce_init(r, e.ty)
@@ -5842,6 +5846,9 @@ struct Lower:
                 acc = self.cx.fb.konst(K.Bool, 0)
             case Reducer.All:
                 acc = self.cx.fb.konst(K.Bool, 1)
+            case Reducer.First:
+                # lowered by `seq_first` / `par_first`
+                acc = self.cx.fb.konst(K.Ptr, 0)
         let has = self.cx.fb.konst(K.Bool, 0)
         return (acc, has)
 
@@ -5911,6 +5918,115 @@ struct Lower:
                 self.cx.fb.mov(has, t)
                 self.cx.fb.jmp(brk)
                 self.cx.fb.place(skip)
+            case Reducer.First:
+                pass
+
+    # `first(...)`: the first `Some` of the generator, or `None`.
+    fn seq_first(ref self, c: Comp, e: Expr, local: int) -> int:
+        let out = self.cx.fb.vreg(K.Ptr)
+        let none = self.variant_const(e.ty, self.variant_index(cg_enum_id(e.ty), "None", 1))
+        self.cx.fb.mov(out, none)
+        let dom = self.domain(c.iter, false)
+        let lc = self.loop_open(dom, local)
+        self.first_step(c, e.ty, out, lc, -1)
+        self.loop_close(dom, lc)
+        return self.temp(out, e.ty)
+
+    # One element of `first`: evaluate it and, when it is `Some`, move it to
+    # `out` and leave the loop (after telling the runtime, for `par first`,
+    # with `stopp` the context's stop word).
+    fn first_step(ref self, c: Comp, ty: Ty, out: int, lc: LoopCtl, stopp: int):
+        match c.filter:
+            case Some(f):
+                self.emit_filter(f, lc.cont)
+            case None:
+                pass
+        self.push_frame()
+        let v = self.owned(c.body)
+        self.pop_frame()
+        let some = self.variant_index(cg_enum_id(ty), "Some", 0)
+        let tag = self.cx.fb.load(K.I64, v, 8)
+        let sv = self.cx.fb.konst(K.I64, some)
+        let is = self.cx.fb.cmp(Op.Eq, tag, sv)
+        let miss = self.cx.fb.label()
+        self.cx.fb.brnot(is, miss)
+        self.cx.fb.mov(out, v)
+        if stopp >= 0:
+            self.cx.fb.call_void("brine_first_found", [stopp, 1])
+        self.cx.fb.jmp(lc.brk)
+        self.cx.fb.place(miss)
+        self.release(v, ty)
+
+    # `par first(...)`: the elements are split into chunks like a `par for`;
+    # each chunk stores its first `Some` (or `None`) in its slot of an array,
+    # and the lowest slot with a value is the result, whatever the thread
+    # count. Chunks after one that found a value stop early.
+    fn par_first(ref self, c: Comp, e: Expr, local: int, captures: [int]) -> int:
+        let loc = self.loc(e.span)
+        let dom = self.domain(c.iter, false)
+        let n = self.dom_count(dom, e.span)
+        let k = self.cx.fb.call(K.I64, "brine_par_chunks", [n])
+        let res = self.new_arr(e.ty, k, loc)
+        self.register(res, Ty.Array(e.ty))
+        var extra = self.dom_fields(dom)
+        extra.push(("res", Ty.Str, res))
+        extra.push(("stop", Ty.Int(IntTy.I64), self.cx.fb.konst(K.I64, 9223372036854775807)))
+        let pc = self.par_ctx(captures, extra)
+        let fp = self.cx.fb.global(f"br_par_{pc.id}")
+        let zero = self.cx.fb.konst(K.I64, 0)
+        self.cx.fb.call_void("brine_par_run", [zero, n, k, fp, pc.ctx])
+
+        # the lowest slot holding a value
+        let out = self.cx.fb.vreg(K.Ptr)
+        let eid = cg_enum_id(e.ty)
+        let none = self.variant_const(e.ty, self.variant_index(eid, "None", 1))
+        self.cx.fb.mov(out, none)
+        let some = self.cx.fb.konst(K.I64, self.variant_index(eid, "Some", 0))
+        let data = self.cx.fb.load(K.Ptr, res, 48)
+        let i = self.cx.fb.copy_of(zero)
+        let one = self.cx.fb.konst(K.I64, 1)
+        let head = self.cx.fb.label()
+        let done = self.cx.fb.label()
+        let next = self.cx.fb.label()
+        self.cx.fb.place(head)
+        let more = self.cx.fb.cmp(Op.Lt, i, k)
+        self.cx.fb.brnot(more, done)
+        let p = self.cx.fb.elem(data, i, 8)
+        let v = self.cx.fb.load(K.Ptr, p, 0)
+        let tag = self.cx.fb.load(K.I64, v, 8)
+        let hit = self.cx.fb.cmp(Op.Eq, tag, some)
+        self.cx.fb.brnot(hit, next)
+        self.retain(v, e.ty)
+        self.cx.fb.mov(out, v)
+        self.cx.fb.jmp(done)
+        self.cx.fb.place(next)
+        let i2 = self.cx.fb.bin(Op.Add, K.I64, i, one)
+        self.cx.fb.mov(i, i2)
+        self.cx.fb.jmp(head)
+        self.cx.fb.place(done)
+
+        let saved = self.lift_enter(
+            f"br_par_{pc.id}",
+            [K.Ptr, K.I64, K.I64, K.I64],
+            pc,
+            captures,
+            []
+        )
+        let found = self.cx.fb.vreg(K.Ptr)
+        let none2 = self.variant_const(e.ty, self.variant_index(eid, "None", 1))
+        self.cx.fb.mov(found, none2)
+        let stopp = self.cx.fb.offset(0, pc.off("stop"))
+        let lc = self.chunk_open(dom, pc, local)
+        let stopped = self.cx.fb.call(K.Bool, "brine_first_stopped", [stopp, 1])
+        self.cx.fb.br(stopped, lc.brk)
+        self.first_step(c, e.ty, found, lc, stopp)
+        self.chunk_close(lc)
+        let r = self.cx.fb.load(K.Ptr, 0, pc.off("res"))
+        let rdata = self.cx.fb.load(K.Ptr, r, 48)
+        let slot = self.cx.fb.elem(rdata, 1, 8)
+        self.cx.fb.store(slot, 0, found)
+        self.lift_exit(saved)
+        return self.temp(out, e.ty)
 
     fn reduce_finish(ref self, r: Reducer, has: int, span: Span):
         if r == Reducer.Min or r == Reducer.Max:
@@ -6567,6 +6683,8 @@ fn reducer_code(r: Reducer) -> int:
             return 4
         case Reducer.All:
             return 5
+        case Reducer.First:
+            return 6
 
 fn kind_code(k: K) -> int:
     match k:

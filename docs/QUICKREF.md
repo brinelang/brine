@@ -393,12 +393,15 @@ compiled (path: a string literal, relative to the file containing the call;
 `\r\n` becomes `\n`). It works in `const`s too: `const HELP = embed("help.txt")`.
 Reductions over generators: `sum(x * x for x in xs)`, `product`, `min`, `max`,
 `any(x < 0 for x in xs)`, `all(...)`. `min`/`max` of an empty sequence panic.
+`first(Some(x) if p(x) else None for x in xs)` is the first `Some` of a generator
+of options (or of an array of them), or `None`; it stops at that element.
 
 ## Parallelism (data-race free by construction)
 
 ```python
 let ys = par [f(x) for x in xs]              # parallel map
 let total = par sum(x * x for x in xs)        # parallel reduction
+let at = par first(Some(i) if ok(i) else None for i in 0..n)  # parallel search
 var out = [0.0] * n
 par for i in 0..n:                            # parallel loop
     out[i] = xs[i] * 2.0                      # outer arrays: only out[i] (or out[k*i + c])
@@ -423,6 +426,8 @@ result in that order traps. Only the scheduling adapts: a reduction over a few
 expensive elements still uses all the threads. `par any`/`par all` stop
 starting new work once an element decides the result; the elements before it
 always run, so a panic the sequential loop would reach still happens.
+`par first(...)` is the lowest-index `Some`, like `first`, on any thread count;
+the elements before it all run, those after it may not.
 `BRINE_THREADS=n` or `brine run --threads n` sets the thread count.
 
 **GPUs.** `par for`, `par [...]` and `par` reductions also run on a GPU (NVIDIA

@@ -2501,6 +2501,18 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
     br_unlock(&br_pool.job_lock);
 }
 
+int64_t brine_par_chunks(int64_t n) { return brine_par_plan(n); }
+
+bool brine_first_stopped(const int64_t *stop, int64_t chunk) {
+    return __atomic_load_n(stop, __ATOMIC_RELAXED) < chunk;
+}
+
+void brine_first_found(int64_t *stop, int64_t chunk) {
+    int64_t cur = __atomic_load_n(stop, __ATOMIC_RELAXED);
+    while (chunk < cur && !__atomic_compare_exchange_n(stop, &cur, chunk, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
+
 typedef struct {
     brine_task_fn fn;
     void *ctx;
