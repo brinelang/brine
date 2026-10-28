@@ -13,7 +13,7 @@
 # `(not f)` (= f.not_()). `diff` and `eval` make it easy to compare two versions
 # of the solver on many queries.
 import solver
-from solver import Lin, F, AtomSet, prove_, add_i128, mul_i128, neg_i128, I128_MAX, I128_MIN, ATOM_UNKNOWN
+from solver import Lin, F, AtomSet, prove_, prove_full, GAVE_UP, NOT_PROVED, add_i128, mul_i128, neg_i128, I128_MAX, I128_MIN, ATOM_UNKNOWN
 
 struct Parser:
     toks: [str]
@@ -184,6 +184,18 @@ fn deep_split(k: int) -> str:
     for i in 1..k + 1:
         s += f" | (ne 0 {i}:1)"
     return s + " | (or (ge -1 0:1) (ge -2 0:1) (ge -3 0:1)) | (ge 0 0:-1)"
+
+# `k` (odd) values in -1..1, none 0, that sum to 0: a contradiction by parity
+# that no case short of fixing every value shows, so about 2^k cases.
+fn parity(k: int) -> str:
+    var r = ""
+    var s = ""
+    var e = "(eq 0"
+    for i in 0..k:
+        r += f" {i}:-1:1"
+        s += f" | (ne 0 {i}:1)"
+        e += f" {i}:1"
+    return r + " | false" + s + " | " + e + ")"
 
 # Every constraint `Σ k_i·x_i + c >= 0` over atoms 0..n-1 with each k_i in `ks`.
 fn dense(n: int, ks: [int], c: int) -> str:
@@ -486,9 +498,21 @@ test "goal with not":
     assert pr(" | (not (and (ge -1 0:1) (ge -1 1:1))) | (ge 0 0:-1)")
 
 test "the search budget counts contradictory cases too":
-    # 3 * 2^8 contradictory cases fit in MAX_NODES; 3 * 2^12 don't
+    # 2^9 contradictory cases fit in MAX_NODES; 2^15 don't
+    assert pr(parity(9))
+    assert not pr(parity(15))
+
+test "out of budget, the search tries again probing every case":
+    # the plain search splits the `!=`s first (3 * 2^12 cases); the second
+    # pass sees that each case of the 3-way disjunction contradicts x0 <= 0
     assert pr(deep_split(8))
-    assert not pr(deep_split(12))
+    assert pr(deep_split(12))
+
+test "running out of budget is told apart from a satisfiable query":
+    let q = parse_query(parity(15))
+    assert prove_full(q.facts, q.goal, q.ranges) == GAVE_UP
+    let q2 = parse_query(" | false | (ne 0 0:1) | (ge 0 0:1) | (ge 1 0:-1)")
+    assert prove_full(q2.facts, q2.goal, q2.ranges) == NOT_PROVED
 
 # ------------------------------------------------------------ prove: booleans
 
@@ -602,18 +626,18 @@ test "overflow substituting an equality gives don't know":
     )
     assert pr(" | false | (eq 0 0:1 1:-2) | (ge -1 0:2) | (ge 0 1:-1) | (ge 0 1:1)")
 
-test "split order decides whether an overflowing case is reached":
+test "known values close a branch before an overflowing case is reached":
     let ovf2 = "(or (ne -170141183460469231731687303715884105728 1:1) (ne -170141183460469231731687303715884105728 1:1))"
     let ovf3 = "(or (ne -170141183460469231731687303715884105728 1:1) (ne -170141183460469231731687303715884105728 1:1) (ne -170141183460469231731687303715884105728 1:1))"
     let two = "(or (ge -1 0:1) (ge -1 0:-1))"
     let three = "(or (ge -1 0:1) (ge -1 0:-1) (ge -2 0:1))"
-    # the shorter disjunction is split first; its cases are all contradictory,
-    # so the overflowing one is never looked at
+    # with x = 0 known, every case of `two` and `three` is false, so the
+    # branch closes before the overflowing disjunction is looked at
     assert pr(" | false | (eq 0 0:1) | " + two + " | " + ovf3)
-    assert not pr(" | false | (eq 0 0:1) | " + three + " | " + ovf2)
-    # equal lengths: which one goes first depends on the order of the facts
-    assert pr(" | false | (eq 0 0:1) | " + two + " | " + ovf2)
-    assert not pr(" | false | (eq 0 0:1) | " + ovf2 + " | " + two)
+    assert pr(" | false | (eq 0 0:1) | " + three + " | " + ovf2)
+    assert pr(" | false | (eq 0 0:1) | " + ovf2 + " | " + two)
+    # with only the overflowing disjunction left, it must be split: don't know
+    assert not pr(" | false | (eq 0 0:1) | " + ovf2)
 
 # ------------------------------------------------------------ prove: budgets
 

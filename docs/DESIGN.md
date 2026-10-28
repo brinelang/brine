@@ -89,7 +89,8 @@ Two kinds of obligations:
   * `invariant` — loop invariant; proven on entry and preserved by every iteration.
   * `prove e` — an inline claim.
 * **Implicit** obligations come from the language's own safety rules: array bounds,
-  division by zero, integer overflow, narrowing conversions, `pop()` on empty arrays.
+  division by zero, integer overflow (also of `x += y`, `-x` and `abs`), shift amounts,
+  narrowing conversions, negative array lengths, `pop()` on empty arrays, missing map keys.
   They are **proven when possible and otherwise checked at runtime** (and the check can
   never be disabled). `brine check --report` lists every remaining runtime check so they
   can be eliminated by adding facts.
