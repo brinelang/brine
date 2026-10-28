@@ -142,7 +142,7 @@ fn builtin_by_name(n: str) -> Option[Builtin]:
 
 fn is_messageable(t: Ty) -> bool:
     match t:
-        case Ty.Int(IntTy.I64) | Ty.Float(FloatTy.F64) | Ty.Bool | Ty.Str:
+        case Ty.Int(_) | Ty.Float(_) | Ty.Bool | Ty.Str:
             return true
         case Ty.Array(e):
             return is_messageable(e)
@@ -4282,7 +4282,7 @@ struct Checker:
         if not t.is_error() and not is_messageable(t):
             let tn = self.tn(t)
             self.err(
-                diag.error("E0319", f"values of type {tn} can't be sent between processes yet").label(sp, "not messageable").note("messageable types: int, float, bool, str, and arrays of those (e.g. [int], [[float]], [str])")
+                diag.error("E0319", f"values of type {tn} can't be sent between processes yet").label(sp, "not messageable").note("messageable types: integers and floats of any width, bool, str, and arrays of those (e.g. [u8], [[float]], [str])")
             )
 
     fn check_world(
@@ -4319,7 +4319,7 @@ struct Checker:
                         d = d.with_help(f"did you mean `world.{b}`?").fix(name_span, b, "replace")
                     case None:
                         d = d.note(
-                            "world functions: rank, size, barrier, broadcast, sum, min, max, gather_all, shift, exchange"
+                            "world functions: rank, size, barrier, broadcast, sum, min, max, any, all, gather_all, shift, exchange"
                         )
                 self.err(d)
                 return Ty.Error
@@ -4339,10 +4339,22 @@ struct Checker:
                 self.nargs(wname, ref args, 0, span)
                 return Ty.Unit
             case WorldOp.Shift:
-                if not self.nargs(wname, ref args, 2, span):
+                if len(args) < 2 or len(args) > 3:
+                    self.err(
+                        diag.error("E0302", f"`world.shift` takes 2 or 3 arguments but {len(args)} were given").label(span, "wrong number of arguments").with_help("`world.shift(v, by)` wraps around; `world.shift(v, by, edge)` doesn't: a rank with nothing to receive (no rank `by` before it) gets `edge`")
+                    )
+                    self.check_all(ref args)
                     return Ty.Error
                 let vt = self.check_expr(ref args[0].expr, exp)
                 self.msg_err(vt, args[0].expr.span)
+                if len(args) == 3:
+                    let et = self.check_expr(ref args[2].expr, Some(vt))
+                    if not et.is_error() and not vt.is_error() and et != vt:
+                        let en = self.tn(et)
+                        let vn = self.tn(vt)
+                        self.err(
+                            diag.error("E0301", f"the edge value of `world.shift` must have the type of the value shifted ({vn}), found {en}").label(args[2].expr.span, f"expected {vn}")
+                        )
                 let t = self.check_expr(ref args[1].expr, Some(int_ty()))
                 if not t.is_error() and t != int_ty():
                     self.err(
@@ -4378,11 +4390,26 @@ struct Checker:
                 if not self.nargs(wname, ref args, 1, span):
                     return Ty.Error
                 let t = self.check_expr(ref args[0].expr, exp)
-                if not t.is_error() and t != int_ty() and t != float_ty():
+                var ok = t == int_ty() or t == float_ty()
+                match t:
+                    case Ty.Array(el):
+                        ok = el == int_ty() or el == float_ty()
+                    case _:
+                        pass
+                if not t.is_error() and not ok:
                     self.err(
-                        diag.error("E0319", f"`{wname}` works on `int` or `float`, found " + self.tn(t)).label(args[0].expr.span, "unsupported type")
+                        diag.error("E0319", f"`{wname}` works on `int`, `float`, `[int]` or `[float]` (element by element), found " + self.tn(t)).label(args[0].expr.span, "unsupported type")
                     )
                 return t
+            case WorldOp.Any | WorldOp.All:
+                if not self.nargs(wname, ref args, 1, span):
+                    return Ty.Error
+                let t = self.check_expr(ref args[0].expr, Some(Ty.Bool))
+                if not t.is_error() and t != Ty.Bool:
+                    self.err(
+                        diag.error("E0319", f"`{wname}` works on `bool`, found " + self.tn(t)).label(args[0].expr.span, "not a bool")
+                    )
+                return Ty.Bool
             case WorldOp.GatherAll:
                 if not self.nargs(wname, ref args, 1, span):
                     return Ty.Error

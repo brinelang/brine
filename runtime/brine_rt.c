@@ -4388,6 +4388,26 @@ void brine_world_shift(const char *d, const void *v, void *out, int64_t by, cons
     br_take((br_rank - k + br_size) % br_size, d, out, loc);
 }
 
+/* `world.shift(v, by, edge)`: no wrapping around; a rank with no rank `by`
+ * before it (rank - by is outside the world) gets `edge`. */
+void brine_world_shift_edge(const char *d, const void *v, void *out, int64_t by, const void *edge, const char *loc) {
+    if (br_size > 1) br_coll(BR_OP_SHIFT, loc);
+    if (by == 0) {
+        br_copy_val(d, v, out);
+        return;
+    }
+    if (by >= br_size || by <= -br_size) {
+        br_copy_val(d, edge, out);
+        return;
+    }
+    int64_t to = br_rank + by, from = br_rank - by;
+    if (to >= 0 && to < br_size) br_put(to, d, v, loc);
+    if (from >= 0 && from < br_size)
+        br_take(from, d, out, loc);
+    else
+        br_copy_val(d, edge, out);
+}
+
 brine_arr *brine_world_exchange(const char *ed, brine_arr *xs, const char *loc) {
     if (xs->len != br_size)
         br_panicf(loc, "world.exchange needs one element per rank: got %lld elements, but the world size is %lld", (long long)xs->len,
@@ -4617,6 +4637,16 @@ double brine_world_reduce_f64(double v, int op, const char *loc) {
     br_coll(br_red_op(op), loc);
     br_allreduce((char *)&v, 1, true, op, loc);
     return v;
+}
+
+/* element by element over `[int]` (ed "i") or `[float]` (ed "f"); a new array */
+brine_arr *brine_world_reduce_arr(const char *ed, brine_arr *xs, int op, const char *loc) {
+    brine_arr *res = brine_arr_new(xs->len, 8, NULL, NULL, loc);
+    if (xs->len) memcpy(res->data, xs->data, (size_t)(xs->len * 8));
+    if (br_size <= 1) return res;
+    br_coll(br_red_op(op), loc);
+    br_allreduce(res->data, xs->len, *ed == 'f', op, loc);
+    return res;
 }
 
 /* ============================================================ init / shutdown */

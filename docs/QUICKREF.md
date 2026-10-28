@@ -410,19 +410,28 @@ fn main():
     if rank == 0:
         print(total)
     let left = world.shift(rank, 1)       # send to rank + 1, receive from rank - 1
+    let up = world.shift(rank, 1, -1)     # no wrapping around: rank 0 gets -1
     let inbox = world.exchange([rank] * world.size())   # xs[j] goes to rank j
+    let sums = world.sum([1.0, float(rank)])            # element by element
+    let done = world.all(rank >= 0)                     # also world.any
 ```
 API: `rank()`, `size()`, `barrier()`, `broadcast(root, v)`, `sum(v)`, `min(v)`,
-`max(v)`, `gather_all(v) -> [T]`, `shift(v, by)`, `exchange(xs) -> [T]`.
-Message types: `int`, `float`, `bool`, `str`, and arrays of those (`[[float]]`, ...).
-Run with `brine run --ranks N`. Without it, `world.size() == 1`.
+`max(v)` (on `int`, `float`, `[int]`, `[float]`), `any(b)`, `all(b)`,
+`gather_all(v) -> [T]`, `shift(v, by)`, `shift(v, by, edge)`, `exchange(xs) -> [T]`.
+Message types: integers and floats of any width (`[u8]` travels as bytes), `bool`,
+`str`, and arrays of those (`[[float]]`, ...).
+Run with `brine run --ranks N` (each rank gets cores / N `par` threads unless
+`--threads` says otherwise). Without it, `world.size() == 1`. If a rank fails,
+`brine run` stops the others and exits with that rank's exit code.
 
 **No deadlocks, by construction.** Every rank takes part in every `world` call,
 and the compiler checks that all ranks make the same calls in the same order:
 a call under a condition that depends on `world.rank()` (or received values,
-`clock()`, ...) is an error (E0510). Results of `sum`/`min`/`max`/`broadcast`/
+`clock()`, ...), or after a rank-dependent `return`, `break` or `exit`, is an
+error (E0510). Results of `sum`/`min`/`max`/`any`/`all`/`broadcast`/
 `gather_all` are the same on every rank, so loops like
-`while world.max(err) > tol:` are fine.
+`while world.max(err) > tol:` are fine. At run time, each message also carries
+its call site, so a mismatch is a clear panic naming both calls.
 
 ## Proofs: rules that can't be broken
 
