@@ -20,7 +20,7 @@
 # at a line, variables are in memory where the debug info says.
 
 from ir import K, Op, Inst, Func, Module
-from opt import promote, reads
+from opt import promote, reads, switches, inline_small
 from dwarf import Dwarf, DFn, DRow, DLocal, new_dwarf, loc_breg, loc_deref, write_dwarf
 from obj import ObjFile, OSym, ORel, new_obj, write_coff, write_elf, put16, put32, put64, set32, uleb, sleb, log2
 from obj import SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, SEC_UNWIND, R_PC32, R_CALL, R_ABS64, R_GOT, R_RVA32
@@ -286,6 +286,10 @@ struct X:
     lpos: [int]
     jat: [int]
     jlab: [int]
+    # jump table entries: where, the label, and the table's start
+    tat: [int]
+    tlab: [int]
+    tbase: [int]
     stubs: [Stub]
     # home of the hidden pointer to a 128-bit result (0: none)
     retp: int
@@ -894,7 +898,8 @@ struct X:
 
     # Reference counting is by far the most frequent runtime call, so it's
     # done inline and only freeing calls out. Same semantics as brine_rt.h:
-    # a negative count is immortal, and lock inc / dec are full barriers.
+    # a negative count is immortal, and lock inc / dec (when other threads
+    # are running) are full barriers.
     fn inline_rc(ref self, x: Inst) -> bool:
         let n = x.s
         let retain = (
@@ -929,10 +934,22 @@ struct X:
             self.rm(0, 1, 131, CMP, m, 1)
             self.b(0)
             skip = self.j8(CC_L)
-        if retain:
-            self.rm(240, 1, 255, 0, m, 0)
-        else:
-            self.rm(240, 1, 255, 1, m, 0)
+        # a plain inc / dec unless other threads may hold the value
+        # (`brine_mt`, see brine_rt.h)
+        let mt = self.sym_ref("brine_mt")
+        var mm = mrip(mt, 0)
+        if not self.direct(mt):
+            self.ld_sym(R11, mt)
+            mm = mreg(R11, 0)
+        self.rm(0, 0, 131, CMP, mm, 1)
+        self.b(0)
+        let shared = self.j8(CC_NE)
+        let k = 0 if retain else 1
+        self.rm(0, 1, 255, k, m, 0)
+        let done = self.jmp8()
+        self.here8(shared)
+        self.rm(240, 1, 255, k, m, 0)
+        self.here8(done)
         if n == "brine_box_dec":
             self.setcc(CC_E, RAX)
         elif not retain:
@@ -1014,6 +1031,9 @@ struct X:
         self.lpos = [-1] * f.nlabels
         self.jat = []
         self.jlab = []
+        self.tat = []
+        self.tlab = []
+        self.tbase = []
         self.stubs = []
         var ndef = [0] * nv
         var dpos = [0] * nv
@@ -1248,6 +1268,8 @@ struct X:
                 )
         for j in 0..len(self.jat):
             set32(ref self.o.text, self.jat[j], self.lpos[self.jlab[j]] - (self.jat[j] + 4))
+        for j in 0..len(self.tat):
+            set32(ref self.o.text, self.tat[j], self.lpos[self.tlab[j]] - self.tbase[j])
         if self.win:
             self.unwind_coff()
         else:
@@ -1542,6 +1564,64 @@ struct X:
                     let y = f.code[i + 1]
                     if (y.op == Op.Br or y.op == Op.BrNot) and y.a == x.d:
                         w[x.d] = -1000000000
+        # Short-lived vregs share registers below instead of taking one for
+        # the whole function, each over an interval: a vreg made once and read
+        # only before the next label (a temporary) from its write to its last
+        # read; or one first mentioned by a write at lo and last mentioned at
+        # hi where every loop is outside lo..hi or inside it, so that every
+        # path between its mentions stays in lo..hi (the lowering never reads
+        # a vreg on a path that doesn't write it first).
+        var temp = [false] * nv
+        var tlo = [-1] * nv
+        var tend = [-1] * nv
+        var bad = [false] * nv
+        var tlab = [-1] * nv
+        var wfirst = [false] * nv
+        var lab = -1
+        var back: [int] = []
+        for i in 0..ncode:
+            let x = f.code[i]
+            if x.op == Op.Label:
+                lab = i
+            elif x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot:
+                let l = lat[x.n]
+                if l >= 0 and l <= i:
+                    back.push(l)
+                    back.push(i)
+            for v in reads(x, nv):
+                if not temp[v] or tlab[v] != lab:
+                    bad[v] = true
+                if tlo[v] < 0:
+                    tlo[v] = i
+                tend[v] = i
+            let xd = x.d
+            if xd >= 0:
+                if tlo[xd] < 0:
+                    tlo[xd] = i
+                    wfirst[xd] = true
+                tend[xd] = i
+                if ndef[xd] == 1 and xd >= f.nparams:
+                    temp[xd] = true
+                    tlab[xd] = lab
+        for v in 0..nv:
+            var ok = temp[v] and not bad[v]
+            if not ok and wfirst[v] and v >= f.nparams:
+                ok = true
+                var j = 0
+                while j < len(back):
+                    let l = back[j]
+                    let e = back[j + 1]
+                    j += 2
+                    if not (e < tlo[v] or l > tend[v] or (tlo[v] <= l and e <= tend[v])):
+                        ok = false
+                        break
+            temp[v] = (
+                ok
+                and tend[v] > tlo[v]
+                and w[v] > 0
+                and self.fold[v] == F_NONE
+                and not f.vk[v].is_wide()
+            )
         let pool = [RBX, RSI, RDI, R12, R13, R14, R15] if self.win else [RBX, R12, R13, R14, R15]
         # without loops, a register only pays off for a vreg used a lot
         let least = 3 if loops else 6
@@ -1551,6 +1631,7 @@ struct X:
             for v in 0..nv:
                 if (
                     w[v] > bw
+                    and not temp[v]
                     and self.reg[v] < 0
                     and self.fold[v] == F_NONE
                     and (ndef[v] > 0 or v < f.nparams)
@@ -1573,6 +1654,7 @@ struct X:
             for v in 0..nv:
                 if (
                     w[v] > bw
+                    and not temp[v]
                     and self.freg[v] < 0
                     and self.fold[v] == F_NONE
                     and (ndef[v] > 0 or v < f.nparams)
@@ -1585,6 +1667,53 @@ struct X:
             self.freg[best] = x
             if self.win:
                 self.fsaved.push(x)
+        # Then the temporaries, in order: each takes a register free since
+        # before it is made (closed intervals, so an instruction's result never
+        # shares a register with its operands), preferring one already saved.
+        # busy[r]: where r's last temporary dies; -2: r holds a vreg for the
+        # whole function
+        var busy = [-1] * 32
+        for v in 0..nv:
+            if self.reg[v] >= 0:
+                busy[self.reg[v]] = -2
+            if self.freg[v] >= 0:
+                busy[16 + self.freg[v]] = -2
+        var fpool: [int] = []
+        for xr in first..16:
+            fpool.push(16 + xr)
+        var starts: [[int]] = [[] for _ in 0..ncode]
+        for v in 0..nv:
+            if temp[v]:
+                starts[tlo[v]].push(v)
+        for i in 0..ncode:
+            for td in starts[i]:
+                let fl = f.vk[td].is_float()
+                let rs = fpool if fl else pool
+                var pick = -1
+                for r in rs:
+                    if busy[r] != -2 and busy[r] < i:
+                        let used = (
+                            busy[r] >= 0
+                            or (not fl and r in self.saved)
+                            or (fl and r - 16 in self.fsaved)
+                        )
+                        if pick < 0 or used:
+                            pick = r
+                        if used:
+                            break
+                if pick < 0:
+                    continue
+                if busy[pick] == -1:
+                    if not fl:
+                        if pick not in self.saved:
+                            self.saved.push(pick)
+                    elif self.win and pick - 16 not in self.fsaved:
+                        self.fsaved.push(pick - 16)
+                busy[pick] = tend[td]
+                if fl:
+                    self.freg[td] = pick - 16
+                else:
+                    self.reg[td] = pick
         if not self.win:
             self.live_ranges(f, lat, ndef)
 
@@ -1788,6 +1917,8 @@ struct X:
                         self.rm(0, 0, 128, 7, self.vm(x.a), 1)
                         self.b(0)
                     self.jcc_label(CC_NE if want else CC_E, x.n)
+            case Op.Switch:
+                self.switch(x)
             case Op.Ret:
                 self.op_ret(x)
             case Op.Unreachable:
@@ -1796,6 +1927,38 @@ struct X:
                 if self.dbg:
                     self.line_row(x)
         return i + 1
+
+    # A jump table in .text after the jump: 32-bit offsets from its start.
+    fn switch(ref self, x: Inst):
+        self.ld(RAX, x.a)
+        if x.n != 0:
+            self.alu_ri(SUB, RAX, x.n)
+        self.alu_ri(CMP, RAX, len(x.args) - 1)
+        self.jcc_label(CC_AE, x.args[0])
+        # lea r11, [rip + table]
+        self.b(76)
+        self.b(141)
+        self.b(29)
+        let at = self.pos()
+        self.b32(0)
+        # movsxd rax, dword [r11 + rax * 4]; add rax, r11; jmp rax
+        self.b(73)
+        self.b(99)
+        self.b(4)
+        self.b(131)
+        self.alu_rr(ADD, RAX, R11)
+        self.b(255)
+        self.b(224)
+        while self.pos() % 4 != 0:
+            self.b(204)
+        let base = self.pos()
+        set32(ref self.o.text, at, base - (at + 4))
+        for l in x.args[1:]:
+            self.tat.push(self.pos())
+            self.tlab.push(l)
+            self.tbase.push(base)
+            self.b32(0)
+        self.cpos = -1
 
     fn op_const(ref self, x: Inst):
         let k = self.vk[x.d]
@@ -2429,6 +2592,9 @@ fn emit(m: Module, windows: bool, dbg: bool, src: str, comp_dir: str, producer: 
         lpos=[],
         jat=[],
         jlab=[],
+        tat=[],
+        tlab=[],
+        tbase=[],
         stubs=[],
         retp=0,
         creg=0,
@@ -2484,8 +2650,8 @@ fn emit(m: Module, windows: bool, dbg: bool, src: str, comp_dir: str, producer: 
             else:
                 x.o.drel.push(rel)
     x.entry_main = dbg and any(f.name == "main__main" for f in m.funcs)
-    for f in emit_order(m.funcs, dbg):
-        x.func(f if dbg else promote(f))
+    for f in emit_order(m.funcs if dbg else inline_small(m.funcs), dbg):
+        x.func(f if dbg else switches(promote(f)))
     # references inside .text need no relocation
     var keep: [ORel] = []
     for r in x.o.trel:

@@ -159,6 +159,9 @@ fn main():
 method: no copy, and changes go to `self.board`). A reference names a variable or
 a field path, not an element (`ref xs[i]`) or a function's result.
 Arguments are passed by value (cheaply: arrays and strings are copy-on-write).
+`x = f(x)` (also `xs[i] = f(xs[i])`, `x = x.step()`) moves x's value into `f`, so
+an `f` that starts with `var t = x` changes it in place instead of copying it
+(unless something else shares the value).
 References can't be stored in structs or arrays or returned, so they never dangle.
 `main` may return `int` (the exit code) or a `Result` (see below). Parameter types are required;
 local types are inferred.
@@ -226,6 +229,13 @@ each alternative is tried in turn: `case (x, _) | (_, x) if x > 5:` matches `(1,
 Every `match` must handle every value (error E0320 shows one it misses);
 end with `case _:` when listing values isn't possible. Variant data is read with
 `match`, never with `.field`.
+
+Cost: an enum whose variants hold at most 64 bytes and that can't contain itself
+(`Shape`, `Option[int]`, `Result[int, str]`) is stored in place, like a struct: making
+one allocates nothing. A recursive enum (`Expr`) or a bigger one is a pointer to a
+shared, reference-counted box. `match (a, b)` on variables doesn't copy them. A `match`
+whose cases test one value against four or more close-together integers or
+variants jumps straight to the right case, in every kind of build.
 
 ## Generics, `Option` and `Result`
 
@@ -317,6 +327,20 @@ change a variable and read it elsewhere (`print(xs.pop(), xs)` is an error), so
 evaluation order never matters. A call in another call's arguments runs first
 (`t.add(t.leaf(1), 2)` is fine), and different fields are different places
 (`both(ref self.a, ref self.b)`, `self.items[self.rng.below(n)]`).
+
+In release builds, a `for j in lo..hi` loop that indexes arrays at `j`, `j + x`,
+`x + j` or `j - x` (`x` a literal or a variable the loop doesn't change) and
+doesn't change those arrays' lengths checks the first and last index once,
+before the loop, and then runs without per-element checks, so the C compiler can
+vectorize it. If that test fails the loop runs checked as written, panicking at
+the same element it always would.
+
+Cost: an empty array allocates nothing for its elements until the first push, so
+taking an inner array out to change it (`var w = xss[i]; xss[i] = []`, then
+`xss[i] = w`) costs one small allocation. A local `var a = [x] * n` with `n` a
+literal (at most 1 KB of numbers or `bool`s; 4 KB per function), in a function
+without `par`, that is only indexed, assigned at an index and measured with `len`
+lives in the stack frame: no allocation at all (a traversal stack, a histogram).
 
 ## Strings
 
@@ -528,6 +552,9 @@ always run, so a panic the sequential loop would reach still happens.
 `par first(...)` is the lowest-index `Some`, like `first`, on any thread count;
 the elements before it all run, those after it may not.
 `BRINE_THREADS=n` or `brine run --threads n` sets the thread count.
+Cost: reference counts use locked (atomic) instructions only while a `par` construct
+is running; the rest of the program updates them with plain ones. In `par for i`,
+`out[i] = f(out[i])` hands `out[i]` to `f` without copying it, as outside `par`.
 
 **GPUs.** `par for`, `par [...]` and `par` reductions also run on a GPU (NVIDIA
 through CUDA, Apple silicon through Metal) when the runtime expects that to be
@@ -537,10 +564,12 @@ the CPU (they have no f64).
 Nothing to write or install beyond the driver: the compiler makes a kernel of every
 body that only uses int/float arithmetic, comparisons, branches, loops, structs,
 tuples, reads of outer arrays and scalars, `out[i]` writes, `sqrt`, `abs`, `floor`,
-`ceil`, `round`, `min`, `max`, and calls to functions that do the same; on NVIDIA
-GPUs also `i128`/`u128` arithmetic (except reductions of them, conversions to and
-from floats, and passing them to functions). Strings, maps, new arrays, printing,
-`sin`/`exp`/`log`/`pow` and the like keep a body on the CPU. `BRINE_GPU=off|on|auto` (default `auto`; `on` uses the GPU whenever it can),
+`ceil`, `round`, `min`, `max`, and calls to functions that do the same (which may
+use local arrays kept in the stack frame, see Arrays); on NVIDIA GPUs also
+`i128`/`u128` arithmetic (except reductions of them, conversions to and from
+floats, and passing them to functions). Strings, maps, other new arrays, printing,
+`sin`/`exp`/`log`/`pow` and the like keep a body on the CPU.
+`BRINE_GPU=off|on|auto` (default `auto`; `on` uses the GPU whenever it can),
 `BRINE_GPU_LOG=1` prints where each construct ran and why. With `--ranks`, the
 k-th rank on a machine uses its k-th GPU and the ranks beyond its GPUs stay on the
 CPU (ranks sharing a GPU queue for it); `on` shares the GPUs out instead.
