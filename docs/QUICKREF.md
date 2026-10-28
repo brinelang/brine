@@ -242,7 +242,8 @@ Each use of a generic function or type with new type arguments makes a
 specialized copy, so generic code is as fast as hand-written code. A generic
 function's body is checked for each set of type arguments it's used with:
 `largest[T]` that compares with `>` works for `int` and `str`, and is an error
-for a struct.
+for a struct. In the same way, `T(x)` converts to what `T` stands for, like
+`int(x)` or `f32(x)`: `fn mean[E](xs: [E]) -> E` can return `total / E(len(xs))`.
 
 Methods can have type parameters of their own, next to their type's:
 
