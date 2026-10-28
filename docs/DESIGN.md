@@ -348,7 +348,7 @@ from what brine knows that C doesn't (no aliasing, proven-away checks, race-free
 
 | Command | Purpose |
 |---|---|
-| `brine new <name>` / `brine init` | Create a project (`brine.toml`, `src/main.br`, `AGENTS.md`, `.gitignore`). |
+| `brine new <name>` / `brine init` | Create a project (`brine.toml`, `src/main.br`, `AGENTS.md`, `README.md`, `.gitignore`). |
 | `brine run [file] [--ranks N] [--threads N] [-- args]` | Build and run. |
 | `brine build [--release\|--debug] [--emit-c]` | Build a native binary into `target/`. |
 | `brine check [--report] [--typed]` | Type-check + verify, no codegen. Fastest feedback loop. `--typed` (or `typed = true` under `[check]` in brine.toml) requires a written type on every variable. |

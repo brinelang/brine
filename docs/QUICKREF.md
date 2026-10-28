@@ -19,8 +19,8 @@ brine run --target wasm        # WebAssembly, run with Node.js (needs wasi-sdk, 
 brine build --target web -o d  # d/: index.html + brine.js + program.wasm, for a browser
 ```
 Add `--json` to any command for one JSON object per line. `brine fmt` leaves
-lines between `# fmt: off` and `# fmt: on` comments (and number tables written
-in rows) as they are.
+lines between `# fmt: off` and `# fmt: on` comments, and number tables written
+in rows that don't fit on one line, as they are.
 WebAssembly runs on one thread (`par` runs in order, same results) and as one
 `world` rank; in a browser there are no files or processes.
 
@@ -51,8 +51,9 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
   unless the compiler proved they can't happen, in which case the check is removed.
   Only the first panic is reported, even when many `par` threads fail at once.
 * Every thread, `main` included, has a 64 MB stack; recursion deeper than that
-  panics with "stack overflow (recursion too deep)". WebAssembly engines allow
-  less (about 10,000 to 100,000 calls, depending on the frames).
+  panics with "stack overflow (recursion too deep)". `brine run` gives
+  WebAssembly the same; in a browser the engine allows less (about 10,000 to
+  100,000 calls, depending on the frames).
 * Integer `/` rounds down like Python's `//` (`-7 / 2 == -4`), and `%` takes the sign of
   the right side (`-7 % 2 == 1`). Use `float(a) / float(b)` for a fractional result.
 * Bit operators on integers: `&` (and), `|` (or), `^` (xor), `~` (not), `<<`, `>>`.
@@ -71,7 +72,8 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
 * Float bits: `x.to_bits()` is the IEEE 754 encoding of a `float` as a `u64` (of
   an `f32` as a `u32`); `float.from_bits(u)` and `f32.from_bits(u)` go back.
 * `<`, `<=`, `>`, `>=` work on numbers, strings (byte order), enums without data
-  (declaration order) and tuples and structs whose parts all support them. Those
+  (declaration order) and tuples and structs whose parts all support them (not
+  on `bool`: write `a and not b` for `b < a`). Those
   compare part by part, in field order, like Python: `(1, "b") < (2, "a")`. A NaN
   makes `<` false, so in a tuple it's false whenever the NaN part decides. The same
   types work with `sort()` (stable; NaN sorts after every number), `min`/`max` of
@@ -475,7 +477,8 @@ run(["cc", "-O2", "-o", "app", "app.c"])  # Result[int, str]: Ok(exit code), Err
 ```
 `write_file`, `append_file`, `run`, `input` and `read_stdin` can't be used inside
 `par` (their effects would happen in an unpredictable order), nor can a function
-that calls one of them, directly or through other functions.
+that calls one of them, directly or through other functions. `exit` can't be
+used in a `par` body either.
 
 The `os` module (built in, no import; errors are `Err` values with the OS's
 message, e.g. `"The system cannot find the file specified. (os error 2)"`):
@@ -507,8 +510,9 @@ os.poll(p)              # Option[int]: exit code if it has exited
 os.kill(p)              # stop it
 let (out, err) = os.output(p)   # captured text once it has exited ("" if not captured)
 ```
-`os.spawn`, `wait`, `poll`, `kill`, `make_dir`, `remove_file`, `rename`, `sleep`
-and `enable_ansi` can't be used inside `par`. Results of `os` calls (except
+`os.spawn`, `wait`, `poll`, `kill`, `make_dir`, `remove_file`, `rename`,
+`set_cwd`, `write_bytes`, `append_bytes`, `sleep` and `enable_ansi` can't be used
+inside `par`, directly or through a function. Results of `os` calls (except
 `os.name()`/`os.arch()`) count as rank-dependent for `world` deadlock checks.
 
 `embed("help.txt")` is a `str` with the file's contents, read when the program is
