@@ -1,0 +1,135 @@
+# 128-bit integers in GPU kernels: every construct here can run on a GPU
+# (tests: "128-bit integers give the same results on a GPU"), and must print
+# what it prints on the CPU. The values hit carries between the halves, the
+# sign boundaries and divisors of every size.
+const P: u128 = 4179340454199820289
+
+fn mulmod(a: u64, b: u64) -> u64:
+    return u64((u128(a) * u128(b)) % P)
+
+# a mix of small, 64-bit edge and full-width values
+fn val(i: int) -> u128:
+    let k = i % 8
+    let x = u128(i) * 2654435761
+    if k == 0:
+        return x
+    elif k == 1:
+        return x << 64 | x
+    elif k == 2:
+        return 18446744073709551615 - u128(i)
+    elif k == 3:
+        return (u128(1) << 127) + x
+    elif k == 4:
+        return (x << 70) ^ (x << 3)
+    elif k == 5:
+        return 340282366920938463463374607431768211455 - x
+    elif k == 6:
+        return u128(1) << u128(i % 128)
+    return x * x + 12345
+
+fn sval(i: int) -> i128:
+    let v = val(i) >> 1
+    let s = i128(v)
+    return s if i % 3 != 0 else -s
+
+fn mix(h: u64, x: u128) -> u64:
+    return (h ^ u64(x & 18446744073709551615) ^ u64(x >> 64)) % 4294967291 * 16777619 % 4294967291
+
+fn smix(h: u64, x: i128) -> u64:
+    return mix(h, u128(x) if x >= 0 else u128(-(x + 1)) + 1)
+
+fn digest(xs: [u128]) -> u64:
+    var h: u64 = 14695981039346656037 % 4294967291
+    for x in xs:
+        h = mix(h, x)
+    return h
+
+fn sdigest(xs: [i128]) -> u64:
+    var h: u64 = 7
+    for x in xs:
+        h = smix(h, x)
+    return h
+
+fn bits(xs: [bool]) -> int:
+    var h = 0
+    for i, b in enumerate(xs):
+        if b:
+            h = (h * 31 + i) % 1000000007
+    return h
+
+fn main():
+    let n = 100_000
+    let a = [val(i) for i in 0..n]
+    let b = [val(i * 7 + 3) for i in 0..n]
+    let sa = [sval(i) for i in 0..n]
+    let sb = [sval(i * 5 + 1) for i in 0..n]
+    let small = [u64(i) * 40961 + 7 for i in 0..n]
+
+    # the repro: a multiply mod a 64-bit prime
+    var mm: [u64] = [0] * n
+    par for i in 0..n:
+        mm[i] = mulmod(small[i], small[(i * 13) % n])
+    print("mulmod", mm[n - 1], digest([u128(x) for x in mm]))
+
+    # wrapping-free arithmetic on halves, so nothing overflows
+    let lo = par [(a[i] & 18446744073709551615) * (b[i] & 18446744073709551615) for i in 0..n]
+    print("mul64x64", digest(lo))
+    let sums = par [(a[i] >> 1) + (b[i] >> 1) for i in 0..n]
+    print("add", digest(sums))
+    let diffs = par [a[i] - b[i] if a[i] >= b[i] else b[i] - a[i] for i in 0..n]
+    print("sub", digest(diffs))
+    let bitw = par [(a[i] & b[i]) ^ (a[i] | ~b[i]) for i in 0..n]
+    print("bits", digest(bitw))
+
+    # shifts by every amount, both ways
+    let shl = par [a[i] << u128(i % 128) for i in 0..n]
+    let shr = par [a[i] >> u128((i * 7) % 128) for i in 0..n]
+    let ssh = par [sa[i] >> i128((i * 3) % 128) for i in 0..n]
+    print("shifts", digest(shl), digest(shr), sdigest(ssh))
+
+    # division by divisors of every size
+    let q = par [a[i] / (b[i] >> u128(i % 128) | 1) for i in 0..n]
+    let r = par [a[i] % (b[i] >> u128((i * 3) % 128) | 1) for i in 0..n]
+    print("udiv", digest(q), digest(r))
+    let sq = par [sa[i] / (sb[i] >> i128(i % 120) | 1) for i in 0..n]
+    let sr = par [sa[i] % (sb[i] >> i128(i % 120) | 1) for i in 0..n]
+    print("sdiv", sdigest(sq), sdigest(sr))
+
+    # comparisons
+    let lt = par [a[i] < b[i] for i in 0..n]
+    let le = par [sa[i] <= sb[i] for i in 0..n]
+    let eq = par [(a[i] & 3) == (b[i] & 3) or a[i] == a[(i + 8) % n] for i in 0..n]
+    let gt = par [sa[i] > -sb[i] for i in 0..n]
+    print("cmp", bits(lt), bits(le), bits(eq), bits(gt))
+
+    # checked arithmetic that never fails here
+    let ck = par [a[i] / 3 + b[i] / 3 for i in 0..n]
+    let sck = par [sa[i] / 2 - sb[i] / 2 for i in 0..n]
+    let smul = par [i128(i - n / 2) * (sa[i] >> 64) for i in 0..n]
+    let umul = par [u128(i) * (b[i] >> 20) for i in 0..n]
+    print("checked", digest(ck), sdigest(sck), sdigest(smul), digest(umul))
+
+    # conversions to and from 128 bits
+    let down = par [u64(a[i] >> 64) % 1000 + u64(u32(a[i] & 4294967295)) % 7 for i in 0..n]
+    let sdown = par [i64(sa[i] >> 64) for i in 0..n]
+    let up = par [i128(small[i]) - i128(i64(i) - 50_000) * 3 for i in 0..n]
+    let flip = par [u128(sa[i]) if sa[i] >= 0 else u128(-(sa[i] + 1)) for i in 0..n]
+    print(
+        "conv",
+        digest([u128(x) for x in down]),
+        sdigest([i128(x) for x in sdown]),
+        sdigest(up),
+        digest(flip)
+    )
+
+    # a loop with a 128-bit accumulator in a register
+    var acc: [u128] = [0] * n
+    par for i in 0..n:
+        var x: u128 = a[i] >> 8
+        for k in 0..20:
+            x = (x * 3 + u128(k)) % 1000000000000000000000000007
+        acc[i] = x
+    print("loop", digest(acc))
+
+    # u128 reductions stay on the CPU (no combine kernel)
+    print("sum", par sum(a[i] >> 40 for i in 0..n))

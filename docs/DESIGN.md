@@ -155,14 +155,16 @@ through CUDA, Apple's through Metal), with no annotation and no change in meanin
 the results are the same bits as on the CPU, and a check that fails on the device
 panics exactly as it would on the CPU.
 * *Which constructs:* the compiler decides. A body can run on a GPU when it (and
-  every function it calls) uses only int and float arithmetic up to 64 bits,
-  comparisons, branches, loops, structs and tuples, reads of captured scalars and of
+  every function it calls) uses only int and float arithmetic (128-bit integers
+  too, on NVIDIA GPUs, as pairs of 64-bit registers), comparisons, branches, loops, structs and tuples, reads of captured scalars and of
   arrays (also arrays of arrays and of structs), writes to `out[i]`, `sqrt`, `abs`,
   `floor`, `ceil`, `round`, `min` and `max`. It can't allocate (no strings, maps,
   enums with payloads or new arrays), print, use `world`, call function values, or
   call `sin`, `cos`, `exp`, `log`, `pow` and the like, whose last bit depends on
-  the C library. Apple GPUs have no f64 and Metal has no recursion, so on macOS
-  those stay on the CPU too. `BRINE_GPU_LOG=1` says why a construct stayed on the
+  the C library. A 128-bit integer can't be a function's parameter or result on
+  the device, be converted to or from a float there, or be a reduction's value.
+  Apple GPUs have no f64 or 128-bit integers and Metal has no recursion, so on
+  macOS those stay on the CPU too. `BRINE_GPU_LOG=1` says why a construct stayed on the
   CPU.
 * *When:* the runtime decides, per launch. It skips constructs under 4096 elements
   and nested ones, and otherwise compares the CPU's time (estimated by running the
