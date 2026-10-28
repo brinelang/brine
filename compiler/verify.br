@@ -16,7 +16,7 @@ from types import Ty, IntTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, Loca
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import children, stmt_exprs, stmt_blocks, lvalue_root
 from info import ProgramInfo, ConstVal
-from solver import Lin, F, AtomSet, prove_, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
+from solver import Lin, F, AtomSet, prove_, prove_full, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
 
 struct Report:
     diags: [Diag]
@@ -1097,21 +1097,24 @@ struct Vf:
         var ga = AtomSet.new()
         goal.atoms(ref ga)
         var out: [str] = []
-        for f in self.st.facts:
+        var unlisted = false
+        var facts: [F] = []
+        for f0 in self.st.facts:
+            conjuncts(f0, ref facts)
+        for f in facts:
             var fa = AtomSet.new()
             f.atoms(ref fa)
-            if f.size() > 9:
-                continue
             if not any(ga.contains(a) for a in fa.xs):
                 continue
-            if any(self.atom_name(a) == "?" for a in fa.xs):
-                continue
-            if huge(f):
+            if f.size() > 9 or huge(f) or any(self.atom_name(a) == "?" for a in fa.xs):
+                unlisted = true
                 continue
             let s = self.show_f(f)
             if s not in out:
                 out.push(s)
         if len(out) == 0:
+            if unlisted:
+                return Some("what is known here about the values involved is too long to list")
             return Some("nothing is known here about the values involved")
         if len(out) > 6:
             out = out[len(out) - 6:]
@@ -1131,6 +1134,17 @@ struct Vf:
                 case None:
                     pass
             d = d.note("to prove: " + self.show_f(goal))
+            if self.live:
+                var all = self.st.facts
+                all.extend(self.defs)
+                if prove_full(all, goal, self.ranges) == GAVE_UP:
+                    d = d.note(
+                        "the prover gave up: what it knows here splits into too many cases to check them all, so this may well be true"
+                    )
+                    # the usual advice (add facts) would only add cases
+                    d.help = [
+                        "check it with `assert` (at runtime) instead, or move the branches before this point into a function whose `ensures` states just what is needed here"
+                    ]
         self.diags.push(d)
 
     # Short source text for naming unknown values in messages.
@@ -3423,3 +3437,12 @@ fn hull_lin(n: Lin, x: Lin, y: Lin, ref out: [F]):
                     pass
         case None:
             pass
+
+# `f` split at its top-level `and`s.
+fn conjuncts(f: F, ref out: [F]):
+    match f:
+        case F.And(xs):
+            for x in xs:
+                conjuncts(x, ref out)
+        case _:
+            out.push(f)
