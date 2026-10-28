@@ -289,6 +289,10 @@ before the loop, and then runs without per-element checks, so the C compiler can
 vectorize it. If that test fails the loop runs checked as written, panicking at
 the same element it always would.
 
+Cost: an empty array allocates nothing for its elements until the first push, so
+taking an inner array out to change it (`var w = xss[i]; xss[i] = []`, then
+`xss[i] = w`) costs one small allocation.
+
 ## Strings
 
 Strings are immutable UTF-8. `len(s)`, `s[i]` and slices count **bytes**;

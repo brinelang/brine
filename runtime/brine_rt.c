@@ -674,7 +674,7 @@ void brine_drop(void *p, void (*fn)(void *)) {
 static void br_arr_drop(void *p) {
     brine_arr *a = (brine_arr *)p;
     for (int64_t i = 0; i < a->len; i++) a->release(a->data + i * a->esz);
-    free(a->data);
+    if (a->data) free(a->data);
     free(a);
 }
 void brine_arr_free(brine_arr *a) {
@@ -683,7 +683,7 @@ void brine_arr_free(brine_arr *a) {
         brine_drop(a, br_arr_drop);
         return;
     }
-    free(a->data);
+    if (a->data) free(a->data);
     free(a);
 }
 void *brine_box_new(int64_t size, int64_t tag) {
@@ -1646,6 +1646,12 @@ brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_
     a->esz = esz;
     a->retain = rt;
     a->release = rl;
+    if (len == 0) {
+        /* no data until the first push: `xs[i] = []`, which takes an inner
+           array out to change it, then costs one allocation, not two */
+        a->data = NULL;
+        return a;
+    }
     if (esz > 0 && len <= BR_SMALL / esz) {
         /* small: a block of our heap, whose spare room the first pushes use
            (`[]` then `push` doesn't reallocate) */
