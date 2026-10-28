@@ -728,6 +728,10 @@ fn run_exe(launch: [str], argv: [str], threads: Option[str], ranks: int) -> Resu
                 return Ok(os.wait(p))
             case Err(e):
                 return Err("could not start " + launch[0] + ": " + e)
+    # the ranks share the machine: by default, each gets its share of the cores
+    var th = threads
+    if th.is_none() and getenv("BRINE_THREADS").is_none():
+        th = Some(f"{max(1, os.cpu_count() / ranks)}")
     var ports: [int] = []
     match os.free_ports(ranks):
         case Ok(ps):
@@ -737,7 +741,7 @@ fn run_exe(launch: [str], argv: [str], threads: Option[str], ranks: int) -> Resu
     let peers = ",".join([f"127.0.0.1:{p}" for p in ports])
     var kids: [int] = []
     for r in 0..ranks:
-        var env = spawn_env(threads)
+        var env = spawn_env(th)
         env["BRINE_RANK"] = f"{r}"
         env["BRINE_WORLD_SIZE"] = f"{ranks}"
         env["BRINE_PEERS"] = peers
@@ -750,33 +754,40 @@ fn run_exe(launch: [str], argv: [str], threads: Option[str], ranks: int) -> Resu
                     os.wait(k)
                 return Err(f"could not start rank {r}: {e}")
     var codes: [Option[int]] = [None] * ranks
+    # the first rank that failed: usually the cause, the others only lost it
+    var first = -1
     var failed_at = -1.0
+    var stopped = false
     while true:
         for i in 0..ranks:
             if codes[i].is_none():
                 match os.poll(kids[i]):
                     case Some(c):
                         codes[i] = Some(c)
-                        if c != 0 and failed_at < 0.0:
+                        if c != 0 and first < 0:
+                            first = i
                             failed_at = clock()
                     case None:
                         pass
         if all(c.is_some() for c in codes):
             break
         # if one rank failed, the others would wait for it forever: stop them
-        if failed_at >= 0.0 and clock() - failed_at > 0.5:
+        if first >= 0 and clock() - failed_at > 0.5:
             for i in 0..ranks:
                 if codes[i].is_none():
                     os.kill(kids[i])
                     os.wait(kids[i])
-                    codes[i] = Some(101)
+                    codes[i] = Some(0)
+                    stopped = true
             break
         os.sleep(0.005)
-    for c in codes:
-        let v = c.unwrap_or(0)
-        if v != 0:
-            return Ok(v)
-    return Ok(0)
+    if first < 0:
+        return Ok(0)
+    let code = codes[first].unwrap_or(1)
+    if stopped:
+        eprint(f"error: rank {first} failed (exit code {code}), so the other ranks were stopped")
+    # an exit code the shell can show (a crash on Windows is a large number)
+    return Ok(code if 1 <= code <= 255 else 1)
 
 fn cmd_run(g: G, a: Args) -> Result[int, str]:
     a.check_flags(["--release", "--debug", "--threads", "--ranks", "--typed", "--target"])?

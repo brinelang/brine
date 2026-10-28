@@ -348,9 +348,13 @@ static void br_stack_leave(void) {
 }
 #endif
 
+static void br_world_finish(const char *how);
 void brine_exit(int64_t code) {
     br_flush();
     br_gpu_settle();
+    /* like returning from `main`: every rank waits for the others */
+    br_world_finish("it called `exit`");
+    br_flush();
     exit((int)code);
 }
 void brine_unreachable(void) {
@@ -2250,6 +2254,7 @@ void brine_err_sb(brine_sb *sb) {
     br_lock(&br_io_mu);
     fflush(stdout);
     fwrite(sb->p, 1, (size_t)sb->len, stderr);
+    fflush(stderr);
     br_unlock(&br_io_mu);
     free(sb->p);
     sb->p = NULL;
@@ -4003,24 +4008,64 @@ void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, v
 }
 
 /* ============================================================ world: transport */
-enum { BR_CH_USER = 0, BR_CH_COLL = 1 };
-enum { BR_K_EMPTY = 0, BR_K_I64 = 1, BR_K_F64 = 2, BR_K_BOOL = 3, BR_K_STR = 4, BR_K_AI64 = 5, BR_K_AF64 = 6, BR_K_MSG = 7 };
+enum { BR_K_EMPTY = 0, BR_K_I64 = 1, BR_K_F64 = 2, BR_K_MSG = 7 };
 static const char *br_kind_name(int64_t k) {
     switch (k) {
+    case BR_K_EMPTY: return "nothing";
     case BR_K_I64: return "int";
     case BR_K_F64: return "float";
-    case BR_K_BOOL: return "bool";
-    case BR_K_STR: return "str";
-    case BR_K_AI64: return "[int]";
-    case BR_K_AF64: return "[float]";
     case BR_K_MSG: return "message";
     default: return "(internal)";
     }
 }
 
+/* Which collective a message belongs to. Every rank makes the same calls in
+ * the same order (the compiler checks this), so each message carries its
+ * call (operation, call site, and how many calls this rank made before it),
+ * and the receiver checks that it is in the same one: a mismatch is a clear
+ * panic instead of a hang or a silently wrong result. */
+enum {
+    BR_OP_BARRIER = 1,
+    BR_OP_SHIFT,
+    BR_OP_EXCHANGE,
+    BR_OP_BCAST,
+    BR_OP_GATHER,
+    BR_OP_SUM,
+    BR_OP_MIN,
+    BR_OP_MAX,
+    BR_OP_ANY,
+    BR_OP_ALL,
+    BR_OP_FINISH
+};
+static const char *br_op_name(int64_t op) {
+    switch (op) {
+    case BR_OP_BARRIER: return "`world.barrier`";
+    case BR_OP_SHIFT: return "`world.shift`";
+    case BR_OP_EXCHANGE: return "`world.exchange`";
+    case BR_OP_BCAST: return "`world.broadcast`";
+    case BR_OP_GATHER: return "`world.gather_all`";
+    case BR_OP_SUM: return "`world.sum`";
+    case BR_OP_MIN: return "`world.min`";
+    case BR_OP_MAX: return "`world.max`";
+    case BR_OP_ANY: return "`world.any`";
+    case BR_OP_ALL: return "`world.all`";
+    case BR_OP_FINISH: return "the end of the program";
+    default: return "(internal)";
+    }
+}
+/* the call this rank is in (collectives only run on the main thread) */
+static int64_t br_cur_op, br_cur_seq;
+static const char *br_cur_site = "";
+static void br_coll(int64_t op, const char *loc) {
+    br_cur_op = op;
+    br_cur_site = loc;
+    br_cur_seq++;
+}
+
 typedef struct br_msg {
     struct br_msg *next;
-    int64_t chan, kind, len;
+    int64_t kind, len, op, seq, slen;
+    /* `len` bytes of payload, then the sender's call site (`slen` bytes) */
     char data[];
 } br_msg;
 
@@ -4030,6 +4075,8 @@ typedef struct {
     br_cond cv;
     br_msg *head, *tail;
     int closed;
+    char *rbuf; /* the receiver's read buffer */
+    int64_t rpos, rend;
     int64_t rank;
 } br_peer;
 
@@ -4039,6 +4086,7 @@ static br_peer *br_peers;
 /* one rank: no peers to talk to */
 static int br_write_all(br_sock s, const char *p, int64_t n) { return (void)s, (void)p, (void)n, 0; }
 static int br_read_all(br_sock s, char *p, int64_t n) { return (void)s, (void)p, (void)n, 0; }
+static int64_t br_read_some(br_sock s, char *p, int64_t n) { return (void)s, (void)p, (void)n, 0; }
 #else
 static int br_write_all(br_sock s, const char *p, int64_t n) {
     while (n > 0) {
@@ -4080,6 +4128,19 @@ static int br_read_all(br_sock s, char *p, int64_t n) {
     }
     return 1;
 }
+/* what has arrived, at least one byte: 0 when the connection is closed */
+static int64_t br_read_some(br_sock s, char *p, int64_t n) {
+    int chunk = n > (1 << 30) ? (1 << 30) : (int)n;
+    for (;;) {
+#ifdef _WIN32
+        int r = recv(s, p, chunk, 0);
+#else
+        ssize_t r = recv(s, p, (size_t)chunk, 0);
+        if (r < 0 && errno == EINTR) continue;
+#endif
+        return r > 0 ? (int64_t)r : 0;
+    }
+}
 
 #endif
 
@@ -4095,24 +4156,48 @@ static void br_enqueue(br_peer *pr, br_msg *m) {
     br_unlock(&pr->mu);
 }
 
+/* The receiver reads through a buffer: one `recv` usually brings in several
+   small messages, or one whole. */
+#define BR_RBUF (1 << 16)
+static int br_rd(br_peer *pr, char *dst, int64_t n) {
+    while (n > 0) {
+        if (pr->rpos == pr->rend) {
+            if (n >= BR_RBUF) return br_read_all(pr->sock, dst, n);
+            int64_t r = br_read_some(pr->sock, pr->rbuf, BR_RBUF);
+            if (r <= 0) return 0;
+            pr->rpos = 0;
+            pr->rend = r;
+        }
+        int64_t k = pr->rend - pr->rpos < n ? pr->rend - pr->rpos : n;
+        memcpy(dst, pr->rbuf + pr->rpos, (size_t)k);
+        pr->rpos += k;
+        dst += k;
+        n -= k;
+    }
+    return 1;
+}
+
 static void br_receiver(void *arg) {
     br_peer *pr = (br_peer *)arg;
+    pr->rbuf = (char *)brine_alloc(BR_RBUF);
     for (;;) {
-        int64_t hdr[3];
-        if (!br_read_all(pr->sock, (char *)hdr, sizeof hdr)) break;
-        if (hdr[2] < 0) break;
-        br_msg *m = (br_msg *)brine_alloc((int64_t)sizeof(br_msg) + hdr[2]);
-        m->chan = hdr[0];
-        m->kind = hdr[1];
-        m->len = hdr[2];
-        if (hdr[2] && !br_read_all(pr->sock, m->data, hdr[2])) {
+        int64_t hdr[5];
+        if (!br_rd(pr, (char *)hdr, sizeof hdr)) break;
+        if (hdr[1] < 0 || hdr[4] < 0 || hdr[4] > 4096) break;
+        br_msg *m = (br_msg *)brine_alloc((int64_t)sizeof(br_msg) + hdr[1] + hdr[4]);
+        m->kind = hdr[0];
+        m->len = hdr[1];
+        m->op = hdr[2];
+        m->seq = hdr[3];
+        m->slen = hdr[4];
+        if (hdr[1] + hdr[4] && !br_rd(pr, m->data, hdr[1] + hdr[4])) {
             free(m);
             break;
         }
         br_enqueue(pr, m);
     }
     br_lock(&pr->mu);
-    pr->closed = 1;
+    __atomic_store_n(&pr->closed, 1, __ATOMIC_RELEASE);
     br_cond_broadcast(&pr->cv);
     br_unlock(&pr->mu);
 }
@@ -4122,55 +4207,102 @@ static void br_check_rank(int64_t r, const char *what, const char *loc) {
         br_panicf(loc, "%s rank %lld is out of range (world size is %lld)", what, (long long)r, (long long)br_size);
 }
 
-static void br_send(int64_t dest, int64_t chan, int64_t kind, const void *data, int64_t len, const char *loc) {
-    br_check_rank(dest, "destination", loc);
+/* A peer is gone. Usually it failed and printed why: give `brine run` time to
+ * stop this rank quietly, so that message is the one people see. */
+static BR_NORETURN void br_peer_lost(int64_t r, const char *loc) {
+    br_flush();
+    br_sleep_ms(1000);
+    br_panicf(loc, "rank %lld stopped before taking part in %s (it finished or failed: see its messages)", (long long)r,
+              br_op_name(br_cur_op));
+}
+
+static void br_send(int64_t dest, int64_t kind, const void *data, int64_t len, const char *loc) {
     /* what this rank printed so far comes out before anything another rank
        prints after hearing from it (ranks share stdout, each with its own buffer) */
     br_lock(&br_io_mu);
     fflush(stdout);
     br_unlock(&br_io_mu);
     br_peer *pr = &br_peers[dest];
+    int64_t slen = (int64_t)strlen(br_cur_site);
+    if (slen > 4096) slen = 4096;
     if (dest == br_rank) {
-        br_msg *m = (br_msg *)brine_alloc((int64_t)sizeof(br_msg) + len);
-        m->chan = chan;
+        br_msg *m = (br_msg *)brine_alloc((int64_t)sizeof(br_msg) + len + slen);
         m->kind = kind;
         m->len = len;
+        m->op = br_cur_op;
+        m->seq = br_cur_seq;
+        m->slen = slen;
         if (len) memcpy(m->data, data, (size_t)len);
+        memcpy(m->data + len, br_cur_site, (size_t)slen);
         br_enqueue(pr, m);
         return;
     }
-    int64_t hdr[3] = {chan, kind, len};
-    br_lock(&pr->send_mu);
-    int ok = br_write_all(pr->sock, (const char *)hdr, sizeof hdr) && (len == 0 || br_write_all(pr->sock, (const char *)data, len));
-    br_unlock(&pr->send_mu);
-    if (!ok) br_panicf(loc, "failed to send to rank %lld (did it exit?)", (long long)dest);
+    int64_t hdr[5] = {kind, len, br_cur_op, br_cur_seq, slen};
+    int ok;
+    if (len <= BR_RBUF) {
+        /* one `send`: each one costs a system call and often a packet */
+        char *buf = (char *)brine_alloc((int64_t)sizeof hdr + len + slen);
+        memcpy(buf, hdr, sizeof hdr);
+        if (len) memcpy(buf + sizeof hdr, data, (size_t)len);
+        memcpy(buf + sizeof hdr + len, br_cur_site, (size_t)slen);
+        br_lock(&pr->send_mu);
+        ok = br_write_all(pr->sock, buf, (int64_t)sizeof hdr + len + slen);
+        br_unlock(&pr->send_mu);
+        free(buf);
+    } else {
+        br_lock(&pr->send_mu);
+        ok = br_write_all(pr->sock, (const char *)hdr, sizeof hdr) && br_write_all(pr->sock, (const char *)data, len) &&
+             (slen == 0 || br_write_all(pr->sock, br_cur_site, slen));
+        br_unlock(&pr->send_mu);
+    }
+    if (!ok) br_peer_lost(dest, loc);
 }
 
-static br_msg *br_recv(int64_t src, int64_t chan, int64_t kind, const char *loc) {
-    br_check_rank(src, "source", loc);
+/* The other rank is in a different call than this one. */
+static BR_NORETURN void br_mismatch(int64_t src, br_msg *m, const char *loc) {
+    const char *site = m->data + m->len;
+    int sl = (int)m->slen;
+    if (m->op == BR_OP_FINISH)
+        br_panicf(loc, "rank %lld has already finished (%.*s), but this rank is in %s", (long long)src, sl, site, br_op_name(br_cur_op));
+    if (br_cur_op == BR_OP_FINISH)
+        br_panicf(loc, "this rank has finished, but rank %lld is still communicating: %s at %.*s", (long long)src, br_op_name(m->op), sl,
+                  site);
+    if (m->op == br_cur_op && (int64_t)strlen(br_cur_site) == m->slen && memcmp(site, br_cur_site, (size_t)sl) == 0)
+        br_panicf(loc,
+                  "mismatched communication: rank %lld is in a different call of %s here (its communication #%lld, this rank's "
+                  "#%lld)",
+                  (long long)src, br_op_name(m->op), (long long)m->seq, (long long)br_cur_seq);
+    br_panicf(loc, "mismatched communication: this rank is in %s, but rank %lld is in %s at %.*s", br_op_name(br_cur_op), (long long)src,
+              br_op_name(m->op), sl, site);
+}
+
+static br_msg *br_recv(int64_t src, int64_t kind, const char *loc) {
     br_peer *pr = &br_peers[src];
+    /* the message usually comes within microseconds: wait for it awake,
+       as waking a sleeping thread takes longer */
+    for (int i = 0; i < BR_SPINS && !__atomic_load_n(&pr->head, __ATOMIC_ACQUIRE) && !__atomic_load_n(&pr->closed, __ATOMIC_ACQUIRE); i++)
+        BR_RELAX();
     br_lock(&pr->mu);
-    for (;;) {
-        br_msg *prev = NULL;
-        for (br_msg *m = pr->head; m; prev = m, m = m->next) {
-            if (m->chan != chan) continue;
-            if (prev)
-                prev->next = m->next;
-            else
-                pr->head = m->next;
-            if (pr->tail == m) pr->tail = prev;
-            br_unlock(&pr->mu);
-            if (m->kind != kind)
-                br_panicf(loc, "type mismatch: rank %lld sent a value of type %s, but this receive expects %s", (long long)src,
-                          br_kind_name(m->kind), br_kind_name(kind));
-            return m;
-        }
+    while (!pr->head) {
         if (pr->closed) {
             br_unlock(&pr->mu);
-            br_panicf(loc, "rank %lld exited before sending the expected message", (long long)src);
+            br_peer_lost(src, loc);
         }
         br_cond_wait(&pr->cv, &pr->mu);
     }
+    br_msg *m = pr->head;
+    pr->head = m->next;
+    if (pr->tail == m) pr->tail = NULL;
+    br_unlock(&pr->mu);
+    /* returning from `main` and `exit` are the same call */
+    bool same = m->op == BR_OP_FINISH ? br_cur_op == BR_OP_FINISH
+                                      : m->op == br_cur_op && m->seq == br_cur_seq && m->slen == (int64_t)strlen(br_cur_site) &&
+                                            memcmp(m->data + m->len, br_cur_site, (size_t)m->slen) == 0;
+    if (!same) br_mismatch(src, m, loc);
+    if (m->kind != kind)
+        br_panicf(loc, "type mismatch: rank %lld sent %s, but this rank expects %s", (long long)src, br_kind_name(m->kind),
+                  br_kind_name(kind));
+    return m;
 }
 
 #ifdef BR_WASM
@@ -4205,6 +4337,28 @@ static br_sock br_connect(const char *host, const char *port) {
 static void br_nodelay(br_sock s) {
     int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+    int big = 4 << 20;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&big, sizeof big);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&big, sizeof big);
+}
+
+#include <signal.h>
+/* stderr is buffered with several ranks: what `abort` would lose */
+static void br_abort_flush(int sig) {
+    (void)sig;
+    fflush(stderr);
+}
+
+/* Processes this rank starts (`run`, `os.spawn`) are not part of its world. */
+static void br_unsetenv(const char *name) {
+#ifdef _WIN32
+    char buf[64];
+    snprintf(buf, sizeof buf, "%s=", name);
+    _putenv(buf);
+    SetEnvironmentVariableA(name, NULL);
+#else
+    unsetenv(name);
+#endif
 }
 
 static void br_world_init(void) {
@@ -4212,11 +4366,20 @@ static void br_world_init(void) {
     if (!er || !es || !ep) return;
     br_rank = atoll(er);
     br_size = atoll(es);
+    char *list = strdup(ep);
+    br_unsetenv("BRINE_RANK");
+    br_unsetenv("BRINE_WORLD_SIZE");
+    br_unsetenv("BRINE_PEERS");
     if (br_size <= 1) {
         br_size = 1;
         br_rank = 0;
+        free(list);
         return;
     }
+    /* ranks share stderr: write each message whole (panics and `eprint` flush) */
+    static char errbuf[1 << 14];
+    setvbuf(stderr, errbuf, _IOFBF, sizeof errbuf);
+    signal(SIGABRT, br_abort_flush);
 #ifdef _WIN32
     br_ws_start();
 #else
@@ -4225,7 +4388,6 @@ static void br_world_init(void) {
     br_peers = (br_peer *)calloc((size_t)br_size, sizeof(br_peer));
     char **hosts = (char **)calloc((size_t)br_size, sizeof(char *));
     char **ports = (char **)calloc((size_t)br_size, sizeof(char *));
-    char *list = strdup(ep);
     char *p = list;
     for (int64_t i = 0; i < br_size; i++) {
         char *comma = strchr(p, ',');
@@ -4314,28 +4476,35 @@ static void br_world_init(void) {
 int64_t brine_world_rank(void) { return br_rank; }
 int64_t brine_world_size(void) { return br_size; }
 
-void brine_world_barrier(void) {
-    if (br_size <= 1) return;
-    const char *loc = "<barrier>";
-    if (br_rank == 0) {
-        for (int64_t r = 1; r < br_size; r++) free(br_recv(r, BR_CH_COLL, BR_K_EMPTY, loc));
-        for (int64_t r = 1; r < br_size; r++) br_send(r, BR_CH_COLL, BR_K_EMPTY, NULL, 0, loc);
-    } else {
-        br_send(0, BR_CH_COLL, BR_K_EMPTY, NULL, 0, loc);
-        free(br_recv(0, BR_CH_COLL, BR_K_EMPTY, loc));
+/* Dissemination barrier: log2(size) rounds, no rank in the middle. */
+static void br_barrier(const char *loc) {
+    for (int64_t k = 1; k < br_size; k <<= 1) {
+        br_send((br_rank + k) % br_size, BR_K_EMPTY, NULL, 0, loc);
+        free(br_recv((br_rank - k + br_size) % br_size, BR_K_EMPTY, loc));
     }
 }
 
-static int64_t br_get8(br_msg *m) {
-    int64_t v;
-    memcpy(&v, m->data, 8);
-    free(m);
-    return v;
+void brine_world_barrier(const char *loc) {
+    if (br_size <= 1) return;
+    br_coll(BR_OP_BARRIER, loc);
+    br_barrier(loc);
 }
+
+/* The end of the program (returning from `main`, or `exit`): wait until
+ * every rank gets there, so no rank leaves while others still talk to it. */
+static void br_world_finish(const char *how) {
+    static bool done = false;
+    if (br_size <= 1 || done) return;
+    done = true;
+    br_coll(BR_OP_FINISH, how);
+    br_barrier("<end of the program>");
+}
+
 /* Messages are encoded from a type description string, which the compiler
- * derives from the static type:  i = int, f = float, b = bool, s = str,
- * a<T> = array of <T>.  Every rank reaches the same collective call (the
- * compiler checks this), so both sides always agree on the description. */
+ * derives from the static type:  i = 64-bit int, 1/2/4/h = 8/16/32/128-bit
+ * int, f = float, g = f32, b = bool, s = str, a<T> = array of <T>.  Every
+ * rank reaches the same collective call (the compiler checks this), so both
+ * sides always agree on the description. */
 typedef struct {
     char *p;
     int64_t len, cap;
@@ -4353,14 +4522,21 @@ static void br_buf_put(br_buf *b, const void *data, int64_t n) {
     b->len += n;
 }
 
+/* bytes per element in memory, and whether it is plain data sent as is */
 static int64_t br_desc_size(const char *d) {
     switch (*d) {
     case 'b': return (int64_t)sizeof(bool);
+    case '1': return 1;
+    case '2': return 2;
+    case '4':
+    case 'g': return 4;
+    case 'h': return 16;
     case 's':
     case 'a': return BR_PSLOT;
     default: return 8;
     }
 }
+static bool br_desc_plain(const char *d) { return *d != 's' && *d != 'a' && *d != 'b'; }
 static void br_desc_fns(const char *d, brine_elem_fn *rt, brine_elem_fn *rl) {
     if (*d == 's') {
         *rt = brine_rt_str;
@@ -4376,8 +4552,6 @@ static void br_desc_fns(const char *d, brine_elem_fn *rt, brine_elem_fn *rl) {
 
 static void br_encode(br_buf *b, const char *d, const void *v) {
     switch (*d) {
-    case 'i':
-    case 'f': br_buf_put(b, v, 8); break;
     case 'b': {
         char c = *(const bool *)v ? 1 : 0;
         br_buf_put(b, &c, 1);
@@ -4393,23 +4567,19 @@ static void br_encode(br_buf *b, const char *d, const void *v) {
         const brine_arr *a = *(brine_arr *const *)v;
         br_buf_put(b, &a->len, 8);
         const char *e = d + 1;
-        if (*e == 'i' || *e == 'f')
-            br_buf_put(b, a->data, a->len * 8);
+        if (br_desc_plain(e))
+            br_buf_put(b, a->data, a->len * br_desc_size(e));
         else
             for (int64_t i = 0; i < a->len; i++) br_encode(b, e, a->data + i * a->esz);
         break;
     }
+    default: br_buf_put(b, v, br_desc_size(d)); break;
     }
 }
 
 /* decode one value at *p into `out` (an owned reference for str/arrays) */
 static void br_decode(const char **p, const char *d, void *out, const char *loc) {
     switch (*d) {
-    case 'i':
-    case 'f':
-        memcpy(out, *p, 8);
-        *p += 8;
-        break;
     case 'b':
         *(bool *)out = **p != 0;
         *p += 1;
@@ -4430,13 +4600,19 @@ static void br_decode(const char **p, const char *d, void *out, const char *loc)
         brine_elem_fn rt, rl;
         br_desc_fns(e, &rt, &rl);
         brine_arr *a = brine_arr_new(n, br_desc_size(e), rt, rl, loc);
-        if (*e == 'i' || *e == 'f') {
-            memcpy(a->data, *p, (size_t)(n * 8));
-            *p += n * 8;
+        if (br_desc_plain(e)) {
+            memcpy(a->data, *p, (size_t)(n * br_desc_size(e)));
+            *p += n * br_desc_size(e);
         } else {
             for (int64_t i = 0; i < n; i++) br_decode(p, e, a->data + i * a->esz, loc);
         }
         *(brine_arr **)out = a;
+        break;
+    }
+    default: {
+        int64_t n = br_desc_size(d);
+        memcpy(out, *p, (size_t)n);
+        *p += n;
         break;
     }
     }
@@ -4455,17 +4631,22 @@ static void br_copy_val(const char *d, const void *v, void *out) {
 static void br_put(int64_t dest, const char *d, const void *v, const char *loc) {
     br_buf b = {0};
     br_encode(&b, d, v);
-    br_send(dest, BR_CH_COLL, BR_K_MSG, b.p, b.len, loc);
+    br_send(dest, BR_K_MSG, b.p, b.len, loc);
     free(b.p);
 }
 static void br_take(int64_t src, const char *d, void *out, const char *loc) {
-    br_msg *m = br_recv(src, BR_CH_COLL, BR_K_MSG, loc);
+    br_msg *m = br_recv(src, BR_K_MSG, loc);
     const char *p = m->data;
     br_decode(&p, d, out, loc);
     free(m);
 }
 
 void brine_world_shift(const char *d, const void *v, void *out, int64_t by, const char *loc) {
+    if (br_size <= 1) {
+        br_copy_val(d, v, out);
+        return;
+    }
+    br_coll(BR_OP_SHIFT, loc);
     int64_t k = by % br_size;
     if (k < 0) k += br_size;
     if (k == 0) {
@@ -4476,6 +4657,26 @@ void brine_world_shift(const char *d, const void *v, void *out, int64_t by, cons
     br_take((br_rank - k + br_size) % br_size, d, out, loc);
 }
 
+/* `world.shift(v, by, edge)`: no wrapping around; a rank with no rank `by`
+ * before it (rank - by is outside the world) gets `edge`. */
+void brine_world_shift_edge(const char *d, const void *v, void *out, int64_t by, const void *edge, const char *loc) {
+    if (br_size > 1) br_coll(BR_OP_SHIFT, loc);
+    if (by == 0) {
+        br_copy_val(d, v, out);
+        return;
+    }
+    if (by >= br_size || by <= -br_size) {
+        br_copy_val(d, edge, out);
+        return;
+    }
+    int64_t to = br_rank + by, from = br_rank - by;
+    if (to >= 0 && to < br_size) br_put(to, d, v, loc);
+    if (from >= 0 && from < br_size)
+        br_take(from, d, out, loc);
+    else
+        br_copy_val(d, edge, out);
+}
+
 brine_arr *brine_world_exchange(const char *ed, brine_arr *xs, const char *loc) {
     if (xs->len != br_size)
         br_panicf(loc, "world.exchange needs one element per rank: got %lld elements, but the world size is %lld", (long long)xs->len,
@@ -4483,83 +4684,240 @@ brine_arr *brine_world_exchange(const char *ed, brine_arr *xs, const char *loc) 
     brine_elem_fn rt, rl;
     br_desc_fns(ed, &rt, &rl);
     brine_arr *res = brine_arr_new(br_size, br_desc_size(ed), rt, rl, loc);
-    for (int64_t j = 0; j < br_size; j++)
-        if (j != br_rank) br_put(j, ed, xs->data + j * xs->esz, loc);
+    if (br_size > 1) br_coll(BR_OP_EXCHANGE, loc);
+    /* everyone sends to a different rank at each step */
+    for (int64_t k = 1; k < br_size; k++) {
+        int64_t j = (br_rank + k) % br_size;
+        br_put(j, ed, xs->data + j * xs->esz, loc);
+    }
     br_copy_val(ed, xs->data + br_rank * xs->esz, res->data + br_rank * res->esz);
-    for (int64_t j = 0; j < br_size; j++)
-        if (j != br_rank) br_take(j, ed, res->data + j * res->esz, loc);
+    for (int64_t k = 1; k < br_size; k++) {
+        int64_t j = (br_rank - k + br_size) % br_size;
+        br_take(j, ed, res->data + j * res->esz, loc);
+    }
     return res;
+}
+
+/* Binomial tree from `root`: log2(size) rounds; the encoded bytes are
+ * forwarded as they are. Takes `*data` (malloc'ed) at the root, returns the
+ * bytes everywhere (the caller frees them). */
+static char *br_bcast_bytes(int64_t root, char *data, int64_t *len, const char *loc) {
+    int64_t vr = (br_rank - root + br_size) % br_size;
+    int64_t mask = 1;
+    br_msg *got = NULL;
+    while (mask < br_size) {
+        if (vr & mask) {
+            got = br_recv((br_rank - mask + br_size) % br_size, BR_K_MSG, loc);
+            break;
+        }
+        mask <<= 1;
+    }
+    if (got) {
+        *len = got->len;
+        data = (char *)brine_alloc(got->len ? got->len : 1);
+        memcpy(data, got->data, (size_t)got->len);
+        free(got);
+    }
+    for (mask >>= 1; mask > 0; mask >>= 1)
+        if (vr + mask < br_size) br_send((br_rank + mask) % br_size, BR_K_MSG, data, *len, loc);
+    return data;
 }
 
 void brine_world_bcast(const char *d, const void *v, void *out, int64_t root, const char *loc) {
     br_check_rank(root, "root", loc);
+    if (br_size <= 1) {
+        br_copy_val(d, v, out);
+        return;
+    }
+    br_coll(BR_OP_BCAST, loc);
+    br_buf b = {0};
+    if (br_rank == root) br_encode(&b, d, v);
+    int64_t len = b.len;
+    char *data = br_bcast_bytes(root, b.p, &len, loc);
     if (br_rank == root) {
-        for (int64_t r = 0; r < br_size; r++)
-            if (r != root) br_put(r, d, v, loc);
         br_copy_val(d, v, out);
     } else {
-        br_take(root, d, out, loc);
+        const char *p = data;
+        br_decode(&p, d, out, loc);
     }
+    free(data);
 }
 
-/* every rank gets [v from rank 0, v from rank 1, ...] */
+/* every rank gets [v from rank 0, v from rank 1, ...]. Each rank encodes
+ * its value once. Strings and arrays (which can be large) go straight to
+ * every other rank, staggered so no rank is sent to by all at once: the
+ * data moves over all connections at the same time. Fixed-size values,
+ * where the number of messages matters more, use Bruck's algorithm: in
+ * round k each rank sends all it has (up to 2^k values) to the rank 2^k
+ * below and gets as much from the rank 2^k above, so log2(size) rounds.
+ * The choice depends on the type only, so every rank makes the same one. */
 brine_arr *brine_world_gather(const char *ed, const void *v, const char *loc) {
     brine_elem_fn rt, rl;
     br_desc_fns(ed, &rt, &rl);
     brine_arr *res = brine_arr_new(br_size, br_desc_size(ed), rt, rl, loc);
-    for (int64_t j = 0; j < br_size; j++)
-        if (j != br_rank) br_put(j, ed, v, loc);
-    br_copy_val(ed, v, res->data + br_rank * res->esz);
-    for (int64_t j = 0; j < br_size; j++)
-        if (j != br_rank) br_take(j, ed, res->data + j * res->esz, loc);
+    if (br_size <= 1) {
+        br_copy_val(ed, v, res->data);
+        return res;
+    }
+    br_coll(BR_OP_GATHER, loc);
+    if (*ed == 's' || *ed == 'a') {
+        br_copy_val(ed, v, res->data + br_rank * res->esz);
+        br_buf one = {0};
+        br_encode(&one, ed, v);
+        for (int64_t k = 1; k < br_size; k++) br_send((br_rank + k) % br_size, BR_K_MSG, one.p, one.len, loc);
+        free(one.p);
+        for (int64_t k = 1; k < br_size; k++) {
+            int64_t j = (br_rank - k + br_size) % br_size;
+            br_take(j, ed, res->data + j * res->esz, loc);
+        }
+        return res;
+    }
+    /* Bruck: rank r collects the values of ranks r, r+1, ... (mod size) */
+    br_buf b = {0};
+    br_encode(&b, ed, v);
+    /* where each collected value starts in b; offs[n] is the end */
+    int64_t *offs = (int64_t *)brine_alloc((br_size + 1) * 8);
+    offs[0] = 0;
+    offs[1] = b.len;
+    int64_t n = 1;
+    for (int64_t d = 1; d < br_size; d <<= 1) {
+        int64_t c = d < br_size - d ? d : br_size - d;
+        /* the first c values: their lengths, then their bytes */
+        br_buf out = {0};
+        for (int64_t i = 0; i < c; i++) {
+            int64_t l = offs[i + 1] - offs[i];
+            br_buf_put(&out, &l, 8);
+        }
+        br_buf_put(&out, b.p, offs[c]);
+        br_send((br_rank - d + br_size) % br_size, BR_K_MSG, out.p, out.len, loc);
+        free(out.p);
+        br_msg *m = br_recv((br_rank + d) % br_size, BR_K_MSG, loc);
+        int64_t got = m->len - c * 8;
+        for (int64_t i = 0; i < c && got >= 0; i++) {
+            int64_t l;
+            memcpy(&l, m->data + i * 8, 8);
+            got -= l;
+            offs[n + i + 1] = offs[n + i] + l;
+        }
+        if (got != 0) br_panicf(loc, "`world.gather_all`: malformed message from rank %lld", (long long)((br_rank + d) % br_size));
+        br_buf_put(&b, m->data + c * 8, m->len - c * 8);
+        free(m);
+        n += c;
+    }
+    for (int64_t i = 0; i < br_size; i++) {
+        const char *p = b.p + offs[i];
+        br_decode(&p, ed, res->data + ((br_rank + i) % br_size) * res->esz, loc);
+    }
+    free(offs);
+    free(b.p);
     return res;
 }
 
-/* reductions: gather to rank 0 in rank order (deterministic), combine, broadcast */
+/* ---- reductions
+ * Recursive doubling: in each round, partners combine (lower ranks' part,
+ * upper ranks' part) in that order, so every rank computes exactly the same
+ * operations and ends with bit-identical results. With a world size that
+ * isn't a power of two, the ranks above it first hand their value to a
+ * partner below and get the result back at the end. */
+static int64_t br_red_op(int op) {
+    static const int64_t ops[] = {BR_OP_SUM, BR_OP_MIN, BR_OP_MAX, BR_OP_ANY, BR_OP_ALL};
+    return op >= 0 && op < 5 ? ops[op] : BR_OP_SUM;
+}
+
+/* out[i] = lo[i] (op) hi[i]; `fl`: doubles, else int64 */
+static void br_combine(int op, bool fl, const char *lo, const char *hi, char *out, int64_t n, const char *loc) {
+    for (int64_t i = 0; i < n; i++) {
+        if (fl) {
+            double a, b, r;
+            memcpy(&a, lo + i * 8, 8);
+            memcpy(&b, hi + i * 8, 8);
+            if (op == 0)
+                r = a + b;
+            else if (op == 1)
+                r = b < a ? b : a;
+            else
+                r = b > a ? b : a;
+            memcpy(out + i * 8, &r, 8);
+        } else {
+            int64_t a, b, r;
+            memcpy(&a, lo + i * 8, 8);
+            memcpy(&b, hi + i * 8, 8);
+            if (op == 0)
+                r = brine_add_i64(a, b, loc);
+            else if (op == 1 || op == 4)
+                r = b < a ? b : a;
+            else
+                r = b > a ? b : a;
+            memcpy(out + i * 8, &r, 8);
+        }
+    }
+}
+
+/* combine `n` elements at `acc` across all ranks, in place */
+static void br_allreduce(char *acc, int64_t n, bool fl, int op, const char *loc) {
+    int64_t kind = fl ? BR_K_F64 : BR_K_I64, bytes = n * 8;
+    int64_t p2 = 1;
+    while (p2 * 2 <= br_size) p2 *= 2;
+    int64_t extra = br_size - p2;
+    char *tmp = (char *)brine_alloc(bytes ? bytes : 1);
+#define BR_TAKE(src)                                                                                                                     \
+    do {                                                                                                                                 \
+        br_msg *m_ = br_recv((src), kind, loc);                                                                                          \
+        if (m_->len != bytes)                                                                                                            \
+            br_panicf(loc, "%s: rank %lld has %lld elements, but this rank has %lld (arrays must be the same length on every rank)",   \
+                      br_op_name(br_cur_op), (long long)(src), (long long)(m_->len / 8), (long long)n);                                 \
+        memcpy(tmp, m_->data, (size_t)bytes);                                                                                            \
+        free(m_);                                                                                                                        \
+    } while (0)
+    if (br_rank >= p2) {
+        br_send(br_rank - p2, kind, acc, bytes, loc);
+        BR_TAKE(br_rank - p2);
+        memcpy(acc, tmp, (size_t)bytes);
+        free(tmp);
+        return;
+    }
+    if (br_rank < extra) {
+        BR_TAKE(br_rank + p2);
+        br_combine(op, fl, acc, tmp, acc, n, loc);
+    }
+    for (int64_t mask = 1; mask < p2; mask <<= 1) {
+        int64_t partner = br_rank ^ mask;
+        br_send(partner, kind, acc, bytes, loc);
+        BR_TAKE(partner);
+        if (br_rank < partner)
+            br_combine(op, fl, acc, tmp, acc, n, loc);
+        else
+            br_combine(op, fl, tmp, acc, acc, n, loc);
+    }
+    if (br_rank < extra) br_send(br_rank + p2, kind, acc, bytes, loc);
+#undef BR_TAKE
+    free(tmp);
+}
+
+/* op: 0 sum, 1 min, 2 max, 3 any, 4 all (on 0/1) */
 int64_t brine_world_reduce_i64(int64_t v, int op, const char *loc) {
     if (br_size <= 1) return v;
-    if (br_rank == 0) {
-        int64_t acc = v;
-        for (int64_t r = 1; r < br_size; r++) {
-            int64_t x = br_get8(br_recv(r, BR_CH_COLL, BR_K_I64, loc));
-            if (op == 0)
-                acc = brine_add_i64(acc, x, loc);
-            else if (op == 1)
-                acc = x < acc ? x : acc;
-            else
-                acc = x > acc ? x : acc;
-        }
-        for (int64_t r = 1; r < br_size; r++) br_send(r, BR_CH_COLL, BR_K_I64, &acc, 8, loc);
-        return acc;
-    }
-    br_send(0, BR_CH_COLL, BR_K_I64, &v, 8, loc);
-    return br_get8(br_recv(0, BR_CH_COLL, BR_K_I64, loc));
+    br_coll(br_red_op(op), loc);
+    br_allreduce((char *)&v, 1, false, op, loc);
+    return v;
 }
 double brine_world_reduce_f64(double v, int op, const char *loc) {
     if (br_size <= 1) return v;
-    double acc = v;
-    if (br_rank == 0) {
-        for (int64_t r = 1; r < br_size; r++) {
-            br_msg *m = br_recv(r, BR_CH_COLL, BR_K_F64, loc);
-            double x;
-            memcpy(&x, m->data, 8);
-            free(m);
-            if (op == 0)
-                acc += x;
-            else if (op == 1)
-                acc = x < acc ? x : acc;
-            else
-                acc = x > acc ? x : acc;
-        }
-        for (int64_t r = 1; r < br_size; r++) br_send(r, BR_CH_COLL, BR_K_F64, &acc, 8, loc);
-        return acc;
-    }
-    br_send(0, BR_CH_COLL, BR_K_F64, &v, 8, loc);
-    br_msg *m = br_recv(0, BR_CH_COLL, BR_K_F64, loc);
-    memcpy(&acc, m->data, 8);
-    free(m);
-    return acc;
+    br_coll(br_red_op(op), loc);
+    br_allreduce((char *)&v, 1, true, op, loc);
+    return v;
 }
+
+/* element by element over `[int]` (ed "i") or `[float]` (ed "f"); a new array */
+brine_arr *brine_world_reduce_arr(const char *ed, brine_arr *xs, int op, const char *loc) {
+    brine_arr *res = brine_arr_new(xs->len, 8, NULL, NULL, loc);
+    if (xs->len) memcpy(res->data, xs->data, (size_t)(xs->len * 8));
+    if (br_size <= 1) return res;
+    br_coll(br_red_op(op), loc);
+    br_allreduce(res->data, xs->len, *ed == 'f', op, loc);
+    return res;
+}
+
 /* ============================================================ init / shutdown */
 #ifdef _WIN32
 #include <io.h>
@@ -4704,7 +5062,7 @@ void brine_rt_shutdown(void) {
     br_procs_free();
     br_flush();
     br_gpu_settle();
-    if (br_size > 1) brine_world_barrier();
+    br_world_finish("it returned from `main`");
     br_flush();
     if (br_leakcheck) fprintf(stderr, "brine: %lld live objects at exit\n", (long long)__atomic_load_n(&br_live, __ATOMIC_RELAXED));
 }

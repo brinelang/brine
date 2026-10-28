@@ -923,12 +923,14 @@ void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, v
 /* ------------------------------------------------------------ world (multi-process) */
 int64_t brine_world_rank(void);
 int64_t brine_world_size(void);
-void brine_world_barrier(void);
+void brine_world_barrier(const char *loc);
+void brine_world_shift_edge(const char *d, const void *v, void *out, int64_t by, const void *edge, const char *loc);
 void brine_world_shift(const char *d, const void *v, void *out, int64_t by, const char *loc);
 brine_arr *brine_world_exchange(const char *ed, brine_arr *xs, const char *loc);
 void brine_world_bcast(const char *d, const void *v, void *out, int64_t root, const char *loc);
 brine_arr *brine_world_gather(const char *ed, const void *v, const char *loc);
 int64_t brine_world_reduce_i64(int64_t v, int op, const char *loc);
 double brine_world_reduce_f64(double v, int op, const char *loc);
+brine_arr *brine_world_reduce_arr(const char *ed, brine_arr *xs, int op, const char *loc);
 
 #endif

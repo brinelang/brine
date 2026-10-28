@@ -4701,16 +4701,22 @@ struct Lower:
             case WorldOp.Size:
                 return self.cx.fb.call(K.I64, "brine_world_size", [])
             case WorldOp.Barrier:
-                self.cx.fb.call_void("brine_world_barrier", [])
+                let loc = self.loc(e.span)
+                self.cx.fb.call_void("brine_world_barrier", [loc])
                 return self.unit()
             case WorldOp.Shift:
-                let x0 = self.expr(args[0].expr)
-                let v = self.wval(x0, e.ty)
+                let v = self.expr(args[0].expr)
                 let by0 = self.expr(args[1].expr)
                 let by = self.cx.fb.conv(K.I64, by0)
                 let de = self.cstr(world_desc(e.ty))
                 let loc = self.loc(e.span)
-                let r = self.world_move("brine_world_shift", e.ty, de, v, by, loc)
+                if len(args) == 3:
+                    # no wrapping around: the ranks at the edge get this value
+                    let ed = self.expr(args[2].expr)
+                    let ep = self.world_ptr(ed, e.ty)
+                    let r = self.world_move("brine_world_shift_edge", e.ty, de, v, [by, ep, loc])
+                    return self.temp(r, e.ty)
+                let r = self.world_move("brine_world_shift", e.ty, de, v, [by, loc])
                 return self.temp(r, e.ty)
             case WorldOp.Exchange:
                 let xs = self.expr(args[0].expr)
@@ -4721,22 +4727,37 @@ struct Lower:
             case WorldOp.Broadcast:
                 let root0 = self.expr(args[0].expr)
                 let root = self.cx.fb.conv(K.I64, root0)
-                let x0 = self.expr(args[1].expr)
-                let v = self.wval(x0, e.ty)
+                let v = self.expr(args[1].expr)
                 let de = self.cstr(world_desc(e.ty))
                 let loc = self.loc(e.span)
-                let r = self.world_move("brine_world_bcast", e.ty, de, v, root, loc)
+                let r = self.world_move("brine_world_bcast", e.ty, de, v, [root, loc])
                 return self.temp(r, e.ty)
-            case WorldOp.Sum | WorldOp.Min | WorldOp.Max:
+            case WorldOp.Sum | WorldOp.Min | WorldOp.Max | WorldOp.Any | WorldOp.All:
                 let x0 = self.expr(args[0].expr)
-                let v = self.wval(x0, e.ty)
+                # the runtime's codes: 0 sum, 1 min, 2 max, 3 any, 4 all
                 var code = 2
                 if op == WorldOp.Sum:
                     code = 0
                 elif op == WorldOp.Min:
                     code = 1
+                elif op == WorldOp.Any:
+                    code = 3
+                elif op == WorldOp.All:
+                    code = 4
                 let c = self.cx.fb.konst(K.I32, code)
                 let loc = self.loc(e.span)
+                match e.ty:
+                    case Ty.Array(el):
+                        let de = self.cstr(world_desc(el))
+                        let r = self.cx.fb.call(K.Ptr, "brine_world_reduce_arr", [de, x0, c, loc])
+                        return self.temp(r, e.ty)
+                    case Ty.Bool:
+                        let b = self.cx.fb.conv(K.I64, x0)
+                        let r = self.cx.fb.call(K.I64, "brine_world_reduce_i64", [b, c, loc])
+                        return self.cx.fb.conv(K.Bool, r)
+                    case _:
+                        pass
+                let v = self.wval(x0, e.ty)
                 let r = self.cx.fb.call(
                     self.wkind(e.ty),
                     f"brine_world_reduce_{world_suffix(e.ty)}",
@@ -4745,25 +4766,29 @@ struct Lower:
                 return self.cx.fb.conv(self.kind(e.ty), r)
             case WorldOp.GatherAll:
                 let t = args[0].expr.ty
-                let x0 = self.expr(args[0].expr)
-                let v = self.wval(x0, t)
+                let v = self.expr(args[0].expr)
                 let de = self.cstr(world_desc(t))
                 let loc = self.loc(e.span)
-                let wk = self.wkind(t)
-                let vp = self.cx.fb.temp_mem(wk.size(), wk.size())
-                self.cx.fb.store(vp, 0, v)
+                let vp = self.world_ptr(v, t)
                 let r = self.cx.fb.call(K.Ptr, "brine_world_gather", [de, vp, loc])
                 return self.temp(r, e.ty)
 
+    # a value in memory, for the runtime to read (at the width of its type)
+    fn world_ptr(ref self, v: int, t: Ty) -> int:
+        let k = self.kind(t)
+        let p = self.cx.fb.temp_mem(k.size(), k.size())
+        self.cx.fb.store(p, 0, v)
+        return p
+
     # shift and broadcast pass the value and the result by pointer
-    fn world_move(ref self, f: str, t: Ty, de: int, v: int, n: int, loc: int) -> int:
-        let wk = self.wkind(t)
-        let vp = self.cx.fb.temp_mem(wk.size(), wk.size())
-        self.cx.fb.store(vp, 0, v)
-        let op = self.cx.fb.temp_mem(wk.size(), wk.size())
-        self.cx.fb.call_void(f, [de, vp, op, n, loc])
-        let r = self.cx.fb.load(wk, op, 0)
-        return self.cx.fb.conv(self.kind(t), r)
+    fn world_move(ref self, f: str, t: Ty, de: int, v: int, rest: [int]) -> int:
+        let k = self.kind(t)
+        let vp = self.world_ptr(v, t)
+        let op = self.cx.fb.temp_mem(k.size(), k.size())
+        var xs = [de, vp, op]
+        xs.extend(rest)
+        self.cx.fb.call_void(f, xs)
+        return self.cx.fb.load(k, op, 0)
 
     # ============================================================ loops and comprehensions
     fn domain(ref self, iter: Expr, stmt: bool) -> Dom:
@@ -5695,11 +5720,23 @@ fn world_suffix(t: Ty) -> str:
         case _:
             return "arr"
 
-# The message type description the runtime's encoder understands.
+# The message type description the runtime's encoder understands: values
+# travel at the width they have in memory.
 fn world_desc(t: Ty) -> str:
     match t:
-        case Ty.Int(_):
+        case Ty.Int(k):
+            let b = k.bits()
+            if b == 8:
+                return "1"
+            elif b == 16:
+                return "2"
+            elif b == 32:
+                return "4"
+            elif b == 128:
+                return "h"
             return "i"
+        case Ty.Float(FloatTy.F32):
+            return "g"
         case Ty.Float(_):
             return "f"
         case Ty.Bool:

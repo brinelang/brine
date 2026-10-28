@@ -146,6 +146,56 @@ test "world programs run on several processes":
         "converged after 22 iterations true\n",
         ["--ranks", "3"]
     )
+    # idioms the deadlock checker must accept
+    run_ok("tests/programs/world_idioms.br", "100 2 [0, 1, 2] Ok(30) [3, 2, 4]\n", ["--ranks", "3"])
+    run_ok("tests/programs/world_ops.br", text("tests/programs/world_ops.out"), ["--ranks", "4"])
+    run_ok("tests/programs/world_ops.br", text("tests/programs/world_ops5.out"), ["--ranks", "5"])
+    run_ok("tests/programs/world_child.br", "inherited: [false, false, false]\n", ["--ranks", "3"])
+    run_ok("tests/programs/world_exit.br", "total 3 true\n", ["--ranks", "3"])
+
+test "world runtime failures are clear":
+    # every rank exits with the same code: it's the launcher's
+    let o = brine(["run", "-q", "--ranks", "3", "tests/programs/world_exit.br", "--", "x"])
+    assert o.code == 3 and o.out == "total 3 true\n" and "error:" not in o.err, o.all()
+    # the first rank to fail is the cause; the others are stopped
+    let p = brine(["run", "-q", "--ranks", "4", "tests/programs/world_panic.br"])
+    assert p.code == 101, p.all()
+    assert "panic (rank 1): rank 1 gives up" in p.err, p.all()
+    assert "error: rank 1 failed (exit code 101), so the other ranks were stopped" in p.err, p.all()
+    # ranks in different collectives (two programs in one world: the compiler
+    # rejects a program that could do this) panic, naming both call sites
+    let d = scratch("mismatch")
+    write(f"{d}/a.br", "fn main():\n    print(world.sum(1))\n")
+    write(f"{d}/b.br", "fn main():\n    world.barrier()\n")
+    var exes: [str] = []
+    for n in ["a", "b"]:
+        let b = brine(["build", "-q", f"{d}/{n}.br", "-o", f"{d}/{n}.exe"])
+        assert b.code == 0, b.all()
+        exes.push(f"{d}/{n}.exe")
+    var peers = ""
+    match os.free_ports(2):
+        case Ok(ps):
+            peers = f"127.0.0.1:{ps[0]},127.0.0.1:{ps[1]}"
+        case Err(e):
+            panic(e)
+    var kids: [int] = []
+    for r in 0..2:
+        let env = {"BRINE_RANK": f"{r}", "BRINE_WORLD_SIZE": "2", "BRINE_PEERS": peers}
+        match os.spawn([exes[r]], env, true, false):
+            case Ok(k):
+                kids.push(k)
+            case Err(e):
+                panic(e)
+    var errs: [str] = []
+    for k in kids:
+        let code = os.wait(k)
+        let (_, er) = os.output(k)
+        assert code == 101, er
+        errs.push(er.replace("\r\n", "\n"))
+    let (e0, e1) = (errs[0], errs[1])
+    assert "mismatched communication: this rank is in `world.sum`, but rank 1 is in `world.barrier` at " in e0, e0
+    assert "b.br:2:5" in e0, e0
+    assert "this rank is in `world.barrier`, but rank 0 is in `world.sum` at " in e1, e1
 
 fn features() -> [str]:
     return [
@@ -603,6 +653,33 @@ test "deadlocks are rejected":
             "E0510@38"
         ]
     )
+    # every line marked `# E05..` in the file, and nothing else
+    let file = "tests/programs/deadlock_errors2.br"
+    var want: [str] = []
+    for i, l in enumerate(read_file(file).unwrap().lines()):
+        if "# E05" in l:
+            want.push(l[l.find("# E05").unwrap() + 2:].strip() + "@" + str(i + 1))
+    assert error_codes(file) == want
+
+test "the deadlock checker iterates to a fixpoint":
+    # a rank-dependent value passed along 120 functions...
+    let d = scratch("fixpoint")
+    var fns = "fn main():\n    if f0() == 0:\n        world.barrier()\n"
+    for i in 0..120:
+        fns += f"fn f{i}() -> int:\n    return f{i + 1}()\n"
+    fns += "fn f120() -> int:\n    return world.rank()\n"
+    write(d + "/fns.br", fns)
+    assert error_codes(d + "/fns.br") == ["E0510@3"]
+    # ... or 60 variables, copied in reverse order inside a loop
+    var vars = "fn main():\n"
+    for i in 0..61:
+        vars += f"    var v{i} = 0\n"
+    vars += "    for k in 0..100:\n"
+    for i in 0..60:
+        vars += f"        v{60 - i} = v{59 - i}\n"
+    vars += "        v0 = world.rank()\n    if v60 == 0:\n        world.barrier()\n"
+    write(d + "/vars.br", vars)
+    assert error_codes(d + "/vars.br") == ["E0510@126"]
 
 test "match errors":
     let want = [
@@ -704,6 +781,19 @@ test "os and embed errors":
     )
     # `os` results (except `os.name()`/`os.arch()`) differ between ranks
     assert error_codes("tests/programs/os_deadlock_errors.br") == ["E0510@5", "E0510@6"]
+    assert (
+        error_codes("tests/programs/world_type_errors.br")
+        == [
+            "E0319@5",
+            "E0319@6",
+            "E0319@7",
+            "E0301@8",
+            "E0319@9",
+            "E0319@10",
+            "E0302@11",
+            "E0319@12"
+        ]
+    )
     assert (
         error_codes("tests/programs/embed_errors.br")
         == ["E0707@3", "E0707@4", "E0707@5", "E0707@6", "E0302@7"]
