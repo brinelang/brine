@@ -52,6 +52,23 @@ struct LoopCx:
     next: Option[(int, V)]
     breaks: [St]
 
+# The state before code that runs on some paths only: its facts (`k` of
+# them) and the number of atoms then (`na`; later ones are new).
+struct Fork:
+    base: St
+    k: int
+    na: int
+
+# The facts added since `fk` that mention an atom created since.
+fn new_facts(facts: [F], fk: Fork) -> [F]:
+    var out: [F] = []
+    for i in fk.k..len(facts):
+        var s = AtomSet.new()
+        facts[i].atoms(ref s)
+        if any(a >= fk.na and a != ATOM_UNKNOWN for a in s.xs):
+            out.push(facts[i])
+    return out
+
 struct FnSpec:
     name: str
     params: [int]
@@ -1260,30 +1277,7 @@ struct Vf:
             return a0
         let a = a0.unwrap()
         let b = b0.unwrap()
-        var env: {int: V} = {}
-        var ea: [F] = []
-        var eb: [F] = []
-        # in a fixed order, so fresh atoms and facts are the same on every run
-        var keys = [x for x in a.env.keys() if x in b.env]
-        keys.sort()
-        for id in keys:
-            let va = a.env[id]
-            let vb = b.env[id]
-            if va == vb:
-                env[id] = va
-                continue
-            let nv = self.fresh_val(self.local_ty(id), self.local_name(id))
-            match val_eq(nv, va):
-                case Some(f):
-                    ea.push(f)
-                case None:
-                    pass
-            match val_eq(nv, vb):
-                case Some(f):
-                    eb.push(f)
-                case None:
-                    pass
-            env[id] = nv
+        let (env, ea, eb) = self.merge_env(a.env, b.env)
         let k = min(k0, min(len(a.facts), len(b.facts)))
         var facts = a.facts[:k]
         var fa = a.facts[k:]
@@ -1299,6 +1293,89 @@ struct Vf:
                 if f in fb:
                     facts.push(f)
         return Some(St(env=env, facts=facts))
+
+    # The variables of two paths' environments: a fresh value where they
+    # differ, with what it equals on each path.
+    fn merge_env(ref self, a: {int: V}, b: {int: V}) -> ({int: V}, [F], [F]):
+        var env: {int: V} = {}
+        var ea: [F] = []
+        var eb: [F] = []
+        # in a fixed order, so fresh atoms and facts are the same on every run
+        var keys = [x for x in a.keys() if x in b]
+        keys.sort()
+        for id in keys:
+            let va = a[id]
+            let vb = b[id]
+            if va == vb:
+                env[id] = va
+                continue
+            let nv = self.fresh_val(self.local_ty(id), self.local_name(id))
+            match val_eq(nv, va):
+                case Some(f):
+                    ea.push(f)
+                case None:
+                    pass
+            match val_eq(nv, vb):
+                case Some(f):
+                    eb.push(f)
+                case None:
+                    pass
+            env[id] = nv
+        return (env, ea, eb)
+
+    # Before code that runs on some paths only (`a if c else b`, the right
+    # side of `and`/`or`, the later operands of `a < b < c`, a `match`
+    # guard): its effects must stay on its path (see `join`). None in
+    # specifications, which change nothing, and where nothing runs.
+    fn fork(self) -> Option[Fork]:
+        if self.spec or not self.live:
+            return None
+        return Some(Fork(base=self.st, k=len(self.st.facts), na=len(self.atom_names)))
+
+    # The state after two paths from `fk`, taken when `ga` and `gb` hold. The
+    # facts a path learned about values it created hold when its guard does
+    # (the others, about older values, are dropped: they'd only slow the
+    # solver down).
+    fn join(ref self, fk: Fork, a0: Option[St], ga: F, b0: Option[St], gb: F) -> Option[St]:
+        if a0.is_none():
+            return b0
+        if b0.is_none():
+            return a0
+        let a = a0.unwrap()
+        let b = b0.unwrap()
+        let (env, ea, eb) = self.merge_env(a.env, b.env)
+        var fa = new_facts(a.facts, fk)
+        fa.extend(ea)
+        var fb = new_facts(b.facts, fk)
+        fb.extend(eb)
+        var facts = fk.base.facts
+        if len(fa) > 0 or len(fb) > 0:
+            fa.push(ga)
+            fb.push(gb)
+            let both = F.or_([F.and_(fa), F.and_(fb)])
+            if both.size() <= MERGE_MAX:
+                facts.push(both)
+        return Some(St(env=env, facts=facts))
+
+    # Evaluate `e` on the path where `guard` holds only; the other path runs nothing.
+    fn eval_when(ref self, guard: F, e: Expr) -> V:
+        match self.fork():
+            case Some(fk):
+                self.assume(guard)
+                let v = self.eval(e)
+                let s1 = self.take()
+                var other = fk.base
+                let ng = guard.not_()
+                if ng != F.True:
+                    other.facts.push(ng)
+                let joined = self.join(fk, s1, guard, Some(other), ng)
+                self.put(joined)
+                return v
+            case None:
+                let s = self.begin_assume(guard)
+                let v = self.eval(e)
+                self.end_assume(s)
+                return v
 
     fn if_chain(ref self, branches: [(Expr, Block)], els: Option[Block]):
         let c = self.cond(branches[0].0)
@@ -1352,9 +1429,15 @@ struct Vf:
             self.put(Some(t))
             self.bind_pattern(c.pat, sv, scrut.ty)
             var gcond = F.True
+            # the state after a guard that changes something
+            var after_guard: Option[St] = None
             match c.guard:
                 case Some(g):
+                    var gm: {int: int} = {}
+                    mods_expr(g, self.info, ref gm)
                     gcond = self.cond(g)
+                    if len(gm) > 0:
+                        after_guard = self.cur()
                     self.assume(gcond)
                 case None:
                     pass
@@ -1362,13 +1445,35 @@ struct Vf:
             let s = self.take()
             out = self.merge(out, s, k)
             # later cases run only if this one didn't match
-            match hit:
-                case Some(h):
-                    let n = F.and_([h, gcond]).not_()
-                    if n != F.True:
-                        cur.facts.push(n)
+            match after_guard:
+                case Some(ag0):
+                    # either the pattern didn't match, or it did and the
+                    # guard (and what it changed) was false
+                    var miss = cur
+                    match hit:
+                        case Some(h):
+                            let nh = h.not_()
+                            if nh != F.True:
+                                miss.facts.push(nh)
+                        case None:
+                            pass
+                    var ag = ag0
+                    let ng = gcond.not_()
+                    if ng != F.True:
+                        ag.facts.push(ng)
+                    match self.merge(Some(miss), Some(ag), len(cur.facts)):
+                        case Some(m):
+                            cur = m
+                        case None:
+                            pass
                 case None:
-                    pass
+                    match hit:
+                        case Some(h):
+                            let n = F.and_([h, gcond]).not_()
+                            if n != F.True:
+                                cur.facts.push(n)
+                        case None:
+                            pass
         self.put(out)
 
     # Exact condition for `p` matching `v`, when it can be expressed.
@@ -1946,7 +2051,17 @@ struct Vf:
                 var prev = self.eval(first)
                 var pt = first.ty
                 var fs: [F] = []
+                var forks: [(Fork, F)] = []
                 for op, x in rest:
+                    if len(fs) > 0:
+                        # `x` runs only while the comparisons so far hold
+                        let g = fs[len(fs) - 1]
+                        match self.fork():
+                            case Some(fk):
+                                forks.push((fk, g))
+                                self.assume(g)
+                            case None:
+                                pass
                     let v = self.eval(x)
                     var f = F.True
                     var done = false
@@ -1978,16 +2093,44 @@ struct Vf:
                     fs.push(f)
                     prev = v
                     pt = x.ty
+                # the paths that stopped early, innermost first
+                var j = len(forks)
+                while j > 0:
+                    j -= 1
+                    let (fk, g) = forks[j]
+                    let s1 = self.take()
+                    var other = fk.base
+                    let ng = g.not_()
+                    if ng != F.True:
+                        other.facts.push(ng)
+                    let joined = self.join(fk, s1, g, Some(other), ng)
+                    self.put(joined)
                 return V.Bool(F.and_(fs))
             case ExprKind.IfElse(cond, then, els):
                 let c = self.cond(cond)
-                let s1 = self.begin_assume(c)
-                let a = self.eval(then)
-                self.end_assume(s1)
-                let s2 = self.begin_assume(c.not_())
-                let b = self.eval(els)
-                self.end_assume(s2)
-                return self.ite(c, a, b, e.ty)
+                let nc = c.not_()
+                match self.fork():
+                    case Some(fk):
+                        self.assume(c)
+                        let a = self.eval(then)
+                        let s1 = self.take()
+                        var other = fk.base
+                        if nc != F.True:
+                            other.facts.push(nc)
+                        self.put(Some(other))
+                        let b = self.eval(els)
+                        let s2 = self.take()
+                        let joined = self.join(fk, s1, c, s2, nc)
+                        self.put(joined)
+                        return self.ite(c, a, b, e.ty)
+                    case None:
+                        let s1 = self.begin_assume(c)
+                        let a = self.eval(then)
+                        self.end_assume(s1)
+                        let s2 = self.begin_assume(nc)
+                        let b = self.eval(els)
+                        self.end_assume(s2)
+                        return self.ite(c, a, b, e.ty)
             case ExprKind.Call(_, args):
                 match e.cres:
                     case CallRes.Fn(id):
@@ -2138,9 +2281,8 @@ struct Vf:
             let a = self.cond(l)
             let and_ = op == BinOp.And
             let guard = a if and_ else a.not_()
-            let s = self.begin_assume(guard)
-            let b = self.cond(r)
-            self.end_assume(s)
+            let bv = self.eval_when(guard, r)
+            let b = self.as_bool(bv)
             return V.Bool(F.and_([a, b]) if and_ else F.or_([a, b]))
         let av = self.eval(l)
         let bv = self.eval(r)
