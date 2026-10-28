@@ -6760,6 +6760,15 @@ BR_X_MATH1(fabs)
 double brine_x_f_pow(double a, double b) { return brine_f_pow(a, b); }
 double brine_x_f_atan2(double y, double x) { return brine_f_atan2(y, x); }
 double brine_x_f_hypot(double x, double y) { return brine_f_hypot(x, y); }
+float brine_x_f_powf(float a, float b) { return brine_f_powf(a, b); }
+float brine_x_f_atan2f(float y, float x) { return brine_f_atan2f(y, x); }
+float brine_x_f_hypotf(float x, float y) { return brine_f_hypotf(x, y); }
+int64_t brine_x_popcnt_u64(uint64_t x) { return brine_popcnt_u64(x); }
+int64_t brine_x_clz_u64(uint64_t x) { return brine_clz_u64(x); }
+int64_t brine_x_ctz_u64(uint64_t x) { return brine_ctz_u64(x); }
+int64_t brine_x_popcnt_u128(const brine_u128 *x) { return brine_popcnt_u128(*x); }
+int64_t brine_x_clz_u128(const brine_u128 *x) { return brine_clz_u128(*x); }
+int64_t brine_x_ctz_u128(const brine_u128 *x) { return brine_ctz_u128(*x); }
 double brine_x_f_fmod(double a, double b) { return brine_f_fmod(a, b); }
 float brine_x_f_fmodf(float a, float b) { return brine_f_fmodf(a, b); }
 double brine_x_f_fmin(double a, double b) { return brine_f_fmin(a, b); }

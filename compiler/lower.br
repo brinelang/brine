@@ -15,7 +15,7 @@
 # tuples and structs are C structs, enums with payload are boxes
 # `{rc, tag, union of variant structs}`, other enums are int32.
 from diag import Span, SourceMap
-from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, LocalKind, int_ty
+from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, LocalKind, int_ty, NumM
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import FmtSpec, parse_fmt_spec, children, stmt_exprs, stmt_blocks, local_of
 from info import ProgramInfo, ConstVal, TryKind, try_kind, mangle_module, PRELUDE
@@ -5070,10 +5070,29 @@ struct Lower:
                         n = "round"
                 let suf = "f" if e.ty == Ty.Float(FloatTy.F32) else ""
                 return self.cx.fb.rt(self.kind(e.ty), f"brine_f_{n}{suf}", [v])
-            case Builtin.Pow:
+            case Builtin.Pow | Builtin.Math2(_):
                 let a = self.expr(args[0].expr)
                 let c = self.expr(args[1].expr)
-                return self.cx.fb.rt(K.F64, "brine_f_pow", [a, c])
+                var n = "pow"
+                match b:
+                    case Builtin.Math2(m):
+                        n = m
+                    case _:
+                        pass
+                let suf = "f" if e.ty == Ty.Float(FloatTy.F32) else ""
+                return self.cx.fb.rt(self.kind(e.ty), f"brine_f_{n}{suf}", [a, c])
+            case Builtin.Math1(n):
+                let v = self.expr(args[0].expr)
+                let suf = "f" if e.ty == Ty.Float(FloatTy.F32) else ""
+                return self.cx.fb.rt(self.kind(e.ty), f"brine_f_{n}{suf}", [v])
+            case Builtin.Num(m):
+                return self.num_method(m, recv.unwrap(), args, e)
+            case Builtin.FromBits:
+                let u = self.expr(args[0].expr)
+                let k = self.kind(e.ty)
+                let p = self.cx.fb.temp_mem(k.size(), k.size())
+                self.cx.fb.store(p, 0, u)
+                return self.cx.fb.load(k, p, 0)
             case Builtin.Clock:
                 return self.cx.fb.call(K.F64, "brine_clock", [])
             case Builtin.Flush:
@@ -5251,6 +5270,87 @@ struct Lower:
                 let loc = self.loc(e.span)
                 let r = self.cx.fb.call(K.Ptr, "brine_chr", [v, loc])
                 return self.temp(r, Ty.Str)
+
+    # Methods of numbers: plain IR, nothing to check. Wrapping arithmetic is the
+    # IR's own (it wraps); rotations and bit counts work on the unsigned bits.
+    fn num_method(ref self, m: NumM, r: Expr, args: [Arg], e: Expr) -> int:
+        let x = self.expr(r)
+        if r.ty.is_float():
+            # `to_bits`: the same bytes, read as an unsigned integer
+            let k = self.kind(e.ty)
+            let p = self.cx.fb.temp_mem(k.size(), k.size())
+            self.cx.fb.store(p, 0, x)
+            return self.cx.fb.load(k, p, 0)
+        var ik = IntTy.I64
+        match r.ty:
+            case Ty.Int(k):
+                ik = k
+            case _:
+                pass
+        let kk = int_kind(ik)
+        let w = ik.bits()
+        var uk = K.U64
+        match w:
+            case 8:
+                uk = K.U8
+            case 16:
+                uk = K.U16
+            case 32:
+                uk = K.U32
+            case 128:
+                uk = K.U128
+            case _:
+                pass
+        match m:
+            case NumM.WrappingAdd | NumM.WrappingSub | NumM.WrappingMul:
+                let y = self.expr(args[0].expr)
+                var o = Op.Add
+                if m == NumM.WrappingSub:
+                    o = Op.Sub
+                elif m == NumM.WrappingMul:
+                    o = Op.Mul
+                return self.cx.fb.bin(o, kk, x, y)
+            case NumM.WrappingNeg:
+                return self.cx.fb.un(Op.Neg, kk, x)
+            case NumM.RotateLeft | NumM.RotateRight:
+                let n0 = self.expr(args[0].expr)
+                let u = self.cx.fb.conv(uk, x) if kk != uk else x
+                # the amount modulo the width (a power of two), so a negative
+                # amount turns the other way: `rotate_left(-1)` is `rotate_right(1)`
+                let n = self.cx.fb.conv(uk, n0)
+                let mask = self.cx.fb.konst(uk, w - 1)
+                let s = self.cx.fb.bin(Op.And, uk, n, mask)
+                let wk = self.cx.fb.konst(uk, w)
+                let t0 = self.cx.fb.bin(Op.Sub, uk, wk, s)
+                # w - s, or 0 when s is 0 (a shift by the width is not allowed)
+                let t = self.cx.fb.bin(Op.And, uk, t0, mask)
+                let left = m == NumM.RotateLeft
+                let a = self.cx.fb.bin(Op.Shl if left else Op.Shr, uk, u, s)
+                let c = self.cx.fb.bin(Op.Shr if left else Op.Shl, uk, u, t)
+                let res = self.cx.fb.bin(Op.Or, uk, a, c)
+                return self.cx.fb.conv(kk, res) if kk != uk else res
+            case _:
+                # count_ones, leading_zeros, trailing_zeros; all `w` for 0
+                var nm = "popcnt"
+                if m == NumM.LeadingZeros:
+                    nm = "clz"
+                elif m == NumM.TrailingZeros:
+                    nm = "ctz"
+                let u = self.cx.fb.conv(uk, x) if kk != uk else x
+                if w == 128:
+                    return self.cx.fb.rt(K.I64, f"brine_{nm}_u128", [u])
+                var z = u
+                if w < 64:
+                    z = self.cx.fb.conv(K.U64, u)
+                    if m == NumM.TrailingZeros:
+                        # a bit just above the value stops the count at `w`
+                        let top = self.cx.fb.konst(K.U64, 1 << w)
+                        z = self.cx.fb.bin(Op.Or, K.U64, z, top)
+                let c = self.cx.fb.rt(K.I64, f"brine_{nm}_u64", [z])
+                if m == NumM.LeadingZeros and w < 64:
+                    let d = self.cx.fb.konst(K.I64, 64 - w)
+                    return self.cx.fb.bin(Op.Sub, K.I64, c, d)
+                return c
 
     # The address of a new 8-byte stack slot holding 0 (an out-parameter).
     fn null_slot(ref self) -> int:

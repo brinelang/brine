@@ -38,7 +38,9 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
 | structs | `Point(x=1, y=2)` or `Point(1, 2)` |
 
 * No implicit conversions. Convert explicitly: `float(i)`, `int(x)` (truncates),
-  `i32(n)` (checked), `str(v)`, `int("42")` (parses), `float("2.5")`.
+  `i32(n)` (checked), `str(v)`, `int("42")` (parses), `float("2.5")`. A literal
+  takes the type it is converted to: `u64(0xcbf29ce484222325)` is fine, `u8(300)`
+  is a compile-time error.
 * Literals adapt to context: `let b: u8 = 200`, `let f: f32 = 1`,
   `let big: i128 = 10_000_000_000_000_000_000_000`. Integer literals go up to
   `u128`'s maximum (2^128 - 1); above `i128`'s maximum only a `u128` holds them.
@@ -59,6 +61,15 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
   sign of signed types (`-8 >> 1 == -4`) and fills unsigned ones with zeros. A shift
   by a negative amount or by the type's width or more panics. Each has a compound
   assignment: `x &= m`, `x |= m`, `x ^= m`, `x <<= 2`, `x >>= 2`.
+* Methods of integers (any width; the result has the receiver's type):
+  `a.wrapping_add(b)`, `wrapping_sub`, `wrapping_mul` and `a.wrapping_neg()` wrap
+  around instead of panicking (hashes, random number generators); `-x` on an
+  unsigned type is an error, `x.wrapping_neg()` is the two's complement.
+  `x.rotate_left(n)` / `rotate_right(n)` rotate the bits (`n` modulo the width).
+  `x.count_ones()`, `x.leading_zeros()`, `x.trailing_zeros()` give an `int`
+  (the width for 0: `u64(0).trailing_zeros() == 64`).
+* Float bits: `x.to_bits()` is the IEEE 754 encoding of a `float` as a `u64` (of
+  an `f32` as a `u32`); `float.from_bits(u)` and `f32.from_bits(u)` go back.
 * Values are **values**: `let b = a` copies (cheaply, copy-on-write). Changing `b`
   never changes `a`. To share a variable on purpose, use `ref` (see Functions).
 
@@ -325,7 +336,9 @@ Keys can be integers, `bool`, `str`, enums, or arrays/tuples/structs of those
 
 `print(a, b, ...)` (`sep=" "` goes between the values and `end="\n"` after
 them: `print(x, end="")`), `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`, `cos`,
-`tan`, `exp`, `log`, `pow(x, y)`, `floor`, `ceil`, `round`, `clock()` (seconds),
+`tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `sinh`, `cosh`, `tanh`, `exp`, `exp2`,
+`log`, `log2`, `log10`, `cbrt`, `pow(x, y)`, `hypot(x, y)` (on `float` or `f32`),
+`floor`, `ceil`, `round`, `clock()` (seconds),
 `args()` (the command-line arguments as `[str]`, without the program's name:
 `brine run app.br -- a b` gives `["a", "b"]`), `exit(code)`, `panic(msg)`,
 `eprint(...)` (print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`, `flush()`.

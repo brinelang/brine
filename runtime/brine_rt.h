@@ -744,6 +744,9 @@ double brine_m_hypot(double x, double y);
 static inline double brine_f_pow(double a, double b) { return brine_m_pow(a, b); }
 static inline double brine_f_atan2(double y, double x) { return brine_m_atan2(y, x); }
 static inline double brine_f_hypot(double x, double y) { return brine_m_hypot(x, y); }
+static inline float brine_f_powf(float a, float b) { return (float)brine_m_pow((double)a, (double)b); }
+static inline float brine_f_atan2f(float y, float x) { return (float)brine_m_atan2((double)y, (double)x); }
+static inline float brine_f_hypotf(float x, float y) { return (float)brine_m_hypot((double)x, (double)y); }
 /* float `%` also takes the sign of the divisor, like Python */
 static inline double brine_f_fmod(double a, double b) { double r = fmod(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
 static inline float brine_f_fmodf(float a, float b) { float r = fmodf(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
@@ -784,6 +787,24 @@ static inline T brine_f_fmax##S(T a, T b) {                                     
 #endif
 BR_MINMAX(double, uint64_t, )
 BR_MINMAX(float, uint32_t, f)
+
+/* ------------------------------------------------------------ bit counts */
+/* `x.count_ones()`, `leading_zeros()`, `trailing_zeros()` of the bits
+ * zero-extended to 64 (or 128); the counts of 0 are the width */
+static inline int64_t brine_popcnt_u64(uint64_t x) { return __builtin_popcountll(x); }
+static inline int64_t brine_clz_u64(uint64_t x) { return x ? __builtin_clzll(x) : 64; }
+static inline int64_t brine_ctz_u64(uint64_t x) { return x ? __builtin_ctzll(x) : 64; }
+static inline int64_t brine_popcnt_u128(brine_u128 x) {
+    return brine_popcnt_u64((uint64_t)x) + brine_popcnt_u64((uint64_t)(x >> 64));
+}
+static inline int64_t brine_clz_u128(brine_u128 x) {
+    uint64_t hi = (uint64_t)(x >> 64);
+    return hi ? brine_clz_u64(hi) : 64 + brine_clz_u64((uint64_t)x);
+}
+static inline int64_t brine_ctz_u128(brine_u128 x) {
+    uint64_t lo = (uint64_t)x;
+    return lo ? brine_ctz_u64(lo) : 64 + brine_ctz_u64((uint64_t)(x >> 64));
+}
 
 /* ------------------------------------------------------------ checked integer arithmetic */
 /* r = a * b; true when it overflows. Clang turns a signed 128-bit overflow

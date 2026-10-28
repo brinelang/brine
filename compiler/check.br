@@ -3,7 +3,7 @@
 from diag import Span, Diag, best_match
 import diag
 from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalKind, LocalInfo
-from types import int_ty, float_ty, builtins, world_ops, os_ops
+from types import int_ty, float_ty, builtins, world_ops, os_ops, NumM, num_methods
 from ast import TypeExpr, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Expr, ExprKind, mk
 from ast import LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, stmt, pattern
 from ast import children, stmt_exprs, stmt_blocks, local_of, lvalue_root, parse_fmt_spec
@@ -2877,7 +2877,14 @@ struct Checker:
                                         diag.error(
                                             "E0305",
                                             f"cannot negate an unsigned `{k.name()}`"
-                                        ).label(span, "unsigned")
+                                        )
+                                        .label(span, "unsigned")
+                                        .with_help(
+                                            "for the two's complement (`0 - x`, wrapping around) use `x.wrapping_neg()`"
+                                        )
+                                        .note(
+                                            "an unsigned number has no negative values; `-x` would be out of range for every `x` but 0"
+                                        )
                                     )
                             case _:
                                 if not t.is_float():
@@ -3911,7 +3918,15 @@ struct Checker:
                         ).label(span, "wrong number of arguments")
                     )
                     return target
-                let at = self.check_expr(ref args[0].expr, None)
+                # `u64(0xcbf29ce484222325)`: an integer literal takes the type it's converted to
+                var aexp: Option[Ty] = None
+                if target.is_int() and args[0].expr.is_literal():
+                    match args[0].expr.kind:
+                        case ExprKind.Int(_) | ExprKind.UInt(_):
+                            aexp = Some(target)
+                        case _:
+                            pass
+                let at = self.check_expr(ref args[0].expr, aexp)
                 if at.is_error():
                     return target
                 var ok = false
@@ -4295,6 +4310,42 @@ struct Checker:
                     ).label(args[i].expr.span, "not printable")
                 )
 
+    # `pow(x, y)`, `atan2(y, x)`, `hypot(x, y)`: two floats of one type, which is the result's.
+    fn float_pair(ref self, name: str, ref args: [Arg], exp: Option[Ty], span: Span) -> Ty:
+        var guide = float_ty()
+        match exp:
+            case Some(Ty.Float(k)):
+                guide = Ty.Float(k)
+            case _:
+                pass
+        var t0 = self.check_expr(ref args[0].expr, Some(guide))
+        if t0.is_float():
+            guide = t0
+        let t1 = self.check_expr(ref args[1].expr, Some(guide))
+        if (
+            args[0].expr.is_literal()
+            and not args[1].expr.is_literal()
+            and t1.is_float()
+            and t0 != t1
+        ):
+            t0 = self.check_expr(ref args[0].expr, Some(t1))
+        if t0.is_error() or t1.is_error():
+            return guide
+        if not t0.is_float() or t0 != t1:
+            self.err(
+                diag.error(
+                    "E0301",
+                    f"`{name}` needs two floats of the same type, found "
+                    + self.tn(t0)
+                    + " and "
+                    + self.tn(t1)
+                )
+                .label(span, "mismatched arguments")
+                .with_help("convert with `float(...)` or `f32(...)`")
+            )
+            return guide
+        return t0
+
     fn check_builtin(ref self, b: Builtin, ref args: [Arg], exp: Option[Ty], span: Span) -> Ty:
         var name = "?"
         for n, x in builtins():
@@ -4399,19 +4450,31 @@ struct Checker:
                 if t.is_error():
                     return float_ty()
                 return t
-            case Builtin.Pow:
+            case Builtin.Math1(_):
+                if not self.nargs(name, ref args, 1, span):
+                    return float_ty()
+                var guide = float_ty()
+                match exp:
+                    case Some(Ty.Float(k)):
+                        guide = Ty.Float(k)
+                    case _:
+                        pass
+                let t = self.check_expr(ref args[0].expr, Some(guide))
+                if not t.is_error() and not t.is_float():
+                    self.err(
+                        diag.error(
+                            "E0301",
+                            f"`{name}` needs a float, found " + self.tn(t)
+                        ).label(args[0].expr.span, "convert with `float(...)`")
+                    )
+                    return float_ty()
+                if t.is_error():
+                    return float_ty()
+                return t
+            case Builtin.Pow | Builtin.Math2(_):
                 if not self.nargs(name, ref args, 2, span):
                     return float_ty()
-                for i in 0..len(args):
-                    let t = self.check_expr(ref args[i].expr, Some(float_ty()))
-                    if not t.is_error() and t != float_ty():
-                        self.err(
-                            diag.error(
-                                "E0301",
-                                "`pow` needs float arguments"
-                            ).label(args[i].expr.span, "found " + self.tn(t))
-                        )
-                return float_ty()
+                return self.float_pair(name, ref args, exp, span)
             case Builtin.Clock:
                 self.nargs(name, ref args, 0, span)
                 return float_ty()
@@ -4530,6 +4593,11 @@ struct Checker:
                     case CallRes.In:
                         e.kind = ExprKind.Contains(a2[0].expr, r2, false)
                         return t
+                    # `float.from_bits(u)`: a plain call; the type name is no value
+                    case CallRes.Builtin(Builtin.FromBits):
+                        e.kind = ExprKind.Call(r2, a2)
+                        e.cres = res
+                        return t
                     case _:
                         pass
                 e.kind = ExprKind.MethodCall(r2, name, name_span, a2)
@@ -4624,6 +4692,19 @@ struct Checker:
                             if rname == "os":
                                 recv.res = Res.Os
                                 return self.check_os(name, name_span, ref args, ref res, span)
+                            match prim_type(rname):
+                                case Some(pt):
+                                    return self.prim_static(
+                                        pt,
+                                        rname,
+                                        name,
+                                        name_span,
+                                        ref args,
+                                        ref res,
+                                        span
+                                    )
+                                case None:
+                                    pass
                         case _:
                             pass
             case ExprKind.Field(base, sname, _):
@@ -4755,6 +4836,8 @@ struct Checker:
                 return self.array_method(recv, el, name, name_span, ref args, ref res, span)
             case Ty.Str:
                 return self.str_method(name, name_span, ref args, ref res, span)
+            case Ty.Int(_) | Ty.Float(_):
+                return self.num_method(rt, name, name_span, ref args, ref res, span)
             case Ty.Struct(_) | Ty.Enum(_):
                 self.inst_method(rt, name, span)
                 let (tname, methods, fields) = self.members(rt)
@@ -5366,6 +5449,117 @@ struct Checker:
         res = CallRes.Builtin(Builtin.Str(m))
         self.typed_args(name, ref args, params, span)
         return ret
+
+    # Methods of numbers: wrapping arithmetic and bit counts on integers, `to_bits` on floats.
+    fn num_method(
+        ref self,
+        rt: Ty,
+        name: str,
+        name_span: Span,
+        ref args: [Arg],
+        ref res: CallRes,
+        span: Span
+    ) -> Ty:
+        var found: Option[NumM] = None
+        for n, m in num_methods():
+            if n == name and (m == NumM.ToBits) == rt.is_float():
+                found = Some(m)
+                break
+        let tn = self.tn(rt)
+        match found:
+            case Some(m):
+                if self.in_spec:
+                    self.spec_err(span)
+                res = CallRes.Builtin(Builtin.Num(m))
+                match m:
+                    case NumM.WrappingAdd | NumM.WrappingSub | NumM.WrappingMul:
+                        self.typed_args(name, ref args, [rt], span)
+                        return rt
+                    case NumM.WrappingNeg:
+                        self.typed_args(name, ref args, [], span)
+                        return rt
+                    case NumM.RotateLeft | NumM.RotateRight:
+                        self.typed_args(name, ref args, [int_ty()], span)
+                        return rt
+                    case NumM.CountOnes | NumM.LeadingZeros | NumM.TrailingZeros:
+                        self.typed_args(name, ref args, [], span)
+                        return int_ty()
+                    case NumM.ToBits:
+                        self.typed_args(name, ref args, [], span)
+                        if rt == Ty.Float(FloatTy.F32):
+                            return Ty.Int(IntTy.U32)
+                        return Ty.Int(IntTy.U64)
+            case None:
+                pass
+        var names: [str] = []
+        for n, m in num_methods():
+            if (m == NumM.ToBits) == rt.is_float():
+                names.push(n)
+        var d = diag.error(
+            "E0206",
+            f"{tn} has no method `{name}`"
+        ).label(name_span, "unknown method")
+        match name:
+            case "abs" | "sqrt" | "floor" | "ceil" | "round" | "exp" | "log" | "sin" | "cos" | "tan":
+                d = d.with_help(f"use `{name}(x)`")
+            case "pow":
+                d = d.with_help("use `pow(x, y)` (floats)")
+            case "to_bits":
+                d = d.with_help(
+                    "`to_bits` is a method of floats (`x.to_bits()`, `float.from_bits(u)`)"
+                )
+            case "to_string" | "to_str":
+                d = d.with_help("use `str(x)`")
+            case "len" | "length":
+                d = d.with_help("numbers have no length")
+            case _:
+                match best_match(name, names):
+                    case Some(b):
+                        d = d.with_help(f"did you mean `{b}`?").fix(name_span, b, "replace")
+                    case None:
+                        let kind = "float" if rt.is_float() else "integer"
+                        d = d.note(f"{kind} methods: " + ", ".join(names))
+        self.err(d)
+        self.check_all(ref args)
+        return Ty.Error
+
+    # Functions of the built-in types: `float.from_bits(u)` and `f32.from_bits(u)`.
+    fn prim_static(
+        ref self,
+        pt: Ty,
+        tname: str,
+        name: str,
+        name_span: Span,
+        ref args: [Arg],
+        ref res: CallRes,
+        span: Span
+    ) -> Ty:
+        if self.in_spec:
+            self.spec_err(span)
+        match pt:
+            case Ty.Float(k):
+                if name == "from_bits":
+                    res = CallRes.Builtin(Builtin.FromBits)
+                    let ut = Ty.Int(IntTy.U32 if k == FloatTy.F32 else IntTy.U64)
+                    self.typed_args(f"{tname}.from_bits", ref args, [ut], span)
+                    return pt
+            case _:
+                pass
+        var d = diag.error(
+            "E0206",
+            f"`{tname}` has no function `{name}`"
+        ).label(name_span, "unknown")
+        if name == "parse" or name == "from_str":
+            d = d.with_help(
+                "to read a number from text use `int(s)` or `float(s)`, which panic if it isn't one; check it with `is_digit` first"
+            )
+        else:
+            d = d.note(
+                "functions of built-in types: `float.from_bits(u)` and `f32.from_bits(u)` (from the IEEE bits)"
+            )
+        self.err(d)
+        self.check_all(ref args)
+        return Ty.Error
 
     # `s.contains(sub)` and `xs.contains(x)` mean `sub in s` and `x in xs`.
     fn contains_method(
