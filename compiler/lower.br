@@ -149,6 +149,8 @@ struct FnCx:
     apps: {int: int}
     # index values evaluated ahead of their place (`pre_index`), by span
     pre_idx: {str: int}
+    # the keys in `arrc` (negative) of the array fields loops cache, by path
+    fkeys: {str: int}
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -198,7 +200,8 @@ fn new_cx(f: Func) -> FnCx:
         hit_e=-1,
         reset={},
         apps={},
-        pre_idx={}
+        pre_idx={},
+        fkeys={}
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -3043,7 +3046,16 @@ struct Lower:
     # loaded once, and those it writes are made unique once. Returns the old set.
     fn loop_arrays(ref self, head: [Expr], body: Block) -> {int: ArrCache}:
         let saved = self.cx.arrc
-        var u = IndexUse(info=self.info, seen={}, written={}, bad={}, decl={})
+        var u = IndexUse(
+            info=self.info,
+            seen={},
+            written={},
+            bad={},
+            decl={},
+            fseen={},
+            fwritten={},
+            whole=[]
+        )
         for e in head:
             u.expr(e)
         u.block(body)
@@ -3071,15 +3083,60 @@ struct Lower:
                     self.cx.arrc[l] = ArrCache(arr=a, data=d, len=n)
                 case _:
                     pass
+        # array fields (`self.stack`), when the loop uses nothing that holds
+        # them in any other way: a `self.f()` or `self.stack.push(x)` could
+        # replace or grow the array
+        for k in u.fseen:
+            let base = u.fseen[k]
+            let (l, p) = field_path(base).unwrap()
+            if l in u.decl or l in self.cx.par_writes:
+                continue
+            if not (l in self.cx.lslot or l in self.cx.lptr):
+                continue
+            if any(w.0 == l and steps_overlap(w.1, p) for w in u.whole):
+                continue
+            if k in u.fwritten:
+                match self.flocals[l].kind:
+                    case LocalKind.Var | LocalKind.RefParam:
+                        pass
+                    case _:
+                        continue
+            match base.ty:
+                case Ty.Array(_):
+                    pass
+                case _:
+                    continue
+            if not (k in self.cx.fkeys):
+                self.cx.fkeys[k] = -1 - len(self.cx.fkeys)
+            let key = self.cx.fkeys[k]
+            if key in self.cx.arrc:
+                continue
+            let fp = self.lvalue(base)
+            if k in u.fwritten:
+                self.cx.fb.call_void("brine_arr_unique", [fp])
+            let a = self.cx.fb.load(K.Ptr, fp, 0)
+            let n = self.cx.fb.load(K.I64, a, 8)
+            let d = self.cx.fb.load(K.Ptr, a, 48)
+            self.cx.arrc[key] = ArrCache(arr=a, data=d, len=n)
         return saved
 
-    # The local array `e` names, when an enclosing loop cached it.
+    # The local array or array field `e` names, when an enclosing loop cached it.
     fn cached_arr(self, e: Expr) -> Option[ArrCache]:
         match local_of(e):
             case Some(l):
                 return self.cx.arrc.get(l)
             case None:
-                return None
+                if len(self.cx.fkeys) == 0:
+                    return None
+                match field_path(e):
+                    case Some((l, p)):
+                        match self.cx.fkeys.get(path_key(l, p)):
+                            case Some(key):
+                                return self.cx.arrc.get(key)
+                            case None:
+                                return None
+                    case None:
+                        return None
 
     # The type an array's elements are stored as: bytes for narrow.br's
     # arrays (the program sees `t`).
@@ -5885,6 +5942,11 @@ struct IndexUse:
     bad: {int: bool}
     # declared inside the loop: not there yet when it starts
     decl: {int: bool}
+    # fields (`self.stack`) indexed and written, by `path_key`, and the
+    # places used in any other way (a variable alone: no steps)
+    fseen: {str: Expr}
+    fwritten: {str: bool}
+    whole: [(int, [int])]
 
     fn expr(ref self, e: Expr):
         match e.kind:
@@ -5893,6 +5955,20 @@ struct IndexUse:
                     case Some(l):
                         self.seen[l] = true
                         self.expr(idx)
+                        return
+                    case None:
+                        pass
+                match field_path(base):
+                    case Some((l, p)):
+                        self.fseen[path_key(l, p)] = base
+                        self.expr(idx)
+                        return
+                    case None:
+                        pass
+            case ExprKind.Field(_, _, _):
+                match field_path(e):
+                    case Some(pp):
+                        self.whole.push(pp)
                         return
                     case None:
                         pass
@@ -5920,7 +5996,9 @@ struct IndexUse:
                     case CallRes.Builtin(b):
                         match b:
                             case Builtin.Len:
-                                if len(args) == 1 and local_of(args[0].expr).is_some():
+                                if len(
+                                    args
+                                ) == 1 and (local_of(args[0].expr).is_some() or field_path(args[0].expr).is_some()):
                                     return
                             case _:
                                 pass
@@ -5930,6 +6008,7 @@ struct IndexUse:
                 match local_of(e):
                     case Some(l):
                         self.bad[l] = true
+                        self.whole.push((l, []))
                     case None:
                         pass
                 return
@@ -5983,6 +6062,11 @@ struct IndexUse:
                     case Some(l):
                         self.written[l] = true
                     case None:
+                        match field_path(base):
+                            case Some((l, p)):
+                                self.fwritten[path_key(l, p)] = true
+                            case None:
+                                pass
                         self.target(base)
             case ExprKind.Field(base, _, _):
                 self.target(base)
@@ -6141,3 +6225,20 @@ fn reaches(e: Expr, refs: [(int, [int])]) -> bool:
                 if mentions_local(e, r.0):
                     return true
             return false
+
+# A place reached through fields only (`self.stack`, `s.a.b`), not a bare variable.
+fn field_path(e: Expr) -> Option[(int, [int])]:
+    match e.kind:
+        case ExprKind.Field(_, _, _):
+            match place_path(e):
+                case Some((l, p)):
+                    if -1 in p:
+                        return None
+                    return Some((l, p))
+                case None:
+                    return None
+        case _:
+            return None
+
+fn path_key(l: int, p: [int]) -> str:
+    return f"{l}:" + ".".join([str(x) for x in p])
