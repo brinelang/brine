@@ -5,6 +5,40 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) 
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-29
+### Added
+- `brine spec-diff [--base <rev>]` compares every `requires`, `ensures` and
+  struct `invariant` with a git revision (default `HEAD`) and says which ones
+  got weaker or stronger. The prover decides this, not a text diff, so the same
+  spec written another way is not a change. It exits 1 when a function promises
+  less or asks more of its callers, and counts the runtime checks left before
+  and after. Run it in CI against the base branch to catch a change that makes
+  the proofs pass by proving less.
+- Struct invariants: `invariant` lines in a struct state facts about `self` that
+  every value of the type keeps. They are proven where a value is built and
+  where a `ref self` method returns, and known everywhere else, so functions
+  that take the type need no `requires` for them. Only the struct's own methods
+  may change its fields (E0406). E0609 reports an invariant that can't be
+  proven. Generic structs can't have invariants yet (E0112).
+- Failed proofs show values the prover can't rule out (`len(xs) = 0`), so you
+  can tell a bug in the code from a fact the prover is missing.
+- `proven = true` under `[check]` in brine.toml (or `--proven`) makes every
+  runtime check the prover can't remove an error (E0607), so the program can't
+  stop on a failed bounds, overflow, division, conversion or map-key check, or
+  on an `assert`. `test` blocks are exempt.
+
+### Changed
+- A function whose `requires` can never all hold is an error (E0608). Before,
+  every claim in its body was proven without meaning anything. Fix the
+  `requires` that is wrong.
+- `brine check --report` also lists the `assert`s outside `test` blocks, since
+  they are runtime checks too.
+- Building the same program to a second output reuses the objects already
+  compiled for the first, instead of compiling them again.
+
+### Fixed
+- A failed proof in generic code is reported once, not once for each instance.
+
 ## [0.6.0] - 2026-10-28
 ### Added
 - Reading input: `input()` / `input(prompt)` returns the next line of stdin as an
@@ -295,7 +329,8 @@ The first version.
 - The compiler is written in brine and builds itself; `bootstrap/brinec.c` builds it
   from scratch with only a C compiler.
 
-[Unreleased]: https://github.com/brinelang/brine/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/brinelang/brine/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/brinelang/brine/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/brinelang/brine/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/brinelang/brine/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/brinelang/brine/compare/v0.4.0...v0.5.0
