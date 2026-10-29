@@ -16,11 +16,11 @@ from types import Ty, IntTy, Res, CallRes, Builtin, NumM, StrM, Reducer, WorldOp
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import children, stmt_exprs, stmt_blocks, lvalue_root
 from info import ProgramInfo, ConstVal
-from solver import Lin, F, AtomSet, prove_, prove_full, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
+from solver import Lin, F, AtomSet, prove_, prove_full, counterexample, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
 
 struct Report:
     diags: [Diag]
-    # implicit checks that remain at runtime: (span, what)
+    # checks that remain at runtime, `assert`s outside tests included: (span, what)
     remaining: [(Span, str)]
     # implicit checks proven and removed
     proven: int
@@ -88,7 +88,9 @@ const TAG_COMPOUND = 3
 fn key(span: Span, tag: int) -> (int, int, int, int):
     return (span.file, span.lo, span.hi, tag)
 
-fn verify_program(ref prog: Program, info: ProgramInfo, sm: SourceMap) -> Report:
+# `must_prove`: a runtime check the prover can't remove is an error (E0607),
+# outside `test` blocks (`[check] proven = true`).
+fn verify_program(ref prog: Program, info: ProgramInfo, sm: SourceMap, must_prove: bool) -> Report:
     var specs: [Option[FnSpec]] = [None] * len(info.fns)
     for m in prog.modules:
         for f in m.fns:
@@ -105,11 +107,17 @@ fn verify_program(ref prog: Program, info: ProgramInfo, sm: SourceMap) -> Report
     # functions are proven independently, so in parallel; the results are
     # applied in order, which keeps the output deterministic
     var fns: [FnDecl] = []
+    var tests: [bool] = []
     for m in prog.modules:
         fns.extend(m.fns)
         fns.extend(m.tests)
+        tests.extend([false] * len(m.fns))
+        tests.extend([true] * len(m.tests))
     let fps = footprints(prog, info)
-    let done = par [verify_fn(info, specs, fps, sm, f) for f in fns]
+    let done = par [
+        verify_fn(info, specs, fps, sm, fns[i], tests[i], must_prove and not tests[i])
+        for i in 0..len(fns)
+    ]
     # let go of the bodies, so rewriting them below doesn't copy them
     fns = []
     var report = Report(diags=[], remaining=[], proven=0)
@@ -162,12 +170,16 @@ fn verify_fn(
     specs: [Option[FnSpec]],
     fps: [[[[int]]]],
     sm: SourceMap,
-    f: FnDecl
+    f: FnDecl,
+    test: bool,
+    must_prove: bool
 ) -> FnResult:
     let t0 = clock()
     if f.is_extern:
         return FnResult(name=f.name, diags=[], remaining=[], proven={}, time=0.0)
     var v = new_vf(info, specs, fps, sm, f)
+    v.test = test
+    v.must_prove = must_prove
     v.run(f)
     var proven: {(int, int, int, int): bool} = {}
     for p in v.proven.keys():
@@ -854,6 +866,8 @@ fn new_vf(
         proven={},
         failed={},
         remaining=[],
+        test=false,
+        must_prove=false,
         diags=[]
     )
 
@@ -886,6 +900,10 @@ struct Vf:
     proven: {(int, int, int, int): bool}
     failed: {(int, int, int, int): bool}
     remaining: [(Span, str)]
+    # a `test` block: its `assert`s are its point, not checks to remove
+    test: bool
+    # every remaining runtime check is an error (E0607)
+    must_prove: bool
     diags: [Diag]
 
     # The state, leaving none behind.
@@ -1133,8 +1151,49 @@ struct Vf:
             self.proven[key(span, tag)] = true
         else:
             self.failed[key(span, tag)] = true
-            self.remaining.push((span, what))
+            self.remain(span, what, Some(goal))
         self.assume(goal)
+
+    # A check that stays at runtime: listed in `--report`, and an error where
+    # everything must be proven. `goal`: what would remove it, if anything can.
+    fn remain(ref self, span: Span, what: str, goal: Option[F]):
+        self.remaining.push((span, what))
+        if not self.must_prove:
+            return
+        let is_assert = what == "assert"
+        var d = (
+            diag.error("E0607", "a runtime check is left in code that must be proven")
+            .label(
+                span,
+                "this `assert` is checked at runtime"
+                if is_assert
+                else f"the prover could not remove this {what}"
+            )
+            .note(
+                "`proven = true` under [check] in brine.toml (or `--proven`) makes every check the prover can't remove an error, outside `test` blocks"
+            )
+        )
+        if what == "map key check":
+            d = d.with_help(
+                "use `m.get(k)`, which gives an `Option` to match on (the prover doesn't follow the keys of maps)"
+            )
+        elif what == "conversion check" and goal.is_none():
+            d = d.with_help(
+                "converting a float to an int is always checked at runtime: compare it with the range you need first, or keep this code outside the proven part"
+            )
+        elif is_assert:
+            d = d.with_help(
+                "give the prover the facts that make it true (`requires`, `invariant`), turn it into a `prove`, or handle the failing case with an `if`"
+            )
+        else:
+            d = d.with_help(
+                "give the prover the facts it needs (`requires`, `invariant`), or handle the failing case with an `if` before this point"
+            )
+        match goal:
+            case Some(g):
+                self.fail(d, g)
+            case None:
+                self.diags.push(d)
 
     # `x op= y`: the new value of `x`; the statement's check is proven or listed.
     fn compound(ref self, span: Span, op: BinOp, a: Lin, b: Lin, k: IntTy) -> V:
@@ -1312,6 +1371,38 @@ struct Vf:
     fn snippet(self, s: Span) -> str:
         return self.sm.snippet(s)
 
+    # Values of the goal's names that satisfy every known fact but not the
+    # goal, when the prover can find some: either the code is wrong for them,
+    # or it needs a fact that rules them out.
+    fn values_note(self, facts: [F], goal: F) -> Option[str]:
+        let m = counterexample(facts, goal, self.ranges)?
+        var ga = AtomSet.new()
+        goal.atoms(ref ga)
+        # the newest value of each name: older ones (before a loop changed
+        # the variable) would read as the same name
+        var newest: {str: int} = {}
+        for a in ga.xs:
+            let n = self.atom_name(a)
+            if a != ATOM_UNKNOWN and n != "?" and a > newest.get(n).unwrap_or(-1):
+                newest[n] = a
+        var out: [str] = []
+        for a2 in ga.xs:
+            let n2 = self.atom_name(a2)
+            if newest.get(n2) != Some(a2):
+                continue
+            match m.ints.get(a2):
+                case Some(v):
+                    out.push(f"{n2} = {v}")
+                case None:
+                    match m.bools.get(a2):
+                        case Some(b):
+                            out.push(n2 + " = " + ("true" if b else "false"))
+                        case None:
+                            pass
+        if len(out) == 0:
+            return None
+        return Some("values the prover can't rule out: " + ", ".join(out))
+
     fn fail(ref self, d0: Diag, goal: F):
         var d = d0
         if goal == F.False:
@@ -1338,7 +1429,14 @@ struct Vf:
             if self.live:
                 var all = self.st.facts
                 all.extend(self.defs)
-                if prove_full(all, goal, self.ranges) == GAVE_UP:
+                let gave_up = prove_full(all, goal, self.ranges) == GAVE_UP
+                if not gave_up:
+                    match self.values_note(all, open):
+                        case Some(n):
+                            d = d.note(n)
+                        case None:
+                            pass
+                if gave_up:
                     d = d.note(
                         "the prover gave up: what it knows here splits into too many cases to check them all, so this may well be true"
                     )
@@ -1545,6 +1643,8 @@ struct Vf:
                     self.proven[key(s.span, TAG_ASSERT)] = true
                 else:
                     self.failed[key(s.span, TAG_ASSERT)] = true
+                    if not self.test and self.live:
+                        self.remain(s.span, "assert", Some(c))
                 self.assume(c)
             case StmtKind.Prove(e):
                 let f = self.spec_cond(e)
@@ -3201,7 +3301,7 @@ struct Vf:
             case (Ty.Int(_), Ty.Float(_), _):
                 # in range and not NaN: checked
                 if not self.spec and self.live:
-                    self.remaining.push((whole.span, "conversion check"))
+                    self.remain(whole.span, "conversion check", None)
                 return self.fresh_val(target, self.name_of(whole))
             case (Ty.Int(_), Ty.Bool, V.Bool(b)):
                 let r = self.fresh_int("int(bool)", IntTy.I64)
@@ -3354,7 +3454,7 @@ struct Vf:
                             # it was one UTF-8 character of 1 to 4 bytes
                             let one = F.equal(l, Lin.konst(1))
                             if not self.spec and self.live and not self.holds(one):
-                                self.remaining.push((e.span, "character check"))
+                                self.remain(e.span, "character check", Some(one))
                             self.assume(
                                 F.and_([F.ge(l.add_c(-1).unwrap_or(l)), F.le(l, Lin.konst(4))])
                             )
@@ -3463,7 +3563,7 @@ struct Vf:
         match m.ty:
             case Ty.Map(_, _):
                 if not self.spec and self.live:
-                    self.remaining.push((span, "map key check"))
+                    self.remain(span, "map key check", None)
             case _:
                 pass
 
@@ -3473,7 +3573,7 @@ struct Vf:
         if self.spec or not self.live:
             return
         if not self.holds(goal):
-            self.remaining.push((span, what))
+            self.remain(span, what, Some(goal))
         self.assume(goal)
 
     fn call_user(ref self, id: int, recv: Option[Expr], args: [Arg], e: Expr) -> V:

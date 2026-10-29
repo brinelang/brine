@@ -1038,6 +1038,61 @@ test "the prover says when it gave up":
     assert o.err.count("the prover gave up") == 1, o.all()
     assert o.err.find("gave up").unwrap() < o.err.find("30 |").unwrap(), o.all()
 
+test "failed proofs show values the prover can't rule out":
+    let d = scratch("values")
+    let f = d + "/values.br"
+    write(
+        f,
+        "fn last(xs: [int]) -> int:\n    ensures 0 <= result < len(xs)\n    return len(xs) - 1\n\n"
+        + "fn clamp(x: int, lo: int, hi: int) -> int:\n    ensures lo <= result <= hi\n    if x < lo:\n        return lo\n    return min(x, hi)\n\n"
+        + "fn sign(neg: bool, x: int) -> int:\n    ensures result >= 0\n    if neg:\n        return -x\n    return x\n\n"
+        + "fn count(n: int) -> int:\n    var i = 0\n    while i < n:\n        invariant i <= n\n        i += 2\n    return i\n\n"
+        + "fn main():\n    print(last([1]), clamp(1, 0, 2), sign(false, 1), count(4))\n"
+    )
+    let o = brine(["check", f])
+    let e = o.err
+    assert "values the prover can't rule out: len(xs) = 0\n" in e, e
+    # both returns of `clamp` fail when the range is empty; to the prover,
+    # a call's value is a value of its own
+    assert "values the prover can't rule out: lo = 1, hi = 0\n" in e, e
+    assert "values the prover can't rule out: lo = 1, min(x, hi) = 0\n" in e, e
+    assert "values the prover can't rule out: x = 1\n" in e, e
+    assert "values the prover can't rule out: x = -1\n" in e, e
+    # an invariant that doesn't hold on entry, and one a step breaks
+    assert "values the prover can't rule out: n = -1\n" in e, e
+    assert "values the prover can't rule out: n = 1, i = 0\n" in e, e
+    # and in the JSON diagnostics
+    let j = brine(["check", f, "--json"]).out
+    assert "values the prover can't rule out: len(xs) = 0" in j, j
+
+test "proven projects can't keep runtime checks":
+    let d = scratch("proven")
+    match os.make_dir(d + "/src"):
+        case _:
+            pass
+    write(d + "/brine.toml", "[package]\nname = \"p\"\n\n[check]\nproven = true\n")
+    let src = (
+        "fn get(xs: [int], i: int) -> int:\n    return xs[i]\n\n"
+        + "fn get_ok(xs: [int], i: int) -> int:\n    requires 0 <= i < len(xs)\n    return xs[i]\n\n"
+        + "fn half(n: int) -> int:\n    assert n % 2 == 0\n    return n / 2\n\n"
+        + "fn main():\n    let m = {1: 2}\n    print(get([1], 0), get_ok([1], 0), half(2), m.get(1).unwrap_or(0), m[1])\n\n"
+        + "test \"tests may check at runtime\":\n    let m = {1: 2}\n    assert m[1] == get([2], 0)\n"
+    )
+    write(d + "/src/main.br", src)
+    # the bounds check, the assert and the map read: not the test block
+    assert error_codes(d) == ["E0607@2", "E0607@9", "E0607@14"]
+    let e = brine(["check", d]).err
+    assert "values the prover can't rule out: len(xs) = 0, i = -1" in e, e
+    assert "use `m.get(k)`" in e, e
+    # the same file outside the project: allowed, unless asked for
+    write(d + "/plain.br", src)
+    let o = brine(["check", d + "/plain.br"])
+    assert o.code == 0, o.all()
+    # (the test block's map read is listed, as a test's checks always were)
+    assert "4 remain" in o.all(), o.all()
+    let p = brine(["check", d + "/plain.br", "--proven", "--json"])
+    assert p.code != 0 and p.out.count("\"code\":\"E0607\"") == 3, p.all()
+
 # false claims the prover once accepted
 test "proofs stay sound":
     assert (
@@ -1126,7 +1181,8 @@ test "the report lists every remaining check":
         "index bounds check",
         "insert index check",
         "character check",
-        "repeat count check"
+        "repeat count check",
+        "assert"
     ], o.all()
 
 test "proofs remove compound assignment checks":
@@ -1325,6 +1381,7 @@ test "every error code is explained":
         "E0501",
         "E0601",
         "E0606",
+        "E0607",
         "E0702",
         "E0706",
         "E0707",

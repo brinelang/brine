@@ -87,7 +87,8 @@ fn usage(cmd: str) -> Option[str]:
             "  --threads <n>       worker threads for `par` (default: all cores)",
             "  --ranks <n>         run <n> cooperating processes (the `world` module)",
             "  --target wasm       build WebAssembly and run it with Node.js",
-            "  --typed             require a written type on every variable"
+            "  --typed             require a written type on every variable",
+            "  --proven            make every runtime check the prover can't remove an error"
         ]
     elif cmd == "build":
         ls = [
@@ -100,7 +101,8 @@ fn usage(cmd: str) -> Option[str]:
             "  -o <path>             output path",
             "  --emit-c              also write the generated C next to the output",
             "  --target <t>          host (default), wasm (a .wasm module) or web (a page)",
-            "  --typed               require a written type on every variable"
+            "  --typed               require a written type on every variable",
+            "  --proven              make every runtime check the prover can't remove an error"
         ]
     elif cmd == "check":
         ls = [
@@ -110,7 +112,8 @@ fn usage(cmd: str) -> Option[str]:
             "",
             "Options:",
             "  --report            list every runtime check the prover could not remove",
-            "  --typed             require a written type on every variable"
+            "  --typed             require a written type on every variable",
+            "  --proven            make every runtime check the prover can't remove an error"
         ]
     elif cmd == "test":
         ls = [
@@ -123,7 +126,8 @@ fn usage(cmd: str) -> Option[str]:
             "  --release           optimize more",
             "  --target wasm       build WebAssembly and run the tests with Node.js",
             "  --timeout <s>       stop a test after <s> seconds (default 300; 0: no limit)",
-            "  --typed             require a written type on every variable"
+            "  --typed             require a written type on every variable",
+            "  --proven            make every runtime check the prover can't remove an error"
         ]
     elif cmd == "debug":
         ls = [
@@ -435,11 +439,14 @@ struct Target:
     version: Option[str]
     # every variable needs a written type
     typed: bool
+    # every runtime check must be proven away
+    proven: bool
 
-    # `--typed` asks for written types even outside a typed project.
+    # `--typed` and `--proven` ask for those even outside such a project.
     fn typed_if(self, a: Args) -> Target:
         var t = self
         t.typed = t.typed or a.has("--typed")
+        t.proven = t.proven or a.has("--proven")
         return t
 
     fn cache_dir(self) -> str:
@@ -482,7 +489,8 @@ fn resolve(file: Option[str]) -> Result[Target, str]:
                             name=name,
                             root=None,
                             version=None,
-                            typed=false
+                            typed=false,
+                            proven=false
                         )
                     )
                 match project.find(f):
@@ -493,7 +501,8 @@ fn resolve(file: Option[str]) -> Result[Target, str]:
                                 name=pr.name,
                                 root=Some(pr.root),
                                 version=Some(pr.version),
-                                typed=pr.typed
+                                typed=pr.typed,
+                                proven=pr.proven
                             )
                         )
                     case Some(Err(e)):
@@ -508,7 +517,9 @@ fn resolve(file: Option[str]) -> Result[Target, str]:
             var stem = driver.file_stem(f)
             if stem == "":
                 stem = "main"
-            return Ok(Target(entry=f, name=stem, root=None, version=None, typed=false))
+            return Ok(
+                Target(entry=f, name=stem, root=None, version=None, typed=false, proven=false)
+            )
         case None:
             pass
     let cwd = os.cwd()
@@ -526,7 +537,8 @@ fn resolve(file: Option[str]) -> Result[Target, str]:
                     name=pr.name,
                     root=Some(pr.root),
                     version=Some(pr.version),
-                    typed=pr.typed
+                    typed=pr.typed,
+                    proven=pr.proven
                 )
             )
         case Some(Err(e)):
@@ -568,7 +580,10 @@ fn build(
     plat: Platform
 ) -> Result[Option[str], str]:
     let t0 = clock()
-    let fe = driver.frontend(t.entry, FrontOpts(verify=true, need_main=not tests, typed=t.typed))
+    let fe = driver.frontend(
+        t.entry,
+        FrontOpts(verify=true, need_main=not tests, typed=t.typed, proven=t.proven)
+    )
     g.diags(fe)
     if fe.has_errors():
         return Ok(None)
@@ -653,7 +668,7 @@ fn cmd_init(g: G, a: Args) -> Result[int, str]:
     return Ok(0)
 
 fn cmd_build(g: G, a: Args) -> Result[int, str]:
-    a.check_flags(["--release", "--debug", "-o", "--emit-c", "--typed", "--target"])?
+    a.check_flags(["--release", "--debug", "-o", "--emit-c", "--typed", "--proven", "--target"])?
     let plat = platform_of(a)?
     let t = resolve(first_pos(a))?.typed_if(a)
     var out: Option[str] = None
@@ -790,7 +805,9 @@ fn run_exe(launch: [str], argv: [str], threads: Option[str], ranks: int) -> Resu
     return Ok(code if 1 <= code <= 255 else 1)
 
 fn cmd_run(g: G, a: Args) -> Result[int, str]:
-    a.check_flags(["--release", "--debug", "--threads", "--ranks", "--typed", "--target"])?
+    a.check_flags(
+        ["--release", "--debug", "--threads", "--ranks", "--typed", "--proven", "--target"]
+    )?
     let plat = platform_of(a)?
     if plat == Platform.Web:
         return Err(
@@ -909,10 +926,13 @@ fn cmd_debug(g: G, a: Args) -> Result[int, str]:
             return Err(e)
 
 fn cmd_check(g: G, a: Args) -> Result[int, str]:
-    a.check_flags(["--report", "--typed"])?
+    a.check_flags(["--report", "--typed", "--proven"])?
     let t = resolve(first_pos(a))?.typed_if(a)
     let t0 = clock()
-    let fe = driver.frontend(t.entry, FrontOpts(verify=true, need_main=false, typed=t.typed))
+    let fe = driver.frontend(
+        t.entry,
+        FrontOpts(verify=true, need_main=false, typed=t.typed, proven=t.proven)
+    )
     g.diags(fe)
     if fe.has_errors():
         return Ok(1)
@@ -991,7 +1011,7 @@ struct TestResult:
     secs: float
 
 fn cmd_test(g: G, a: Args) -> Result[int, str]:
-    a.check_flags(["--release", "--typed", "--target", "--timeout"])?
+    a.check_flags(["--release", "--typed", "--proven", "--target", "--timeout"])?
     let plat = platform_of(a)?
     if plat == Platform.Web:
         return Err("tests run with `--target wasm` (Node.js), not in a browser")
@@ -1256,7 +1276,7 @@ fn cmd_doctor(g: G) -> Result[int, str]:
         ):
             case _:
                 pass
-        let t = Target(entry=src, name="doctor", root=None, version=None, typed=false)
+        let t = Target(entry=src, name="doctor", root=None, version=None, typed=false, proven=false)
         let quiet = G(json=false, color=false, quiet=true)
         var built: Option[str] = None
         match build(
@@ -1358,7 +1378,10 @@ fn cmd_emit_c(g: G, a: Args) -> Result[int, str]:
     if len(a.pos) == 0:
         return Err("usage: brine emit-c [--tests] [--debug] <file> -o <out.c>")
     let tests = a.has("--tests")
-    let fe = driver.frontend(a.pos[0], FrontOpts(verify=true, need_main=not tests, typed=false))
+    let fe = driver.frontend(
+        a.pos[0],
+        FrontOpts(verify=true, need_main=not tests, typed=false, proven=false)
+    )
     g.diags(fe)
     if fe.has_errors():
         return Ok(1)

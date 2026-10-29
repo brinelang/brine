@@ -93,7 +93,16 @@ Two kinds of obligations:
   narrowing conversions, negative array lengths, `pop()` on empty arrays, missing map keys.
   They are **proven when possible and otherwise checked at runtime** (and the check can
   never be disabled). `brine check --report` lists every remaining runtime check so they
-  can be eliminated by adding facts.
+  can be eliminated by adding facts. A project can require that none remain:
+  `proven = true` under `[check]` in brine.toml (or `--proven`) makes each one, and
+  each `assert` the prover can't remove, an error (E0607), outside `test` blocks.
+
+When a claim isn't proven, the error shows the facts the prover knew, the goal, and,
+when the prover finds them, values it can't rule out (`len(xs) = 0`). They come from
+the case its search couldn't close: Fourier–Motzkin elimination run forward, then
+values picked in reverse elimination order, each as close to 0 as its bounds allow.
+Integer tightening isn't exact, so every candidate is checked by evaluating the facts
+and the goal with it, and only values that pass are shown.
 
 `assert e` is the bridge between the two: a runtime check (always on) that also
 becomes a *known fact* for the prover afterwards. When a precondition can't be proven,
@@ -351,7 +360,7 @@ from what brine knows that C doesn't (no aliasing, proven-away checks, race-free
 | `brine new <name>` / `brine init` | Create a project (`brine.toml`, `src/main.br`, `AGENTS.md`, `README.md`, `.gitignore`). |
 | `brine run [file] [--ranks N] [--threads N] [-- args]` | Build and run. |
 | `brine build [--release\|--debug] [--emit-c]` | Build a native binary into `target/`. |
-| `brine check [--report] [--typed]` | Type-check + verify, no codegen. Fastest feedback loop. `--typed` (or `typed = true` under `[check]` in brine.toml) requires a written type on every variable. |
+| `brine check [--report] [--typed] [--proven]` | Type-check + verify, no codegen. Fastest feedback loop. `--typed` (or `typed = true` under `[check]` in brine.toml) requires a written type on every variable; `--proven` (or `proven = true`) requires every runtime check to be proven away. |
 | `brine test [filter]` | Run `test "name":` blocks, each in its own process, in parallel. |
 | `brine fmt [--check]` | Canonical formatting. |
 | `brine debug` | Debug build + launch gdb/lldb. |
@@ -377,6 +386,7 @@ Global flags: `--json` (machine-readable diagnostics, one JSON object per line),
 | `E0604` | a loop `invariant` might not be preserved by an iteration |
 | `E0605` | a `prove` claim can't be proven |
 | `E0606` | something not allowed in a specification (e.g. a call with side effects) |
+| `E0607` | a runtime check is left in code that must be proven (`proven = true`) |
 | `E07xx` | driver: missing module, no C compiler, no `main`, C compile/link failures |
 
 Proof failures list the facts the prover knew at that point and the exact goal,
@@ -424,7 +434,8 @@ GPUs are part of it: Metal is used only on Apple GPUs for now.
 
 **Proofs:** generic bodies checked once against constraints (rather than per
 instance), quantifiers in specs (`forall i in 0..n: a[i] >= 0`), array-content
-reasoning, nonlinear facts (`i * j`), counterexamples on proof failure.
+reasoning, nonlinear facts (`i * j`), running a failed proof's values through the code
+to tell a bug from a missing fact.
 
 **Tools:** LSP server, `brine fix` (apply machine fixes), package manager
 (`brine add`), `brine launch --hosts`.

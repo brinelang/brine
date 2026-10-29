@@ -10,6 +10,7 @@ brine new hello && cd hello    # create a project (brine.toml, src/main.br, AGEN
 brine run                      # build + run          brine run file.br -- args
 brine check                    # type-check + prove   brine check --report
 brine check --typed            # also require a written type on every variable
+brine check --proven           # also require every runtime check to be proven away
 brine test                     # run test blocks      brine test "name filter"
 brine fmt                      # format               brine fmt --check
 brine run --ranks 4            # 4 cooperating processes (world module)
@@ -640,7 +641,9 @@ fn index_of(xs: [int], target: int) -> int:
     return -1
 ```
 * `requires`, `ensures`, `invariant` and `prove e` **must** be proven at compile
-  time; if the prover can't, it's an error listing the facts it knew.
+  time; if the prover can't, it's an error listing the facts it knew and, when
+  it finds some, values it can't rule out (`len(xs) = 0`): either the code is
+  wrong for them, or it needs a fact that excludes them.
 * `assert e` checks at runtime (always, in every build) and is a known fact
   afterwards. Use it to hand the prover a fact it can't derive itself.
 * Specs may use arithmetic, comparisons, `and`/`or`/`not`, `len`, `abs`, `min`,
@@ -652,7 +655,10 @@ fn index_of(xs: [int], target: int) -> int:
   call forgets only what the function may change in its `ref` arguments.
 * The prover handles linear integer arithmetic (`+ - ` and multiplication or
   division by constants). It never accepts a false claim.
-* `brine check --report` lists the runtime checks that remain.
+* `brine check --report` lists the runtime checks that remain, `assert`s outside
+  `test` blocks included. With `proven = true` under `[check]` in brine.toml (or
+  `--proven`), each of them is an error (E0607): outside `test` blocks, the
+  program can't stop on a failed check.
 
 ## Modules
 
