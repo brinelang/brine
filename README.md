@@ -449,6 +449,7 @@ test result: ok. 2 passed; 0 failed; finished in 0.03s
 | `brine check` | type-check and prove without building (`--report` lists remaining runtime checks) |
 | `brine test [filter]` | run `test "...":` blocks in parallel |
 | `brine fmt` | format sources (`--check`) |
+| `brine spec-diff` | which `requires`/`ensures`/`invariant`s got weaker since a git revision (`--base main`) |
 | `brine debug` | debug build, then launch gdb or lldb |
 | `brine explain E0601` | explain an error code |
 | `brine guide` | the whole language on one page |

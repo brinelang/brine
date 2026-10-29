@@ -1,0 +1,404 @@
+# `brine spec-diff`: how the contracts changed since a git revision.
+#
+# A proof only means what its spec says, so a change that weakens a spec
+# (drops an `ensures`, adds a `requires`, loosens a struct `invariant`) passes
+# every check while promising less. This finds those changes by asking the
+# prover, not by comparing text: each old and new clause becomes a small
+# function, added to the new program, that assumes one side and proves the
+# other. `a >= 0 and a < n` and `0 <= a < n` are the same spec.
+from ast import Program, FnDecl, Param
+from diag import Span, Diag, SourceMap
+from lexer import lex, Tok
+from driver import Frontend, FrontOpts, Source
+from info import PRELUDE
+import driver
+from verify import split_ws
+
+# The contracts of one function, as text.
+struct FnSpec:
+    module: str
+    # `S.f` for a method
+    name: str
+    # parameters and return type, which the clauses' names refer to
+    sig: str
+    generic: bool
+    # the parameters of a generated function: a `ref` parameter `p` is `p` after
+    # the call and `p__in` before it
+    params: [str]
+    refs: [str]
+    requires: [str]
+    ensures: [str]
+    loc: str
+    # where each clause is
+    req_locs: [str]
+    ens_locs: [str]
+
+struct InvSpec:
+    module: str
+    name: str
+    generic: bool
+    invariants: [str]
+    loc: str
+    inv_locs: [str]
+
+struct Specs:
+    fns: [FnSpec]
+    invs: [InvSpec]
+
+# One change, in words.
+struct Finding:
+    # weakened, narrowed, widened, stronger, unknown, skipped, removed
+    kind: str
+    # a weaker promise: what `brine spec-diff` fails on
+    bad: bool
+    subject: str
+    clause: str
+    loc: str
+
+    fn message(self) -> str:
+        let s = self.subject
+        let c = self.clause
+        if self.kind == "weakened":
+            return f"`{s}` no longer promises `{c}`"
+        if self.kind == "narrowed":
+            return f"`{s}` now requires `{c}`"
+        if self.kind == "widened":
+            return f"`{s}` no longer requires `{c}`"
+        if self.kind == "stronger":
+            return f"`{s}` now promises `{c}`"
+        if self.kind == "inv-weakened":
+            return f"`{s}` no longer keeps `{c}`"
+        if self.kind == "inv-added":
+            return f"`{s}` has a new invariant `{c}`"
+        if self.kind == "unknown":
+            return f"`{c}` of `{s}` could not be compared: it doesn't check against the new code"
+        if self.kind == "skipped":
+            return f"the signature of `{s}` changed, so its specs were not compared"
+        return f"`{s}` was removed"
+
+struct Outcome:
+    findings: [Finding]
+    # the new program's own errors, if it has any
+    fe: Option[Frontend]
+    # runtime checks left in the program, by kind: before and after
+    checks_before: Option[{str: int}]
+    checks_after: Option[{str: int}]
+
+# A question for the prover: do `assume` imply `goal`?
+struct Query:
+    module: str
+    params: [str]
+    assume: [str]
+    goal: str
+    finding: Finding
+
+fn text_of(sm: SourceMap, s: Span) -> str:
+    return split_ws(sm.snippet(s))
+
+fn type_text(sm: SourceMap, p: Param, self_ty: str) -> str:
+    match p.ty:
+        case Some(t):
+            return text_of(sm, t.span())
+        case None:
+            return self_ty
+
+fn fn_spec(sm: SourceMap, module: str, f: FnDecl, generic_owner: bool) -> FnSpec:
+    let owner = f.method_of.unwrap_or("")
+    let name = owner + "." + f.name if owner != "" else f.name
+    var sig: [str] = []
+    var params: [str] = []
+    var refs: [str] = []
+    for p in f.params:
+        let ty = type_text(sm, p, owner)
+        let pre = "ref " if p.by_ref else ("mut " if p.mutable else "")
+        sig.push(pre + p.name + ": " + ty)
+        let n = "__self" if p.name == "self" else p.name
+        if p.by_ref:
+            params.push(n + "__in: " + ty)
+            refs.push(p.name)
+        params.push(n + ": " + ty)
+    var ret = ""
+    match f.ret:
+        case Some(t):
+            ret = text_of(sm, t.span())
+            params.push("__result: " + ret)
+        case None:
+            pass
+    return FnSpec(
+        module=module,
+        name=name,
+        sig="(" + ", ".join(sig) + ") -> " + ret,
+        generic=generic_owner or len(f.tparams) > 0,
+        params=params,
+        refs=refs,
+        requires=[text_of(sm, e.span) for e in f.requires],
+        ensures=[text_of(sm, e.span) for e in f.ensures],
+        loc=sm.loc(f.name_span),
+        req_locs=[sm.loc(e.span) for e in f.requires],
+        ens_locs=[sm.loc(e.span) for e in f.ensures]
+    )
+
+fn specs_of(prog: Program, sm: SourceMap) -> Specs:
+    var out = Specs(fns=[], invs=[])
+    for m in prog.modules:
+        if m.name == PRELUDE:
+            continue
+        var generic: {str: bool} = {}
+        for s in m.structs:
+            generic[s.name] = len(s.tparams) > 0
+            out.invs.push(
+                InvSpec(
+                    module=m.name,
+                    name=s.name,
+                    generic=len(s.tparams) > 0,
+                    invariants=[text_of(sm, e.span) for e in s.invariants],
+                    loc=sm.loc(s.span),
+                    inv_locs=[sm.loc(e.span) for e in s.invariants]
+                )
+            )
+        for e in m.enums:
+            generic[e.name] = len(e.tparams) > 0
+        for f in m.fns:
+            let owner = f.method_of.unwrap_or("")
+            out.fns.push(fn_spec(sm, m.name, f, generic.get(owner).unwrap_or(false)))
+    return out
+
+# A clause in the generated functions' names: `self` and `result` become
+# parameters, and before the call (`pre`) a `ref` parameter is its `__in` copy.
+fn rename(text: str, pre: bool, refs: [str]) -> str:
+    let (toks, ds) = lex(text, 0, 0, false, false)
+    if len(ds) > 0:
+        return text
+    var out = ""
+    var at = 0
+    var after_dot = false
+    for t in toks:
+        match t.tok:
+            case Tok.Ident(n):
+                if not after_dot:
+                    var m = n
+                    if n == "self":
+                        m = "__self"
+                    elif n == "result":
+                        m = "__result"
+                    if pre and n in refs:
+                        m = m + "__in"
+                    if m != n:
+                        out += text[at:t.lo] + m
+                        at = t.hi
+            case _:
+                pass
+        match t.tok:
+            case Tok.Dot:
+                after_dot = true
+            case _:
+                after_dot = false
+    return out + text[at:]
+
+fn finding(kind: str, bad: bool, subject: str, clause: str, loc: str) -> Finding:
+    return Finding(kind=kind, bad=bad, subject=subject, clause=clause, loc=loc)
+
+# The questions that tell how `old` became `new` (same signature).
+fn fn_queries(old: FnSpec, new: FnSpec, ref qs: [Query]):
+    let pre0 = [rename(c, true, new.refs) for c in old.requires]
+    let pre1 = [rename(c, true, new.refs) for c in new.requires]
+    let post0 = [rename(c, false, new.refs) for c in old.ensures]
+    let post1 = [rename(c, false, new.refs) for c in new.ensures]
+    for i, c in enumerate(new.requires):
+        if c not in old.requires:
+            qs.push(query(new, pre0, pre1[i], "narrowed", true, c, new.req_locs[i]))
+    for i, c in enumerate(old.requires):
+        if c not in new.requires:
+            qs.push(query(new, pre1, pre0[i], "widened", false, c, new.loc))
+    var both = pre0
+    both.extend(pre1)
+    for i, c in enumerate(old.ensures):
+        if c not in new.ensures:
+            var a = both
+            a.extend(post1)
+            qs.push(query(new, a, post0[i], "weakened", true, c, new.loc))
+    for i, c in enumerate(new.ensures):
+        if c not in old.ensures:
+            var a = both
+            a.extend(post0)
+            qs.push(query(new, a, post1[i], "stronger", false, c, new.ens_locs[i]))
+
+fn query(f: FnSpec, assume: [str], goal: str, kind: str, bad: bool, clause: str, loc: str) -> Query:
+    return Query(
+        module=f.module,
+        params=f.params,
+        assume=assume,
+        goal=goal,
+        finding=finding(kind, bad, f.name, clause, loc)
+    )
+
+# Every new value of the type keeps the new invariants, so a generated
+# function's `__self` parameter already knows them: it proves each old one.
+# That also means an added invariant can't be checked against the old ones,
+# so it is only noted.
+fn inv_queries(old: InvSpec, new: InvSpec, ref qs: [Query], ref out: [Finding]):
+    for c in old.invariants:
+        if c not in new.invariants:
+            qs.push(
+                Query(
+                    module=new.module,
+                    params=["__self: " + new.name],
+                    assume=[],
+                    goal=rename(c, false, []),
+                    finding=finding("inv-weakened", true, new.name, c, new.loc)
+                )
+            )
+    for i, c in enumerate(new.invariants):
+        if c not in old.invariants:
+            out.push(finding("inv-added", false, new.name, c, new.inv_locs[i]))
+
+fn compare(old: Specs, new: Specs, base: str, ref qs: [Query]) -> [Finding]:
+    var out: [Finding] = []
+    var by_key: {str: int} = {}
+    for i, f in enumerate(new.fns):
+        by_key[f.module + ":" + f.name] = i
+    for o in old.fns:
+        match by_key.get(o.module + ":" + o.name):
+            case Some(i):
+                let n = new.fns[i]
+                if o.requires == n.requires and o.ensures == n.ensures:
+                    continue
+                if o.sig != n.sig or o.generic or n.generic:
+                    out.push(finding("skipped", false, n.name, "", n.loc))
+                else:
+                    fn_queries(o, n, ref qs)
+            case None:
+                if len(o.requires) + len(o.ensures) > 0:
+                    out.push(finding("removed", false, o.name, "", base + ":" + o.loc))
+    var inv_key: {str: int} = {}
+    for i, s in enumerate(new.invs):
+        inv_key[s.module + ":" + s.name] = i
+    for o in old.invs:
+        match inv_key.get(o.module + ":" + o.name):
+            case Some(i):
+                let n = new.invs[i]
+                if o.invariants == n.invariants:
+                    continue
+                if o.generic or n.generic:
+                    out.push(finding("skipped", false, n.name, "", n.loc))
+                else:
+                    inv_queries(o, n, ref qs, ref out)
+            case None:
+                pass
+    return out
+
+# The generated functions, one module's source each, and where each query's
+# function is in it.
+struct Gen:
+    extra: {str: str}
+    # query index -> (module, lo, hi)
+    at: [(str, int, int)]
+
+fn generate(qs: [Query], live: [bool]) -> Gen:
+    var g = Gen(extra={}, at=[])
+    for i, q in enumerate(qs):
+        if not live[i]:
+            g.at.push(("", 0, 0))
+            continue
+        let before = g.extra.get(q.module).unwrap_or("\n")
+        var s = f"fn __spec_diff_{i}(" + ", ".join(q.params) + "):\n"
+        for a in q.assume:
+            s += "    requires (" + a + ")\n"
+        s += "    prove (" + q.goal + ")\n"
+        g.at.push((q.module, len(before), len(before) + len(s)))
+        g.extra[q.module] = before + s
+    return g
+
+# The query a diagnostic in a generated function is about, if it is in one.
+fn query_of(d: Diag, sm: SourceMap, g: Gen) -> Option[int]:
+    if len(d.labels) == 0:
+        return None
+    let s = d.labels[0].span
+    if not sm.has_file(s.file):
+        return None
+    let path = sm.file(s.file).path
+    for i, a in enumerate(g.at):
+        if a.0 != "" and path == f"<spec-diff {a.0}>" and a.1 <= s.lo and s.lo < a.2:
+            return Some(i)
+    return None
+
+fn checks_by_kind(fe: Frontend) -> Option[{str: int}]:
+    match fe.report:
+        case Some(r):
+            var m: {str: int} = {}
+            for _, what in r.remaining:
+                m[what] = m.get(what).unwrap_or(0) + 1
+            return Some(m)
+        case None:
+            return None
+
+fn opts(verify: bool) -> FrontOpts:
+    return FrontOpts(verify=verify, need_main=false, typed=false, proven=false)
+
+# Compares `entry` on disk with the same file in git revision `base`.
+fn run(entry: str, base: str) -> Result[Outcome, str]:
+    let old_fe = driver.frontend_at(entry, opts(true), Source(rev=Some(base), extra={}))
+    var old_prog: Option[Program] = old_fe.prog
+    if old_prog.is_none():
+        for d in old_fe.diags:
+            if d.code == "E0701":
+                return Err(d.msg)
+        return Err(f"could not load `{entry}` from git revision `{base}`")
+    var sm = SourceMap.new()
+    var ds: [Diag] = []
+    let new_prog = driver.load(entry, ref sm, ref ds)
+    if new_prog.is_none() or driver.has_errors(ds):
+        let fe = driver.frontend(entry, opts(false))
+        return Ok(Outcome(findings=[], fe=Some(fe), checks_before=None, checks_after=None))
+    let old = specs_of(old_prog.unwrap(), old_fe.sm)
+    let new = specs_of(new_prog.unwrap(), sm)
+    var qs: [Query] = []
+    var out = compare(old, new, base, ref qs)
+    # A clause that doesn't check against the new program (it names something
+    # that is gone) can't be asked about, and stops verification: it is
+    # dropped and the rest run again. Each round drops one, so this ends.
+    var live = [true for _ in qs]
+    while true:
+        let g = generate(qs, live)
+        var fe = driver.frontend_at(entry, opts(true), Source(rev=None, extra=g.extra))
+        var broken: [int] = []
+        var real: [Diag] = []
+        var failed = [false for _ in qs]
+        for d in fe.diags:
+            match query_of(d, fe.sm, g):
+                case Some(i):
+                    if not d.is_error() or d.code == "E0608":
+                        # E0608: the two sides can't both hold, so nothing is lost
+                        continue
+                    if d.code == "E0605":
+                        failed[i] = true
+                    else:
+                        broken.push(i)
+                case None:
+                    real.push(d)
+        for i in broken:
+            live[i] = false
+        if fe.report.is_none():
+            if len(broken) > 0:
+                continue
+            # the new program itself has errors
+            fe.diags = real
+            return Ok(Outcome(findings=[], fe=Some(fe), checks_before=None, checks_after=None))
+        fe.diags = real
+        for i, q in enumerate(qs):
+            if not live[i]:
+                var f = q.finding
+                f.kind = "unknown"
+                f.bad = false
+                out.push(f)
+            elif failed[i]:
+                out.push(q.finding)
+        return Ok(
+            Outcome(
+                findings=out,
+                fe=Some(fe),
+                checks_before=checks_by_kind(old_fe),
+                checks_after=checks_by_kind(fe)
+            )
+        )
+    return Err("unreachable")

@@ -12,9 +12,9 @@
 # when it has been proven or is enforced by a runtime check.
 from diag import Span, Diag, SourceMap
 import diag
-from types import Ty, IntTy, Res, CallRes, Builtin, NumM, StrM, Reducer, WorldOp, LocalInfo, int_ty
+from types import Ty, IntTy, Res, CallRes, Builtin, NumM, StrM, Reducer, WorldOp, LocalInfo, LocalKind, int_ty
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
-from ast import children, stmt_exprs, stmt_blocks, lvalue_root
+from ast import children, stmt_exprs, stmt_blocks, lvalue_root, local_of
 from info import ProgramInfo, ConstVal
 from solver import Lin, F, AtomSet, prove_, prove_full, counterexample, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
 
@@ -155,6 +155,18 @@ fn verify_program(ref prog: Program, info: ProgramInfo, sm: SourceMap, must_prov
                 continue
         out.push(r)
     report.remaining = out
+    # generic code is verified once per instance; report each problem once
+    var seen: {(str, str, int, int, int): bool} = {}
+    var kept: [Diag] = []
+    for d in report.diags:
+        var k = (d.code, d.msg, -1, 0, 0)
+        if len(d.labels) > 0:
+            let s = d.labels[0].span
+            k = (d.code, d.msg, s.file, s.lo, s.hi)
+        if k not in seen:
+            seen[k] = true
+            kept.push(d)
+    report.diags = kept
     return report
 
 struct FnResult:
@@ -868,7 +880,11 @@ fn new_vf(
         remaining=[],
         test=false,
         must_prove=false,
-        diags=[]
+        diags=[],
+        own_self=-1,
+        own_sid=-1,
+        own_ref=false,
+        skip_inv=false
     )
 
 struct Vf:
@@ -905,6 +921,14 @@ struct Vf:
     # every remaining runtime check is an error (E0607)
     must_prove: bool
     diags: [Diag]
+    # in a method of a struct with an `invariant`: the `self` local, the
+    # struct, and whether `self` is `ref`. `self` may break the invariant
+    # in between: it is proven where `self` is used whole and on return.
+    own_self: int
+    own_sid: int
+    own_ref: bool
+    # `fresh_val` makes a value that may break its invariant (`self`, havocked)
+    skip_inv: bool
 
     # The state, leaving none behind.
     fn take(ref self) -> Option[St]:
@@ -931,19 +955,44 @@ struct Vf:
         return self.locals[id].ty if 0 <= id < len(self.locals) else Ty.Unknown
 
     fn run(ref self, f: FnDecl):
-        var env: {int: V} = {}
+        if f.method_of.is_some() and len(f.params) > 0 and f.params[0].name == "self":
+            let id = f.param_locals[0]
+            match self.local_ty(id):
+                case Ty.Struct(sid):
+                    if len(self.info.structs[sid].invariants) > 0:
+                        self.own_self = id
+                        self.own_sid = sid
+                        self.own_ref = self.locals[id].kind == LocalKind.RefParam
+                case _:
+                    pass
+        # live first: the parameters' invariants are facts
+        self.put(Some(St(env={}, facts=[])))
         for i, id in enumerate(f.param_locals):
             let li = self.locals[id]
             let name = "old(" + f.params[i].name + ")" if f.params[i].mutable else f.params[i].name
             let v = self.fresh_val(li.ty, name)
-            env[id] = v
-        self.put(Some(St(env=env, facts=[])))
+            self.bind(id, v)
         for r in f.requires:
             let c = self.spec_cond(r)
             self.assume(c)
+        # preconditions that contradict each other make every proof in the body
+        # trivially true, and no call can meet them
+        if len(f.requires) > 0 and self.holds(F.False):
+            let first = f.requires[0].span
+            let last = f.requires[len(f.requires) - 1].span
+            var d = diag.error("E0608", f"the preconditions of `{f.name}` can never all hold")
+            d = d.label(first.to(last), "no values meet all of these")
+            d = d.note("everything the body claims is proven vacuously, and no call can prove them")
+            self.diags.push(
+                d.with_help(
+                    "fix the `requires` that is wrong, or remove the function if it can't be called"
+                )
+            )
+            return
         self.block(f.body)
         if self.live:
             let end = Span(file=f.span.file, lo=f.span.hi, hi=f.span.hi)
+            self.check_own_inv(end)
             self.check_ensures(None, end)
 
     # ------------------------------------------------------------ atoms
@@ -1064,11 +1113,17 @@ struct Vf:
                     vs.push(self.fresh_val(t, f"{name}.{i}"))
                 return V.Agg(vs)
             case Ty.Struct(sid):
+                let skip = self.skip_inv
+                self.skip_inv = false
                 let fields = self.info.structs[sid].fields
                 var vs: [V] = []
                 for n, t in fields:
                     vs.push(self.fresh_val(t, name + "." + n))
-                return V.Agg(vs)
+                let v = V.Agg(vs)
+                # every value of the type keeps its invariant
+                if not skip:
+                    self.assume_inv(sid, v)
+                return v
             case _:
                 return V.Opaque
 
@@ -1479,6 +1534,81 @@ struct Vf:
         self.alt_env = saved
         return f
 
+    # ------------------------------------------------------------ struct invariants
+    fn inv_facts(ref self, sid: int, v: V) -> [F]:
+        let si = self.info.structs[sid]
+        var out: [F] = []
+        for inv in si.invariants:
+            out.push(self.spec_cond_in({si.inv_self: v}, inv))
+        return out
+
+    fn assume_inv(ref self, sid: int, v: V):
+        if not self.live or len(self.info.structs[sid].invariants) == 0:
+            return
+        for f in self.inv_facts(sid, v):
+            self.assume(f)
+
+    # E0609 unless `v` keeps the invariant of struct `sid`
+    fn check_inv(ref self, sid: int, v: V, span: Span, what: str, help: str):
+        let si = self.info.structs[sid]
+        if not self.live or len(si.invariants) == 0:
+            return
+        let fs = self.inv_facts(sid, v)
+        for i, f in enumerate(fs):
+            if not self.holds(f):
+                let d = (
+                    diag.error(
+                        "E0609",
+                        f"cannot prove the invariant of `{self.info.struct_names[sid]}`"
+                    )
+                    .label(span, what)
+                    .label(si.invariants[i].span, "invariant declared here")
+                    .with_help(help)
+                )
+                self.fail(d, f)
+            self.assume(f)
+
+    # A `ref self` method returns: `self` must keep its invariant again.
+    fn check_own_inv(ref self, span: Span):
+        if self.own_self < 0 or not self.own_ref or not self.live:
+            return
+        let v = self.lookup(self.own_self, self.local_ty(self.own_self))
+        self.check_inv(
+            self.own_sid,
+            v,
+            span,
+            "`self` might break the invariant when the method returns here",
+            "make every path through the method restore the invariant, or `assert` the fact it needs"
+        )
+
+    # `S(...)`: a new value, which must keep the invariant of `S`
+    fn ctor(ref self, sid: int, args: [Arg], e: Expr) -> V:
+        let fields = self.info.structs[sid].fields
+        var vals: [V] = [V.Opaque] * len(fields)
+        for i, a in enumerate(args):
+            let v = self.eval(a.expr)
+            var idx = i
+            match a.name:
+                case Some((n, _)):
+                    for j, fd in enumerate(fields):
+                        if fd.0 == n:
+                            idx = j
+                            break
+                case None:
+                    pass
+            if idx < len(vals):
+                vals[idx] = v
+        let out = V.Agg(vals)
+        if not self.spec:
+            self.check_inv(
+                sid,
+                out,
+                e.span,
+                f"this `{self.info.struct_names[sid]}` might break its invariant",
+                "check the values before building it, e.g. with an `if` that returns an error otherwise"
+            )
+        return out
+
     fn check_ensures(ref self, ret: Option[V], span: Span):
         let ens = self.ensures
         if len(ens) == 0:
@@ -1620,6 +1750,7 @@ struct Vf:
                     case None:
                         pass
                 if self.live:
+                    self.check_own_inv(s.span)
                     self.check_ensures(v, s.span)
                 self.live = false
             case StmtKind.Break:
@@ -2032,7 +2163,16 @@ struct Vf:
                 case Some(cur):
                     var nv = cur
                     for p in mods[id]:
+                        self.skip_inv = id == self.own_self and len(p) == 0
                         nv = self.havoc_at(nv, p, self.local_ty(id), self.local_name(id))
+                    self.skip_inv = false
+                    # only a method's `self` breaks its invariant in between
+                    if id != self.own_self:
+                        match self.local_ty(id):
+                            case Ty.Struct(sid):
+                                self.assume_inv(sid, nv)
+                            case _:
+                                pass
                     self.bind(id, nv)
                 case None:
                     pass
@@ -2745,7 +2885,17 @@ struct Vf:
             case ExprKind.Ident(_):
                 match e.res:
                     case Res.Local(id):
-                        return self.lookup(id, e.ty)
+                        let v = self.lookup(id, e.ty)
+                        # `self` leaves the method here (copied, passed, returned)
+                        if id == self.own_self and not self.spec:
+                            self.check_inv(
+                                self.own_sid,
+                                v,
+                                e.span,
+                                "`self` is used here, where it might break the invariant",
+                                "restore the invariant before using `self` whole"
+                            )
+                        return v
                     case Res.Const(id):
                         return self.const_val(id)
                     case _:
@@ -2755,6 +2905,7 @@ struct Vf:
                 # the path where `x` is `None`/`Err` returns here
                 if self.live:
                     let saved = self.cur()
+                    self.check_own_inv(e.span)
                     self.check_ensures(None, e.span)
                     self.put(saved)
                 return self.fresh_val(e.ty, "?")
@@ -2875,22 +3026,7 @@ struct Vf:
                     case CallRes.Method(id):
                         return self.call_user(id, None, args, e)
                     case CallRes.Ctor(sid):
-                        let fields = self.info.structs[sid].fields
-                        var vals: [V] = [V.Opaque] * len(fields)
-                        for i, a in enumerate(args):
-                            let v = self.eval(a.expr)
-                            var idx = i
-                            match a.name:
-                                case Some((n, _)):
-                                    for j, fd in enumerate(fields):
-                                        if fd.0 == n:
-                                            idx = j
-                                            break
-                                case None:
-                                    pass
-                            if idx < len(vals):
-                                vals[idx] = v
-                        return V.Agg(vals)
+                        return self.ctor(sid, args, e)
                     case CallRes.Builtin(b):
                         return self.builtin(b, None, args, e)
                     case CallRes.Reduce(r):
@@ -2904,6 +3040,8 @@ struct Vf:
                         return self.fresh_val(e.ty, "?")
             case ExprKind.MethodCall(recv, _, _, args):
                 match e.cres:
+                    case CallRes.Ctor(sid):
+                        return self.ctor(sid, args, e)
                     case CallRes.Fn(id):
                         return self.call_user(id, None, args, e)
                     case CallRes.Method(id):
@@ -2946,7 +3084,13 @@ struct Vf:
                         return V.Opaque
                     case _:
                         pass
-                match self.eval(b):
+                # a field of `self` is not a use of `self` whole
+                var bv = V.Opaque
+                if self.own_self >= 0 and local_of(b) == Some(self.own_self):
+                    bv = self.lookup(self.own_self, b.ty)
+                else:
+                    bv = self.eval(b)
+                match bv:
                     case V.Agg(vs):
                         if e.idx < len(vs):
                             return vs[e.idx]
@@ -3652,6 +3796,12 @@ struct Vf:
                                 vals[i] = nv
                             case None:
                                 vals[i] = self.fresh_val(p.ty, name)
+                        # the callee keeps the invariant of what it changes
+                        match p.ty:
+                            case Ty.Struct(sid):
+                                self.assume_inv(sid, vals[i])
+                            case _:
+                                pass
                     case None:
                         pass
         let nm = self.name_of(e)

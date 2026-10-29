@@ -87,6 +87,11 @@ Two kinds of obligations:
   * `requires` — precondition; proven at *every call site*.
   * `ensures` — postcondition; proven at *every return*. `result` names the return value.
   * `invariant` — loop invariant; proven on entry and preserved by every iteration.
+    In a struct, a fact about `self` that every value of the type keeps: proven where
+    a value is built and where a `ref self` method returns or uses `self` whole, and
+    assumed everywhere else. Only the struct's methods change its fields (E0406), and
+    values can't alias, so nothing else can break it in between ("parse, don't
+    validate": check input once when building the value, and the fact travels with it).
   * `prove e` — an inline claim.
 * **Implicit** obligations come from the language's own safety rules: array bounds,
   division by zero, integer overflow (also of `x += y`, `-x` and `abs`), shift amounts,
@@ -363,6 +368,7 @@ from what brine knows that C doesn't (no aliasing, proven-away checks, race-free
 | `brine check [--report] [--typed] [--proven]` | Type-check + verify, no codegen. Fastest feedback loop. `--typed` (or `typed = true` under `[check]` in brine.toml) requires a written type on every variable; `--proven` (or `proven = true`) requires every runtime check to be proven away. |
 | `brine test [filter]` | Run `test "name":` blocks, each in its own process, in parallel. |
 | `brine fmt [--check]` | Canonical formatting. |
+| `brine spec-diff [--base <rev>]` | How every `requires`, `ensures` and struct `invariant` changed since a git revision, decided by the prover (weaker, stronger, or the same written another way), and the runtime checks left before and after. Exit 1 when a spec promises less. A proof only means what its spec says, so this is for review and CI: it shows when a change made the proofs pass by proving less. |
 | `brine debug` | Debug build + launch gdb/lldb. |
 | `brine explain E0601` | Long-form explanation of any diagnostic. |
 | `brine guide` | Print the language quick reference (great for agents). |
@@ -378,7 +384,7 @@ Global flags: `--json` (machine-readable diagnostics, one JSON object per line),
 | `E01xx` | syntax: literals, indentation, operators from other languages |
 | `E02xx` | names: not found, defined twice, unknown types/fields/methods, shadowing |
 | `E03xx` | types |
-| `E04xx` | mutability and references (`let`/`var`, `ref` parameters and arguments, aliasing) |
+| `E04xx` | mutability and references (`let`/`var`, `ref` parameters and arguments, aliasing, fields of structs with an invariant) |
 | `E05xx` | parallel safety (`par` rules) |
 | `E0601` | a call's `requires` can't be proven |
 | `E0602` | a function's `ensures` can't be proven at some `return` |
@@ -387,6 +393,8 @@ Global flags: `--json` (machine-readable diagnostics, one JSON object per line),
 | `E0605` | a `prove` claim can't be proven |
 | `E0606` | something not allowed in a specification (e.g. a call with side effects) |
 | `E0607` | a runtime check is left in code that must be proven (`proven = true`) |
+| `E0608` | a function's preconditions contradict each other, so its proofs mean nothing |
+| `E0609` | a struct `invariant` can't be proven where a value is built or a method returns |
 | `E07xx` | driver: missing module, no C compiler, no `main`, C compile/link failures |
 
 Proof failures list the facts the prover knew at that point and the exact goal,
@@ -433,7 +441,8 @@ vendor's own shader compiler, so it waits for real devices. Intel Macs' AMD and 
 GPUs are part of it: Metal is used only on Apple GPUs for now.
 
 **Proofs:** generic bodies checked once against constraints (rather than per
-instance), quantifiers in specs (`forall i in 0..n: a[i] >= 0`), array-content
+instance), invariants on generic structs, ranged integer types (`int in 0..=200`) and
+distinct types, quantifiers in specs (`forall i in 0..n: a[i] >= 0`), array-content
 reasoning, nonlinear facts (`i * j`), running a failed proof's values through the code
 to tell a bug from a missing fact.
 

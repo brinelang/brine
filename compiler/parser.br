@@ -307,16 +307,22 @@ struct Parser:
         self.end_stmt()?
         return Ok(ConstDecl(name=name, span=span, ty=ty, value=value))
 
-    # one line of a struct body: `name: type`, a method or `pass`
+    # one line of a struct body: `name: type`, `invariant e`, a method or `pass`
     fn struct_member(
         ref self,
         owner: str,
         ref fields: [FieldDecl],
+        ref invariants: [Expr],
         ref m: Module
     ) -> Result[(), ()]:
         match self.peek():
             case Tok.Keyword(Kw.Fn):
                 m.fns.push(self.fn_decl(Some(owner))?)
+            # `invariant: int` is a field
+            case Tok.Keyword(Kw.Invariant) if self.peek_at(1) != Tok.Colon:
+                self.bump()
+                invariants.push(self.expr()?)
+                self.end_stmt()?
             case Tok.Keyword(Kw.Pass):
                 self.bump()
                 self.end_stmt()?
@@ -344,11 +350,22 @@ struct Parser:
             )
             return Err(())
         var fields: [FieldDecl] = []
+        var invariants: [Expr] = []
         while not self.at(Tok.Dedent) and not self.at(Tok.Eof):
-            if self.struct_member(name, ref fields, ref m).is_err():
+            if self.struct_member(name, ref fields, ref invariants, ref m).is_err():
                 self.sync_line()
         self.eat(Tok.Dedent)
-        m.structs.push(StructDecl(name=name, span=start, tparams=tparams, fields=fields))
+        if len(tparams) > 0 and len(invariants) > 0:
+            self.diags.push(
+                diag.error("E0112", "generic structs can't have an `invariant` yet")
+                .label(invariants[0].span, "invariant of a generic struct")
+                .with_help(
+                    "state the fact in the `requires` and `ensures` of the functions that use it"
+                )
+            )
+        m.structs.push(
+            StructDecl(name=name, span=start, tparams=tparams, fields=fields, invariants=invariants)
+        )
         return Ok(())
 
     # one line of an enum body: a variant (`Circle(radius: float)` or `Empty`), a method or `pass`
@@ -678,7 +695,7 @@ struct Parser:
                         contracts.push((k, e))
                     else:
                         let where = (
-                            "at the start of a `while` or `for` loop body"
+                            "at the start of a `while` or `for` loop body, or in a `struct`"
                             if k == ContractKind.Invariant
                             else "at the start of a function body"
                         )

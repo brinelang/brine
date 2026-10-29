@@ -13,6 +13,7 @@ brine check --typed            # also require a written type on every variable
 brine check --proven           # also require every runtime check to be proven away
 brine test                     # run test blocks      brine test "name filter"
 brine fmt                      # format               brine fmt --check
+brine spec-diff --base main    # which specs got weaker since a git revision
 brine run --ranks 4            # 4 cooperating processes (world module)
 brine debug file.br            # debug build in gdb/lldb: break file.br:12, step, print x
 brine explain E0601            # explain any error code
@@ -188,6 +189,35 @@ struct Particle:
 var p = Particle(pos=0.0, vel=2.0)
 p.step(0.1)
 print(p, p.energy())                 # Particle(pos=0.2, vel=2.0) 2.0
+```
+
+An `invariant` in a struct is a fact about `self` that every value of the type
+keeps. It is proven where a value is built and where a `ref self` method
+returns (or uses `self` whole); everywhere else it is a known fact. Only the
+struct's own methods change its fields, through `self` (E0406), so build values
+from untrusted input behind a check:
+
+```python
+struct Ring:
+    items: [int]
+    cap: int
+    invariant 0 < self.cap
+    invariant len(self.items) <= self.cap
+
+    fn push(ref self, x: int) -> bool:
+        if len(self.items) == self.cap:
+            return false                 # without this check: E0609
+        self.items.push(x)
+        return true
+
+fn new_ring(cap: int) -> Result[Ring, str]:
+    if cap <= 0:
+        return Err("the capacity must be positive")
+    return Ok(Ring(items=[], cap=cap))   # proven here
+
+fn room(r: Ring) -> int:
+    ensures result >= 0                  # from the invariant: no `requires` needed
+    return r.cap - len(r.items)
 ```
 
 ## Enums and `match`
@@ -644,6 +674,9 @@ fn index_of(xs: [int], target: int) -> int:
   time; if the prover can't, it's an error listing the facts it knew and, when
   it finds some, values it can't rule out (`len(xs) = 0`): either the code is
   wrong for them, or it needs a fact that excludes them.
+* A function's `requires` must be able to hold together: `requires n > 0` and
+  `requires n < 0` is an error (E0608), since every claim in the body would be
+  proven without meaning anything.
 * `assert e` checks at runtime (always, in every build) and is a known fact
   afterwards. Use it to hand the prover a fact it can't derive itself.
 * Specs may use arithmetic, comparisons, `and`/`or`/`not`, `len`, `abs`, `min`,
@@ -659,6 +692,13 @@ fn index_of(xs: [int], target: int) -> int:
   `test` blocks included. With `proven = true` under `[check]` in brine.toml (or
   `--proven`), each of them is an error (E0607): outside `test` blocks, the
   program can't stop on a failed check.
+* A proof means only what its spec says. `brine spec-diff` compares every
+  `requires`, `ensures` and struct `invariant` with a git revision (`--base`,
+  default `HEAD`) by asking the prover, so `0 <= i < n` and `i >= 0 and i < n`
+  are the same spec. It fails when one promises less: an `ensures` or
+  `invariant` that no longer follows, or a `requires` that asks more of callers.
+  It also counts the runtime checks left before and after. Run it in CI against
+  the base branch, so a reviewer sees each weaker spec.
 
 ## Modules
 

@@ -248,6 +248,7 @@ fn features() -> [str]:
         "tests/programs/enum_int.br",
         "tests/programs/ordering.br",
         "tests/programs/ref_fields.br",
+        "tests/programs/struct_invariants.br",
         "tests/programs/mut_order.br",
         "tests/programs/inline_enums.br",
         "tests/programs/borrowed_returns.br",
@@ -847,6 +848,14 @@ test "generic errors":
         error_codes("tests/programs/generic_method_errors.br")
         == ["E0331@16", "E0334@21", "E0332@22", "E0334@23", "E0206@24", "E0334@26", "E0206@27"]
     )
+    # a proof that fails in every instance is reported once
+    let f = scratch("generic_proof") + "/g.br"
+    write(
+        f,
+        "fn first[T](xs: [T], i: int) -> int:\n    ensures result > 0\n    return i\n\n"
+        + "fn main():\n    print(first([1], 1), first([\"a\"], 1))\n"
+    )
+    assert error_codes(f) == ["E0602@3"]
 
 test "typed projects require types":
     assert (
@@ -1013,6 +1022,48 @@ test "proof errors":
         error_codes("tests/programs/proof_errors.br")
         == ["E0602@6", "E0603@15", "E0604@15", "E0601@20", "E0601@22", "E0605@24"]
     )
+    # preconditions that contradict each other, or the parameter's type
+    let f = scratch("vacuous") + "/v.br"
+    write(
+        f,
+        "fn f(n: int) -> int:\n    requires n > 0\n    requires n < 0\n    ensures result == 7\n    return 1\n\n"
+        + "fn g(xs: [int]) -> int:\n    requires len(xs) < 0\n    return 0\n\n"
+        + "fn h(n: int) -> int:\n    requires n > 0\n    requires n < 10\n    return n\n\n"
+        + "fn main():\n    print(h(1))\n"
+    )
+    assert error_codes(f) == ["E0608@2", "E0608@8"]
+    assert "the preconditions of `f` can never all hold" in brine(["check", f]).err
+
+test "struct invariants are kept by every value":
+    # built, returned from a `ref self` method, used whole in one
+    assert (
+        error_codes("tests/programs/invariant_errors.br")
+        == ["E0609@6", "E0609@13", "E0609@24", "E0609@27"]
+    )
+    # only the struct's methods change its fields
+    assert (
+        error_codes("tests/programs/invariant_fields.br")
+        == ["E0406@17", "E0406@18", "E0406@19", "E0406@20"]
+    )
+    let e = brine(["check", "tests/programs/invariant_errors.br"]).err
+    assert "values the prover can't rule out: self.lo = 0, self.hi = 0, by = -1" in e, e
+    assert "`self` is used here, where it might break the invariant" in e, e
+    # generic structs can't have one yet; a field may still be named `invariant`
+    let f = scratch("generic_inv") + "/g.br"
+    write(
+        f,
+        "struct Pair[T]:\n    a: T\n    n: int\n    invariant self.n >= 0\n\n"
+        + "struct K:\n    invariant: int\n\nfn main():\n    print(K(invariant=1).invariant)\n"
+    )
+    assert error_codes(f) == ["E0112@4"]
+    # built through its module's name
+    let d = scratch("module_inv")
+    write(
+        d + "/geo.br",
+        "struct Range:\n    lo: int\n    hi: int\n    invariant self.lo <= self.hi\n"
+    )
+    write(d + "/main.br", "import geo\n\nfn main():\n    print(geo.Range(lo=3, hi=1))\n")
+    assert error_codes(d + "/main.br") == ["E0609@4"]
 
 test "the notes of failed proofs":
     let f = "tests/programs/proof_notes.br"
@@ -1092,6 +1143,91 @@ test "proven projects can't keep runtime checks":
     assert "4 remain" in o.all(), o.all()
     let p = brine(["check", d + "/plain.br", "--proven", "--json"])
     assert p.code != 0 and p.out.count("\"code\":\"E0607\"") == 3, p.all()
+
+fn git(dir: str, args: [str]):
+    var cmd = [
+        "git",
+        "-C",
+        dir,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "commit.gpgsign=false"
+    ]
+    cmd.extend(args)
+    let o = exec(cmd, {})
+    assert o.code == 0, f"git {args}: {o.all()}"
+
+test "spec-diff finds specs that promise less":
+    let d = scratch("specdiff")
+    let f = d + "/main.br"
+    let ring = "struct Ring:\n    items: [int]\n    cap: int\n"
+    let clamp = "fn clamp(x: int, lo: int, hi: int) -> int:\n"
+    let body = "    if x < lo:\n        return lo\n    if x > hi:\n        return hi\n    return x\n\n"
+    let get = "fn get(xs: [int], i: int) -> int:\n"
+    let main = "fn main():\n    var n = 0\n    bump(ref n)\n    print(clamp(5, 0, 3), n, get([1, 2], 1))\n"
+    write(
+        f,
+        ring
+        + "    invariant 0 < self.cap\n\n"
+        + clamp
+        + "    requires lo <= hi\n    ensures lo <= result <= hi\n"
+        + body
+        + "fn bump(ref n: int):\n    requires n >= 0\n    ensures n >= 1\n    n += 1\n\n"
+        + get
+        + "    requires 0 <= i and i < len(xs)\n    return xs[i]\n\n"
+        + main
+    )
+    git(d, ["init", "-q"])
+    git(d, ["add", "main.br"])
+    git(d, ["commit", "-q", "-m", "v1"])
+    let same = brine(["spec-diff", f])
+    assert same.code == 0 and "no spec changes" in same.err, same.all()
+    # weaker in four ways, the same `requires` written another way, a stronger
+    # `ensures` and a new runtime check
+    write(
+        f,
+        ring
+        + "    invariant 0 <= self.cap\n\n"
+        + clamp
+        + "    requires lo <= hi\n    requires x >= 0\n    ensures lo <= result\n"
+        + body
+        + "fn bump(ref n: int):\n    requires n >= 0\n    ensures n >= 0\n    ensures n > 0 or n == 0\n    n += 1\n\n"
+        + get
+        + "    requires i < len(xs) and i >= 0\n    ensures result == xs[i]\n    return xs[i]\n\n"
+        + "fn first(xs: [int]) -> int:\n    return xs[0]\n\n"
+        + main
+    )
+    let o = brine(["spec-diff", f, "--json"])
+    assert o.code == 1, o.all()
+    var got: [str] = []
+    for l in o.out.lines():
+        if "\"change\":" in l:
+            got.push(
+                field(l, "change")
+                + " "
+                + field(l, "kind")
+                + " "
+                + field(l, "item")
+                + ": "
+                + field(l, "clause")
+            )
+    assert got == [
+        "weaker narrowed clamp: x >= 0",
+        "weaker weakened clamp: lo <= result <= hi",
+        "weaker weakened bump: n >= 1",
+        "weaker inv-weakened Ring: 0 < self.cap",
+        "note inv-added Ring: 0 <= self.cap",
+        "stronger stronger get: result == xs[i]"
+    ], "\n".join(got)
+    assert "\"checks_before\":1,\"checks_after\":2" in o.out, o.out
+    let t = brine(["spec-diff", f])
+    assert "main.br:6:4: weaker: `clamp` no longer promises `lo <= result <= hi`" in t.out, t.all()
+    assert "runtime checks left: 1 → 2 (+1 index bounds check)" in t.out, t.all()
+    let bad = brine(["spec-diff", f, "--base", "nope"])
+    assert bad.code == 2 and "could not read" in bad.err, bad.all()
 
 # false claims the prover once accepted
 test "proofs stay sound":
@@ -1379,9 +1515,12 @@ test "every error code is explained":
         "E0341",
         "E0342",
         "E0501",
+        "E0406",
         "E0601",
         "E0606",
         "E0607",
+        "E0608",
+        "E0609",
         "E0702",
         "E0706",
         "E0707",
@@ -1454,6 +1593,7 @@ test "every command describes itself":
         "test",
         "debug",
         "fmt",
+        "spec-diff",
         "explain",
         "guide",
         "doctor",

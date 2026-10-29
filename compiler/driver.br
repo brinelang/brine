@@ -54,6 +54,37 @@ fn read_source(path: str) -> Result[str, str]:
             # read_file's message already names the file
             return Err(e)
 
+# Where `load` reads a program from: the files on disk, or (`rev`) the files
+# as they are in a git revision. `extra` is more source for a module, by module
+# name: `brine spec-diff` adds functions to a program this way.
+struct Source:
+    rev: Option[str]
+    extra: {str: str}
+
+fn on_disk() -> Source:
+    return Source(rev=None, extra={})
+
+fn read_at(path: str, rev: Option[str]) -> Result[str, str]:
+    match rev:
+        case None:
+            return read_source(path)
+        case Some(r):
+            let dir = dir_of(path)
+            let name = project.file_name(path).unwrap_or(path)
+            let cmd = ["git", "-C", dir if dir != "" else ".", "show", r + ":./" + name]
+            match os.spawn(cmd, {}, true, false):
+                case Ok(p):
+                    let code = os.wait(p)
+                    let (out, err) = os.output(p)
+                    if code != 0:
+                        let why = err.strip().split("\n")[0].replace("fatal: ", "")
+                        return Err(
+                            f"could not read `{display_path(path)}` from git revision `{r}`: {why}"
+                        )
+                    return Ok(out.replace("\r\n", "\n"))
+                case Err(e):
+                    return Err(f"could not run git: {e}")
+
 # Path for messages: relative to the current directory when it's inside it.
 fn display_path(p: str) -> str:
     var s = p
@@ -127,11 +158,14 @@ fn parse_found(f: Found) -> (Module, [Diag]):
             )
 
 fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
+    return load_from(entry, on_disk(), ref sm, ref diags)
+
+fn load_from(entry: str, at: Source, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
     var root = dir_of(entry)
     if root == "":
         root = "."
     var text = ""
-    match read_source(entry):
+    match read_at(entry, at.rev):
         case Ok(t):
             text = t
         case Err(e):
@@ -166,7 +200,7 @@ fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
                 let idx = first_new + len(found)
                 by_name[name] = idx
                 targets.push(idx)
-                match read_source(p):
+                match read_at(p, at.rev):
                     case Ok(src):
                         found.push(
                             Found(name=name, src=Some(src), file=sm.add(display_path(p), src))
@@ -188,6 +222,16 @@ fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
         diags.extend(pd)
         prog.modules.push(pm)
         prog.import_targets.push([])
+    for mi in 0..len(prog.modules):
+        let name = prog.modules[mi].name
+        match at.extra.get(name):
+            case Some(more):
+                let f = sm.add(f"<spec-diff {name}>", more)
+                let (em, ed) = parse_module(more, f, name)
+                diags.extend(ed)
+                prog.modules[mi].fns.extend(em.fns)
+            case None:
+                pass
     prog.main_module = 0
     return Some(prog)
 
@@ -243,10 +287,13 @@ fn phase_time(t0: float, what: str) -> float:
     return now
 
 fn frontend(entry: str, opts: FrontOpts) -> Frontend:
+    return frontend_at(entry, opts, on_disk())
+
+fn frontend_at(entry: str, opts: FrontOpts, at: Source) -> Frontend:
     var sm = SourceMap.new()
     var diags: [Diag] = []
     var t = clock()
-    let loaded = load(entry, ref sm, ref diags)
+    let loaded = load_from(entry, at, ref sm, ref diags)
     t = phase_time(t, "parse")
     if loaded.is_none() or has_errors(diags):
         return Frontend(sm=sm, diags=diags, prog=loaded, info=None, report=None)
