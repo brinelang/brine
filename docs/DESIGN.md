@@ -95,6 +95,13 @@ Two kinds of obligations:
   never be disabled). `brine check --report` lists every remaining runtime check so they
   can be eliminated by adding facts.
 
+When a claim isn't proven, the error shows the facts the prover knew, the goal, and,
+when the prover finds them, values it can't rule out (`len(xs) = 0`). They come from
+the case its search couldn't close: Fourier–Motzkin elimination run forward, then
+values picked in reverse elimination order, each as close to 0 as its bounds allow.
+Integer tightening isn't exact, so every candidate is checked by evaluating the facts
+and the goal with it, and only values that pass are shown.
+
 `assert e` is the bridge between the two: a runtime check (always on) that also
 becomes a *known fact* for the prover afterwards. When a precondition can't be proven,
 the compiler suggests adding an `assert` (runtime) or a `requires` (push the obligation
@@ -424,7 +431,8 @@ GPUs are part of it: Metal is used only on Apple GPUs for now.
 
 **Proofs:** generic bodies checked once against constraints (rather than per
 instance), quantifiers in specs (`forall i in 0..n: a[i] >= 0`), array-content
-reasoning, nonlinear facts (`i * j`), counterexamples on proof failure.
+reasoning, nonlinear facts (`i * j`), running a failed proof's values through the code
+to tell a bug from a missing fact.
 
 **Tools:** LSP server, `brine fix` (apply machine fixes), package manager
 (`brine add`), `brine launch --hosts`.

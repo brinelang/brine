@@ -16,7 +16,7 @@ from types import Ty, IntTy, Res, CallRes, Builtin, NumM, StrM, Reducer, WorldOp
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import children, stmt_exprs, stmt_blocks, lvalue_root
 from info import ProgramInfo, ConstVal
-from solver import Lin, F, AtomSet, prove_, prove_full, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
+from solver import Lin, F, AtomSet, prove_, prove_full, counterexample, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
 
 struct Report:
     diags: [Diag]
@@ -1312,6 +1312,38 @@ struct Vf:
     fn snippet(self, s: Span) -> str:
         return self.sm.snippet(s)
 
+    # Values of the goal's names that satisfy every known fact but not the
+    # goal, when the prover can find some: either the code is wrong for them,
+    # or it needs a fact that rules them out.
+    fn values_note(self, facts: [F], goal: F) -> Option[str]:
+        let m = counterexample(facts, goal, self.ranges)?
+        var ga = AtomSet.new()
+        goal.atoms(ref ga)
+        # the newest value of each name: older ones (before a loop changed
+        # the variable) would read as the same name
+        var newest: {str: int} = {}
+        for a in ga.xs:
+            let n = self.atom_name(a)
+            if a != ATOM_UNKNOWN and n != "?" and a > newest.get(n).unwrap_or(-1):
+                newest[n] = a
+        var out: [str] = []
+        for a2 in ga.xs:
+            let n2 = self.atom_name(a2)
+            if newest.get(n2) != Some(a2):
+                continue
+            match m.ints.get(a2):
+                case Some(v):
+                    out.push(f"{n2} = {v}")
+                case None:
+                    match m.bools.get(a2):
+                        case Some(b):
+                            out.push(n2 + " = " + ("true" if b else "false"))
+                        case None:
+                            pass
+        if len(out) == 0:
+            return None
+        return Some("values the prover can't rule out: " + ", ".join(out))
+
     fn fail(ref self, d0: Diag, goal: F):
         var d = d0
         if goal == F.False:
@@ -1338,7 +1370,14 @@ struct Vf:
             if self.live:
                 var all = self.st.facts
                 all.extend(self.defs)
-                if prove_full(all, goal, self.ranges) == GAVE_UP:
+                let gave_up = prove_full(all, goal, self.ranges) == GAVE_UP
+                if not gave_up:
+                    match self.values_note(all, open):
+                        case Some(n):
+                            d = d.note(n)
+                        case None:
+                            pass
+                if gave_up:
                     d = d.note(
                         "the prover gave up: what it knows here splits into too many cases to check them all, so this may well be true"
                     )

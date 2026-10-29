@@ -421,14 +421,44 @@ const NOT_PROVED = 0
 const GAVE_UP = 2
 
 fn prove_full(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> int:
+    match prepare(facts, goal, ranges):
+        case Prep.Proved:
+            return PROVED
+        case Prep.NotProved:
+            return NOT_PROVED
+        case Prep.Used(used, _):
+            var leaf = Leaf.new(false)
+            var budget = MAX_NODES
+            var b = Branch.new()
+            var r = refute(ref b, used, ref budget, false, 0, ref leaf)
+            if r.is_none() and budget < 0:
+                # out of budget: try once more, splitting where it decides most
+                budget = MAX_NODES
+                var b2 = Branch.new()
+                r = refute(ref b2, used, ref budget, true, 0, ref leaf)
+            match r:
+                case Some(true):
+                    return PROVED
+                case Some(false):
+                    return NOT_PROVED
+                case None:
+                    return GAVE_UP if budget < 0 else NOT_PROVED
+
+enum Prep:
+    Proved
+    NotProved
+    # the formulas to refute (the negated goal first) and the relevant atoms
+    Used(fs: [F], rel: AtomSet)
+
+fn prepare(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> Prep:
     let neg = goal.not_()
     var rel = atoms_of(neg)
     if rel.contains(ATOM_UNKNOWN):
-        return NOT_PROVED
+        return Prep.NotProved
     var fs: [F] = []
     for f in facts:
         if f == F.False:
-            return PROVED  # unreachable code: anything holds
+            return Prep.Proved  # unreachable code: anything holds
         if f != F.True:
             fs.push(f)
     if rel.is_empty():
@@ -448,7 +478,7 @@ fn prove_full(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> int:
     for f4 in fs:
         let w = weaken(f4, rel)
         if w == F.False:
-            return PROVED
+            return Prep.Proved
         if w != F.True:
             used.push(w)
     for x in rel.xs:
@@ -464,21 +494,293 @@ fn prove_full(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> int:
                         used.push(F.ge(Lin(c=hi, t=[(x, -one)])))
                 case None:
                     pass
-    var budget = MAX_NODES
-    var b = Branch.new()
-    var r = refute(ref b, used, ref budget, false, 0)
-    if r.is_none() and budget < 0:
-        # out of budget: try once more, splitting where it decides most
-        budget = MAX_NODES
-        var b2 = Branch.new()
-        r = refute(ref b2, used, ref budget, true, 0)
-    match r:
-        case Some(true):
-            return PROVED
-        case Some(false):
-            return NOT_PROVED
-        case None:
-            return GAVE_UP if budget < 0 else NOT_PROVED
+    return Prep.Used(used, rel)
+
+# ------------------------------------------------------------ counterexamples
+
+# Values for atoms (integers and booleans).
+struct Model:
+    ints: {int: i128}
+    bools: {int: bool}
+
+# The first case the search couldn't close, when asked for (`want`).
+struct Leaf:
+    want: bool
+    found: bool
+    b: Branch
+
+    fn new(want: bool) -> Leaf:
+        return Leaf(want=want, found=false, b=Branch.new())
+
+    fn keep(ref self, b: Branch):
+        if self.want and not self.found:
+            self.found = true
+            self.b = b
+
+# Values under which every fact holds and the goal doesn't, when the prover
+# can't prove the goal and can find some. They are checked by evaluating
+# every formula the prover used, so they are a real solution of what the
+# prover knows (the program may still rule them out in ways the prover
+# doesn't know). None: proven, out of budget, or no integer solution found.
+fn counterexample(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> Option[Model]:
+    match prepare(facts, goal, ranges):
+        case Prep.Used(used, rel):
+            var leaf = Leaf.new(true)
+            var budget = MAX_NODES
+            var b = Branch.new()
+            var r = refute(ref b, used, ref budget, false, 0, ref leaf)
+            if r.is_none() and budget < 0:
+                budget = MAX_NODES
+                leaf = Leaf.new(true)
+                var b2 = Branch.new()
+                r = refute(ref b2, used, ref budget, true, 0, ref leaf)
+            if r != Some(false) or not leaf.found:
+                return None
+            var m = Model(ints=solve_ints(leaf.b.eqs, leaf.b.ges)?, bools={})
+            for a in leaf.b.pos:
+                m.bools[a] = true
+            for a2 in leaf.b.neg:
+                m.bools[a2] = false
+            # every relevant atom gets a value: 0 or false when nothing constrains it
+            for f in used:
+                fill_defaults(f, ref m)
+            for x in rel.xs:
+                if x not in m.ints and x not in m.bools:
+                    m.ints[x] = 0
+            for f2 in used:
+                if eval_model(f2, m) != Some(true):
+                    return None
+            # nothing the prover set aside as irrelevant may be false with these values
+            for f3 in facts:
+                if eval_model(f3, m) == Some(false):
+                    return None
+            return Some(m)
+        case _:
+            return None
+
+fn fill_defaults(f: F, ref m: Model):
+    match f:
+        case F.Ge(l):
+            fill_lin(l, ref m)
+        case F.Eq(l2):
+            fill_lin(l2, ref m)
+        case F.Ne(l3):
+            fill_lin(l3, ref m)
+        case F.B(a, _):
+            if a != ATOM_UNKNOWN and a not in m.bools:
+                m.bools[a] = false
+        case F.And(xs):
+            for x in xs:
+                fill_defaults(x, ref m)
+        case F.Or(ys):
+            for y in ys:
+                fill_defaults(y, ref m)
+        case _:
+            pass
+
+fn fill_lin(l: Lin, ref m: Model):
+    for p in l.t:
+        if p.0 not in m.ints:
+            m.ints[p.0] = 0
+
+# `f`'s truth value with the model's values; None if it mentions an atom
+# without one.
+fn eval_model(f: F, m: Model) -> Option[bool]:
+    match f:
+        case F.True:
+            return Some(true)
+        case F.False:
+            return Some(false)
+        case F.Ge(l):
+            return Some(eval_lin(l, m.ints)? >= 0)
+        case F.Eq(l2):
+            return Some(eval_lin(l2, m.ints)? == 0)
+        case F.Ne(l3):
+            return Some(eval_lin(l3, m.ints)? != 0)
+        case F.B(a, p):
+            if a == ATOM_UNKNOWN:
+                return None
+            return Some(m.bools.get(a)? == p)
+        case F.And(xs):
+            var all_true = true
+            for x in xs:
+                match eval_model(x, m):
+                    case Some(false):
+                        return Some(false)
+                    case Some(true):
+                        pass
+                    case None:
+                        all_true = false
+            return Some(true) if all_true else None
+        case F.Or(ys):
+            var all_false = true
+            for y in ys:
+                match eval_model(y, m):
+                    case Some(true):
+                        return Some(true)
+                    case Some(false):
+                        pass
+                    case None:
+                        all_false = false
+            return Some(false) if all_false else None
+
+# An integer solution of `eqs == 0` and `ges >= 0`: Fourier–Motzkin, keeping
+# the constraints on each atom as it is eliminated, then values chosen in the
+# opposite order, each as close to 0 as its constraints allow (they mention
+# only atoms that already have values). Tightening isn't exact over the
+# integers, so this may find none; the caller checks what it returns.
+fn solve_ints(eqs_in: [Lin], ges_in: [Lin]) -> Option[{int: i128}]:
+    var eqs = eqs_in
+    var ges = ges_in
+    # atoms defined by an equality, in the order they were substituted
+    var defs: [(int, Lin)] = []
+    while len(eqs) > 0:
+        let e0 = eqs.pop()
+        if len(e0.t) == 0:
+            if e0.c != 0:
+                return None
+            continue
+        let g = e0.gcd_coefs()
+        if rem_trunc(e0.c, g) != 0:
+            return None
+        let e = Lin(c=div_trunc(e0.c, g), t=[(p.0, div_trunc(p.1, g)) for p in e0.t])
+        var unit = -1
+        for i in 0..len(e.t):
+            if wrapping_abs(e.t[i].1) == 1:
+                unit = i
+                break
+        if unit >= 0:
+            # k*x + r = 0  ⇒  x = -k*r
+            let x = e.t[unit].0
+            let k = e.t[unit].1
+            var r = e
+            r.t = [q for q in e.t if q.0 != x]
+            let val = r.scale(-k)?
+            for j in 0..len(eqs):
+                let s1 = eqs[j].subst(x, val)?
+                eqs[j] = s1
+            for j2 in 0..len(ges):
+                let s2 = ges[j2].subst(x, val)?
+                ges[j2] = s2
+            defs.push((x, val))
+        else:
+            ges.push(e)
+            ges.push(e.neg()?)
+    var cur: [Lin] = []
+    var at: {[(int, i128)]: int} = {}
+    for g0 in ges:
+        match tighten(g0):
+            case Tight.False:
+                return None
+            case Tight.True:
+                pass
+            case Tight.L(l):
+                keep_tightest(ref cur, ref at, l)
+    # each eliminated atom with the constraints that mentioned it
+    var steps: [(int, [Lin])] = []
+    while true:
+        var atoms = AtomSet.new()
+        var nps: {int: int} = {}
+        var nns: {int: int} = {}
+        for l1 in cur:
+            for p1 in l1.t:
+                atoms.insert(p1.0)
+                if p1.1 > 0:
+                    nps[p1.0] = nps.get(p1.0).unwrap_or(0) + 1
+                elif p1.1 < 0:
+                    nns[p1.0] = nns.get(p1.0).unwrap_or(0) + 1
+        if atoms.is_empty():
+            break
+        var best_cost = -1
+        var x2 = 0
+        for a in atoms.xs:
+            let cost = nps.get(a).unwrap_or(0) * nns.get(a).unwrap_or(0)
+            if best_cost < 0 or cost < best_cost:
+                best_cost = cost
+                x2 = a
+        var next: [Lin] = []
+        var pos: [Lin] = []
+        var neg: [Lin] = []
+        for l3 in cur:
+            let k3 = l3.coef(x2)
+            if k3 > 0:
+                pos.push(l3)
+            elif k3 < 0:
+                neg.push(l3)
+            else:
+                next.push(l3)
+        var at2: {[(int, i128)]: int} = {}
+        for i4, l4 in enumerate(next):
+            at2[l4.t] = i4
+        for pl in pos:
+            let ca = pl.coef(x2)
+            for nl in neg:
+                let comb = combine(pl, wrapping_neg(nl.coef(x2)), nl, ca)?
+                match tighten(comb):
+                    case Tight.False:
+                        return None
+                    case Tight.True:
+                        pass
+                    case Tight.L(l5):
+                        keep_tightest(ref next, ref at2, l5)
+                if len(next) > MAX_CONSTRAINTS:
+                    return None
+        var mentions = pos
+        mentions.extend(neg)
+        steps.push((x2, mentions))
+        cur = next
+    var vals: {int: i128} = {}
+    var si = len(steps)
+    while si > 0:
+        si -= 1
+        let (x, cs) = steps[si]
+        var lo: Option[i128] = None
+        var hi: Option[i128] = None
+        for l in cs:
+            let k = l.coef(x)
+            # k*x + rest >= 0, with the values chosen so far (0 for an atom
+            # no later step constrains)
+            var rest = l.c
+            for a, c in l.t:
+                if a != x:
+                    if a not in vals:
+                        vals[a] = 0
+                    rest = add_i128(rest, mul_i128(c, vals[a])?)?
+            if k > 0:
+                # x >= ceil(-rest / k), and `/` rounds down
+                let b = neg_i128(rest / k)?
+                if lo.is_none() or b > lo.unwrap():
+                    lo = Some(b)
+            else:
+                # x <= floor(rest / -k)
+                let b2 = rest / neg_i128(k)?
+                if hi.is_none() or b2 < hi.unwrap():
+                    hi = Some(b2)
+        var v: i128 = 0
+        match lo:
+            case Some(l0):
+                if v < l0:
+                    v = l0
+            case None:
+                pass
+        match hi:
+            case Some(h0):
+                if v > h0:
+                    v = h0
+            case None:
+                pass
+        if lo.is_some() and v < lo.unwrap():
+            return None
+        vals[x] = v
+    var di = len(defs)
+    while di > 0:
+        di -= 1
+        let (x3, e3) = defs[di]
+        for p3 in e3.t:
+            if p3.0 not in vals:
+                vals[p3.0] = 0
+        vals[x3] = eval_lin(e3, vals)?
+    return Some(vals)
 
 # Does literal `f` mention an atom in `rel`?
 fn touches(f: F, rel: AtomSet) -> bool:
@@ -595,7 +897,8 @@ fn refute(
     mut todo: [F],
     ref budget: int,
     thorough: bool,
-    depth: int
+    depth: int,
+    ref leaf: Leaf
 ) -> Option[bool]:
     budget -= 1
     if budget < 0:
@@ -640,6 +943,7 @@ fn refute(
     if fm_unsat(b.eqs, b.ges)?:
         return Some(true)
     if len(ors) == 0:
+        leaf.keep(b)
         return Some(false)
     # With the values this branch fixes, drop the alternatives that are false
     # and the disjunctions that hold (they add nothing here).
@@ -664,6 +968,7 @@ fn refute(
         live.push(alts)
         from_goal.push(goal_from <= oi and oi < goal_to)
     if len(live) == 0:
+        leaf.keep(b)
         return Some(false)
     # Probe: an alternative that contradicts the branch's literals on its own
     # goes; a disjunction left without any closes the branch, one left with a
@@ -697,7 +1002,7 @@ fn refute(
         var t: [F] = [F.Or(o) for o in rest]
         t.extend(units)
         var nb = b
-        return refute(ref nb, t, ref budget, thorough, depth + 1)
+        return refute(ref nb, t, ref budget, thorough, depth + 1, ref leaf)
     # split on a disjunction whose cases fix values first (each case then
     # decides many others), else on the smallest
     var pick = 0
@@ -713,7 +1018,7 @@ fn refute(
         var nb2 = b
         var t2 = others
         t2.push(alt3)
-        let r = refute(ref nb2, t2, ref budget, thorough, depth + 1)
+        let r = refute(ref nb2, t2, ref budget, thorough, depth + 1, ref leaf)
         if r != Some(true):
             return r
     return Some(true)

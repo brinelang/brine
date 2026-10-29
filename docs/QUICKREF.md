@@ -640,7 +640,9 @@ fn index_of(xs: [int], target: int) -> int:
     return -1
 ```
 * `requires`, `ensures`, `invariant` and `prove e` **must** be proven at compile
-  time; if the prover can't, it's an error listing the facts it knew.
+  time; if the prover can't, it's an error listing the facts it knew and, when
+  it finds some, values it can't rule out (`len(xs) = 0`): either the code is
+  wrong for them, or it needs a fact that excludes them.
 * `assert e` checks at runtime (always, in every build) and is a known fact
   afterwards. Use it to hand the prover a fact it can't derive itself.
 * Specs may use arithmetic, comparisons, `and`/`or`/`not`, `len`, `abs`, `min`,
