@@ -35,8 +35,10 @@ esac
 bootstrap() {
     mkdir -p target/boot
     echo "building the seed with $cc"
+    # brine0 only builds ./brine once, and the seed is one big C file: -O1
+    # compiles it in about half the time of -O2 and runs just as fast here
     # shellcheck disable=SC2086
-    "$cc" $cflags bootstrap/brinec.c runtime/brine_rt.c -o "target/boot/brine0$exe" $libs
+    "$cc" $cflags -O1 bootstrap/brinec.c runtime/brine_rt.c -o "target/boot/brine0$exe" $libs
     # brine0 carries the seed's copy of the runtime, which may predate fixes in
     # runtime/; build with the C compiler that just built it, which handles it.
     BRINE_CC="$cc" "target/boot/brine0$exe" build compiler/main.br -o "brine$exe"
