@@ -387,6 +387,7 @@ Global flags: `--json` (machine-readable diagnostics, one JSON object per line),
 | `E0605` | a `prove` claim can't be proven |
 | `E0606` | something not allowed in a specification (e.g. a call with side effects) |
 | `E0607` | a runtime check is left in code that must be proven (`proven = true`) |
+| `E0608` | a function's preconditions contradict each other, so its proofs mean nothing |
 | `E07xx` | driver: missing module, no C compiler, no `main`, C compile/link failures |
 
 Proof failures list the facts the prover knew at that point and the exact goal,
