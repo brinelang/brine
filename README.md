@@ -365,6 +365,26 @@ $ brine check examples/contracts.br --report
    Checked contracts in 0.00s — 9 runtime checks proven unnecessary, 0 remain
 ```
 
+A project can require that none remain: with `proven = true` under `[check]` in
+brine.toml (or `--proven`), every runtime check and `assert` the prover can't
+remove is an error, so code written by anyone, or by an AI, can't stop on a
+failed check. A failed proof shows values the prover can't rule out:
+
+```text
+error[E0602]: cannot prove the postcondition of `last_index`
+ --> last.br:3:5
+  |
+2 |     ensures 0 <= result < len(xs)
+  |             --------------------- postcondition declared here
+3 |     return len(xs) - 1
+  |     ^^^^^^^^^^^^^^^^^^ this might return without `0 <= result < len(xs)` being true
+  |
+  = note: nothing is known here about the values involved
+  = note: to prove: len(xs) > 0
+  = note: values the prover can't rule out: len(xs) = 0
+  = help: strengthen the function's `requires`, add a loop `invariant`, or check the claim with `assert` before returning
+```
+
 ### Structs, enums and errors as values
 
 ```python
