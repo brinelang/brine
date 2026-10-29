@@ -5,6 +5,129 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) 
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-28
+### Added
+- Reading input: `input()` / `input(prompt)` returns the next line of stdin as an
+  `Option[str]` (`None` at its end) and `read_stdin()` all of it. Binary files:
+  `os.read_bytes(path)` and `os.append_bytes`, and `str.from_utf8(bytes)` checks
+  and converts. `append_file(path, text)` appends without rewriting the file.
+- Parsing that doesn't panic: `s.to_int()` and `s.to_float()` return an `Option`
+  (`s.to_int[u8]()` for other widths). `int()` and `float()` accept `_` between
+  digits, like literals.
+- Math: `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `exp2`, `log2`,
+  `log10`, `cbrt` and `hypot`, on `float` and `f32`; `pow` on `f32`. Float bits:
+  `x.to_bits()`, `float.from_bits(u)`, `f32.from_bits(u)`.
+- Integer methods: `wrapping_add`, `wrapping_sub`, `wrapping_mul`, `wrapping_neg`,
+  `rotate_left`, `rotate_right`, `count_ones`, `leading_zeros` and
+  `trailing_zeros`. Compound assignments `&=`, `|=`, `^=`, `<<=` and `>>=`. A
+  literal takes the type it's converted to (`u64(0xcbf29ce484222325)`).
+- `s.find(sub, start)` and `xs.index(x, start)`; `xs + ys` and `xs += ys` join
+  arrays; `s * n` repeats a string.
+- Format specs `{x:g}` and thousands separators `{n:,}` (also `{x:>12,.2f}`).
+- `flush()`, and `os.thread_count()` (the threads `par` uses).
+- Ordering: `<`, `<=`, `>`, `>=` compare tuples and structs part by part and enums
+  without data in declaration order, so `sort()`, `min`/`max` and
+  `min(... for ...)` work on them.
+- Constants: array constants (`const TABLE = [1, 2, 3]`), `case NAME:` matches a
+  constant's value, and enums without data convert to and from `int`
+  (`int(color)`, `Color.from_int(i)` returns an `Option`).
+- Syntax: multi-line strings (`"""..."""`, also f-strings), string literals inside
+  f-string fields (`f"{d["k"]}"`), names bound in `|` patterns
+  (`case A(x) | B(x):`), tuple assignment (`a, b = b, a % b`), `T(x)` in generic
+  code, and `test` and `case` as ordinary names outside their statements.
+- `import ..lib` imports from the parent directory (one `.` per level), and
+  `from b import Thing` takes a name `b` imported itself.
+- `let t = ref self.field` names a field; different fields of one value can be
+  passed as separate `ref` arguments, and nested calls like `t.f(t.g(x))` are
+  allowed when their order is fixed by the data.
+- `main` may return `Result[int, E]`: `Ok(n)` exits with `n`.
+- `first(...)` and `par first(...)`: the lowest-index `Some` of a generator of
+  options, the same at every thread count; `par first` stops the work after a hit.
+- `par for` may write `out[k * i + c]` (constants `k >= 1` and `c`, all writes of
+  `out` with the same `k`), so red-black and strided sweeps run in place.
+- GPU: 128-bit integer code runs in CUDA kernels.
+- `extern` functions can take `str` arguments (C gets a NUL-terminated copy).
+- `world`: `world.any`/`world.all`, array `sum`/`min`/`max`, edge shifts and
+  narrow numeric messages.
+- `brine test` stops a test that runs longer than `--timeout` (300 s by default);
+  `# fmt: off` / `# fmt: on` keep lines as written; `--help`/`-h` on every command.
+
+### Changed
+- **Breaking:** `par for x in xs: out[x] = ...` is rejected: the elements of `xs`
+  may repeat, so two iterations could write the same element at the same time.
+  Loop over a range instead (`par for i in 0..len(xs)`).
+- **Breaking:** a `par` body can't call a function that writes files, runs
+  processes or reads stdin, however deep the call (these were only caught when
+  written in the body itself). Do the effect before or after the `par`.
+- **Breaking:** the `world` deadlock checker is now sound: it rejects programs it
+  used to accept that could hang, such as a collective in an `assert` message, an
+  `exit()` under a rank-dependent condition, or a builtin result used as if it
+  were the same on every rank. It also accepts more correct programs: it follows
+  values through assignments and tracks tuple elements, struct fields and array
+  lengths separately.
+- **Breaking:** the prover no longer accepts several false claims: what a
+  `while` condition or a mutating array method changes, effects of branches,
+  comprehension bodies and loop invariants are now modeled. Fix the `prove`,
+  `requires`/`ensures` or invariant it reports, or add a runtime `assert`.
+- A rank removes `BRINE_RANK`, `BRINE_WORLD_SIZE` and `BRINE_PEERS` from its
+  environment after reading them, so programs it starts don't join its world.
+  Use `world.rank()` instead of reading the variable.
+- `brine fmt` breaks long lines at operators and inside nested brackets, so
+  `fmt --check` may ask to reformat files formatted by 0.5.
+- stdout is written line by line to terminals and pipes (still buffered to
+  files), so line protocols over pipes work.
+- `sin`, `exp`, `pow` and the other math functions give the same bits on every
+  target (musl's code is built in), and generated C is compiled with
+  `-ffp-contract=off`, so float results no longer depend on the C compiler.
+- The prover knows more: bounds of products, remainders, bit operations, shifts
+  and bit counts, lengths of `xs + ys` and `s * n`, ranges of literal arrays, and
+  loops and calls forget only the fields they change. It is much faster on
+  branchy loops (1.45 s to 0.01 s on one test), says when it gave up instead of
+  "not proven", and its notes show only the parts of a claim it couldn't prove.
+- Faster code:
+  - Small enums that can't contain themselves (`Option[int]`, `Result`, small
+    payloads) are stored in place instead of in heap boxes.
+  - `for x in xs`, returning part of a parameter, `let`/`var` copies of fields,
+    `x = f(x)`, `out[i] = f(out[i])` in a `par for`, and the take idiom borrow or
+    move instead of copying.
+  - Release builds check `a[j + x]` once before a loop that calls no
+    functions instead of every iteration, so C compilers vectorize it (ikj
+    matmul: 31 to 74 GFLOP/s).
+  - Reference counts use plain instructions while no other thread runs.
+  - Small local `[x] * n` arrays live in the stack frame.
+  - x86-64 dev builds share registers, use jump tables for `match` and inline
+    small functions (a ray tracer: 113 s to 45 s).
+  - `par sum` over a few expensive elements uses all the threads; `par any` and
+    `par all` stop starting work once the answer is known.
+  - A GPU `par for` no longer uploads arrays it only writes; with `--ranks`, the
+    k-th rank on a machine uses its k-th GPU.
+  - `world` collectives take log2(ranks) rounds (sum at 8 ranks: 133 to 51 us),
+    and each rank gets its share of the cores instead of all of them. A float
+    `world.sum` adds in a tree: still the same on every run, but its last digits
+    can differ from 0.5's rank-by-rank sum.
+  - WebAssembly builds use SIMD.
+
+### Fixed
+- Crashes in `brine run` and `brine test` are reported with the reason instead of
+  exit code 0; a stack overflow is a panic, `main` has a 64 MB stack, and freeing
+  a deep structure no longer overflows the stack.
+- `world` messages carry their call, so mismatched collectives panic with both
+  call sites; a failing rank is named, and only the first panic is shown.
+- GPU kernels were rejected as "using a global" when they used stack slots; the
+  GPU log now gives the exact reason a construct stays on the CPU.
+- A string slice that cuts a character in two panics; `unwrap()` on an `Err`
+  shows the error; `nan` and `inf` print the same everywhere.
+- By-value arguments that the same call changes through a `ref` are copied first.
+- The smallest `i128` literal is accepted.
+- A call's other arguments can't change what one of its `ref` arguments refers
+  to, even inside a comprehension (E0405): `f(ref xs[0], sum(g(ref xs) for ...))`
+  passed checks and broke `f`'s precondition at run time.
+- WebAssembly programs run on a worker thread with a 256 MB stack, so deep
+  recursion works as natively, and `--target web` programs run in a Web Worker.
+- Many error messages: operators not defined for a type, unclosed strings (one
+  error instead of a cascade), imports (where they looked), and help that
+  suggested code which would have changed the program.
+
 ## [0.5.1] - 2026-10-28
 ### Fixed
 - WebAssembly modules no longer carry the debug info of wasi-sdk's C library, which
@@ -172,7 +295,8 @@ The first version.
 - The compiler is written in brine and builds itself; `bootstrap/brinec.c` builds it
   from scratch with only a C compiler.
 
-[Unreleased]: https://github.com/brinelang/brine/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/brinelang/brine/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/brinelang/brine/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/brinelang/brine/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/brinelang/brine/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/brinelang/brine/compare/v0.3.0...v0.4.0
