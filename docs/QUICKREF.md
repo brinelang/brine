@@ -13,6 +13,7 @@ brine check --typed            # also require a written type on every variable
 brine check --proven           # also require every runtime check to be proven away
 brine test                     # run test blocks      brine test "name filter"
 brine fmt                      # format               brine fmt --check
+brine spec-diff --base main    # which specs got weaker since a git revision
 brine run --ranks 4            # 4 cooperating processes (world module)
 brine debug file.br            # debug build in gdb/lldb: break file.br:12, step, print x
 brine explain E0601            # explain any error code
@@ -691,6 +692,13 @@ fn index_of(xs: [int], target: int) -> int:
   `test` blocks included. With `proven = true` under `[check]` in brine.toml (or
   `--proven`), each of them is an error (E0607): outside `test` blocks, the
   program can't stop on a failed check.
+* A proof means only what its spec says. `brine spec-diff` compares every
+  `requires`, `ensures` and struct `invariant` with a git revision (`--base`,
+  default `HEAD`) by asking the prover, so `0 <= i < n` and `i >= 0 and i < n`
+  are the same spec. It fails when one promises less: an `ensures` or
+  `invariant` that no longer follows, or a `requires` that asks more of callers.
+  It also counts the runtime checks left before and after. Run it in CI against
+  the base branch, so a reviewer sees each weaker spec.
 
 ## Modules
 

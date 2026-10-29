@@ -15,6 +15,7 @@ import verify
 import project
 import fmt
 import explain
+import specdiff
 
 const GUIDE = embed("../docs/QUICKREF.md")
 
@@ -48,6 +49,8 @@ fn help_text() -> str:
             "",
             "Tools:",
             "  fmt [files] [--check] Format source files (default: the whole project)",
+            "  spec-diff [file]      Show how the specs changed since a git revision",
+            "      --base <rev>          the revision to compare with (default: HEAD)",
             "  explain <code>        Explain an error code, e.g. `brine explain E0601`",
             "  guide                 Print the language quick reference",
             "  doctor                Check that your toolchain works",
@@ -114,6 +117,21 @@ fn usage(cmd: str) -> Option[str]:
             "  --report            list every runtime check the prover could not remove",
             "  --typed             require a written type on every variable",
             "  --proven            make every runtime check the prover can't remove an error"
+        ]
+    elif cmd == "spec-diff":
+        ls = [
+            "Usage: brine spec-diff [file | folder] [--base <rev>]",
+            "",
+            "Compare every `requires`, `ensures` and struct `invariant` with the same",
+            "file in a git revision (default: HEAD), asking the prover whether each",
+            "promise got weaker or stronger, and count the runtime checks left before",
+            "and after. Fails (exit 1) when a function promises less (an `ensures` or",
+            "`invariant` lost) or asks more of its callers (a new `requires`): run it in",
+            "CI against the base branch to catch a change that makes proofs pass by",
+            "weakening what they prove.",
+            "",
+            "Options:",
+            "  --base <rev>        the git revision to compare with (default: HEAD)"
         ]
     elif cmd == "test":
         ls = [
@@ -292,7 +310,7 @@ struct Args:
         return Ok(())
 
 fn parse_args(raw: [str]) -> Result[Args, str]:
-    let value_flags = ["--ranks", "--threads", "-o", "--color", "--target", "--timeout"]
+    let value_flags = ["--ranks", "--threads", "-o", "--color", "--target", "--timeout", "--base"]
     var a = Args(pos=[], flags=[], rest=[])
     var i = 0
     while i < len(raw):
@@ -379,6 +397,8 @@ fn main() -> int:
         r = cmd_debug(g, rest)
     elif cmd == "fmt":
         r = cmd_fmt(g, rest)
+    elif cmd == "spec-diff":
+        r = cmd_spec_diff(g, rest)
     elif cmd == "explain":
         r = explain.explain_cmd(first_pos(rest), g.json)
     elif cmd == "guide":
@@ -408,6 +428,7 @@ fn main() -> int:
             "test",
             "debug",
             "fmt",
+            "spec-diff",
             "explain",
             "guide",
             "doctor",
@@ -924,6 +945,104 @@ fn cmd_debug(g: G, a: Args) -> Result[int, str]:
             return Ok(os.wait(p))
         case Err(e):
             return Err(e)
+
+fn cmd_spec_diff(g: G, a: Args) -> Result[int, str]:
+    a.check_flags(["--base"])?
+    let t = resolve(first_pos(a))?
+    let base = a.val("--base").unwrap_or("HEAD")
+    let t0 = clock()
+    let o = specdiff.run(t.entry, base)?
+    match o.fe:
+        case Some(fe):
+            let errs = [d for d in fe.diags if d.is_error()]
+            if len(errs) > 0:
+                g.diag_list(errs, fe.sm)
+                return Ok(1)
+        case None:
+            pass
+    var weaker = 0
+    var stronger = 0
+    var notes = 0
+    let c = g.c()
+    for bad in [true, false]:
+        for f in o.findings:
+            if f.bad != bad:
+                continue
+            var what = "note"
+            if f.bad:
+                what = "weaker"
+                weaker += 1
+            elif f.kind in ["stronger", "widened"]:
+                what = "stronger"
+                stronger += 1
+            else:
+                notes += 1
+            if g.json:
+                print(
+                    "{\"change\":"
+                    + json_str(what)
+                    + ",\"kind\":"
+                    + json_str(f.kind)
+                    + ",\"item\":"
+                    + json_str(f.subject)
+                    + ",\"clause\":"
+                    + json_str(f.clause)
+                    + ",\"location\":"
+                    + json_str(f.loc)
+                    + ",\"message\":"
+                    + json_str(f.message())
+                    + "}"
+                )
+            else:
+                let col = c.red() if f.bad else (c.green() if what == "stronger" else "")
+                print(f"{f.loc}: {c.bold()}{col}{what}{c.reset()}: {f.message()}")
+    var before = -1
+    var after = -1
+    var kinds = ""
+    match (o.checks_before, o.checks_after):
+        case (Some(b), Some(n)):
+            before = 0
+            after = 0
+            var names: [str] = []
+            for k, v in b.items():
+                before += v
+                names.push(k)
+            for k, v in n.items():
+                after += v
+                if k not in b:
+                    names.push(k)
+            var parts: [str] = []
+            for k in names:
+                let d = n.get(k).unwrap_or(0) - b.get(k).unwrap_or(0)
+                if d != 0:
+                    parts.push(("+" if d > 0 else "") + f"{d} {k}")
+            kinds = " (" + ", ".join(parts) + ")" if len(parts) > 0 else ""
+        case _:
+            pass
+    if g.json:
+        print(
+            "{\"ok\":"
+            + ("false" if weaker > 0 else "true")
+            + ",\"weaker\":"
+            + f"{weaker}"
+            + ",\"stronger\":"
+            + f"{stronger}"
+            + ",\"notes\":"
+            + f"{notes}"
+            + ",\"checks_before\":"
+            + (f"{before}" if before >= 0 else "null")
+            + ",\"checks_after\":"
+            + (f"{after}" if after >= 0 else "null")
+            + "}"
+        )
+    else:
+        if before >= 0 and not g.quiet:
+            print(f"runtime checks left: {before} → {after}{kinds}")
+        let ch = (
+            "no spec changes" if len(o.findings) == 0 else f"{weaker} weaker, {stronger} stronger"
+        )
+        g.status("Compared", f"{t.name} with {base} in {clock() - t0:.2f}s — {ch}")
+    return Ok(1 if weaker > 0 else 0)
 
 fn cmd_check(g: G, a: Args) -> Result[int, str]:
     a.check_flags(["--report", "--typed", "--proven"])?

@@ -1144,6 +1144,91 @@ test "proven projects can't keep runtime checks":
     let p = brine(["check", d + "/plain.br", "--proven", "--json"])
     assert p.code != 0 and p.out.count("\"code\":\"E0607\"") == 3, p.all()
 
+fn git(dir: str, args: [str]):
+    var cmd = [
+        "git",
+        "-C",
+        dir,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "commit.gpgsign=false"
+    ]
+    cmd.extend(args)
+    let o = exec(cmd, {})
+    assert o.code == 0, f"git {args}: {o.all()}"
+
+test "spec-diff finds specs that promise less":
+    let d = scratch("specdiff")
+    let f = d + "/main.br"
+    let ring = "struct Ring:\n    items: [int]\n    cap: int\n"
+    let clamp = "fn clamp(x: int, lo: int, hi: int) -> int:\n"
+    let body = "    if x < lo:\n        return lo\n    if x > hi:\n        return hi\n    return x\n\n"
+    let get = "fn get(xs: [int], i: int) -> int:\n"
+    let main = "fn main():\n    var n = 0\n    bump(ref n)\n    print(clamp(5, 0, 3), n, get([1, 2], 1))\n"
+    write(
+        f,
+        ring
+        + "    invariant 0 < self.cap\n\n"
+        + clamp
+        + "    requires lo <= hi\n    ensures lo <= result <= hi\n"
+        + body
+        + "fn bump(ref n: int):\n    requires n >= 0\n    ensures n >= 1\n    n += 1\n\n"
+        + get
+        + "    requires 0 <= i and i < len(xs)\n    return xs[i]\n\n"
+        + main
+    )
+    git(d, ["init", "-q"])
+    git(d, ["add", "main.br"])
+    git(d, ["commit", "-q", "-m", "v1"])
+    let same = brine(["spec-diff", f])
+    assert same.code == 0 and "no spec changes" in same.err, same.all()
+    # weaker in four ways, the same `requires` written another way, a stronger
+    # `ensures` and a new runtime check
+    write(
+        f,
+        ring
+        + "    invariant 0 <= self.cap\n\n"
+        + clamp
+        + "    requires lo <= hi\n    requires x >= 0\n    ensures lo <= result\n"
+        + body
+        + "fn bump(ref n: int):\n    requires n >= 0\n    ensures n >= 0\n    ensures n > 0 or n == 0\n    n += 1\n\n"
+        + get
+        + "    requires i < len(xs) and i >= 0\n    ensures result == xs[i]\n    return xs[i]\n\n"
+        + "fn first(xs: [int]) -> int:\n    return xs[0]\n\n"
+        + main
+    )
+    let o = brine(["spec-diff", f, "--json"])
+    assert o.code == 1, o.all()
+    var got: [str] = []
+    for l in o.out.lines():
+        if "\"change\":" in l:
+            got.push(
+                field(l, "change")
+                + " "
+                + field(l, "kind")
+                + " "
+                + field(l, "item")
+                + ": "
+                + field(l, "clause")
+            )
+    assert got == [
+        "weaker narrowed clamp: x >= 0",
+        "weaker weakened clamp: lo <= result <= hi",
+        "weaker weakened bump: n >= 1",
+        "weaker inv-weakened Ring: 0 < self.cap",
+        "note inv-added Ring: 0 <= self.cap",
+        "stronger stronger get: result == xs[i]"
+    ], "\n".join(got)
+    assert "\"checks_before\":1,\"checks_after\":2" in o.out, o.out
+    let t = brine(["spec-diff", f])
+    assert "main.br:6:4: weaker: `clamp` no longer promises `lo <= result <= hi`" in t.out, t.all()
+    assert "runtime checks left: 1 → 2 (+1 index bounds check)" in t.out, t.all()
+    let bad = brine(["spec-diff", f, "--base", "nope"])
+    assert bad.code == 2 and "could not read" in bad.err, bad.all()
+
 # false claims the prover once accepted
 test "proofs stay sound":
     assert (
@@ -1508,6 +1593,7 @@ test "every command describes itself":
         "test",
         "debug",
         "fmt",
+        "spec-diff",
         "explain",
         "guide",
         "doctor",
