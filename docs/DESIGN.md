@@ -87,6 +87,11 @@ Two kinds of obligations:
   * `requires` — precondition; proven at *every call site*.
   * `ensures` — postcondition; proven at *every return*. `result` names the return value.
   * `invariant` — loop invariant; proven on entry and preserved by every iteration.
+    In a struct, a fact about `self` that every value of the type keeps: proven where
+    a value is built and where a `ref self` method returns or uses `self` whole, and
+    assumed everywhere else. Only the struct's methods change its fields (E0406), and
+    values can't alias, so nothing else can break it in between ("parse, don't
+    validate": check input once when building the value, and the fact travels with it).
   * `prove e` — an inline claim.
 * **Implicit** obligations come from the language's own safety rules: array bounds,
   division by zero, integer overflow (also of `x += y`, `-x` and `abs`), shift amounts,
@@ -378,7 +383,7 @@ Global flags: `--json` (machine-readable diagnostics, one JSON object per line),
 | `E01xx` | syntax: literals, indentation, operators from other languages |
 | `E02xx` | names: not found, defined twice, unknown types/fields/methods, shadowing |
 | `E03xx` | types |
-| `E04xx` | mutability and references (`let`/`var`, `ref` parameters and arguments, aliasing) |
+| `E04xx` | mutability and references (`let`/`var`, `ref` parameters and arguments, aliasing, fields of structs with an invariant) |
 | `E05xx` | parallel safety (`par` rules) |
 | `E0601` | a call's `requires` can't be proven |
 | `E0602` | a function's `ensures` can't be proven at some `return` |
@@ -388,6 +393,7 @@ Global flags: `--json` (machine-readable diagnostics, one JSON object per line),
 | `E0606` | something not allowed in a specification (e.g. a call with side effects) |
 | `E0607` | a runtime check is left in code that must be proven (`proven = true`) |
 | `E0608` | a function's preconditions contradict each other, so its proofs mean nothing |
+| `E0609` | a struct `invariant` can't be proven where a value is built or a method returns |
 | `E07xx` | driver: missing module, no C compiler, no `main`, C compile/link failures |
 
 Proof failures list the facts the prover knew at that point and the exact goal,
@@ -434,7 +440,8 @@ vendor's own shader compiler, so it waits for real devices. Intel Macs' AMD and 
 GPUs are part of it: Metal is used only on Apple GPUs for now.
 
 **Proofs:** generic bodies checked once against constraints (rather than per
-instance), quantifiers in specs (`forall i in 0..n: a[i] >= 0`), array-content
+instance), invariants on generic structs, ranged integer types (`int in 0..=200`) and
+distinct types, quantifiers in specs (`forall i in 0..n: a[i] >= 0`), array-content
 reasoning, nonlinear facts (`i * j`), running a failed proof's values through the code
 to tell a bug from a missing fact.
 

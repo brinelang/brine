@@ -226,7 +226,8 @@ fn new_checker() -> Checker:
         or_seen=[],
         const_exprs={},
         ref_paths=[],
-        failed_imports={}
+        failed_imports={},
+        own_self=(-1, -1)
     )
 
 struct Checker:
@@ -279,6 +280,8 @@ struct Checker:
     # `"<module> <name>"` for each `from m import name` that failed, already
     # reported: its uses aren't reported again
     failed_imports: {str: bool}
+    # in a method: its `self` local and the struct it belongs to (else -1s)
+    own_self: (int, int)
 
     fn err(ref self, d: Diag):
         self.diags.push(d)
@@ -312,7 +315,9 @@ struct Checker:
                         methods={},
                         span=s.span,
                         c_name=f"{mm}__{s.name}",
-                        origin=None
+                        origin=None,
+                        invariants=[],
+                        inv_self=-1
                     )
                 )
                 self.info.struct_names.push(s.name)
@@ -538,6 +543,18 @@ struct Checker:
                                                 )
                                             )
                         prog.modules[mi].consts[ci] = c
+                    case _:
+                        pass
+
+        # ---- struct invariants, checked like contracts about `self`
+        for mi in 0..len(prog.modules):
+            self.cur_mod = mi
+            for si in 0..len(prog.modules[mi].structs):
+                if len(prog.modules[mi].structs[si].invariants) == 0:
+                    continue
+                match self.items[mi].get(prog.modules[mi].structs[si].name):
+                    case Some(Item.Struct(sid)):
+                        self.check_struct_invs(ref prog.modules[mi].structs[si], sid)
                     case _:
                         pass
 
@@ -1041,18 +1058,40 @@ struct Checker:
                 return None
 
     # ============================================================ functions
+    fn check_struct_invs(ref self, ref s: StructDecl, sid: int):
+        self.locals = []
+        self.scopes = [[]]
+        self.loops = []
+        self.par_stack = []
+        let id = self.declare("self", s.span, Ty.Struct(sid), LocalKind.Param)
+        self.in_spec = true
+        for i in 0..len(s.invariants):
+            self.check_expr(ref s.invariants[i], Some(Ty.Bool))
+            self.expect_ty(Ty.Bool, s.invariants[i])
+        self.in_spec = false
+        self.info.structs[sid].invariants = s.invariants
+        self.info.structs[sid].inv_self = id
+        self.locals = []
+
     fn check_fn(ref self, ref f: FnDecl, params: [ParamSig], ret: Ty):
         self.locals = []
         self.scopes = [[]]
         self.ret_ty = ret
         self.loops = []
         self.par_stack = []
+        self.own_self = (-1, -1)
         f.param_locals = []
         for pi, p in enumerate(f.params):
             let ps = params[pi]
             let kind = LocalKind.RefParam if ps.by_ref else LocalKind.Param
             let id = self.declare(p.name, p.span, ps.ty, kind)
             f.param_locals.push(id)
+            if pi == 0 and p.name == "self" and f.method_of.is_some():
+                match ps.ty:
+                    case Ty.Struct(sid):
+                        self.own_self = (id, sid)
+                    case _:
+                        pass
         self.in_spec = true
         for ri in 0..len(f.requires):
             self.check_expr(ref f.requires[ri], Some(Ty.Bool))
@@ -2932,6 +2971,40 @@ struct Checker:
             for blk in stmt_blocks(s):
                 self.bad_uses_block(blk, w, lv, k, cs, ref bad)
 
+    # A struct with an `invariant` is changed only by its own methods, through
+    # `self`: the invariant is proven when they return, and holds everywhere else.
+    fn inv_fields_ok(ref self, e: Expr) -> bool:
+        var cur = e
+        while true:
+            match cur.kind:
+                case ExprKind.Field(b, _, _):
+                    match b.ty:
+                        case Ty.Struct(sid):
+                            let own = (
+                                local_of(b) == Some(self.own_self.0) and self.own_self.1 == sid
+                            )
+                            if len(self.info.structs[sid].invariants) > 0 and not own:
+                                let n = self.info.struct_names[sid]
+                                self.err(
+                                    diag.error("E0406", f"cannot change a field of `{n}` here")
+                                    .label(e.span, f"`{n}` has an `invariant`")
+                                    .note(
+                                        f"only the methods of `{n}` change its fields, through `self`, so the invariant can be proven when they return"
+                                    )
+                                    .with_help(
+                                        f"call a `ref self` method of `{n}` that makes the change, or assign a whole new value: `x = {n}(...)`"
+                                    )
+                                )
+                                return false
+                        case _:
+                            pass
+                    cur = b
+                case ExprKind.Index(b, _):
+                    cur = b
+                case _:
+                    return true
+        return true
+
     # Validates that `e` can be mutated: it must be a place rooted at a mutable
     # local, and must respect the race-freedom rules inside `par` bodies.
     fn check_mutation_target(ref self, e: Expr, what: str) -> Option[int]:
@@ -2970,6 +3043,8 @@ struct Checker:
                         ).label(e.span, "not a variable, field or array element")
                     )
                 return None
+        if not self.inv_fields_ok(e):
+            return None
         let info = self.locals[root]
         match info.kind:
             case LocalKind.Var | LocalKind.RefParam:
@@ -6917,7 +6992,9 @@ struct Checker:
                     methods={},
                     span=sd.span,
                     c_name=c_name,
-                    origin=origin
+                    origin=origin,
+                    invariants=[],
+                    inv_self=-1
                 )
             )
             self.info.struct_names.push(display)

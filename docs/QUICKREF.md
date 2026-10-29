@@ -190,6 +190,35 @@ p.step(0.1)
 print(p, p.energy())                 # Particle(pos=0.2, vel=2.0) 2.0
 ```
 
+An `invariant` in a struct is a fact about `self` that every value of the type
+keeps. It is proven where a value is built and where a `ref self` method
+returns (or uses `self` whole); everywhere else it is a known fact. Only the
+struct's own methods change its fields, through `self` (E0406), so build values
+from untrusted input behind a check:
+
+```python
+struct Ring:
+    items: [int]
+    cap: int
+    invariant 0 < self.cap
+    invariant len(self.items) <= self.cap
+
+    fn push(ref self, x: int) -> bool:
+        if len(self.items) == self.cap:
+            return false                 # without this check: E0609
+        self.items.push(x)
+        return true
+
+fn new_ring(cap: int) -> Result[Ring, str]:
+    if cap <= 0:
+        return Err("the capacity must be positive")
+    return Ok(Ring(items=[], cap=cap))   # proven here
+
+fn room(r: Ring) -> int:
+    ensures result >= 0                  # from the invariant: no `requires` needed
+    return r.cap - len(r.items)
+```
+
 ## Enums and `match`
 
 ```python
