@@ -10,7 +10,15 @@
 //
 // Output arrives as text whenever the program flushes it. There is no file
 // system (opening a file fails) and standard input is empty. `os.sleep`
-// waits by spinning, so a program that sleeps is best run in a Web Worker.
+// waits by spinning.
+//
+// `run` blocks the thread it runs on until the program ends: on a page's
+// main thread nothing is drawn meanwhile, and output only shows at the end.
+// `runInWorker` takes the same arguments and runs the program in a Web
+// Worker (this file, loaded as `brine.js?worker`) instead:
+//
+//     import { runInWorker } from "./brine.js";
+//     const code = await runInWorker("program.wasm", { stdout: (t) => show(t) });
 
 const ERRNO_BADF = 8;
 const ERRNO_INVAL = 28;
@@ -77,11 +85,8 @@ export async function run(wasm, options = {}) {
       v.setUint32(written, total, true);
       return 0;
     },
-    fd_read: (fd, iovs, n, read) => {
-      if (fd !== 0) return ERRNO_BADF;
-      view().setUint32(read, 0, true);
-      return 0;
-    },
+    // a page has no stdin: `input()` gives None, `read_stdin()` an Err
+    fd_read: () => ERRNO_BADF,
     fd_fdstat_get: (fd, ptr) => {
       if (fd > 2) return ERRNO_BADF;
       const v = view();
@@ -145,12 +150,75 @@ export async function run(wasm, options = {}) {
   try {
     instance.exports._start();
   } catch (e) {
-    if (!(e instanceof Exit)) throw e;
-    code = e.code;
+    if (!(e instanceof Exit)) {
+      // a trap: what the program printed before it is still in its buffer
+      try {
+        instance.exports.brine_flush?.();
+      } catch {}
+      if (!(e instanceof RangeError)) throw e;
+      // the engine's call stack ran out: report it as native code does
+      out[1]("\npanic: stack overflow (recursion too deep)\n");
+      code = 101;
+    } else code = e.code;
   }
   for (let fd = 0; fd < 2; fd++) {
     const rest = decoders[fd].decode();
     if (rest) out[fd](rest);
   }
   return code;
+}
+
+// Runs a module like `run`, but in a Web Worker: the page keeps drawing and
+// the output callbacks get the text as the program prints it. `wasm` is a
+// URL (relative to the page), bytes or a WebAssembly.Module.
+export function runInWorker(wasm, options = {}) {
+  const out = [options.stdout || ((t) => console.log(t)), options.stderr || ((t) => console.error(t))];
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("?worker", import.meta.url), { type: "module" });
+    const done = (f, x) => {
+      worker.terminate();
+      f(x);
+    };
+    worker.onmessage = ({ data }) => {
+      if (data.fd !== undefined) out[data.fd - 1](data.text);
+      else if (data.error !== undefined) done(reject, new Error(data.error));
+      else done(resolve, data.code);
+    };
+    worker.onerror = (e) => {
+      e.preventDefault();
+      done(reject, new Error(e.message || "the worker failed to start"));
+    };
+    (async () => {
+      let module = wasm;
+      if (typeof wasm === "string" || wasm instanceof URL) {
+        module = new URL(wasm, globalThis.document ? document.baseURI : location.href).href;
+      } else if (wasm instanceof Response) {
+        module = await wasm.arrayBuffer();
+      }
+      worker.postMessage({ module, args: options.args || [], env: options.env || {} });
+    })().catch((e) => done(reject, e));
+  });
+}
+
+// The worker side of `runInWorker`: only when this file is loaded as
+// `brine.js?worker`, so importing it in a worker of your own changes nothing.
+if (typeof WorkerGlobalScope !== "undefined" && new URL(import.meta.url).searchParams.has("worker")) {
+  addEventListener(
+    "message",
+    async ({ data: { module, args, env } }) => {
+      try {
+        const code = await run(module, {
+          args,
+          env,
+          stdout: (text) => postMessage({ fd: 1, text }),
+          stderr: (text) => postMessage({ fd: 2, text }),
+        });
+        postMessage({ code });
+      } catch (e) {
+        // "RuntimeError: unreachable" (a trap) and the like
+        postMessage({ error: String(e) });
+      }
+    },
+    { once: true },
+  );
 }

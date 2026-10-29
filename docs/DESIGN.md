@@ -67,7 +67,7 @@ fn main():
 | Integers | `int` = 64-bit signed. `i8..i128`, `u8..u128`. Overflow **traps** (checked arithmetic). Narrowing conversions are checked. 128-bit types need a 64-bit target, and their overflow checks are never proved away (the prover's arithmetic is itself 128-bit). |
 | Floats | `float` = f64, `f32`. IEEE semantics. |
 | Values | Everything has **value semantics**: `let b = a` copies and arguments are passed by value. Arrays and strings are copy-on-write and reference counted, so copies are O(1) until mutated. |
-| References | Explicit at both ends: `fn fill(ref xs: [int])` is called as `fill(ref xs)`; methods that change their receiver take `ref self`. `let r = ref x` makes `r` a second name for the variable `x`. References are *second-class*: they can't be stored in structs or arrays or returned, so they can never dangle, and the compiler always knows what they point to (exclusive access is enforced: a `ref` argument cannot alias another argument). `mut x: T` on a parameter means a local copy the function may change. |
+| References | Explicit at both ends: `fn fill(ref xs: [int])` is called as `fill(ref xs)`; methods that change their receiver take `ref self`. `let r = ref x` makes `r` a second name for the variable `x` (or for a field path: `let b = ref self.board`). References are *second-class*: they can't be stored in structs or arrays or returned, so they can never dangle, and the compiler always knows what they point to (exclusive access is enforced: a `ref` argument cannot alias another argument). `mut x: T` on a parameter means a local copy the function may change. |
 | Maps | `{K: V}` hash maps that remember insertion order. Values, like arrays (copy-on-write). Reading a missing key panics; `m.get(k)` returns `Option[V]`. Keys must have a total `==` (no floats). `par` bodies may read maps but not change them. |
 | Strings | Immutable UTF-8. `len`, `s[i]` and slices count bytes (`s[i]` is a one-character `str`); `for c in s` walks characters. Case conversion and character classes follow Unicode (`is_digit` is `0`-`9`). |
 | Slices | `xs[a:b]`, `s[a:b]` copy; out-of-range bounds panic (or are proven in range). No negative indexes. |
@@ -76,7 +76,7 @@ fn main():
 | Enums | Tagged unions with named fields per variant; values are immutable and may be recursive. `match` must be exhaustive (checked at compile time, with an example of a missed value). |
 | Memory | Deterministic: reference counting (atomic), freed at scope exit. No GC pauses. |
 | Generics | `fn f[T](x: T)`, `struct Pair[A, B]`, `enum Option[T]`. Monomorphized: every use with new type arguments is a specialized copy, checked and proven like ordinary code. Type arguments are inferred from arguments and the expected type. |
-| Errors | `Result[T, E]` and `Option[T]` from the prelude for expected failures; runtime traps with a source location (`panic`) for bugs. `x?` returns a `None`/`Err` to the caller (no implicit error conversions). `main` may return `Result[(), E]`. |
+| Errors | `Result[T, E]` and `Option[T]` from the prelude for expected failures; runtime traps with a source location (`panic`) for bugs. `x?` returns a `None`/`Err` to the caller (no implicit error conversions). `main` may return `Result[(), E]` or `Result[int, E]` (`Ok(n)`: exit code `n`). |
 
 ### 2.2 Proofs ("rules cannot be broken")
 
@@ -89,7 +89,8 @@ Two kinds of obligations:
   * `invariant` — loop invariant; proven on entry and preserved by every iteration.
   * `prove e` — an inline claim.
 * **Implicit** obligations come from the language's own safety rules: array bounds,
-  division by zero, integer overflow, narrowing conversions, `pop()` on empty arrays.
+  division by zero, integer overflow (also of `x += y`, `-x` and `abs`), shift amounts,
+  narrowing conversions, negative array lengths, `pop()` on empty arrays, missing map keys.
   They are **proven when possible and otherwise checked at runtime** (and the check can
   never be disabled). `brine check --report` lists every remaining runtime check so they
   can be eliminated by adding facts.
@@ -117,12 +118,17 @@ be a rule that can be broken. Use `assert` explicitly instead.
 | `par for i in lo..hi:` | Data-parallel loop over a thread pool. |
 | `par [e for i in lo..hi]` | Parallel map / comprehension. |
 | `par sum(e for i in lo..hi)` | Parallel reduction (`sum`, `product`, `min`, `max`, `any`, `all`). |
+| `par first(e for i in lo..hi)` | Parallel search: the lowest-index `Some` of `Option` values, or `None`. |
 | `par(f(a), g(b))` | Fork-join of independent expressions; returns a tuple. |
 
 **Race freedom is a compile-time rule.** Inside a `par` body, variables from the
-enclosing scope are read-only, with one exception: an array declared outside may be
-written *only at the loop index* (`out[i] = ...`), and then it may not be accessed at
-any other index in the body. Function calls cannot receive outer variables as `ref`.
+enclosing scope are read-only, with one exception: in a `par for` over a range, an
+array declared outside may be written *only at the loop index* (`out[i] = ...`), and
+then it may not be accessed at any other index in the body. Strided writes
+generalize this: `out[k * i + c]` with constants `k >= 1` and `c`, the same `k` for
+every write of `out` and offsets `c` that aren't a multiple of `k` apart, never hit
+another iteration's element (k·i + c = k·j + c' needs k | c' - c), and reads at
+offsets that no write has modulo `k` touch elements no iteration writes. Function calls cannot receive outer variables as `ref`.
 Since values have no observable aliasing, this is sufficient for data-race freedom.
 
 Reductions are **deterministic**: they combine in one fixed order that depends only
@@ -134,7 +140,14 @@ binary tree, level by level: leaves 0 and 1, 2 and 3, ..., then those results in
 and so on (a node without a partner moves up a level unchanged; a leaf whose elements
 were all filtered out doesn't take part). Integer `sum` and `product` trap on overflow
 of any partial result in this order. Besides being parallel, the tree loses less
-precision than a left-to-right sum.
+precision than a left-to-right sum. Only the scheduling depends on the machine: when
+there are few leaves for the threads (a `par sum` of a few expensive calls), each
+element runs as a task of its own and the leaves are folded from their values
+afterwards, in the same order. `any` and `all` stop starting elements once one
+decides the result, like their sequential loop; every element before it still runs.
+`par first` is the same search with a deterministic answer: the elements are split
+into chunks, each keeps its first `Some`, and the lowest chunk's wins; chunks after
+one that found a value stop.
 
 Threads: `BRINE_THREADS=n` or `brine run --threads n` (default: all cores).
 
@@ -143,14 +156,16 @@ through CUDA, Apple's through Metal), with no annotation and no change in meanin
 the results are the same bits as on the CPU, and a check that fails on the device
 panics exactly as it would on the CPU.
 * *Which constructs:* the compiler decides. A body can run on a GPU when it (and
-  every function it calls) uses only int and float arithmetic up to 64 bits,
-  comparisons, branches, loops, structs and tuples, reads of captured scalars and of
+  every function it calls) uses only int and float arithmetic (128-bit integers
+  too, on NVIDIA GPUs, as pairs of 64-bit registers), comparisons, branches, loops, structs and tuples, reads of captured scalars and of
   arrays (also arrays of arrays and of structs), writes to `out[i]`, `sqrt`, `abs`,
   `floor`, `ceil`, `round`, `min` and `max`. It can't allocate (no strings, maps,
   enums with payloads or new arrays), print, use `world`, call function values, or
   call `sin`, `cos`, `exp`, `log`, `pow` and the like, whose last bit depends on
-  the C library. Apple GPUs have no f64 and Metal has no recursion, so on macOS
-  those stay on the CPU too. `BRINE_GPU_LOG=1` says why a construct stayed on the
+  the C library. A 128-bit integer can't be a function's parameter or result on
+  the device, be converted to or from a float there, or be a reduction's value.
+  Apple GPUs have no f64 or 128-bit integers and Metal has no recursion, so on
+  macOS those stay on the CPU too. `BRINE_GPU_LOG=1` says why a construct stayed on the
   CPU.
 * *When:* the runtime decides, per launch. It skips constructs under 4096 elements
   and nested ones, and otherwise compares the CPU's time (estimated by running the
@@ -159,7 +174,9 @@ panics exactly as it would on the CPU.
   at least 25% faster. Getting the device ready takes 0.1-0.7 s, so a construct that
   would gain only later starts it in the background and stays on the CPU until it
   is ready. `BRINE_GPU=off` never uses a GPU, `BRINE_GPU=on` uses one whenever it
-  can.
+  can. Ranks of a `world` take one GPU each: the k-th rank on a machine uses its
+  k-th GPU, and the ranks beyond the machine's GPUs stay on the CPU, since ranks
+  sharing a device queue for it (with `on`, they share the GPUs round-robin).
 * *How:* the compiler turns the lifted body of each eligible construct into a
   kernel, and the program carries the module: PTX (`compiler/ptx.br`), or Metal
   Shading Language source on macOS (`compiler/msl.br`). The runtime loads the CUDA
@@ -178,10 +195,14 @@ panics exactly as it would on the CPU.
   the construct reruns on the CPU, which panics with the usual message. Apple GPUs
   flush subnormal f32 values to zero, so on Metal a subnormal operand or result
   sets the flag too, and the construct reruns on the CPU. Results are
-  only copied back after a launch succeeded, and a body may only write `out[i]`, so
-  rerunning is safe.
+  only copied back after a launch succeeded, and a body may only write its own
+  elements (`out[i]`), so rerunning is safe.
 * *Copies:* every launch copies the arrays the body reads to the device and the ones
-  it writes back (arrays are values, so nothing else can see them in between).
+  it writes back (arrays are values, so nothing else can see them in between). The
+  results of a `par [...]`, and an array that a `par for i in lo..hi` body writes as
+  `out[i] = ...` in every iteration (a top-level statement, no `continue` before it)
+  and never reads, aren't copied to the device, and only the elements the device
+  wrote come back.
   Keeping arrays on the device between constructs is future work, so constructs
   that do little work per byte (a plain sum of an array) stay on the CPU.
 
@@ -327,7 +348,7 @@ from what brine knows that C doesn't (no aliasing, proven-away checks, race-free
 
 | Command | Purpose |
 |---|---|
-| `brine new <name>` / `brine init` | Create a project (`brine.toml`, `src/main.br`, `AGENTS.md`, `.gitignore`). |
+| `brine new <name>` / `brine init` | Create a project (`brine.toml`, `src/main.br`, `AGENTS.md`, `README.md`, `.gitignore`). |
 | `brine run [file] [--ranks N] [--threads N] [-- args]` | Build and run. |
 | `brine build [--release\|--debug] [--emit-c]` | Build a native binary into `target/`. |
 | `brine check [--report] [--typed]` | Type-check + verify, no codegen. Fastest feedback loop. `--typed` (or `typed = true` under `[check]` in brine.toml) requires a written type on every variable. |

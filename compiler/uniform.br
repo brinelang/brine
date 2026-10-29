@@ -5,82 +5,355 @@
 # program can only deadlock if some ranks skip a call that others make. This
 # pass rules that out. It tracks, for every value, whether it may differ
 # between ranks ("varying": derived from `world.rank()`, `clock()`, received
-# messages, C functions, ...) and which parameters of the current function it
-# depends on. A communication call is an error if the conditions that lead
-# to it may vary between ranks. Requirements on parameters become part of the
-# function's summary and are checked at every call site.
+# messages, files, C functions, ...) and which parameters of the current
+# function it depends on. A communication call is an error if the conditions
+# that lead to it may vary between ranks. Requirements on parameters become
+# part of the function's summary and are checked at every call site.
+#
+# Variables are tracked flow-sensitively (`x = world.max(x)` makes `x` the same
+# everywhere from then on), and the parts of a value separately: the fields of
+# tuples and structs, the length and the elements of an array, the variant and
+# the payload of an enum. Loops and function summaries are iterated to a real
+# fixpoint: every value only grows, and values have a bounded depth, so this
+# always ends.
 from diag import Span, Diag
 import diag
-from types import Res, CallRes, Builtin, Reducer, WorldOp, world_ops
-from ast import BinOp, Arg, Comp, Expr, ExprKind, Pattern, PatKind, Stmt, StmtKind, Block, FnDecl, Program, children, stmt_exprs, stmt_blocks, lvalue_root
-from info import ProgramInfo
+from types import Res, CallRes, Builtin, Reducer, WorldOp, world_ops, Ty
+from ast import BinOp, Arg, Comp, Expr, ExprKind, Pattern, PatKind, Stmt, StmtKind, Block, FnDecl, Program, LetPat, children, stmt_exprs, stmt_blocks, lvalue_root
+from info import ProgramInfo, FnSig
+
+# Values nested deeper than this are tracked as one piece.
+const MAX_DEPTH = 3
 
 # What a value or a condition depends on.
 struct Dep:
     # may differ between ranks
     vary: bool
-    # parameters (bit i = parameter i) it depends on
+    # parameter slots (bit i = slot i) it depends on
     params: u64
-    # where the variation comes from, for messages
-    why: Option[Span]
+    # where a rank-dependent value comes from, for messages
+    src: Option[Span]
+    # a rank-dependent decision on the way (a condition), for messages
+    via: Option[(Span, str)]
+    # an early exit some ranks may take (`return`, `?`, `break`, `exit`), for messages
+    exit: Option[(Span, str)]
 
     fn join(self, o: Dep) -> Dep:
-        var why = self.why
-        if self.vary and self.why.is_some():
-            why = self.why
-        elif o.vary:
-            why = o.why if o.why.is_some() else self.why
-        return Dep(vary=self.vary or o.vary, params=self.params | o.params, why=why)
+        if not o.vary and o.params == u64(0):
+            return self
+        if not self.vary and self.params == u64(0):
+            return o
+        if not self.vary:
+            return Dep(
+                vary=o.vary,
+                params=self.params | o.params,
+                src=o.src,
+                via=o.via,
+                exit=o.exit
+            )
+        var src = self.src
+        var via = self.via
+        var ex = self.exit
+        if o.vary:
+            if src.is_none():
+                src = o.src
+            if via.is_none():
+                via = o.via
+            if ex.is_none():
+                ex = o.exit
+        return Dep(vary=true, params=self.params | o.params, src=src, via=via, exit=ex)
 
     fn same(self, o: Dep) -> bool:
         return self.vary == o.vary and self.params == o.params
 
-    # A branch condition: if it varies, blame the condition itself.
-    fn at(self, span: Span) -> Dep:
+    fn is_none(self) -> bool:
+        return not self.vary and self.params == u64(0)
+
+    # A decision: if it varies, blame it.
+    fn at(self, span: Span, what: str) -> Dep:
         if self.vary:
-            return Dep(vary=self.vary, params=self.params, why=Some(span))
+            return Dep(
+                vary=true,
+                params=self.params,
+                src=self.src,
+                via=Some((span, what)),
+                exit=self.exit
+            )
         return self
 
-    # Add a reason span if there is none yet.
-    fn because(self, span: Span) -> Dep:
-        if self.vary and self.why.is_none():
-            return Dep(vary=self.vary, params=self.params, why=Some(span))
+    # An early exit taken under this dependence.
+    fn exits_at(self, span: Span, what: str) -> Dep:
+        if self.vary and self.exit.is_none():
+            return Dep(
+                vary=true,
+                params=self.params,
+                src=self.src,
+                via=self.via,
+                exit=Some((span, what))
+            )
         return self
 
 fn none() -> Dep:
-    return Dep(vary=false, params=u64(0), why=None)
+    return Dep(vary=false, params=u64(0), src=None, via=None, exit=None)
 
-fn varying(why: Span) -> Dep:
-    return Dep(vary=true, params=u64(0), why=Some(why))
-
-fn param(i: int) -> Dep:
-    if 0 <= i < 64:
-        return Dep(vary=false, params=u64(1) << i, why=None)
-    return Dep(vary=true, params=u64(0), why=None)
+fn varying(src: Span) -> Dep:
+    return Dep(vary=true, params=u64(0), src=Some(src), via=None, exit=None)
 
 fn bit(i: int) -> u64:
     return u64(1) << i
+
+# The dependence of a value, part by part. With no parts, `d` covers the whole
+# value. Otherwise `parts` are the fields of a tuple or struct, the elements
+# (one part) of an array, or the payload fields of an enum (by position); `d`
+# is then the array's length or the enum's variant.
+struct Val:
+    d: Dep
+    parts: [Val]
+
+    fn flat(self) -> Dep:
+        var d = self.d
+        for p in self.parts:
+            d = d.join(p.flat())
+        return d
+
+    fn part(self, k: int) -> Val:
+        if len(self.parts) == 0:
+            return atom(self.d)
+        if k < len(self.parts):
+            return self.parts[k]
+        return atom(none())
+
+    # Every part also depends on `d`.
+    fn spread(self, d: Dep) -> Val:
+        if d.is_none():
+            return self
+        if len(self.parts) == 0:
+            return atom(self.d.join(d))
+        return Val(d=self.d.join(d), parts=[p.spread(d) for p in self.parts])
+
+    fn join(self, o: Val) -> Val:
+        if len(self.parts) == 0 and len(o.parts) == 0:
+            return atom(self.d.join(o.d))
+        if len(self.parts) == 0:
+            return o.spread(self.d)
+        if len(o.parts) == 0:
+            return self.spread(o.d)
+        var parts: [Val] = []
+        for k in 0..max(len(self.parts), len(o.parts)):
+            if k >= len(o.parts):
+                parts.push(self.parts[k])
+            elif k >= len(self.parts):
+                parts.push(o.parts[k])
+            else:
+                parts.push(self.parts[k].join(o.parts[k]))
+        return Val(d=self.d.join(o.d), parts=parts)
+
+    fn same(self, o: Val) -> bool:
+        if not self.d.same(o.d) or len(self.parts) != len(o.parts):
+            return false
+        for k in 0..len(self.parts):
+            if not self.parts[k].same(o.parts[k]):
+                return false
+        return true
+
+    # The same value, tracked as one piece below `depth` levels.
+    fn capped(self, depth: int) -> Val:
+        if len(self.parts) == 0:
+            return self
+        if depth <= 0:
+            return atom(self.flat())
+        return Val(d=self.d, parts=[p.capped(depth - 1) for p in self.parts])
+
+fn atom(d: Dep) -> Val:
+    return Val(d=d, parts=[])
+
+fn join_states(a: [Val], b: [Val]) -> [Val]:
+    var out = a
+    for i in 0..min(len(a), len(b)):
+        if not a[i].same(b[i]):
+            out[i] = a[i].join(b[i])
+    return out
+
+fn same_states(a: [Val], b: [Val]) -> bool:
+    if len(a) != len(b):
+        return false
+    for i in 0..len(a):
+        if not a[i].same(b[i]):
+            return false
+    return true
+
+# A program state where some ranks may be (`live`).
+struct St:
+    vals: [Val]
+    live: bool
+
+    fn join(self, o: St) -> St:
+        if not o.live:
+            return self
+        if not self.live:
+            return o
+        return St(vals=join_states(self.vals, o.vals), live=true)
+
+    fn same(self, o: St) -> bool:
+        return self.live == o.live and same_states(self.vals, o.vals)
+
+fn dead() -> St:
+    return St(vals=[], live=false)
+
+# A part of a parameter with its own dependence bit.
+struct Slot:
+    param: int
+    # field / element (0) indexes from the parameter; -1 last: the length or variant
+    path: [int]
+    # for messages, e.g. `b.px` or `len(xs)`
+    name: str
+
+# The slots of a function's parameters, and each parameter's initial value.
+struct ParamSlots:
+    slots: [Slot]
+    vals: [Val]
+
+fn param_slots(info: ProgramInfo, sig: FnSig) -> ParamSlots:
+    for depth in [2, 1, 0]:
+        var slots: [Slot] = []
+        var vals: [Val] = []
+        for i, p in enumerate(sig.params):
+            vals.push(param_val(info, p.ty, i, [], p.name, depth, ref slots))
+        if len(slots) <= 64 or depth == 0:
+            return ParamSlots(slots=slots, vals=vals)
+    return ParamSlots(slots=[], vals=[])
+
+fn new_slot(i: int, path: [int], name: str, ref slots: [Slot]) -> Dep:
+    let k = len(slots)
+    slots.push(Slot(param=i, path=path, name=name))
+    if k < 64:
+        return Dep(vary=false, params=bit(k), src=None, via=None, exit=None)
+    # out of bits: assume the worst
+    return Dep(vary=true, params=u64(0), src=None, via=None, exit=None)
+
+fn param_val(
+    info: ProgramInfo,
+    t: Ty,
+    i: int,
+    path: [int],
+    name: str,
+    depth: int,
+    ref slots: [Slot]
+) -> Val:
+    if depth > 0:
+        match t:
+            case Ty.Struct(sid):
+                let fs = info.structs[sid].fields
+                if len(fs) > 0:
+                    var parts: [Val] = []
+                    for k, f in enumerate(fs):
+                        var p = path
+                        p.push(k)
+                        parts.push(
+                            param_val(info, f.1, i, p, name + "." + f.0, depth - 1, ref slots)
+                        )
+                    return Val(d=none(), parts=parts)
+            case Ty.Tuple(ts):
+                if len(ts) > 0:
+                    var parts: [Val] = []
+                    for k, et in enumerate(ts):
+                        var p = path
+                        p.push(k)
+                        parts.push(
+                            param_val(info, et, i, p, name + "." + str(k), depth - 1, ref slots)
+                        )
+                    return Val(d=none(), parts=parts)
+            case Ty.Array(et):
+                var pl = path
+                pl.push(-1)
+                let d = new_slot(i, pl, "len(" + name + ")", ref slots)
+                var pe = path
+                pe.push(0)
+                let e = param_val(info, et, i, pe, name + "[..]", depth - 1, ref slots)
+                return Val(d=d, parts=[e])
+            case Ty.Enum(eid):
+                let en = info.enums[eid]
+                if en.has_payload():
+                    var n = 0
+                    for v in en.variants:
+                        n = max(n, len(v.fields))
+                    var pl = path
+                    pl.push(-1)
+                    let d = new_slot(i, pl, "the variant of " + name, ref slots)
+                    var parts: [Val] = []
+                    for k in 0..n:
+                        var p = path
+                        p.push(k)
+                        parts.push(atom(new_slot(i, p, "the value in " + name, ref slots)))
+                    return Val(d=d, parts=parts)
+            case _:
+                pass
+    return atom(new_slot(i, path, name, ref slots))
+
+# The dependence of slot `s` in the arguments `vs`.
+fn project(vs: [Val], s: Slot) -> Dep:
+    if s.param >= len(vs):
+        return none()
+    var v = vs[s.param]
+    for step in s.path:
+        if len(v.parts) == 0 or step < 0:
+            return v.d
+        v = v.part(step)
+    return v.flat()
 
 struct Summary:
     # the function (transitively) communicates
     comm: bool
     # where, for messages
     comm_site: Option[Span]
-    # parameters that must be the same on every rank
+    # parameter slots that must be the same on every rank
     need: u64
-    ret: Dep
+    ret: Val
     # what each `ref` parameter may hold afterwards
-    outs: [Dep]
+    outs: [Val]
+    # the function may end the process (`exit`), under this dependence
+    exits: bool
+    exit_dep: Dep
 
     fn same(self, o: Summary) -> bool:
-        if self.comm != o.comm or self.need != o.need or not self.ret.same(
-            o.ret
-        ) or len(self.outs) != len(o.outs):
+        if (
+            self.comm != o.comm
+            or self.need != o.need
+            or self.exits != o.exits
+            or not self.exit_dep.same(o.exit_dep)
+            or not self.ret.same(o.ret)
+            or len(self.outs) != len(o.outs)
+        ):
             return false
         for i in 0..len(self.outs):
             if not self.outs[i].same(o.outs[i]):
                 return false
         return true
+
+    # Summaries only grow, so the fixpoint iteration ends.
+    fn join(self, o: Summary) -> Summary:
+        var outs = self.outs
+        for i in 0..min(len(outs), len(o.outs)):
+            outs[i] = outs[i].join(o.outs[i]).capped(MAX_DEPTH)
+        return Summary(
+            comm=self.comm or o.comm,
+            comm_site=self.comm_site if self.comm_site.is_some() else o.comm_site,
+            need=self.need | o.need,
+            ret=self.ret.join(o.ret).capped(MAX_DEPTH),
+            outs=outs,
+            exits=self.exits or o.exits,
+            exit_dep=self.exit_dep.join(o.exit_dep)
+        )
+
+# Does place `e` have an index in it (`xs[i].f`)?
+fn has_index(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Index(_, _):
+            return true
+        case ExprKind.Field(b, _, _):
+            return has_index(b)
+        case _:
+            return false
 
 # Does any expression in `b` communicate (a `world` call other than rank/size)?
 fn block_comm(b: Block) -> bool:
@@ -105,6 +378,34 @@ fn expr_comm(e: Expr) -> bool:
             return true
     return false
 
+# The functions `b` calls.
+fn block_calls(b: Block, ref out: [int]):
+    for s in b.stmts:
+        for e in stmt_exprs(s):
+            expr_calls(e, ref out)
+        for sb in stmt_blocks(s):
+            block_calls(sb, ref out)
+
+fn expr_calls(e: Expr, ref out: [int]):
+    match e.cres:
+        case CallRes.Fn(id):
+            out.push(id)
+        case CallRes.Method(id):
+            out.push(id)
+        case _:
+            pass
+    for c in children(e):
+        expr_calls(c, ref out)
+
+# Callees before callers, so most summaries are right the first time.
+fn post_order(id: int, calls: {int: [int]}, ref seen: {int: bool}, ref out: [int]):
+    if id in seen:
+        return
+    seen[id] = true
+    for c in calls.get(id, []):
+        post_order(c, calls, ref seen, ref out)
+    out.push(id)
+
 fn check(prog: Program, info: ProgramInfo) -> [Diag]:
     # only communication can deadlock: most programs have none
     var any = false
@@ -123,141 +424,190 @@ fn check(prog: Program, info: ProgramInfo) -> [Diag]:
             if not f.is_extern:
                 decls[f.id] = f
     var sums: [Summary] = []
+    var slots: [ParamSlots] = []
     for s in info.fns:
-        var ret = none()
+        var ret = atom(none())
         if s.is_extern:
             # C code may return anything
-            ret = Dep(vary=true, params=u64(0), why=None)
+            ret = atom(Dep(vary=true, params=u64(0), src=None, via=None, exit=None))
+        let ps = param_slots(info, s)
+        slots.push(ps)
         sums.push(
-            Summary(comm=false, comm_site=None, need=u64(0), ret=ret, outs=[none()] * len(s.params))
+            Summary(
+                comm=false,
+                comm_site=None,
+                need=u64(0),
+                ret=ret,
+                outs=[atom(none())] * len(s.params),
+                exits=false,
+                exit_dep=none()
+            )
         )
     var ids = decls.keys()
     ids.sort()
-    # summaries only grow, so this reaches a fixpoint
-    for _ in 0..100:
-        var changed = false
-        for id in ids:
-            let f = decls[id]
-            var a = new_fa(info, sums, f, false)
-            a.run(f)
-            let s = a.summary(f, [p.by_ref for p in info.fns[id].params])
-            if not s.same(sums[id]):
-                sums[id] = s
-                changed = true
-        if not changed:
-            break
+    var calls: {int: [int]} = {}
+    var callers: {int: [int]} = {}
+    for id in ids:
+        var cs: [int] = []
+        block_calls(decls[id].body, ref cs)
+        calls[id] = cs
+        for c in cs:
+            var l = callers.get(c, [])
+            l.push(id)
+            callers[c] = l
+    var queue: [int] = []
+    var seen: {int: bool} = {}
+    for id in ids:
+        post_order(id, calls, ref seen, ref queue)
+    var queued: {int: bool} = {}
+    for id in queue:
+        queued[id] = true
+    # a worklist: when a summary grows, its callers are analyzed again
+    var qi = 0
+    while qi < len(queue):
+        let id = queue[qi]
+        qi += 1
+        queued[id] = false
+        match decls.get(id):
+            case Some(f):
+                var a = new_fa(info, sums, slots, f, false)
+                a.run(f)
+                let s = sums[id].join(a.summary(f, [p.by_ref for p in info.fns[id].params]))
+                if not s.same(sums[id]):
+                    sums[id] = s
+                    for c in callers.get(id, []):
+                        if not queued.get(c, false):
+                            queued[c] = true
+                            queue.push(c)
+            case None:
+                pass
     var diags: [Diag] = []
-    var seen: {str: bool} = {}
+    var reported: {str: bool} = {}
     for m in prog.modules:
         var all: [FnDecl] = [f for f in m.fns if not f.is_extern]
         all.extend(m.tests)
         for f in all:
-            var a = new_fa(info, sums, f, true)
+            var a = new_fa(info, sums, slots, f, true)
             a.run(f)
             for d in a.diags:
                 var key = d.code
                 if len(d.labels) > 0:
                     let s = d.labels[0].span
                     key = f"{d.code} {s.file} {s.lo} {s.hi}"
-                if key not in seen:
-                    seen[key] = true
+                if key not in reported:
+                    reported[key] = true
                     diags.push(d)
     return diags
 
-fn new_fa(info: ProgramInfo, sums: [Summary], f: FnDecl, report: bool) -> Fa:
-    var deps = [none()] * len(f.locals)
-    for i, l in enumerate(f.param_locals):
-        if 0 <= l < len(deps):
-            deps[l] = param(i)
+fn new_fa(info: ProgramInfo, sums: [Summary], slots: [ParamSlots], f: FnDecl, report: bool) -> Fa:
+    var vals = [atom(none())] * len(f.locals)
+    if 0 <= f.id < len(slots):
+        let pv = slots[f.id].vals
+        for i, l in enumerate(f.param_locals):
+            if 0 <= l < len(vals) and i < len(pv):
+                vals[l] = pv[i]
     return Fa(
         info=info,
         sums=sums,
-        deps=deps,
+        slots=slots,
+        vals=vals,
+        live=true,
         report=report,
         diags=[],
         ret_poison=none(),
+        cont_poison=none(),
         loop_poison={},
         loops=[],
-        ret=none(),
+        brk=[],
+        cont=[],
+        heads={},
+        ret=atom(none()),
+        ret_st=dead(),
         comm=false,
         comm_site=None,
         need=u64(0),
-        par=0
+        exits=false,
+        exit_dep=none(),
+        par=0,
+        idx_seen={}
     )
 
 # Analysis of one function.
 struct Fa:
     info: ProgramInfo
     sums: [Summary]
-    deps: [Dep]
+    slots: [ParamSlots]
+    # what each local holds here
+    vals: [Val]
+    # false after `return`, `break`, ...: no rank gets here
+    live: bool
     report: bool
     diags: [Diag]
-    # control dependence added by `return`s seen so far
+    # control dependence added by `return`s (and `exit`s) seen so far
     ret_poison: Dep
-    # per loop (keyed by span): control dependence added by break/continue/return inside it
+    # added by `continue`s seen so far in the current loop body
+    cont_poison: Dep
+    # per loop (keyed by span): control dependence added by break/return inside it
     loop_poison: {Span: Dep}
     loops: [Span]
-    ret: Dep
+    # per loop: the states at its `break`s and `continue`s
+    brk: [St]
+    cont: [St]
+    # the state at the start of each loop's body, from earlier passes
+    heads: {Span: St}
+    ret: Val
+    # the state at the `return`s, for `ref` parameters
+    ret_st: St
     comm: bool
     comm_site: Option[Span]
     need: u64
+    exits: bool
+    exit_dep: Dep
     par: int
+    # the dependence of each index expression where it was last evaluated:
+    # storing into `xs[g()]` after reading it doesn't run `g()` again
+    idx_seen: {Span: Dep}
 
     fn run(ref self, f: FnDecl):
-        # variables are tracked flow-insensitively: iterate until nothing changes
-        let report = self.report
-        self.report = false
-        for _ in 0..50:
-            let before = self.deps
-            let lp = self.loop_poison.items()
-            self.ret_poison = none()
-            self.block(f.body, none())
-            var stable = true
-            for i in 0..len(before):
-                if not before[i].same(self.deps[i]):
-                    stable = false
-                    break
-            if stable:
-                for k, v in lp:
-                    match self.loop_poison.get(k):
-                        case Some(n):
-                            if not n.same(v):
-                                stable = false
-                                break
-                        case None:
-                            stable = false
-                            break
-            if stable:
-                break
-        if report:
-            self.report = true
-            self.ret_poison = none()
-            self.block(f.body, none())
+        self.block(f.body, none())
+        self.ret_st = self.ret_st.join(self.st())
 
     fn summary(self, f: FnDecl, by_ref: [bool]) -> Summary:
-        var outs: [Dep] = []
+        var outs: [Val] = []
         for i in 0..min(len(f.param_locals), len(by_ref)):
             let l = f.param_locals[i]
-            if by_ref[i] and 0 <= l < len(self.deps):
-                outs.push(self.deps[l])
+            if by_ref[i] and self.ret_st.live and 0 <= l < len(self.ret_st.vals):
+                outs.push(self.ret_st.vals[l].capped(MAX_DEPTH))
             else:
-                outs.push(none())
+                outs.push(atom(none()))
         return Summary(
             comm=self.comm,
             comm_site=self.comm_site,
             need=self.need,
-            ret=self.ret,
-            outs=outs
+            ret=self.ret.capped(MAX_DEPTH),
+            outs=outs,
+            exits=self.exits,
+            exit_dep=self.exit_dep
         )
 
-    fn set(ref self, l: int, d: Dep):
-        if 0 <= l < len(self.deps):
-            self.deps[l] = self.deps[l].join(d)
+    fn st(self) -> St:
+        if not self.live:
+            return dead()
+        return St(vals=self.vals, live=true)
+
+    fn restore(ref self, s: St):
+        if s.live:
+            self.vals = s.vals
+        self.live = s.live
+
+    fn set(ref self, l: int, v: Val):
+        if 0 <= l < len(self.vals):
+            self.vals[l] = v.capped(MAX_DEPTH)
 
     # Control dependence in effect: the given context plus everything that
-    # makes some ranks leave the function or loop early.
+    # makes some ranks leave the function, loop or loop body early.
     fn eff(self, ctx: Dep) -> Dep:
-        var e = ctx.join(self.ret_poison)
+        var e = ctx.join(self.ret_poison).join(self.cont_poison)
         for l in self.loops:
             match self.loop_poison.get(l):
                 case Some(p):
@@ -267,181 +617,402 @@ struct Fa:
         return e
 
     fn poison_loop(ref self, d: Dep, all: bool):
+        if d.is_none():
+            return
         let k = len(self.loops)
         let n = k if all else min(k, 1)
         for l in self.loops[k - n:]:
             let e = self.loop_poison.get(l, none())
             self.loop_poison[l] = e.join(d)
 
+    # Some ranks may leave the function here.
+    fn leave(ref self, here: Dep):
+        self.ret_poison = self.ret_poison.join(here)
+        self.poison_loop(here, true)
+        self.ret_st = self.ret_st.join(self.st())
+
     # ------------------------------------------------------------ statements
     fn block(ref self, b: Block, ctx: Dep):
         for s in b.stmts:
+            if not self.live:
+                # unreachable
+                return
             self.stmt(s, ctx)
 
     fn stmt(ref self, s: Stmt, ctx: Dep):
         match s.kind:
-            case StmtKind.Let(_, _, _, init, _):
-                let v = self.expr(init, ctx)
-                let d = v.join(self.eff(ctx))
-                for l in s.locals:
-                    self.set(l, d)
-            case StmtKind.Assign(target, _, value):
-                let v = self.expr(value, ctx)
-                let pl = self.place(target, ctx)
-                let d = v.join(pl).join(self.eff(ctx))
-                match lvalue_root(target):
-                    case Some(r):
-                        self.set(r, d)
-                    case None:
-                        pass
+            case StmtKind.Let(_, pat, _, init, _):
+                let v0 = self.expr(init, ctx)
+                let v = v0.spread(self.eff(ctx))
+                match pat:
+                    case LetPat.Tuple(_):
+                        for i, l in enumerate(s.locals):
+                            self.set(l, v.part(i))
+                    case _:
+                        for l in s.locals:
+                            self.set(l, v)
+            case StmtKind.Assign(target, op, value):
+                var v = self.expr(value, ctx)
+                if op.is_some():
+                    v = v.join(self.expr(target, ctx))
+                self.store(target, v.spread(self.eff(ctx)), ctx, op.is_some())
             case StmtKind.ExprStmt(e):
                 self.expr(e, ctx)
             case StmtKind.If(branches, els):
                 var c = ctx
+                var out = dead()
                 for cond, body in branches:
-                    let d = self.expr(cond, c).at(cond.span)
+                    let d = (
+                        self.expr(cond, c)
+                        .flat()
+                        .at(cond.span, "this condition may differ between ranks")
+                    )
                     c = c.join(d)
+                    let before = self.st()
                     self.block(body, c)
+                    out = out.join(self.st())
+                    self.restore(before)
                 match els:
                     case Some(b):
                         self.block(b, c)
                     case None:
                         pass
+                out = out.join(self.st())
+                self.restore(out)
             case StmtKind.Match(scrut, cases):
-                # which case runs depends on the value, like an `if` chain
-                let d = self.expr(scrut, ctx).at(scrut.span)
-                var c = ctx.join(d)
+                let sv = self.expr(scrut, ctx)
+                # which case runs depends on what the patterns look at
+                var md = none()
                 for case_ in cases:
-                    self.bind_pattern(case_.pat, d.join(self.eff(ctx)))
+                    md = md.join(pat_dep(case_.pat, sv))
+                md = md.at(scrut.span, "which case runs may differ between ranks")
+                var c = ctx.join(md)
+                var cur = self.st()
+                var out = dead()
+                let bind = self.eff(ctx)
+                for case_ in cases:
+                    self.restore(cur)
+                    self.bind_pattern(case_.pat, sv.spread(bind))
                     match case_.guard:
                         case Some(g):
-                            let gd = self.expr(g, c).at(g.span)
+                            let gd = (
+                                self.expr(g, c)
+                                .flat()
+                                .at(g.span, "this condition may differ between ranks")
+                            )
                             c = c.join(gd)
                         case None:
                             pass
+                    cur = self.st()
                     self.block(case_.body, c)
-            case StmtKind.While(cond, _, body):
-                self.loops.push(s.span)
-                let d = self.expr(cond, ctx).at(cond.span)
-                let inner = ctx.join(d)
-                self.block(body, inner)
-                # the condition is evaluated again after each iteration
-                self.expr(cond, inner)
-                self.loops.pop()
-            case StmtKind.For(_, _, _, iter, _, body, is_par):
-                let d = self.expr(iter, ctx).at(iter.span)
-                self.set(s.local, d.join(self.eff(ctx)))
-                self.loops.push(s.span)
-                if is_par:
-                    self.par += 1
-                self.block(body, ctx.join(d))
-                if is_par:
-                    self.par -= 1
-                self.loops.pop()
+                    out = out.join(self.st())
+                self.restore(out)
+            case StmtKind.While(_, _, _):
+                self.run_loop(s, ctx, none(), atom(none()))
+            case StmtKind.For(_, _, _, iter, _, _, _):
+                let iv = self.expr(iter, ctx)
+                let n = iv.d.at(iter.span, "the number of iterations may differ between ranks")
+                self.run_loop(s, ctx, n, iv.part(0))
             case StmtKind.Return(value):
-                var d = self.eff(ctx)
+                var v = atom(none())
                 match value:
                     case Some(e):
-                        d = d.join(self.expr(e, ctx))
+                        v = self.expr(e, ctx)
                     case None:
                         pass
-                self.ret = self.ret.join(d)
-                let here = self.eff(ctx).because(s.span)
-                self.ret_poison = self.ret_poison.join(here)
-                self.poison_loop(here, true)
+                let e = self.eff(ctx)
+                self.ret = self.ret.join(v.spread(e))
+                self.leave(e.exits_at(s.span, "some ranks may return here"))
+                self.live = false
             case StmtKind.Break:
-                let here = self.eff(ctx).because(s.span)
+                let here = self.eff(ctx).exits_at(s.span, "some ranks may leave the loop here")
                 self.poison_loop(here, false)
+                let k = len(self.brk)
+                if k > 0:
+                    self.brk[k - 1] = self.brk[k - 1].join(self.st())
+                self.live = false
             case StmtKind.Continue:
-                let here = self.eff(ctx).because(s.span)
-                self.poison_loop(here, false)
+                let here = self.eff(
+                    ctx
+                ).exits_at(s.span, "some ranks may skip the rest of the loop body here")
+                # every rank still evaluates the loop condition: only the rest
+                # of this pass through the body is affected
+                self.cont_poison = self.cont_poison.join(here)
+                let k = len(self.cont)
+                if k > 0:
+                    self.cont[k - 1] = self.cont[k - 1].join(self.st())
+                self.live = false
             case StmtKind.Assert(cond, msg):
-                self.expr(cond, ctx)
+                let cd = self.expr(cond, ctx).flat()
                 match msg:
                     case Some(m):
-                        self.expr(m, ctx)
+                        # the message is only evaluated on ranks where the assertion fails
+                        let before = self.st()
+                        self.expr(
+                            m,
+                            ctx.join(
+                                cd.at(
+                                    cond.span,
+                                    "whether this assertion holds may differ between ranks"
+                                )
+                            )
+                        )
+                        self.restore(before)
                     case None:
                         pass
             case _:
                 pass
 
-    fn bind_pattern(ref self, p: Pattern, d: Dep):
+    # A `while` or `for` loop: iterate its body until nothing changes.
+    # `n` is the dependence of the number of iterations (`for`), `elem` what
+    # the loop variable holds.
+    fn run_loop(ref self, s: Stmt, ctx: Dep, n: Dep, elem: Val):
+        self.loops.push(s.span)
+        self.brk.push(dead())
+        self.cont.push(dead())
+        var head = self.st()
+        match self.heads.get(s.span):
+            case Some(h):
+                if head.live:
+                    head = head.join(h)
+            case None:
+                pass
+        var exit = dead()
+        while true:
+            let lp = self.loop_poison
+            self.restore(head)
+            exit = self.loop_pass(s, ctx, n, elem)
+            var next = head.join(self.st())
+            next = next.join(self.cont[len(self.cont) - 1])
+            if next.same(head) and same_poison(lp, self.loop_poison):
+                break
+            head = next
+        self.heads[s.span] = head
+        let b = self.brk.pop()
+        self.cont.pop()
+        self.loops.pop()
+        self.restore(exit.join(b))
+
+    # One pass through a loop from the current state; returns the state in
+    # which the loop ends normally.
+    fn loop_pass(ref self, s: Stmt, ctx: Dep, n: Dep, elem: Val) -> St:
+        let saved = self.cont_poison
+        match s.kind:
+            case StmtKind.While(cond, _, body):
+                let d = (
+                    self.expr(cond, ctx)
+                    .flat()
+                    .at(cond.span, "the loop condition may differ between ranks")
+                )
+                let exit = self.st()
+                self.block(body, ctx.join(d))
+                self.cont_poison = saved
+                return exit
+            case StmtKind.For(_, _, _, _, _, body, is_par):
+                let exit = self.st()
+                self.set(s.local, elem.spread(self.eff(ctx)))
+                if is_par:
+                    self.par += 1
+                self.block(body, ctx.join(n))
+                if is_par:
+                    self.par -= 1
+                self.cont_poison = saved
+                return exit
+            case _:
+                return self.st()
+
+    fn bind_pattern(ref self, p: Pattern, v: Val):
         match p.kind:
             case PatKind.Bind(_):
-                self.set(p.local, d)
+                self.set(p.local, v)
             case PatKind.Tuple(ps):
-                for q in ps:
-                    self.bind_pattern(q, d)
+                for k, q in enumerate(ps):
+                    self.bind_pattern(q, v.part(k))
             case PatKind.Or(ps):
                 for q in ps:
-                    self.bind_pattern(q, d)
+                    self.bind_pattern(q, v)
             case PatKind.Variant(_, _):
-                for q in p.fields:
-                    self.bind_pattern(q, d)
+                for k, q in enumerate(p.fields):
+                    self.bind_pattern(q, v.part(k))
             case _:
                 pass
 
-    # Dependencies of the index expressions in an assignment target.
-    fn place(ref self, e: Expr, ctx: Dep) -> Dep:
+    # What the place `e` holds now (without evaluating anything).
+    fn peek(self, e: Expr) -> Val:
         match e.kind:
-            case ExprKind.Index(b, idx):
-                let a = self.place(b, ctx)
-                return a.join(self.expr(idx, ctx))
-            case ExprKind.Field(b, _, _):
-                return self.place(b, ctx)
-            case _:
-                return none()
-
-    # ------------------------------------------------------------ expressions
-    fn expr(ref self, e: Expr, ctx: Dep) -> Dep:
-        match e.kind:
-            case ExprKind.Int(
-                _
-            ) | ExprKind.UInt(_) | ExprKind.Float(_) | ExprKind.Bool(_) | ExprKind.Str(_) | ExprKind.Error:
-                return none()
-            # `x?` may return early, depending on `x`
-            case ExprKind.Try(x):
-                let d = self.expr(x, ctx)
-                let here = self.eff(ctx.join(d)).because(e.span)
-                self.ret = self.ret.join(here)
-                self.ret_poison = self.ret_poison.join(here)
-                self.poison_loop(here, true)
-                return d
             case ExprKind.Ident(_):
                 match e.res:
                     case Res.Local(l):
-                        if 0 <= l < len(self.deps):
-                            return self.deps[l]
-                        return none()
+                        if 0 <= l < len(self.vals):
+                            return self.vals[l]
                     case _:
-                        return none()
+                        pass
+                return atom(none())
+            case ExprKind.Field(b, _, _):
+                return self.peek(b).part(e.idx)
+            case ExprKind.Index(b, _):
+                let bv = self.peek(b)
+                match b.ty:
+                    case Ty.Array(_):
+                        return bv.part(0)
+                    case _:
+                        return atom(bv.flat())
+            case _:
+                return atom(none())
+
+    # `e = v`, where `v` already includes the control dependence.
+    # `read`: `e` was just evaluated, so its indexes aren't evaluated again.
+    fn store(ref self, e: Expr, v: Val, ctx: Dep, read: bool):
+        match e.kind:
+            case ExprKind.Ident(_):
+                match e.res:
+                    case Res.Local(l):
+                        self.set(l, v)
+                    case _:
+                        pass
+            case ExprKind.Field(b, _, _):
+                var o = self.peek(b)
+                let n = nparts(self.info, b.ty)
+                if e.idx < n:
+                    if len(o.parts) == 0:
+                        o = Val(d=o.d, parts=[atom(o.d)] * n)
+                    while len(o.parts) < n:
+                        o.parts.push(atom(none()))
+                    o.parts[e.idx] = v
+                    self.store(b, o, ctx, read)
+                else:
+                    self.store(b, o.join(v), ctx, read)
+            case ExprKind.Index(b, idx):
+                var i = none()
+                match self.idx_seen.get(idx.span):
+                    case Some(d) if read:
+                        i = d
+                    case _:
+                        i = self.expr(idx, ctx).flat()
+                let o = self.peek(b)
+                match b.ty:
+                    case Ty.Array(_):
+                        # one element changes: the others keep their values
+                        let el = o.part(0).join(v).spread(i)
+                        self.store(b, Val(d=o.d, parts=[el]), ctx, read)
+                    case _:
+                        self.store(b, atom(o.flat().join(v.flat()).join(i)), ctx, read)
+            case _:
+                self.expr(e, ctx)
+
+    # ------------------------------------------------------------ expressions
+    fn expr(ref self, e: Expr, ctx: Dep) -> Val:
+        match e.kind:
+            case ExprKind.Int(_) | ExprKind.UInt(
+                _
+            ) | ExprKind.Float(_) | ExprKind.Bool(_) | ExprKind.Str(_) | ExprKind.Error:
+                return atom(none())
+            # `x?` may return early, depending on the variant of `x`
+            case ExprKind.Try(x):
+                let xv = self.expr(x, ctx)
+                let tag = xv.d.at(x.span, "this may succeed on some ranks and fail on others")
+                let ef = self.eff(ctx.join(tag))
+                self.ret = self.ret.join(Val(d=ef, parts=[xv.part(0).spread(ef)]))
+                let q = Span(file=e.span.file, lo=max(e.span.lo, e.span.hi - 1), hi=e.span.hi)
+                self.leave(ef.exits_at(q, "so some ranks may return early here (`?`)"))
+                return xv.part(0)
+            case ExprKind.Ident(_):
+                match e.res:
+                    case Res.Local(l):
+                        if 0 <= l < len(self.vals):
+                            return self.vals[l]
+                        return atom(none())
+                    case _:
+                        return atom(none())
+            case ExprKind.Field(b, _, _):
+                let bv = self.expr(b, ctx)
+                match b.ty:
+                    case Ty.Struct(_) | Ty.Tuple(_):
+                        return bv.part(e.idx)
+                    case _:
+                        return atom(bv.flat())
+            case ExprKind.Index(b, i):
+                let bv = self.expr(b, ctx)
+                let iv = self.expr(i, ctx).flat()
+                self.idx_seen[i.span] = iv
+                match b.ty:
+                    case Ty.Array(_):
+                        return bv.part(0).spread(iv)
+                    case _:
+                        return atom(bv.flat().join(iv))
+            case ExprKind.Slice(b, lo, hi):
+                let bv = self.expr(b, ctx)
+                var d = bv.d
+                match lo:
+                    case Some(x):
+                        d = d.join(self.expr(x, ctx).flat())
+                    case None:
+                        pass
+                match hi:
+                    case Some(x):
+                        d = d.join(self.expr(x, ctx).flat())
+                    case None:
+                        pass
+                match b.ty:
+                    case Ty.Array(_):
+                        return Val(d=d, parts=[bv.part(0)])
+                    case _:
+                        return atom(d.join(bv.flat()))
+            case ExprKind.Tuple(elems):
+                return Val(d=none(), parts=[self.expr(x, ctx) for x in elems])
+            case ExprKind.Array(elems):
+                if len(elems) == 0:
+                    return atom(none())
+                var el = atom(none())
+                for x in elems:
+                    el = el.join(self.expr(x, ctx))
+                return Val(d=none(), parts=[el])
+            case ExprKind.Repeat(x, count):
+                let xv = self.expr(x, ctx)
+                let n = self.expr(count, ctx).flat()
+                return Val(d=n, parts=[xv])
             case ExprKind.Binary(op, l, r):
                 if op == BinOp.And or op == BinOp.Or:
                     # the right side only runs on some ranks if the left side varies
-                    let a = self.expr(l, ctx)
-                    let b = self.expr(r, ctx.join(a.at(l.span)))
-                    return a.join(b)
+                    let a = self.expr(l, ctx).flat()
+                    let before = self.st()
+                    let b = self.expr(
+                        r,
+                        ctx.join(a.at(l.span, "this condition may differ between ranks"))
+                    ).flat()
+                    self.restore(before.join(self.st()))
+                    return atom(a.join(b))
             case ExprKind.Compare(first, rest):
-                var d = self.expr(first, ctx)
+                var d = self.expr(first, ctx).flat()
+                let before = self.st()
                 for _, x in rest:
-                    let c = ctx.join(d)
-                    d = d.join(self.expr(x, c))
-                return d
+                    let c = ctx.join(d.at(first.span, "this condition may differ between ranks"))
+                    d = d.join(self.expr(x, c).flat())
+                self.restore(before.join(self.st()))
+                return atom(d)
             case ExprKind.IfElse(cond, then, els):
-                let c = self.expr(cond, ctx).at(cond.span)
+                let c = (
+                    self.expr(cond, ctx)
+                    .flat()
+                    .at(cond.span, "this condition may differ between ranks")
+                )
                 let inner = ctx.join(c)
+                let before = self.st()
                 let t = self.expr(then, inner)
+                let after_t = self.st()
+                self.restore(before)
                 let f = self.expr(els, inner)
-                return c.join(t).join(f)
+                self.restore(after_t.join(self.st()))
+                return t.join(f).spread(c)
             case ExprKind.Comp(c):
                 return self.comp(c, e.local, None, ctx)
             case ExprKind.ParTuple(elems):
                 self.par += 1
-                var d = none()
+                var parts: [Val] = []
                 for x in elems:
-                    d = d.join(self.expr(x, ctx))
+                    parts.push(self.expr(x, ctx))
                 self.par -= 1
-                return d
+                return Val(d=none(), parts=parts)
             case ExprKind.Call(_, args):
                 return self.call(e, None, args, ctx)
             case ExprKind.MethodCall(recv, _, _, args):
@@ -450,39 +1021,59 @@ struct Fa:
                 pass
         var d = none()
         for c in children(e):
-            d = d.join(self.expr(c, ctx))
-        return d
+            d = d.join(self.expr(c, ctx).flat())
+        return atom(d)
 
-    fn comp(ref self, c: Comp, local: int, red: Option[Reducer], ctx: Dep) -> Dep:
-        let it = self.expr(c.iter, ctx).at(c.iter.span)
-        self.set(local, it.join(self.eff(ctx)))
-        var inner = ctx.join(it)
-        var d = it
-        match c.filter:
-            case Some(fl):
-                let f = self.expr(fl, inner).at(fl.span)
-                inner = inner.join(f)
-                d = d.join(f)
-            case None:
-                pass
-        if c.par:
-            self.par += 1
-        var b = none()
-        if red == Some(Reducer.Any) or red == Some(Reducer.All):
-            # any/all stop early, depending on the values themselves
-            let report = self.report
-            self.report = false
-            let b0 = self.expr(c.body, inner)
-            self.report = report
-            b = self.expr(c.body, inner.join(b0.because(c.body.span)))
-        else:
-            b = self.expr(c.body, inner)
-        if c.par:
-            self.par -= 1
-        return d.join(b)
+    fn comp(ref self, c: Comp, local: int, red: Option[Reducer], ctx: Dep) -> Val:
+        let iv = self.expr(c.iter, ctx)
+        let n = iv.d.at(c.iter.span, "the number of iterations may differ between ranks")
+        let elem = iv.part(0)
+        let inner = ctx.join(n)
+        # the body runs many times: repeat until nothing changes (it rarely does)
+        var start = self.st()
+        var f = none()
+        var b = atom(none())
+        while true:
+            self.restore(start)
+            self.set(local, elem.spread(self.eff(ctx)))
+            var body_ctx = inner
+            match c.filter:
+                case Some(fl):
+                    f = (
+                        self.expr(fl, inner)
+                        .flat()
+                        .at(fl.span, "this condition may differ between ranks")
+                    )
+                    body_ctx = body_ctx.join(f)
+                case None:
+                    pass
+            if c.par:
+                self.par += 1
+            if red == Some(Reducer.Any) or red == Some(Reducer.All) or red == Some(Reducer.First):
+                # any/all/first stop early, depending on the values themselves
+                let b0 = self.expr(c.body, body_ctx).flat()
+                b = self.expr(
+                    c.body,
+                    body_ctx.join(
+                        b0.at(c.body.span, "whether this stops early may differ between ranks")
+                    )
+                )
+            else:
+                b = self.expr(c.body, body_ctx)
+            if c.par:
+                self.par -= 1
+            let next = start.join(self.st())
+            if next.same(start):
+                break
+            start = next
+        self.restore(start)
+        if red.is_some():
+            return atom(n.join(f).join(b.flat()))
+        # a filter changes which element ends up where
+        return Val(d=n.join(f), parts=[b.spread(f)])
 
-    fn args_deps(ref self, recv: Option[Expr], args: [Arg], ctx: Dep) -> [Dep]:
-        var out: [Dep] = []
+    fn args_vals(ref self, recv: Option[Expr], args: [Arg], ctx: Dep) -> [Val]:
+        var out: [Val] = []
         match recv:
             case Some(r):
                 out.push(self.expr(r, ctx))
@@ -492,15 +1083,48 @@ struct Fa:
             out.push(self.expr(a.expr, ctx))
         return out
 
-    # `dep` (in terms of the callee's parameters) in terms of the arguments `ds`.
-    fn subst(self, dep: Dep, ds: [Dep], span: Span) -> Dep:
-        var out = Dep(vary=dep.vary, params=u64(0), why=Some(span) if dep.vary else None)
-        for i, d in enumerate(ds):
-            if i < 64 and dep.params & bit(i) != u64(0):
-                out = out.join(d)
+    # `dep` (in terms of the callee's parameter slots) in terms of the arguments `vs`.
+    fn subst(self, dep: Dep, vs: [Val], slots: [Slot], span: Span) -> Dep:
+        var out = Dep(
+            vary=dep.vary,
+            params=u64(0),
+            src=Some(span) if dep.vary else None,
+            via=None,
+            exit=None
+        )
+        if dep.params == u64(0):
+            return out
+        for i in 0..min(64, len(slots)):
+            if dep.params & bit(i) != u64(0):
+                out = out.join(project(vs, slots[i]))
         return out
 
-    fn call(ref self, e: Expr, recv: Option[Expr], args: [Arg], ctx: Dep) -> Dep:
+    fn subst_val(self, v: Val, vs: [Val], slots: [Slot], span: Span) -> Val:
+        let d = self.subst(v.d, vs, slots, span)
+        if len(v.parts) == 0:
+            return atom(d)
+        return Val(d=d, parts=[self.subst_val(p, vs, slots, span) for p in v.parts])
+
+    # A struct or enum variant built from `args` (by position or by name).
+    fn build(ref self, fields: [(str, Ty)], args: [Arg], ctx: Dep) -> Val:
+        var parts = [atom(none())] * len(fields)
+        for i, a in enumerate(args):
+            let v = self.expr(a.expr, ctx)
+            var k = i
+            match a.name:
+                case Some((n, _)):
+                    for j, f in enumerate(fields):
+                        if f.0 == n:
+                            k = j
+                case None:
+                    pass
+            if k < len(parts):
+                parts[k] = v
+        if len(parts) == 0:
+            return atom(none())
+        return Val(d=none(), parts=parts)
+
+    fn call(ref self, e: Expr, recv: Option[Expr], args: [Arg], ctx: Dep) -> Val:
         match e.cres:
             case CallRes.Reduce(r):
                 if len(args) > 0:
@@ -509,75 +1133,193 @@ struct Fa:
                             return self.comp(c, args[0].expr.local, Some(r), ctx)
                         case _:
                             pass
-                return join_all(self.args_deps(recv, args, ctx))
+                return atom(flat_all(self.args_vals(recv, args, ctx)))
             case CallRes.World(op):
                 # `world` itself is the receiver; only the arguments matter
-                let ds = self.args_deps(None, args, ctx)
+                let vs = self.args_vals(None, args, ctx)
                 match op:
                     case WorldOp.Rank:
-                        return varying(e.span)
+                        return atom(varying(e.span))
                     case WorldOp.Size:
-                        return none()
+                        return atom(none())
                     case _:
                         self.communicate(e.span, ctx, "`world." + world_name(op) + "`", None)
                         match op:
                             case WorldOp.Broadcast:
                                 self.same_on_all(
                                     args[0].expr,
-                                    ds[0],
+                                    vs[0].flat(),
                                     "the root rank of `world.broadcast`"
                                 )
                             case WorldOp.Shift:
                                 self.same_on_all(
                                     args[1].expr,
-                                    ds[1],
+                                    vs[1].flat(),
                                     "the distance of `world.shift`"
                                 )
                             case _:
                                 pass
                         match op:
                             # each rank receives different values
-                            case WorldOp.Shift | WorldOp.Exchange:
-                                return varying(e.span)
+                            case WorldOp.Shift:
+                                return atom(varying(e.span))
+                            # ... but always one per rank
+                            case WorldOp.Exchange:
+                                return Val(d=none(), parts=[atom(varying(e.span))])
                             # collective results are identical on every rank
                             case _:
-                                return none()
+                                return atom(none())
             case CallRes.Os(op):
                 # `os` itself is the receiver; only the arguments matter
-                let ds = self.args_deps(None, args, ctx)
+                let vs = self.args_vals(None, args, ctx)
                 if op.uniform():
-                    return join_all(ds)
-                return varying(e.span)
+                    return atom(flat_all(vs))
+                return atom(varying(e.span))
             case CallRes.Fn(id):
                 return self.call_fn(e, id, recv, args, ctx)
             case CallRes.Method(id):
                 return self.call_fn(e, id, recv, args, ctx)
+            case CallRes.Ctor(sid):
+                return self.build(self.info.structs[sid].fields, args, ctx)
+            case CallRes.Variant(eid, vi):
+                return self.build(self.info.enums[eid].variants[vi].fields, args, ctx)
             case CallRes.Builtin(b):
-                let ds = self.args_deps(recv, args, ctx)
-                let all = join_all(ds)
-                match b:
-                    case Builtin.Clock | Builtin.ReadFile | Builtin.FileExists | Builtin.Getenv | Builtin.Run:
-                        return varying(e.span)
-                    case _:
-                        if b.mutates_recv():
-                            match recv:
-                                case Some(r):
-                                    match lvalue_root(r):
-                                        case Some(root):
-                                            let d = all.join(self.eff(ctx))
-                                            self.set(root, d)
-                                        case None:
-                                            pass
-                                case None:
-                                    pass
-                        return all
+                return self.builtin(e, b, recv, args, ctx)
             case _:
-                return join_all(self.args_deps(recv, args, ctx))
+                return atom(flat_all(self.args_vals(recv, args, ctx)))
 
-    fn call_fn(ref self, e: Expr, id: int, recv: Option[Expr], args: [Arg], ctx: Dep) -> Dep:
-        let ds = self.args_deps(recv, args, ctx)
+    fn builtin(ref self, e: Expr, b: Builtin, recv: Option[Expr], args: [Arg], ctx: Dep) -> Val:
+        let vs = self.args_vals(recv, args, ctx)
+        let all = flat_all(vs)
+        let ef = self.eff(ctx)
+        match b:
+            case Builtin.Exit:
+                let here = ef.exits_at(e.span, "some ranks may exit here")
+                self.exits = true
+                self.exit_dep = self.exit_dep.join(here)
+                self.leave(here)
+                self.live = false
+                return atom(none())
+            case Builtin.Panic:
+                # a panic stops every rank: the others fail when they next
+                # communicate with this one
+                self.live = false
+                return atom(all)
+            case Builtin.Len:
+                if len(vs) > 0:
+                    return atom(vs[0].d)
+                return atom(none())
+            case Builtin.Enumerate:
+                if len(vs) > 0:
+                    let pair = Val(d=none(), parts=[atom(none()), vs[0].part(0)])
+                    return Val(d=vs[0].d, parts=[pair])
+                return atom(all)
+            # array methods: the receiver comes first
+            case Builtin.Push:
+                if len(vs) == 2:
+                    # with a varying length, the new element lands at different places
+                    let o = vs[0]
+                    let el = o.part(0).join(vs[1]).spread(ef.join(o.d))
+                    self.update(recv, Val(d=o.d.join(ef), parts=[el]), ctx)
+                    return atom(none())
+            case Builtin.Pop:
+                if len(vs) == 1:
+                    let o = vs[0]
+                    self.update(recv, Val(d=o.d.join(ef), parts=[o.part(0).spread(ef)]), ctx)
+                    return o.part(0).spread(o.d)
+            case Builtin.PopAt:
+                if len(vs) == 2:
+                    let o = vs[0]
+                    let i = vs[1].flat()
+                    self.update(
+                        recv,
+                        Val(d=o.d.join(ef), parts=[o.part(0).spread(ef.join(i))]),
+                        ctx
+                    )
+                    return o.part(0).spread(i)
+            case Builtin.Insert:
+                if len(vs) == 3:
+                    let o = vs[0]
+                    let el = o.part(0).join(vs[2]).spread(ef.join(vs[1].flat()))
+                    self.update(recv, Val(d=o.d.join(ef), parts=[el]), ctx)
+                    return atom(none())
+            case Builtin.Extend:
+                if len(vs) == 2:
+                    let o = vs[0]
+                    let el = o.part(0).join(vs[1].part(0)).spread(ef.join(o.d))
+                    self.update(recv, Val(d=o.d.join(vs[1].d).join(ef), parts=[el]), ctx)
+                    return atom(none())
+            case Builtin.Sort | Builtin.Reverse | Builtin.Clear:
+                if len(vs) == 1:
+                    let o = vs[0]
+                    match recv:
+                        case Some(r):
+                            match r.ty:
+                                case Ty.Array(_):
+                                    let el = o.part(0).spread(ef.join(o.d))
+                                    self.update(recv, Val(d=o.d.join(ef), parts=[el]), ctx)
+                                    return atom(none())
+                                case _:
+                                    pass
+                        case None:
+                            pass
+            # these only read their arguments, and the same arguments give the same result
+            case Builtin.Print | Builtin.Eprint | Builtin.Abs | Builtin.Min | Builtin.Max | Builtin.Sqrt | Builtin.Sin | Builtin.Cos | Builtin.Tan | Builtin.Exp | Builtin.Log | Builtin.Pow:
+                pass
+            case Builtin.Floor | Builtin.Ceil | Builtin.Round | Builtin.Args | Builtin.Ord | Builtin.Chr | Builtin.Embed | Builtin.Str(
+                _
+            ) | Builtin.IndexOf | Builtin.Get | Builtin.Remove | Builtin.Keys | Builtin.Values | Builtin.Items:
+                pass
+            case Builtin.Math1(_) | Builtin.Math2(_) | Builtin.Num(_) | Builtin.FromBits:
+                pass
+            case Builtin.ToInt | Builtin.ToFloat | Builtin.IndexFrom:
+                pass
+            case Builtin.FromUtf8:
+                pass
+            # Clock, ReadFile, WriteFile, FileExists, Getenv, Run, and anything
+            # else that looks at the outside world: may differ between ranks
+            # (AppendFile, Input and ReadStdin too: each rank has its own stdin)
+            case _:
+                return atom(varying(e.span))
+        if b.mutates_recv():
+            if len(vs) > 0:
+                self.update(recv, atom(vs[0].flat().join(all).join(ef)), ctx)
+        return atom(all)
+
+    # The receiver of a method that changes it now holds `v`.
+    fn update(ref self, recv: Option[Expr], v: Val, ctx: Dep):
+        match recv:
+            case Some(r):
+                if lvalue_root(r).is_some():
+                    self.store(r, v, ctx, true)
+            case None:
+                pass
+
+    fn call_fn(ref self, e: Expr, id: int, recv: Option[Expr], args: [Arg], ctx: Dep) -> Val:
+        var vs = self.args_vals(recv, args, ctx)
         let s = self.sums[id]
         let sig = self.info.fns[id]
+        # the callee sees a `ref` argument as the later arguments left it
+        # (`f(ref x, set(ref x))`): read those places again
+        for i, p in enumerate(sig.params):
+            if not p.by_ref:
+                continue
+            var ae: Option[Expr] = None
+            if recv.is_some():
+                if i == 0:
+                    ae = recv
+                elif i - 1 < len(args):
+                    ae = Some(args[i - 1].expr)
+            elif i < len(args):
+                ae = Some(args[i].expr)
+            match ae:
+                case Some(x):
+                    # (an indexed place can't change: E0405)
+                    if lvalue_root(x).is_some() and not has_index(x) and i < len(vs):
+                        vs[i] = self.expr(x, ctx)
+                case None:
+                    pass
+        let slots = self.slots[id].slots
         let name = sig.name
         let has_recv = recv.is_some()
         if s.comm:
@@ -587,18 +1329,25 @@ struct Fa:
                 f"`{name}`, which communicates with other ranks",
                 s.comm_site
             )
-            for i, d in enumerate(ds):
-                if i < 64 and s.need & bit(i) != u64(0):
-                    var ae = recv.unwrap() if has_recv and i == 0 else e
+            for i in 0..min(64, len(slots)):
+                if s.need & bit(i) != u64(0):
+                    let sl = slots[i]
+                    let p = sl.param
+                    var ae = e
                     if has_recv:
-                        if i > 0:
-                            ae = args[i - 1].expr
-                    else:
-                        ae = args[i].expr
-                    let pname = sig.params[i].name if i < len(sig.params) else ""
-                    self.same_on_all(ae, d, f"argument `{pname}` of `{name}`")
+                        if p == 0:
+                            ae = recv.unwrap()
+                        elif p - 1 < len(args):
+                            ae = args[p - 1].expr
+                    elif p < len(args):
+                        ae = args[p].expr
+                    let pname = sig.params[p].name if p < len(sig.params) else ""
+                    var what = f"argument `{pname}` of `{name}`"
+                    if len(sl.path) > 0:
+                        what = f"`{sl.name}` in argument `{pname}` of `{name}`"
+                    self.same_on_all(ae, project(vs, sl), what)
         # `ref` arguments may come back changed
-        let eff = self.eff(ctx)
+        let ef = self.eff(ctx)
         for i, p in enumerate(sig.params):
             if not p.by_ref:
                 continue
@@ -612,16 +1361,20 @@ struct Fa:
                 ae = Some(args[i].expr)
             match ae:
                 case Some(x):
-                    match lvalue_root(x):
-                        case Some(root):
-                            let out = s.outs[i] if i < len(s.outs) else none()
-                            let d = self.subst(out, ds, e.span).join(eff)
-                            self.set(root, d)
-                        case None:
-                            pass
+                    if lvalue_root(x).is_some():
+                        let out = s.outs[i] if i < len(s.outs) else atom(none())
+                        self.store(x, self.subst_val(out, vs, slots, e.span).spread(ef), ctx, true)
                 case None:
                     pass
-        return self.subst(s.ret, ds, e.span)
+        if s.exits:
+            let here = ef.join(
+                self.subst(s.exit_dep, vs, slots, e.span)
+            ).exits_at(e.span, f"`{name}` may exit here on some ranks")
+            self.exits = true
+            self.exit_dep = self.exit_dep.join(here)
+            if here.vary or here.params != u64(0):
+                self.leave(here)
+        return self.subst_val(s.ret, vs, slots, e.span)
 
     # A communication call at `span`: every rank must get here.
     fn communicate(ref self, span: Span, ctx: Dep, what: str, inner: Option[Span]):
@@ -634,7 +1387,9 @@ struct Fa:
             return
         if self.par > 0:
             self.diags.push(
-                diag.error("E0503", f"can't call {what} inside a `par` body").label(span, "communication inside a parallel section").with_help("communicate before or after the parallel section")
+                diag.error("E0503", f"can't call {what} inside a `par` body")
+                .label(span, "communication inside a parallel section")
+                .with_help("communicate before or after the parallel section")
             )
             return
         if c.vary:
@@ -642,19 +1397,54 @@ struct Fa:
                 "E0510",
                 "some ranks might not reach this communication"
             ).label(span, f"calls {what}")
-            match c.why:
-                case Some(w):
-                    d = d.label(w, "this may differ between ranks")
+            var used: [Span] = [span]
+            match c.exit:
+                case Some((s, m)):
+                    d = d.label(s, m)
+                    used.push(s)
+                case None:
+                    pass
+            match c.via:
+                case Some((s, m)):
+                    if s not in used:
+                        d = d.label(s, m)
+                        used.push(s)
+                case None:
+                    pass
+            match c.src:
+                case Some(s):
+                    if not inside(s, used):
+                        d = d.label(s, "this value differs between ranks")
+                        used.push(s)
                 case None:
                     pass
             match inner:
                 case Some(i):
-                    d = d.label(i, "communicates here")
+                    if i not in used:
+                        d = d.label(i, "communicates here")
                 case None:
                     pass
             d = d.note(
                 "every rank must make the same `world` calls in the same order, otherwise the program could hang"
-            ).with_help("move the call out of the rank-dependent branch or loop; compute rank-specific values first, then communicate on every rank")
+            )
+            match c.exit:
+                case Some((_, m)):
+                    if "`?`" in m:
+                        d = d.with_help(
+                            "handle the error the same way on every rank (e.g. agree on it with `world.max` first), or use `.unwrap()` to stop the whole program"
+                        )
+                    elif "exit" in m:
+                        d = d.with_help(
+                            "decide to exit on every rank together (e.g. agree on it with `world.max` first), or use `panic(...)` to stop the whole program"
+                        )
+                    else:
+                        d = d.with_help(
+                            "make every rank take the early exit together (decide it with a collective like `world.max`), or move the communication before it"
+                        )
+                case None:
+                    d = d.with_help(
+                        "move the call out of the rank-dependent branch or loop; compute rank-specific values first, then communicate on every rank"
+                    )
             self.diags.push(d)
 
     # `e` (with dependencies `d`) must have the same value on every rank.
@@ -665,20 +1455,75 @@ struct Fa:
                 "E0511",
                 f"{what} must be the same on every rank"
             ).label(e.span, "might differ between ranks")
-            match d.why:
-                case Some(w):
-                    if w != e.span:
-                        dg = dg.label(w, "because this depends on which rank is running")
+            var used: [Span] = [e.span]
+            match d.via:
+                case Some((s, m)):
+                    if s not in used:
+                        dg = dg.label(s, m)
+                        used.push(s)
+                case None:
+                    pass
+            match d.src:
+                case Some(s):
+                    if not inside(s, used):
+                        dg = dg.label(s, "because this depends on which rank is running")
                 case None:
                     pass
             self.diags.push(
-                dg.with_help("compute it from values that are the same everywhere, e.g. `world.size()`, constants, or the result of `world.broadcast`")
+                dg.with_help(
+                    "compute it from values that are the same everywhere, e.g. `world.size()`, constants, or the result of `world.broadcast`"
+                )
             )
 
-fn join_all(ds: [Dep]) -> Dep:
+# Whether pattern `p` matches a value with dependence `v`.
+fn pat_dep(p: Pattern, v: Val) -> Dep:
+    match p.kind:
+        case PatKind.Wild | PatKind.Bind(_):
+            return none()
+        case PatKind.Variant(_, _):
+            var d = v.d
+            for k, q in enumerate(p.fields):
+                d = d.join(pat_dep(q, v.part(k)))
+            return d
+        case PatKind.Tuple(ps):
+            var d = none()
+            for k, q in enumerate(ps):
+                d = d.join(pat_dep(q, v.part(k)))
+            return d
+        case PatKind.Or(ps):
+            var d = none()
+            for q in ps:
+                d = d.join(pat_dep(q, v))
+            return d
+        case _:
+            return v.flat()
+
+# How many parts a value of type `t` has.
+fn nparts(info: ProgramInfo, t: Ty) -> int:
+    match t:
+        case Ty.Struct(sid):
+            return len(info.structs[sid].fields)
+        case Ty.Tuple(ts):
+            return len(ts)
+        case _:
+            return 0
+
+fn same_poison(a: {Span: Dep}, b: {Span: Dep}) -> bool:
+    if len(a) != len(b):
+        return false
+    for k, v in a.items():
+        match b.get(k):
+            case Some(w):
+                if not v.same(w):
+                    return false
+            case None:
+                return false
+    return true
+
+fn flat_all(vs: [Val]) -> Dep:
     var d = none()
-    for x in ds:
-        d = d.join(x)
+    for v in vs:
+        d = d.join(v.flat())
     return d
 
 fn world_name(op: WorldOp) -> str:
@@ -686,3 +1531,10 @@ fn world_name(op: WorldOp) -> str:
         if o == op:
             return n
     return "?"
+
+# Is `s` within one of the spans already labeled?
+fn inside(s: Span, used: [Span]) -> bool:
+    for u in used:
+        if u.file == s.file and u.lo <= s.lo and s.hi <= u.hi:
+            return true
+    return false

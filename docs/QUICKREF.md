@@ -18,7 +18,9 @@ brine explain E0601            # explain any error code
 brine run --target wasm        # WebAssembly, run with Node.js (needs wasi-sdk, $WASI_SDK_PATH)
 brine build --target web -o d  # d/: index.html + brine.js + program.wasm, for a browser
 ```
-Add `--json` to any command for one JSON object per line.
+Add `--json` to any command for one JSON object per line. `brine fmt` leaves
+lines between `# fmt: off` and `# fmt: on` comments, and number tables written
+in rows that don't fit on one line, as they are.
 WebAssembly runs on one thread (`par` runs in order, same results) and as one
 `world` rank; in a browser there are no files or processes.
 
@@ -36,7 +38,9 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
 | structs | `Point(x=1, y=2)` or `Point(1, 2)` |
 
 * No implicit conversions. Convert explicitly: `float(i)`, `int(x)` (truncates),
-  `i32(n)` (checked), `str(v)`, `int("42")` (parses), `float("2.5")`.
+  `i32(n)` (checked), `str(v)`, `int("42")` (parses), `float("2.5")`. A literal
+  takes the type it is converted to: `u64(0xcbf29ce484222325)` is fine, `u8(300)`
+  is a compile-time error.
 * Literals adapt to context: `let b: u8 = 200`, `let f: f32 = 1`,
   `let big: i128 = 10_000_000_000_000_000_000_000`. Integer literals go up to
   `u128`'s maximum (2^128 - 1); above `i128`'s maximum only a `u128` holds them.
@@ -45,8 +49,36 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
 * Integer overflow, out-of-range conversions, division by zero and
   out-of-bounds indexing stop the program with a clear message (a *panic*),
   unless the compiler proved they can't happen, in which case the check is removed.
+  Only the first panic is reported, even when many `par` threads fail at once.
+* Every thread, `main` included, has a 64 MB stack; recursion deeper than that
+  panics with "stack overflow (recursion too deep)". `brine run` gives
+  WebAssembly the same; in a browser the engine allows less (about 10,000 to
+  100,000 calls, depending on the frames).
 * Integer `/` rounds down like Python's `//` (`-7 / 2 == -4`), and `%` takes the sign of
   the right side (`-7 % 2 == 1`). Use `float(a) / float(b)` for a fractional result.
+* Bit operators on integers: `&` (and), `|` (or), `^` (xor), `~` (not), `<<`, `>>`.
+  Unlike `+` and `*`, `<<` doesn't check for overflow: bits shifted past the type's
+  width are dropped (`u64(1) << 63` is 2^63, `3 << 63` is `-2^63`). `>>` keeps the
+  sign of signed types (`-8 >> 1 == -4`) and fills unsigned ones with zeros. A shift
+  by a negative amount or by the type's width or more panics. Each has a compound
+  assignment: `x &= m`, `x |= m`, `x ^= m`, `x <<= 2`, `x >>= 2`.
+* Methods of integers (any width; the result has the receiver's type):
+  `a.wrapping_add(b)`, `wrapping_sub`, `wrapping_mul` and `a.wrapping_neg()` wrap
+  around instead of panicking (hashes, random number generators); `-x` on an
+  unsigned type is an error, `x.wrapping_neg()` is the two's complement.
+  `x.rotate_left(n)` / `rotate_right(n)` rotate the bits (`n` modulo the width).
+  `x.count_ones()`, `x.leading_zeros()`, `x.trailing_zeros()` give an `int`
+  (the width for 0: `u64(0).trailing_zeros() == 64`).
+* Float bits: `x.to_bits()` is the IEEE 754 encoding of a `float` as a `u64` (of
+  an `f32` as a `u32`); `float.from_bits(u)` and `f32.from_bits(u)` go back.
+* `<`, `<=`, `>`, `>=` work on numbers, strings (byte order), enums without data
+  (declaration order) and tuples and structs whose parts all support them (not
+  on `bool`: write `a and not b` for `b < a`). Those
+  compare part by part, in field order, like Python: `(1, "b") < (2, "a")`. A NaN
+  makes `<` false, so in a tuple it's false whenever the NaN part decides. The same
+  types work with `sort()` (stable; NaN sorts after every number), `min`/`max` of
+  two (ties keep the first) and `min(... for ...)`/`max(...)`; `par min`/`par max`
+  need numbers.
 * Values are **values**: `let b = a` copies (cheaply, copy-on-write). Changing `b`
   never changes `a`. To share a variable on purpose, use `ref` (see Functions).
 
@@ -58,12 +90,20 @@ var total = 0           # mutable
 total += x
 let (q, r) = (17 / 5, 17 % 5)   # tuple unpacking
 let (a, (b, c)) = (1, (2, 3))   # nests
+u, v = v, u % v         # assign several `var` places at once; parentheses optional
+xs[i], xs[j] = xs[j], xs[i]     # every value is computed first, then stored
+lo, _ = bounds          # `_` drops a value
 var names: [str] = []   # annotate when the type can't be inferred
 let n: i32 = 7          # ...or whenever you like
 for i: int in 0..3:     # loop variables too: `for k: str, v: int in m.items():`
     total += i
 const LIMIT = 100       # compile-time constant (top level)
+const BASE = [3, 4, 5, 6]       # read-only arrays too; `len(BASE)` is a constant
 ```
+In `x, y = ...` the places can't overlap, and an index can't read a variable
+the same line assigns (`i, xs[i] = ...` is error E0405): the result would
+depend on the order of the stores.
+
 Types are optional, Python style. To require them, put `typed = true` under
 `[check]` in brine.toml (or pass `--typed`): then every `let`, `var` and `for`
 variable needs a written type (error E0337 tells you which one to add).
@@ -117,9 +157,15 @@ fn main():
     let d = ref data                 # `d` is another name for `data`
     d[0] = 1                         # changes `data`
 ```
+`let r = ref p.field` names a field the same way (`let b = ref self.board` in a
+method: no copy, and changes go to `self.board`). A reference names a variable or
+a field path, not an element (`ref xs[i]`) or a function's result.
 Arguments are passed by value (cheaply: arrays and strings are copy-on-write).
+`x = f(x)` (also `xs[i] = f(xs[i])`, `x = x.step()`) moves x's value into `f`, so
+an `f` that starts with `var t = x` changes it in place instead of copying it
+(unless something else shares the value).
 References can't be stored in structs or arrays or returned, so they never dangle.
-`main` may return `int` (the exit code). Parameter types are required;
+`main` may return `int` (the exit code) or a `Result` (see below). Parameter types are required;
 local types are inferred.
 
 ## Structs and methods
@@ -170,14 +216,28 @@ enum Expr:                           # recursive enums are fine
 
 let s = Shape.Rect(w=2.0, h=3.0)     # positional or keyword fields
 print(s, s.area(), s == Shape.Empty) # Shape.Rect(w=2.0, h=3.0) 6.0 false
+
+print(int(Color.Green))              # 1: an enum without data converts to its position
+print(Color.from_int(0), Color.from_int(7))   # Some(Color.Red) None
 ```
 
 Patterns: `_`, a name (captures), int/str/bool literals, tuples `(a, 0)`,
 alternatives `1 | 2 | 3`, and variants `Shape.Rect(w, _)` / `Expr.Add(left=l)`
 (nested to any depth). A guard adds a condition: `case x if x < 0:`.
+A constant matches its value: `case OP_ADD:` (integer, string and bool constants).
+Alternatives may bind names when each binds the same ones with the same types:
+`case Shape.Circle(n) | Shape.Square(n):` (E0321 otherwise). With a guard,
+each alternative is tried in turn: `case (x, _) | (_, x) if x > 5:` matches `(1, 9)`.
 Every `match` must handle every value (error E0320 shows one it misses);
 end with `case _:` when listing values isn't possible. Variant data is read with
 `match`, never with `.field`.
+
+Cost: an enum whose variants hold at most 64 bytes and that can't contain itself
+(`Shape`, `Option[int]`, `Result[int, str]`) is stored in place, like a struct: making
+one allocates nothing. A recursive enum (`Expr`) or a bigger one is a pointer to a
+shared, reference-counted box. `match (a, b)` on variables doesn't copy them. A `match`
+whose cases test one value against four or more close-together integers or
+variants jumps straight to the right case, in every kind of build.
 
 ## Generics, `Option` and `Result`
 
@@ -222,15 +282,17 @@ fn main() -> Result[(), str]:           # an Err prints "error: ..." and exits w
     print(load("bit.txt")?)
     return Ok(())
 ```
+`main` may also return `Result[int, E]`: `Ok(n)` exits with code `n`.
 
 `Option[T]` (`Some(value)`, `None`) and `Result[T, E]` (`Ok(value)`, `Err(error)`)
 are always available. Methods: `is_some()`, `is_none()`, `is_ok()`, `is_err()`,
-`unwrap()` (panics on `None`/`Err`), `unwrap_or(default)`, `ok()` (Result to Option).
+`unwrap()` (panics on `None`, and on `Err` with the error), `unwrap_or(default)`, `ok()` (Result to Option).
 Each use of a generic function or type with new type arguments makes a
 specialized copy, so generic code is as fast as hand-written code. A generic
 function's body is checked for each set of type arguments it's used with:
-`largest[T]` that compares with `>` works for `int` and `str`, and is an error
-for a struct.
+`largest[T]` that compares with `>` works for `int`, `str` or a tuple, and is an
+error for a struct with an array field. In the same way, `T(x)` converts to what `T` stands for, like
+`int(x)` or `f32(x)`: `fn mean[E](xs: [E]) -> E` can return `total / E(len(xs))`.
 
 Methods can have type parameters of their own, next to their type's:
 
@@ -253,40 +315,95 @@ xs.push(5)              # append
 let last = xs.pop()     # remove and return the last element (xs.pop(i): at i)
 xs.insert(0, 9)         # put 9 at index 0, shifting the rest right
 xs.extend([7, 8])       # append every element
-xs.sort()               # numbers and strings; stable
+xs.sort()               # anything `<` works on; stable
 xs.reverse()
 xs.clear()
 print(len(xs), xs == [3, 1, 2], 3 in xs, xs.index(3))  # index: Option[int]
+print([3, 1, 3].index(3, 1))    # Some(2): searching from index 1 (0 to len, else a panic)
 print(xs.contains(3))   # the same as `3 in xs`
 print(xs[1:3], xs[:2], xs[2:])   # slices are copies; out of range panics
+let both = xs + [4, 5]  # a new array; `xs += ys` extends xs in place
 ```
 There are no negative indexes: write `xs[len(xs) - 1]`. A statement can't both
 change a variable and read it elsewhere (`print(xs.pop(), xs)` is an error), so
-evaluation order never matters.
+evaluation order never matters. A call in another call's arguments runs first
+(`t.add(t.leaf(1), 2)` is fine), and different fields are different places
+(`both(ref self.a, ref self.b)`, `self.items[self.rng.below(n)]`).
+
+In release builds, a `for j in lo..hi` loop that indexes arrays at `j`, `j + x`,
+`x + j` or `j - x` (`x` a literal or a variable the loop doesn't change), calls
+no functions of the program and doesn't change those arrays' lengths checks the first and last index once,
+before the loop, and then runs without per-element checks, so the C compiler can
+vectorize it. If that test fails the loop runs checked as written, panicking at
+the same element it always would.
+
+Cost: an empty array allocates nothing for its elements until the first push, so
+taking an inner array out to change it (`var w = xss[i]; xss[i] = []`, then
+`xss[i] = w`) costs one small allocation. A local `var a = [x] * n` with `n` a
+literal (at most 1 KB of numbers or `bool`s; 4 KB per function), in a function
+without `par`, that is only indexed, assigned at an index and measured with `len`
+lives in the stack frame: no allocation at all (a traversal stack, a histogram).
 
 ## Strings
 
 Strings are immutable UTF-8. `len(s)`, `s[i]` and slices count **bytes**;
-`s[i]` is a one-character string (ASCII text is the common case, and
-`for c in s` / `s.chars()` walk real characters).
+`s[i]` is the byte at `i` as a one-byte string: a character for ASCII text
+(the common case), a piece of one otherwise, so scan text byte by byte and
+compare with ASCII (`s[i] == " "`). A slice must not cut a character in two:
+`"aé"[0:2]` panics. `for c in s` / `s.chars()` walk real characters.
 
 ```python
 let s = "hello, brine"
 print(s[0], s[7:], s + "!", "ri" in s, s.contains("ri"), f"{s} has {len(s)} bytes")
 print(s.find("brine"))                    # Some(7); None if absent
+print(s.find("e", 2))                     # Some(11): searching from byte 2 (0 to len(s))
 print(s.split(", "), "a b  c".split())    # ["hello", "brine"], ["a", "b", "c"]
-print("-".join(["a", "b"]), "ab".repeat(3), s.replace("l", "L"))
+print("-".join(["a", "b"]), "ab".repeat(3), "ab" * 3, s.replace("l", "L"))
 print(s.starts_with("he"), s.ends_with("!"), s.count("l"))
 print("  x ".strip(), "  x".lstrip(), "x  ".rstrip(), s.upper(), s.lower())
-print("a\nb".lines(), s.chars(), s.bytes())  # [str], [str], [int]
+print("a\nb".lines(), s.chars(), s.bytes())  # [str], [str], [u8]
 print("42".is_digit(), "ab".is_alpha(), " ".is_space(), "a1".is_alnum())
 print(ord("a"), chr(97))                   # 97 "a"
 ```
+Text over several lines goes between `"""` quotes (also `f"""..."""`). A line
+break right after the opening quotes is dropped, and so is the indentation all
+the lines share (the closing quotes' line counts, blank lines don't); `\` at the
+end of a line joins it with the next:
+
+```python
+fn usage(name: str) -> str:
+    return f"""
+        usage: {name} [--verbose] FILE
+          --verbose   say more
+        """
+# usage("app") == "usage: app [--verbose] FILE\n  --verbose   say more\n"
+```
+An f-string field holds any expression, strings included: `f"{d["key"]}"`,
+`f"{", ".join(names)}"`.
+
 Case conversion and `is_alpha`/`is_space` follow Unicode, as in Python
 (`"straße".upper()` is `"STRASSE"`); `is_digit` is `0`-`9`, the digits `int()`
 reads. `str(x)` converts any
-printable value; `int("42")` and `float("2.5")` parse (and panic on bad input, so
-check with `is_digit` first when the text comes from outside).
+printable value; `int("42")` and `float("2.5")` parse (and panic on bad input).
+For text from outside, `s.to_int()` and `s.to_float()` give `None` instead:
+
+```python
+match line.to_int():                      # Option[int]; blanks around it are fine
+    case Some(n):
+        print(n + 1)
+    case None:
+        print("not a number")
+"200".to_int[u8]()                        # Some(200): other types; None if out of range
+"2.5".to_float[f32]()                     # Some(2.5)
+str.from_utf8(bytes)                      # Result[str, str]: Err names the bad byte
+```
+Both accept `_` between digits (`"1_000"`), as `int()` and `float()` do.
+
+Format specs in f-strings, as in Python: `{x:.2f}` (fixed), `{x:.3e}`
+(scientific), `{x:g}` / `{x:.10g}` (general: the shorter of the two, trailing
+zeros dropped), `{n:,}` / `{x:,.2f}` (thousands separators: `1,234,567.89`),
+`{n:x}` / `{n:b}` (hex, binary), a width `{n:8}` (`<8` to left-align, `08` to pad
+with zeros) and combinations like `{x:>12,.2f}`.
 
 ## Maps
 
@@ -311,9 +428,38 @@ Keys can be integers, `bool`, `str`, enums, or arrays/tuples/structs of those
 
 `print(a, b, ...)` (`sep=" "` goes between the values and `end="\n"` after
 them: `print(x, end="")`), `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`, `cos`,
-`tan`, `exp`, `log`, `pow(x, y)`, `floor`, `ceil`, `round`, `clock()` (seconds),
-`args()` (command-line arguments), `exit(code)`, `panic(msg)`, `eprint(...)`
-(print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`.
+`tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `sinh`, `cosh`, `tanh`, `exp`, `exp2`,
+`log`, `log2`, `log10`, `cbrt`, `pow(x, y)`, `hypot(x, y)` (on `float` or `f32`),
+`floor`, `ceil`, `round`, `clock()` (seconds),
+`args()` (the command-line arguments as `[str]`, without the program's name:
+`brine run app.br -- a b` gives `["a", "b"]`), `exit(code)`, `panic(msg)`,
+`eprint(...)` (print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`, `flush()`.
+On floats, `min` and `max` ignore a NaN (the other argument wins; both NaN gives
+NaN) and order `-0.0` below `0.0`, the same on every target.
+
+The math functions give the same bits on every platform, natively and in
+WebAssembly: brine has its own math library (from musl) rather than the C
+library's, whose last bits differ between systems.
+
+`print` output to a terminal or a pipe is written at the end of each line; to a
+file it is buffered (and written at exit, or when `eprint`, `run` or `flush()`
+needs it out). `flush()` writes out what is buffered, such as a prompt printed
+with `end=""`.
+
+Standard input, from a terminal, a pipe or a file:
+
+```python
+while true:
+    match input("> "):                  # Option[str]: a line without its "\n"
+        case Some(line):                # (or "\r\n"), None at the end of input
+            print(line.upper())
+        case None:
+            break
+let all = read_stdin()                  # Result[str, str]: everything that is left
+```
+`input(prompt)` writes the prompt first. Text that isn't UTF-8 becomes U+FFFD in
+`input()` and an `Err` from `read_stdin()`. On Windows a console's input is read
+as UTF-8 too. A web page has no stdin: `input()` gives `None` there.
 
 Files and processes (all failures are values, never crashes):
 
@@ -324,12 +470,15 @@ match read_file("in.txt"):              # Result[str, str]; text must be UTF-8
     case Err(e):
         eprint(e)                       # "cannot read in.txt: No such file or directory"
 write_file("out.txt", "hi\n")          # Result[(), str]
+append_file("log.txt", "one more\n")   # Result[(), str]: creates the file if needed
 file_exists("out.txt")                  # bool
 getenv("HOME")                          # Option[str]
 run(["cc", "-O2", "-o", "app", "app.c"])  # Result[int, str]: Ok(exit code), Err if it can't start
 ```
-`write_file` and `run` can't be used inside `par` (their effects would happen in
-an unpredictable order).
+`write_file`, `append_file`, `run`, `input` and `read_stdin` can't be used inside
+`par` (their effects would happen in an unpredictable order), nor can a function
+that calls one of them, directly or through other functions. `exit` can't be
+used in a `par` body either.
 
 The `os` module (built in, no import; errors are `Err` values with the OS's
 message, e.g. `"The system cannot find the file specified. (os error 2)"`):
@@ -342,10 +491,13 @@ os.remove_file(path), os.rename(src, dst)    # Result[(), str]; rename replaces 
 os.cwd(), os.temp_dir() # str (temp_dir has no trailing separator)
 os.set_cwd(path)        # Result[(), str]: change the working directory
 os.write_bytes(path, b) # Result[(), str]: write a [u8] as a binary file
+os.append_bytes(path, b)                     # Result[(), str]: add to the end
+os.read_bytes(path)     # Result[[u8], str]: a file's bytes, whatever they are
 os.exe_path()           # str: the absolute path of the running program
 os.abs_path(path)       # Result[str, str]: canonical; on Windows `\\?\C:\...`
 os.name(), os.arch()    # "windows"/"macos"/"linux"..., "x86_64"/"aarch64"...
 os.pid(), os.cpu_count()                     # int (cpu_count >= 1)
+os.thread_count()       # int: threads `par` uses (BRINE_THREADS / --threads; 1 on wasm)
 os.sleep(0.5)           # seconds
 os.is_terminal(2)       # is fd 1 (stdout) / 2 (stderr) / 0 a terminal?
 os.enable_ansi()        # Windows: let the console show color codes
@@ -358,8 +510,9 @@ os.poll(p)              # Option[int]: exit code if it has exited
 os.kill(p)              # stop it
 let (out, err) = os.output(p)   # captured text once it has exited ("" if not captured)
 ```
-`os.spawn`, `wait`, `poll`, `kill`, `make_dir`, `remove_file`, `rename`, `sleep`
-and `enable_ansi` can't be used inside `par`. Results of `os` calls (except
+`os.spawn`, `wait`, `poll`, `kill`, `make_dir`, `remove_file`, `rename`,
+`set_cwd`, `write_bytes`, `append_bytes`, `sleep` and `enable_ansi` can't be used
+inside `par`, directly or through a function. Results of `os` calls (except
 `os.name()`/`os.arch()`) count as rank-dependent for `world` deadlock checks.
 
 `embed("help.txt")` is a `str` with the file's contents, read when the program is
@@ -367,25 +520,45 @@ compiled (path: a string literal, relative to the file containing the call;
 `\r\n` becomes `\n`). It works in `const`s too: `const HELP = embed("help.txt")`.
 Reductions over generators: `sum(x * x for x in xs)`, `product`, `min`, `max`,
 `any(x < 0 for x in xs)`, `all(...)`. `min`/`max` of an empty sequence panic.
+`first(Some(x) if p(x) else None for x in xs)` is the first `Some` of a generator
+of options (or of an array of them), or `None`; it stops at that element.
 
 ## Parallelism (data-race free by construction)
 
 ```python
 let ys = par [f(x) for x in xs]              # parallel map
 let total = par sum(x * x for x in xs)        # parallel reduction
+let at = par first(Some(i) if ok(i) else None for i in 0..n)  # parallel search
 var out = [0.0] * n
 par for i in 0..n:                            # parallel loop
-    out[i] = xs[i] * 2.0                      # only out[i] of outer arrays may be written
+    out[i] = xs[i] * 2.0                      # outer arrays: only out[i] (or out[k*i + c])
 let (a, b) = par(work(1), work(2))            # fork-join
 ```
 Rules: inside a `par` body, outer variables are read-only, except that
-`par for i` may write `arr[i]` (exactly the loop variable) of an outer array.
+`par for i in lo..hi` (over a range) may write `arr[i]` (exactly the loop
+variable) of an outer array, or `arr[k * i + c]` with integer constants
+`k >= 1` and `c`: every write of `arr` in the loop uses the same `k`, and its
+offsets `c` aren't a multiple of `k` apart, so no two iterations write the same
+element. The loop may also read `arr[k * i + c]` at an element it writes, or at
+one no iteration writes. So in-place red-black sweeps work:
+```python
+par for i in 0..n:
+    a[2 * i + 1] = 0.5 * (a[2 * i] + a[2 * i + 2])   # odd from even
+```
 Reductions are deterministic: same result bits on any machine and thread count.
 They fold leaves of 16 consecutive elements left to right, then combine the leaves
 in a balanced pairwise tree (so `par sum` of floats can differ in the last bits from
 a sequential `sum`, usually by being more accurate). Integer overflow of any partial
-result in that order traps.
+result in that order traps. Only the scheduling adapts: a reduction over a few
+expensive elements still uses all the threads. `par any`/`par all` stop
+starting new work once an element decides the result; the elements before it
+always run, so a panic the sequential loop would reach still happens.
+`par first(...)` is the lowest-index `Some`, like `first`, on any thread count;
+the elements before it all run, those after it may not.
 `BRINE_THREADS=n` or `brine run --threads n` sets the thread count.
+Cost: reference counts use locked (atomic) instructions only while a `par` construct
+is running; the rest of the program updates them with plain ones. In `par for i`,
+`out[i] = f(out[i])` hands `out[i]` to `f` without copying it, as outside `par`.
 
 **GPUs.** `par for`, `par [...]` and `par` reductions also run on a GPU (NVIDIA
 through CUDA, Apple silicon through Metal) when the runtime expects that to be
@@ -395,10 +568,15 @@ the CPU (they have no f64).
 Nothing to write or install beyond the driver: the compiler makes a kernel of every
 body that only uses int/float arithmetic, comparisons, branches, loops, structs,
 tuples, reads of outer arrays and scalars, `out[i]` writes, `sqrt`, `abs`, `floor`,
-`ceil`, `round`, `min`, `max`, and calls to functions that do the same. Strings,
-maps, new arrays, printing, `sin`/`exp`/`log`/`pow` and the like keep a body on the
-CPU. `BRINE_GPU=off|on|auto` (default `auto`; `on` uses the GPU whenever it can),
-`BRINE_GPU_LOG=1` prints where each construct ran and why.
+`ceil`, `round`, `min`, `max`, and calls to functions that do the same (which may
+use local arrays kept in the stack frame, see Arrays); on NVIDIA GPUs also
+`i128`/`u128` arithmetic (except reductions of them, conversions to and from
+floats, and passing them to functions). Strings, maps, other new arrays, printing,
+`sin`/`exp`/`log`/`pow` and the like keep a body on the CPU.
+`BRINE_GPU=off|on|auto` (default `auto`; `on` uses the GPU whenever it can),
+`BRINE_GPU_LOG=1` prints where each construct ran and why. With `--ranks`, the
+k-th rank on a machine uses its k-th GPU and the ranks beyond its GPUs stay on the
+CPU (ranks sharing a GPU queue for it); `on` shares the GPUs out instead.
 
 ## Multiple processes and machines: `world`
 
@@ -410,19 +588,29 @@ fn main():
     if rank == 0:
         print(total)
     let left = world.shift(rank, 1)       # send to rank + 1, receive from rank - 1
+    let up = world.shift(rank, 1, -1)     # no wrapping around: rank 0 gets -1
     let inbox = world.exchange([rank] * world.size())   # xs[j] goes to rank j
+    let sums = world.sum([1.0, float(rank)])            # element by element
+    let done = world.all(rank >= 0)                     # also world.any
 ```
 API: `rank()`, `size()`, `barrier()`, `broadcast(root, v)`, `sum(v)`, `min(v)`,
-`max(v)`, `gather_all(v) -> [T]`, `shift(v, by)`, `exchange(xs) -> [T]`.
-Message types: `int`, `float`, `bool`, `str`, and arrays of those (`[[float]]`, ...).
-Run with `brine run --ranks N`. Without it, `world.size() == 1`.
+`max(v)` (on `int`, `float`, `[int]`, `[float]`), `any(b)`, `all(b)`,
+`gather_all(v) -> [T]`, `shift(v, by)`, `shift(v, by, edge)`, `exchange(xs) -> [T]`.
+Message types: integers and floats of any width (`[u8]` travels as bytes), `bool`,
+`str`, and arrays of those (`[[float]]`, ...). A float `sum` adds the ranks'
+values in a fixed tree: the same result on every rank and every run.
+Run with `brine run --ranks N` (each rank gets cores / N `par` threads unless
+`--threads` says otherwise). Without it, `world.size() == 1`. If a rank fails,
+`brine run` stops the others and exits with that rank's exit code.
 
 **No deadlocks, by construction.** Every rank takes part in every `world` call,
 and the compiler checks that all ranks make the same calls in the same order:
 a call under a condition that depends on `world.rank()` (or received values,
-`clock()`, ...) is an error (E0510). Results of `sum`/`min`/`max`/`broadcast`/
+`clock()`, ...), or after a rank-dependent `return`, `break` or `exit`, is an
+error (E0510). Results of `sum`/`min`/`max`/`any`/`all`/`broadcast`/
 `gather_all` are the same on every rank, so loops like
-`while world.max(err) > tol:` are fine.
+`while world.max(err) > tol:` are fine. At run time, each message also carries
+its call site, so a mismatch is a clear panic naming both calls.
 
 ## Proofs: rules that can't be broken
 
@@ -459,6 +647,9 @@ fn index_of(xs: [int], target: int) -> int:
   `max`, fields, indexing, constants and `result`.
 * In `for i in a..b` loops, invariants may mention `i`: they must hold at the start
   of each iteration (and with `i = b` after the loop).
+* Of what a loop changes (down to the fields and array elements it writes), the
+  prover knows only what the invariants say; everything else it still knows. A
+  call forgets only what the function may change in its `ref` arguments.
 * The prover handles linear integer arithmetic (`+ - ` and multiplication or
   division by constants). It never accepts a false claim.
 * `brine check --report` lists the runtime checks that remain.
@@ -468,6 +659,7 @@ fn index_of(xs: [int], target: int) -> int:
 ```python
 import geometry            # loads geometry.br next to the main file
 import util.strings as s   # loads util/strings.br
+import ..common            # loads common.br from the directory above
 
 let a = geometry.area(2.0, 3.0)
 let p = geometry.Point(x=1, y=2)
@@ -476,7 +668,14 @@ from geometry import Point, area   # use these names directly
 let q = Point(x=3, y=4)
 ```
 
-`from m import x` only imports items defined in `m` itself. A name can't be both
+Every module path starts at the main file's directory, in whichever module the
+`import` is written. Each leading `..` goes one directory up: `import ..common`,
+`from ..common import Thing`, `import ....shared.util` (two up), and the module
+is named after its last part (`common`, `util`).
+
+`from m import x` takes an item `m` defines or itself imports with `from`, so
+a module can gather names for others (`m.x` finds the same item). Modules `m`
+loads with `import` aren't passed on. A name can't be both
 imported and defined in the same module.
 
 ## Tests
@@ -486,11 +685,20 @@ test "clamp keeps values in range":
     assert clamp(15, 0, 10) == 10
     assert clamp(-5, 0, 10) == 0
 ```
+`test` is a keyword only at the start of a top-level line (and `case` only at
+the start of a line in a `match`), so both are fine as names elsewhere.
 `brine test` runs each test in its own process, in parallel. `$BRINE` is set to the
-`brine` running the tests, so a test can run the compiler.
+`brine` running the tests, so a test can run the compiler. A test that runs longer
+than 300 seconds is stopped and fails (`brine test --timeout <seconds>`; 0: no limit).
 
 ## C interop
 
 ```python
-extern fn rand() -> i32     # declare a C standard library function (ints, floats, bools only)
+extern fn rand() -> i32     # declare a C standard library function
+extern fn puts(s: str) -> i32
 ```
+Extern functions take integers, floats, bools and strings, and return integers,
+floats, bools or nothing; the types must match the C declaration (`int` is
+`i32`, `size_t` is `u64` on 64-bit targets and `u32` in WebAssembly). A `str`
+reaches C as a NUL-terminated `const char *` copy that lives until the call
+returns (a string containing a NUL byte panics). Strings can't be returned.

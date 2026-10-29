@@ -146,12 +146,63 @@ test "world programs run on several processes":
         "converged after 22 iterations true\n",
         ["--ranks", "3"]
     )
+    # idioms the deadlock checker must accept
+    run_ok("tests/programs/world_idioms.br", "100 2 [0, 1, 2] Ok(30) [3, 2, 4]\n", ["--ranks", "3"])
+    run_ok("tests/programs/world_ops.br", text("tests/programs/world_ops.out"), ["--ranks", "4"])
+    run_ok("tests/programs/world_ops.br", text("tests/programs/world_ops5.out"), ["--ranks", "5"])
+    run_ok("tests/programs/world_child.br", "inherited: [false, false, false]\n", ["--ranks", "3"])
+    run_ok("tests/programs/world_exit.br", "total 3 true\n", ["--ranks", "3"])
+
+test "world runtime failures are clear":
+    # every rank exits with the same code: it's the launcher's
+    let o = brine(["run", "-q", "--ranks", "3", "tests/programs/world_exit.br", "--", "x"])
+    assert o.code == 3 and o.out == "total 3 true\n" and "error:" not in o.err, o.all()
+    # the first rank to fail is the cause; the others are stopped
+    let p = brine(["run", "-q", "--ranks", "4", "tests/programs/world_panic.br"])
+    assert p.code == 101, p.all()
+    assert "panic (rank 1): rank 1 gives up" in p.err, p.all()
+    assert "error: rank 1 failed (exit code 101), so the other ranks were stopped" in p.err, p.all()
+    # ranks in different collectives (two programs in one world: the compiler
+    # rejects a program that could do this) panic, naming both call sites
+    let d = scratch("mismatch")
+    write(f"{d}/a.br", "fn main():\n    print(world.sum(1))\n")
+    write(f"{d}/b.br", "fn main():\n    world.barrier()\n")
+    var exes: [str] = []
+    for n in ["a", "b"]:
+        let b = brine(["build", "-q", f"{d}/{n}.br", "-o", f"{d}/{n}.exe"])
+        assert b.code == 0, b.all()
+        exes.push(f"{d}/{n}.exe")
+    var peers = ""
+    match os.free_ports(2):
+        case Ok(ps):
+            peers = f"127.0.0.1:{ps[0]},127.0.0.1:{ps[1]}"
+        case Err(e):
+            panic(e)
+    var kids: [int] = []
+    for r in 0..2:
+        let env = {"BRINE_RANK": f"{r}", "BRINE_WORLD_SIZE": "2", "BRINE_PEERS": peers}
+        match os.spawn([exes[r]], env, true, false):
+            case Ok(k):
+                kids.push(k)
+            case Err(e):
+                panic(e)
+    var errs: [str] = []
+    for k in kids:
+        let code = os.wait(k)
+        let (_, er) = os.output(k)
+        assert code == 101, er
+        errs.push(er.replace("\r\n", "\n"))
+    let (e0, e1) = (errs[0], errs[1])
+    assert "mismatched communication: this rank is in `world.sum`, but rank 1 is in `world.barrier` at " in e0, e0
+    assert "b.br:2:5" in e0, e0
+    assert "this rank is in `world.barrier`, but rank 0 is in `world.sum` at " in e1, e1
 
 fn features() -> [str]:
     return [
         "tests/programs/features.br",
         "tests/programs/ownership.br",
         "tests/programs/proofs.br",
+        "tests/programs/proof_facts.br",
         "tests/programs/division.br",
         "tests/programs/references.br",
         "tests/programs/enums.br",
@@ -175,7 +226,39 @@ fn features() -> [str]:
         "tests/programs/idioms.br",
         "tests/programs/kernels.br",
         "tests/programs/gpu.br",
-        "tests/programs/string_building.br"
+        "tests/programs/string_building.br",
+        "tests/programs/float_text.br",
+        "tests/programs/math_bits.br",
+        "tests/programs/arg_alias.br",
+        "tests/programs/deep_drop.br",
+        "tests/programs/field_arrays.br",
+        "tests/programs/float_minmax.br",
+        "tests/programs/take_put.br",
+        "tests/programs/own_update.br",
+        "tests/programs/borrow_let.br",
+        "tests/programs/stdlib.br",
+        "tests/programs/par_small.br",
+        "tests/programs/first.br",
+        "tests/programs/text_syntax.br",
+        "tests/programs/generic_convert.br",
+        "tests/programs/tuple_assign.br",
+        "tests/programs/or_patterns.br",
+        "tests/programs/const_patterns.br",
+        "tests/programs/const_arrays.br",
+        "tests/programs/enum_int.br",
+        "tests/programs/ordering.br",
+        "tests/programs/ref_fields.br",
+        "tests/programs/mut_order.br",
+        "tests/programs/inline_enums.br",
+        "tests/programs/borrowed_returns.br",
+        "tests/programs/bounds_versioned.br",
+        "tests/programs/native_regs.br",
+        "tests/programs/jump_tables.br",
+        "tests/programs/inline_small.br",
+        "tests/programs/rc_threads.br",
+        "tests/programs/empty_arrays.br",
+        "tests/programs/par_moves.br",
+        "tests/programs/stack_arrays.br"
     ]
 
 test "language features":
@@ -275,7 +358,16 @@ test "gdb debugs brine source":
 test "imports and generics":
     run_ok("tests/programs/imports", expected("tests/programs/imports"), [])
     assert error_codes("tests/programs/imports/bad.br") == ["E0201@1", "E0202@1"]
+    run_ok(
+        "tests/programs/imports/shapes/up.br",
+        expected("tests/programs/imports/shapes/up.br"),
+        []
+    )
+    let missing = brine(["check", "tests/programs/imports/shapes/missing.br"])
+    assert "E0701" in missing.err and "import ..util" in missing.err, missing.all()
     run_ok("tests/programs/generics", expected("tests/programs/generics"), [])
+    run_ok("tests/programs/reexport", expected("tests/programs/reexport"), [])
+    assert error_codes("tests/programs/reexport/bad.br") == ["E0201@2"]
 
 test "parallel results don't depend on the thread count":
     var runs: [str] = []
@@ -283,8 +375,13 @@ test "parallel results don't depend on the thread count":
         let o = brine(["run", "tests/programs/parallel_det.br", "-q", "--threads", t])
         assert o.code == 0, o.err
         runs.push(o.out)
-        let r = brine(["run", "tests/programs/reductions.br", "-q", "--threads", t])
-        assert r.out == expected("tests/programs/reductions.br"), r.all()
+        for f in [
+            "tests/programs/reductions.br",
+            "tests/programs/par_small.br",
+            "tests/programs/first.br"
+        ]:
+            let r = brine(["run", f, "-q", "--threads", t])
+            assert r.out == expected(f), r.all()
     assert runs[0] == runs[1] and runs[0] == runs[2]
 
 # GPU offload (brine_rt.c, "GPU"). BRINE_GPU=on runs every construct that can
@@ -316,7 +413,8 @@ test "par constructs give the same results on a GPU":
         var gpu = 0
         let mine = "brine gpu: tests/programs/gpu.br:"
         for l in o.err.lines():
-            # (the compiler's own constructs are logged too)
+            # the compiler's own constructs are not logged
+            assert not l.starts_with("brine gpu: compiler/"), o.err
             if not l.starts_with(mine):
                 continue
             if "not GPU-eligible" in l:
@@ -324,9 +422,28 @@ test "par constructs give the same results on a GPU":
                     cpu.push(l[len(mine):].split(":")[0])
             elif " -> gpu " in l:
                 gpu += 1
-        assert cpu == (["109", "113"] if metal else ["109", "111", "113"]), o.err
+        assert cpu == (["109", "113", "135"] if metal else ["109", "111", "113", "135"]), o.err
+        # and says why
+        for why in ["its results are strings", "it reads `m`, a map", "its results are arrays"]:
+            assert f"(not GPU-eligible: {why})" in o.err, o.err
         if gpu_ready(o.err):
-            assert gpu == (23 if metal else 50), o.err
+            assert gpu == (27 if metal else 59), o.err
+
+test "128-bit integers give the same results on a GPU":
+    let f = "tests/programs/gpu_u128.br"
+    for backend in ["native", "c"]:
+        let o = brine_env(
+            ["run", f, "-q"],
+            {"BRINE_GPU": "on", "BRINE_GPU_LOG": "1", "BRINE_BACKEND": backend}
+        )
+        assert o.code == 0, o.all()
+        assert o.out == expected(f), f"{backend}: unexpected output on the GPU:\n{o.out}"
+        # everything but the reduction can run on a GPU (on Apple's, nothing)
+        let metal = os.name() == "macos"
+        let why = "uses 128-bit integers" if metal else "reduces 128-bit integers"
+        assert f"(not GPU-eligible: {why})" in o.err, o.err
+        if gpu_ready(o.err) and not metal:
+            assert o.err.count(" -> gpu ") == 25, o.err
 
 test "a check that fails on a GPU panics as on the CPU":
     let f = "tests/programs/gpu_panic.br"
@@ -337,7 +454,11 @@ test "a check that fails on a GPU panics as on the CPU":
         ("overflow", "integer overflow in multiplication"),
         ("combine", "integer overflow in addition"),
         ("convert", "float to integer conversion out of range (or NaN) for i32"),
-        ("shift", "shift amount out of range")
+        ("shift", "shift amount out of range"),
+        ("mul128", "integer overflow in multiplication"),
+        ("smul128", "integer overflow in multiplication"),
+        ("div128", "division by zero"),
+        ("convert128", "integer conversion out of range for u64")
     ]:
         let off = brine_env(["run", f, "-q", "--", which], {"BRINE_GPU": "off"})
         let on = brine_env(["run", f, "-q", "--", which], {"BRINE_GPU": "on", "BRINE_GPU_LOG": "1"})
@@ -346,19 +467,39 @@ test "a check that fails on a GPU panics as on the CPU":
         if gpu_ready(on.err):
             assert "a check failed on the GPU, running it on the CPU" in on.err, on.err
 
+test "ranks take one GPU each":
+    # with BRINE_GPU=auto, a second rank on a one-GPU machine stays on the CPU
+    let f = "tests/programs/gpu_ranks.br"
+    let off = brine_env(["run", "--ranks", "2", f, "-q"], {"BRINE_GPU": "off"})
+    let o = brine_env(["run", "--ranks", "2", f, "-q"], {"BRINE_GPU_LOG": "1"})
+    assert off.code == 0 and o.code == 0 and o.out == off.out, o.all()
+    if gpu_ready(o.err):
+        assert "brine gpu: rank 0: " in o.err, o.err
+        let shared = "brine gpu: rank 1: not used: 1 lower rank on this machine uses its 1 GPU"
+        assert shared in o.err or o.err.count(" ready in ") == 2, o.err
+
 test "panics are clear":
     for f, msg in [
         ("tests/programs/panic_assert.br", "x was 5"),
         ("tests/programs/panic_index.br", "index 7 is out of bounds"),
+        ("tests/programs/panic_assert_check.br", "index 7 is out of bounds"),
         ("tests/programs/panic_overflow.br", "overflow"),
         ("tests/programs/panic_overflow128.br", "overflow in addition"),
         ("tests/programs/panic_slice.br", "slice [1:8] is out of bounds"),
-        ("tests/programs/panic_str_byte.br", "index 3 is out of bounds")
+        (
+            "tests/programs/panic_str_split.br",
+            "slice [0:2] splits the character \"é\" (bytes 1..3)"
+        ),
+        ("tests/programs/panic_str_byte.br", "index 3 is out of bounds"),
+        ("tests/programs/panic_par.br", "out of bounds for an array of length 3"),
+        ("tests/programs/panic_unwrap.br", "unwrap() called on Err: not a number: x")
     ]:
         let o = brine(["run", f, "-q"])
         assert o.code == 101, f"{f}: exit {o.code}\n{o.err}"
         assert msg in o.err, f"{f}: expected `{msg}` in:\n{o.err}"
         assert f"--> {f}:" in o.err, f"{f}: no location in:\n{o.err}"
+        # one report, even when many threads fail at once
+        assert o.err.count("panic:") == 1, f"{f}: more than one panic in:\n{o.err}"
     # `s += t[i]` appends the byte without making a string of it (here through
     # the loop's appender), but panics where `t[i]` would, in every kind of build
     for extra in [["-q"], ["-q", "--release"], ["-q", "--debug"]]:
@@ -367,6 +508,54 @@ test "panics are clear":
         let o = brine(args)
         assert o.code == 101, f"{extra}: exit {o.code}\n{o.err}"
         assert "--> tests/programs/panic_str_byte.br:5:14" in o.err, f"{extra}: wrong location in:\n{o.err}"
+
+test "a stack overflow is a panic":
+    let f = "tests/programs/panic_stack.br"
+    # deeper than an OS's first thread allows (1 MB on Windows): `main` has
+    # the stack of a `par` thread
+    let modes: [[str]] = [[], ["par"]]
+    for extra in modes:
+        var args = ["run", f, "-q", "--", "100000"]
+        args.extend(extra)
+        let o = brine(args)
+        assert o.code == 0 and o.out == "before\n100000\n", f"{extra}: {o.all()}"
+        var deep = ["run", f, "-q", "--", "100000000"]
+        deep.extend(extra)
+        let p = brine(deep)
+        assert (
+            p.code == 101 and "panic: stack overflow (recursion too deep)" in p.err
+        ), f"{extra}: {p.all()}"
+        # what was printed before is still there
+        assert p.out == "before\n", f"{extra}: {p.all()}"
+
+test "a program knows how many threads par uses":
+    let f = "tests/programs/thread_count.br"
+    let e = brine_env(["run", f, "-q"], {"BRINE_THREADS": "3"})
+    assert e.code == 0 and e.out == "3 3 true\n", e.all()
+    let o = brine(["run", f, "-q", "--threads", "2"])
+    assert o.code == 0 and o.out == "2 2 true\n", o.all()
+
+test "stdout to a pipe is written line by line, and flush() writes the rest":
+    let d = scratch("flush")
+    let x = exe(d + "/flush")
+    let b = brine(["build", "tests/programs/flush.br", "-q", "-o", x])
+    assert b.code == 0, b.all()
+    let marker = d + "/printed"
+    var h = 0
+    match os.spawn([x, marker], {}, true, false):
+        case Ok(p):
+            h = p
+        case Err(e):
+            panic(e)
+    var waited = 0
+    while not file_exists(marker) and waited < 1200:
+        os.sleep(0.05)
+        waited += 1
+    # killed: nothing at exit writes out a buffer
+    os.kill(h)
+    os.wait(h)
+    let (o, _) = os.output(h)
+    assert o == "ready\npartial", f"got {o}"
 
 # ------------------------------------------------------------ WebAssembly
 
@@ -412,8 +601,20 @@ test "WebAssembly programs give the same results":
         "Point(x=3.0, y=4.0) 5.0\n[6.0, 2.25] 8.25\nbig circle 3.14159\nShape.Square(side=2.0) 4.0\ndot\n",
         wasm
     )
+    # deep recursion: Node's main thread would trap after ~10k frames
+    let d = scratch("wasm-deep")
+    write(
+        d + "/deep.br",
+        "fn depth(n: int) -> int:\n    if n == 0:\n        return 0\n    return 1 + depth(n - 1)\n\nfn main():\n    print(depth(200_000))\n"
+    )
+    run_ok(d + "/deep.br", "200000\n", wasm)
     let p = brine(["run", "--target", "wasm", "tests/programs/panic_index.br", "-q"])
     assert p.code == 101 and "index 7 is out of bounds" in p.err, p.all()
+    # the engine's stack runs out: a panic, and the output before it is kept
+    let s = brine(
+        ["run", "--target", "wasm", "tests/programs/panic_stack.br", "-q", "--", "10000000"]
+    )
+    assert s.code == 101 and s.out == "before\n" and "panic: stack overflow" in s.err, s.all()
     let t = brine(["test", "--target", "wasm", "examples/contracts.br"])
     assert t.code == 0 and "2 passed; 0 failed" in t.all(), t.all()
     # a runner that fails is an error, not zero tests
@@ -437,11 +638,65 @@ test "web builds run through their loader":
     assert len(os.list_dir(d + "/site").unwrap_or([])) == 3, "extra files in the web folder"
     write(
         d + "/load.mjs",
-        "import { readFileSync } from 'node:fs';\n" + "import { pathToFileURL } from 'node:url';\n" + "const dir = process.argv[2];\n" + "const { run } = await import(pathToFileURL(dir + '/brine.js').href);\n" + "let out = '';\n" + "const code = await run(readFileSync(dir + '/program.wasm'), { stdout: (t) => (out += t), stderr: (t) => (out += t) });\n" + "process.stdout.write(out + 'exit ' + code + '\\n');\n" + "const mod = new WebAssembly.Module(readFileSync(dir + '/program.wasm'));\n" + "console.log('debug sections', WebAssembly.Module.customSections(mod, '.debug_info').length);\n"
+        "import { readFileSync } from 'node:fs';\n"
+        + "import { pathToFileURL } from 'node:url';\n"
+        + "const dir = process.argv[2];\n"
+        + "const { run } = await import(pathToFileURL(dir + '/brine.js').href);\n"
+        + "let out = '';\n"
+        + "const code = await run(readFileSync(dir + '/program.wasm'), { stdout: (t) => (out += t), stderr: (t) => (out += t) });\n"
+        + "process.stdout.write(out + 'exit ' + code + '\\n');\n"
+        + "const mod = new WebAssembly.Module(readFileSync(dir + '/program.wasm'));\n"
+        + "console.log('debug sections', WebAssembly.Module.customSections(mod, '.debug_info').length);\n"
     )
     let o = exec(["node", d + "/load.mjs", d + "/site"], {})
     # the C library's debug info is left out of builds without --debug
     assert o.code == 0 and o.out == "Hello, world!\nexit 0\ndebug sections 0\n", o.all()
+    # `runInWorker` (what the page uses) runs it in a Web Worker: Node.js has
+    # none, so a stand-in made of a worker thread
+    let shim = [
+        "import { parentPort, workerData } from 'node:worker_threads';",
+        "globalThis.WorkerGlobalScope = class {};",
+        "globalThis.postMessage = (m) => parentPort.postMessage(m);",
+        "globalThis.addEventListener = (type, f) => parentPort.once('message', (data) => f({ data }));",
+        "await import(workerData);"
+    ]
+    write(d + "/shim.mjs", "\n".join(shim) + "\n")
+    let main = [
+        "import { Worker } from 'node:worker_threads';",
+        "import { readFileSync } from 'node:fs';",
+        "import { pathToFileURL } from 'node:url';",
+        "const dir = process.argv[2];",
+        "globalThis.Worker = class {",
+        "  constructor(url) {",
+        "    this.w = new Worker(new URL('./shim.mjs', import.meta.url), { workerData: url.href });",
+        "    this.w.on('message', (data) => this.onmessage({ data }));",
+        "  }",
+        "  postMessage(m) { this.w.postMessage(m); }",
+        "  terminate() { this.w.terminate(); }",
+        "};",
+        "const { runInWorker } = await import(pathToFileURL(dir + '/brine.js').href);",
+        "let out = '';",
+        "const mod = new WebAssembly.Module(readFileSync(dir + '/program.wasm'));",
+        "const code = await runInWorker(mod, { stdout: (t) => (out += t), stderr: (t) => (out += t) });",
+        "console.log(out + 'exit ' + code);"
+    ]
+    write(d + "/worker.mjs", "\n".join(main) + "\n")
+    let w = exec(["node", d + "/worker.mjs", d + "/site"], {})
+    assert w.code == 0 and w.out == "Hello, world!\nexit 0\n", w.all()
+
+test "a source file that isn't UTF-8 is reported once":
+    let d = scratch("utf8")
+    let f = d + "/latin1.br"
+    let bytes: [u8] = [112, 114, 105, 110, 116, 40, 34, 233, 34, 41, 10]
+    match os.write_bytes(f, bytes):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+    let o = brine(["check", f])
+    assert o.code != 0, o.all()
+    assert f"cannot read {f}: the file is not valid UTF-8 text" in o.err, o.err
+    assert o.err.count("cannot read") == 1, o.err
 
 test "main can return a Result":
     let d = scratch("main")
@@ -461,13 +716,95 @@ test "main can return a Result":
     write(d + "/sig.br", "fn main(n: int) -> str:\n    return \"x\"\n")
     let o3 = brine(["run", d + "/sig.br", "-q"])
     assert "error[E0706]" in o3.err, o3.err
+    # `Result[int, E]`: `Ok(n)` is the exit code
+    write(
+        d + "/code.br",
+        """
+        fn main() -> Result[int, str]:
+            let n = int("7")
+            if len(args()) > 0:
+                return Err("no args, please")
+            return Ok(n)
+        """
+    )
+    let o4 = brine(["run", d + "/code.br", "-q"])
+    assert o4.code == 7, o4.all()
+    let o5 = brine(["run", d + "/code.br", "-q", "--", "x"])
+    assert o5.code == 1 and "error: no args, please" in o5.err, o5.all()
 
 # ------------------------------------------------------------ errors
 
 test "deadlocks are rejected":
-    assert error_codes(
-        "tests/programs/deadlock_errors.br"
-    ) == ["E0510@17", "E0510@21", "E0511@24", "E0511@26", "E0510@30", "E0510@34", "E0511@35", "E0510@38"]
+    assert (
+        error_codes("tests/programs/deadlock_errors.br")
+        == [
+            "E0510@17",
+            "E0510@21",
+            "E0511@24",
+            "E0511@26",
+            "E0510@30",
+            "E0510@34",
+            "E0511@35",
+            "E0510@38"
+        ]
+    )
+    # every line marked `# E05..` in the file, and nothing else
+    let file = "tests/programs/deadlock_errors2.br"
+    var want: [str] = []
+    for i, l in enumerate(read_file(file).unwrap().lines()):
+        if "# E05" in l:
+            want.push(l[l.find("# E05").unwrap() + 2:].strip() + "@" + str(i + 1))
+    assert error_codes(file) == want
+
+test "par bodies that could race are rejected":
+    # every line marked `# E05..` in the file, and nothing else
+    let file = "tests/programs/par_errors.br"
+    var want: [str] = []
+    for i, l in enumerate(read_file(file).unwrap().lines()):
+        if "# E05" in l:
+            want.push(l[l.find("# E05").unwrap() + 2:].strip() + "@" + str(i + 1))
+    assert error_codes(file) == want
+
+test "par bodies can't reach effects through calls":
+    assert (
+        error_codes("tests/programs/par_effects.br")
+        == ["E0503@16", "E0503@17", "E0503@20", "E0503@21"]
+    )
+
+test "first needs options":
+    assert error_codes("tests/programs/first_errors.br") == ["E0301@2", "E0301@3", "E0302@4"]
+
+test "language errors are reported on the marked lines":
+    # every line marked `# E....` in the file, and nothing else
+    let file = "tests/programs/lang_errors.br"
+    var want: [str] = []
+    for i, l in enumerate(read_file(file).unwrap().lines()):
+        match l.find("  # E"):
+            case Some(k):
+                want.push(l[k + 4:].strip() + "@" + str(i + 1))
+            case None:
+                pass
+    assert error_codes(file) == want, str(error_codes(file))
+
+test "the deadlock checker iterates to a fixpoint":
+    # a rank-dependent value passed along 120 functions...
+    let d = scratch("fixpoint")
+    var fns = "fn main():\n    if f0() == 0:\n        world.barrier()\n"
+    for i in 0..120:
+        fns += f"fn f{i}() -> int:\n    return f{i + 1}()\n"
+    fns += "fn f120() -> int:\n    return world.rank()\n"
+    write(d + "/fns.br", fns)
+    assert error_codes(d + "/fns.br") == ["E0510@3"]
+    # ... or 60 variables, copied in reverse order inside a loop
+    var vars = "fn main():\n"
+    for i in 0..61:
+        vars += f"    var v{i} = 0\n"
+    vars += "    for k in 0..100:\n"
+    for i in 0..60:
+        vars += f"        v{60 - i} = v{59 - i}\n"
+    vars += "        v0 = world.rank()\n    if v60 == 0:\n        world.barrier()\n"
+    write(d + "/vars.br", vars)
+    assert error_codes(d + "/vars.br") == ["E0510@126"]
 
 test "match errors":
     let want = [
@@ -506,14 +843,16 @@ test "generic errors":
         "E0201@32"
     ]
     assert error_codes("tests/programs/generic_errors.br") == want
-    assert error_codes(
-        "tests/programs/generic_method_errors.br"
-    ) == ["E0331@16", "E0334@21", "E0332@22", "E0334@23", "E0206@24", "E0334@26", "E0206@27"]
+    assert (
+        error_codes("tests/programs/generic_method_errors.br")
+        == ["E0331@16", "E0334@21", "E0332@22", "E0334@23", "E0206@24", "E0334@26", "E0206@27"]
+    )
 
 test "typed projects require types":
-    assert error_codes(
-        "tests/programs/typed"
-    ) == ["E0337@6", "E0337@7", "E0337@12", "E0337@14", "E0337@16", "E0337@17", "E0337@23"]
+    assert (
+        error_codes("tests/programs/typed")
+        == ["E0337@6", "E0337@7", "E0337@12", "E0337@14", "E0337@16", "E0337@17", "E0337@23"]
+    )
     # the same file is fine without `typed = true`, and a fully typed file passes `--typed`
     let o = brine(["check", "tests/programs/typed/src/main.br"])
     assert o.code == 0, o.err
@@ -536,36 +875,259 @@ test "map, string, try and alias errors":
         "E0335@16"
     ]
     assert error_codes("tests/programs/map_errors.br") == maps
-    assert error_codes(
-        "tests/programs/string_errors.br"
-    ) == ["E0404@3", "E0304@4", "E0405@6", "E0305@8", "E0206@9", "E0301@10", "E0503@13", "E0301@14", "E0301@15", "E0302@16"]
-    assert error_codes(
-        "tests/programs/try_errors.br"
-    ) == ["E0341@5", "E0341@8", "E0340@12", "E0341@13", "E0342@13"]
-    assert error_codes(
-        "tests/programs/alias_errors.br"
-    ) == ["E0405@9", "E0405@10", "E0405@11", "E0405@12"]
+    assert (
+        error_codes("tests/programs/string_errors.br")
+        == [
+            "E0404@3",
+            "E0304@4",
+            "E0405@6",
+            "E0305@8",
+            "E0206@9",
+            "E0301@10",
+            "E0503@13",
+            "E0301@14",
+            "E0301@15",
+            "E0302@16"
+        ]
+    )
+    assert (
+        error_codes("tests/programs/try_errors.br")
+        == ["E0341@5", "E0341@8", "E0340@12", "E0341@13", "E0342@13"]
+    )
+    assert (
+        error_codes("tests/programs/alias_errors.br")
+        == ["E0405@9", "E0405@10", "E0405@11", "E0405@12"]
+    )
 
 test "os and embed errors":
-    assert error_codes(
-        "tests/programs/os_errors.br"
-    ) == ["E0503@4", "E0503@5", "E0206@7", "E0310@8", "E0302@9", "E0301@9"]
+    assert (
+        error_codes("tests/programs/os_errors.br")
+        == ["E0503@4", "E0503@5", "E0206@7", "E0310@8", "E0302@9", "E0301@9"]
+    )
     # `os` results (except `os.name()`/`os.arch()`) differ between ranks
-    assert error_codes("tests/programs/os_deadlock_errors.br") == ["E0510@5", "E0510@6"]
-    assert error_codes(
-        "tests/programs/embed_errors.br"
-    ) == ["E0707@3", "E0707@4", "E0707@5", "E0707@6", "E0302@7"]
+    assert (
+        error_codes("tests/programs/os_deadlock_errors.br")
+        == ["E0510@5", "E0510@6", "E0510@13", "E0510@14"]
+    )
+    assert (
+        error_codes("tests/programs/world_type_errors.br")
+        == [
+            "E0319@5",
+            "E0319@6",
+            "E0319@7",
+            "E0301@8",
+            "E0319@9",
+            "E0319@10",
+            "E0302@11",
+            "E0319@12"
+        ]
+    )
+    assert (
+        error_codes("tests/programs/embed_errors.br")
+        == ["E0707@3", "E0707@4", "E0707@5", "E0707@6", "E0302@7"]
+    )
+
+test "standard library errors":
+    assert (
+        error_codes("tests/programs/stdlib_errors.br")
+        == [
+            "E0305@5",
+            "E0301@5",
+            "E0302@5",
+            "E0206@5",
+            "E0206@5",
+            "E0206@6",
+            "E0301@6",
+            "E0206@6",
+            "E0334@7",
+            "E0334@7",
+            "E0318@8",
+            "E0318@8",
+            "E0318@8",
+            "E0318@8",
+            "E0305@9",
+            "E0305@9",
+            "E0305@9",
+            "E0311@11",
+            "E0311@13",
+            "E0301@17",
+            "E0301@17",
+            "E0302@17",
+            "E0302@17",
+            "E0503@19",
+            "E0503@20",
+            "E0503@21",
+            "E0503@22"
+        ]
+    )
+
+# A shell command that runs `prog args` with stdin from `input` (a file, or
+# `cat`/`type` piped into it).
+fn stdin_cmd(prog: str, args: str, input: str, pipe: bool) -> [str]:
+    if os.name() == "windows":
+        let p = prog.replace("/", "\\")
+        let i = input.replace("/", "\\")
+        if pipe:
+            return ["cmd", "/c", f"type {i} | {p} {args}"]
+        return ["cmd", "/c", f"{p} {args} < {i}"]
+    if pipe:
+        return ["sh", "-c", f"cat '{input}' | '{prog}' {args}"]
+    return ["sh", "-c", f"'{prog}' {args} < '{input}'"]
+
+# `input()` and `read_stdin()` with stdin a file, a pipe and the null device
+test "programs read their standard input":
+    let d = scratch("stdin")
+    let prog = exe(d + "/stdin")
+    let b = brine(["build", "-q", "tests/programs/stdin.br", "-o", prog])
+    assert b.code == 0, b.all()
+    # CR LF, an empty line, a byte that is not UTF-8, no newline at the end
+    var bytes = "first\r\nsecond\n\nhé".bytes()
+    bytes.push(u8(255))
+    bytes.extend("x\nlast".bytes())
+    match os.write_bytes(d + "/in.txt", bytes):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+    write(d + "/ok.txt", "a\r\nb\n")
+    let lines = "0> [first]\n1> [second]\n2> []\n3> [hé\u{fffd}x]\n4> [last]\n5> end after 5\n"
+    let all_ok = "5 bytes: a<CR><LF>b<LF>\n"
+    let cases = [
+        (stdin_cmd(prog, "", d + "/in.txt", false), lines),
+        (stdin_cmd(prog, "", d + "/in.txt", true), lines),
+        (stdin_cmd(prog, "all", d + "/ok.txt", false), all_ok),
+        (stdin_cmd(prog, "all", d + "/ok.txt", true), all_ok),
+        (
+            stdin_cmd(prog, "all", d + "/in.txt", false),
+            "error: cannot read stdin: the input is not valid UTF-8 text\n"
+        ),
+        ([prog], "0> end after 0\n"),
+        ([prog, "all"], "0 bytes: \n")
+    ]
+    for cmd, want in cases:
+        let o = exec(cmd, {})
+        assert o.code == 0 and o.out == want, f"{cmd}: {o.all()}"
 
 test "proof errors":
-    assert error_codes(
-        "tests/programs/proof_errors.br"
-    ) == ["E0602@6", "E0603@15", "E0604@15", "E0601@20", "E0601@22", "E0605@24"]
+    assert (
+        error_codes("tests/programs/proof_errors.br")
+        == ["E0602@6", "E0603@15", "E0604@15", "E0601@20", "E0601@22", "E0605@24"]
+    )
+
+test "the notes of failed proofs":
+    let f = "tests/programs/proof_notes.br"
+    assert error_codes(f) == ["E0605@16", "E0605@24", "E0605@29", "E0604@37", "E0604@47"]
+    let e = brine(["check", f]).err
+    # a `let` names its value, also when unpacking a tuple
+    assert "to prove: len(t.xs) > i" in e, e
+    assert "mk(n)" not in e, e
+    assert "to prove: end >= 0" in e, e
+    # only the part that isn't proven; a remainder's quotient in parentheses
+    assert "to prove: i <= 4 and m > 0 (the rest of it is proven)" in e, e
+    assert "m == 4*(m / 4)" in e, e
+    # an inner loop forgot `bi`: no facts about its old value, and a hint
+    assert "known facts here: n == len(xs)\n" in e, e
+    assert "`bi` is changed by a loop before this point" in e, e
+    assert "where `p` is p + 1" in e, e
+
+test "the prover says when it gave up":
+    let f = "tests/programs/proof_gave_up.br"
+    assert error_codes(f) == ["E0605@25", "E0605@30"]
+    let o = brine(["check", f])
+    # only the true claim that needs too many cases, not the false one
+    assert o.err.count("the prover gave up") == 1, o.all()
+    assert o.err.find("gave up").unwrap() < o.err.find("30 |").unwrap(), o.all()
+
+# false claims the prover once accepted
+test "proofs stay sound":
+    assert (
+        error_codes("tests/programs/proof_soundness.br")
+        == [
+            "E0601@15",
+            "E0601@33",
+            "E0601@48",
+            "E0601@50",
+            "E0605@53",
+            "E0605@60",
+            "E0605@65",
+            "E0605@70",
+            "E0605@75",
+            "E0605@80",
+            "E0605@85",
+            "E0605@90",
+            "E0605@96",
+            "E0605@102",
+            "E0605@108",
+            "E0605@113",
+            "E0605@118",
+            "E0605@126",
+            "E0604@132",
+            "E0605@140",
+            "E0605@145",
+            "E0605@150",
+            "E0605@154",
+            "E0605@157",
+            "E0605@160",
+            "E0605@164",
+            "E0605@168",
+            "E0605@171",
+            "E0605@174",
+            "E0605@178",
+            "E0605@182",
+            "E0605@189",
+            "E0605@200",
+            "E0605@212",
+            "E0605@222",
+            "E0605@232",
+            "E0605@239",
+            "E0605@245",
+            "E0605@307",
+            "E0605@313",
+            "E0605@319",
+            "E0605@325",
+            "E0605@331",
+            "E0605@337",
+            "E0605@344",
+            "E0605@350",
+            "E0605@357",
+            "E0605@365",
+            "E0605@374",
+            "E0605@381",
+            "E0605@389",
+            "E0601@454"
+        ]
+    )
 
 test "proofs remove runtime checks":
     for f in ["examples/contracts.br", "examples/find_signal.br"]:
         let o = brine(["check", f, "--report"])
         assert o.code == 0, o.all()
         assert "0 remain" in o.all(), o.all()
+
+test "the report lists every remaining check":
+    let o = brine(["check", "tests/programs/report_checks.br", "--report"])
+    assert o.code == 0, o.all()
+    var lines: [str] = []
+    for l in o.out.lines():
+        if l.starts_with("tests/programs/report_checks.br:"):
+            lines.push(l.split(": ")[1].split(" `")[0])
+    assert lines == [
+        "overflow check",
+        "overflow check",
+        "overflow check",
+        "conversion check",
+        "conversion check",
+        "array length check",
+        "empty array check",
+        "shift check",
+        "map key check",
+        "map key check",
+        "overflow check",
+        "index bounds check",
+        "insert index check",
+        "character check",
+        "repeat count check"
+    ], o.all()
 
 test "proofs remove compound assignment checks":
     let d = scratch("compound")
@@ -630,9 +1192,9 @@ test "release builds build strings and count them in place":
     let o = brine(["emit-c", "--release", "tests/programs/string_building.br", "-o", c])
     assert o.code == 0, o.all()
     let t = text(c)
-    # `w += t[i]` appends the byte without a one-byte string
-    # (the one left is `text[i] == " "` in `appenders`, a one-byte string)
-    assert t.count("brine_str_at(") == 1, t
+    # `w += t[i]` appends the byte without a one-byte string, and the index in
+    # `text[i] == " "` is proven (`i` only grows from 0), so no read is checked
+    assert t.count("brine_str_at(") == 0, t
     # the `var w = ""` in each loop keeps its block from one iteration to the next
     assert t.count("brine_str_reset(") == 4, t
     # `if w in m: m[w] += 1` looks the key up once
@@ -680,7 +1242,10 @@ test "release builds run loop idioms as one operation":
     # out of bounds: the loop as written panics where it would have
     for p in [
         ("tests/programs/panic_reverse.br", "11:20", "index 13"),
-        ("tests/programs/panic_rotate.br", "7:20", "index 12")
+        ("tests/programs/panic_rotate.br", "7:20", "index 12"),
+        ("tests/programs/panic_bounds.br", "7:15", "index 6"),
+        ("tests/programs/panic_inlined.br", "2:12", "index 3"),
+        ("tests/programs/panic_stack_array.br", "3:5", "index 6")
     ]:
         let (f, at, what) = p
         for extra in [["-q"], ["-q", "--release"]]:
@@ -689,6 +1254,27 @@ test "release builds run loop idioms as one operation":
             let r = brine(args)
             assert r.code == 101, f"{extra}: exit {r.code}\n{r.err}"
             assert f"{what} is out of bounds" in r.err and f"--> {f}:{at}" in r.err, r.err
+
+# Data is C string literals; a big `embed` is compiled once, not per CPU level.
+test "embedded files survive every backend":
+    let d = scratch("embed")
+    let tail = "q?\"\\??=x\n\t\u{e9}\u{20ac}\u{1}7"
+    write(d + "/blob.txt", "abcdefghij".repeat(30000) + tail)
+    write(
+        d + "/main.br",
+        "const BLOB = embed(\"blob.txt\")\n\nfn main():\n    print(len(BLOB), BLOB.count(\"a\"), BLOB[len(BLOB) - 17:] == \""
+        + tail.replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+        .replace("\u{1}", "\\u{1}")
+        + "\")\n"
+    )
+    let want = "300017 30000 true\n"
+    run_ok(d + "/main.br", want, ["--release"])
+    run_with(d + "/main.br", want, [], {"BRINE_BACKEND": "c"})
+    if wasm_ready():
+        run_ok(d + "/main.br", want, ["--target", "wasm"])
 
 test "release builds run small fixed-size loops as vector kernels":
     let d = scratch("kernels")
@@ -757,6 +1343,73 @@ test "the test command":
     let s = brine(["test", "examples/find_signal.br"])
     assert s.code == 0, s.all()
     assert "1 passed; 0 failed" in s.all(), s.all()
+    # a test that dies without a word, or never finishes, still says what happened
+    let d = scratch("test-cmd")
+    let down = "fn down(n: int) -> int:\n    if n == 0:\n        return 0\n    return 1 + down(n - 1)\n\n"
+    write(
+        d + "/t.br",
+        down
+        + "test \"silent\":\n    exit(3)\n\ntest \"forever\":\n    var i = 0\n    while i >= 0:\n        i = (i + 1) % 7\n\ntest \"deep\":\n    assert down(100_000_000) == 100_000_000\n"
+    )
+    let t = brine(["test", d + "/t.br", "--timeout", "1"])
+    assert t.code == 1 and "0 passed; 3 failed" in t.out, t.all()
+    assert "the test exited with code 3 and printed nothing" in t.out, t.out
+    assert "timed out after 1s" in t.out, t.out
+    if os.name() == "windows":
+        # (the runtime may also say so itself)
+        assert "stack overflow" in t.out, t.out
+        # and `brine run` doesn't call a crash a success
+        write(d + "/crash.br", down + "fn main():\n    print(down(100_000_000))\n")
+        let r = brine(["run", d + "/crash.br", "-q"])
+        assert r.code == 101 and "stack overflow" in r.err, r.all()
+
+# Windows can't replace a running executable: that's not a compiler bug.
+test "a locked executable is not called a compiler bug":
+    if os.name() != "windows":
+        return
+    let d = scratch("locked")
+    let f = d + "/slow.br"
+    let out = exe(d + "/slow")
+    write(f, "fn main():\n    os.sleep(20.0)\n")
+    assert brine(["build", f, "-q", "-o", out]).code == 0
+    var h = 0
+    match os.spawn([out], {}, true, false):
+        case Ok(p):
+            h = p
+        case Err(e):
+            panic(e)
+    write(f, "fn main():\n    os.sleep(20.0)\n    print(1)\n")
+    let o = brine(["build", f, "-q", "-o", out])
+    os.kill(h)
+    os.wait(h)
+    assert o.code == 1 and "E0704" in o.err and "still running" in o.err, o.all()
+    assert "bug" not in o.err, o.err
+
+test "every command describes itself":
+    let h = brine(["help"])
+    assert h.code == 0 and "Usage: brine <command>" in h.out, h.all()
+    for c in [
+        "new",
+        "init",
+        "run",
+        "build",
+        "check",
+        "test",
+        "debug",
+        "fmt",
+        "explain",
+        "guide",
+        "doctor",
+        "version",
+        "help"
+    ]:
+        for flag in ["--help", "-h"]:
+            let o = brine([c, flag])
+            assert o.code == 0 and o.out.starts_with(f"Usage: brine {c}"), f"{c} {flag}: {o.all()}"
+        let o2 = brine(["help", c])
+        assert o2.code == 0 and o2.out.starts_with(f"Usage: brine {c}"), f"help {c}: {o2.all()}"
+    let bad = brine(["help", "nope"])
+    assert bad.code == 2 and "unknown command `nope`" in bad.err, bad.all()
 
 test "the formatter is stable":
     var files: [str] = []
@@ -768,6 +1421,7 @@ test "the formatter is stable":
         "tests/programs/generics",
         "tests/programs/imports",
         "tests/programs/imports/shapes",
+        "tests/programs/reexport",
         "tests/programs/typed/src",
         "runtime",
         "compiler"
@@ -783,6 +1437,100 @@ test "the formatter is stable":
     args.extend(files)
     let o = brine(args)
     assert o.code == 0, o.all()
+
+# the repros of #70 and #109: break at operators and in nested brackets,
+# never in the pattern of a `let`; keep tables and `# fmt: off` regions
+test "the formatter breaks long lines where they read best":
+    let path = scratch("fmt") + "/long.br"
+    let before = "\n".join(
+        [
+            "fn divide(a: int, b: int) -> (int, int):",
+            "    return (a / b, a % b)",
+            "",
+            "fn f(t: [int], w: int, i: int) -> int:",
+            "    let c = t[1792 + (w & 0xff)] ^ t[1536 + ((w >> 8) & 0xff)] ^ t[1280 + ((w >> 16) & 0xff)] ^ t[1024 + (w >> 24)]",
+            "    if 0 <= i < len(t) and 0 <= w < len(t) and (i + w + c) % 2 == 0 and t[i] >= w and t[w] + w < 1000000:",
+            "        return c",
+            "    let (q, r) = divide(c + 1000000 * w + 1000 * i, w + i + 1) if c > 10 else divide(i * 1000000 + c, w + 1)",
+            "    return q * (1 + r * (2 + q * (3 + r * (4 + q * (5 + r * (6 + q * (7 + r * (8 + q * (9 + r * (10 + q))))))))))",
+            "",
+            "fn table() -> [int]:",
+            "    return [",
+            "        -50, -40, -30, -30, -30, -30, -40, -50,",
+            "        -40, -20, 0, 0, 0, 0, -20, -40,",
+            "        -30, 0, 10, 15, 15, 10, 0, -30,",
+            "        -30, 5, 15, 20, 20, 15, 5, -30",
+            "    ]",
+            "",
+            "fn main():",
+            "    # fmt: off",
+            "    let m = [1,0,",
+            "             0,1]",
+            "    # fmt: on",
+            "    let primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97]",
+            "    print(f([3] * 4096, 7, 9), len(table()), m[1], len(primes))"
+        ]
+    ) + "\n"
+    let want = "\n".join(
+        [
+            "fn divide(a: int, b: int) -> (int, int):",
+            "    return (a / b, a % b)",
+            "",
+            "fn f(t: [int], w: int, i: int) -> int:",
+            "    let c = (",
+            "        t[1792 + (w & 0xff)]",
+            "        ^ t[1536 + ((w >> 8) & 0xff)]",
+            "        ^ t[1280 + ((w >> 16) & 0xff)]",
+            "        ^ t[1024 + (w >> 24)]",
+            "    )",
+            "    if (",
+            "        0 <= i < len(t)",
+            "        and 0 <= w < len(t)",
+            "        and (i + w + c) % 2 == 0",
+            "        and t[i] >= w",
+            "        and t[w] + w < 1000000",
+            "    ):",
+            "        return c",
+            "    let (q, r) = (",
+            "        divide(c + 1000000 * w + 1000 * i, w + i + 1) if c > 10 else divide(i * 1000000 + c, w + 1)",
+            "    )",
+            "    return q * (",
+            "        1 + r * (",
+            "            2 + q * (3 + r * (4 + q * (5 + r * (6 + q * (7 + r * (8 + q * (9 + r * (10 + q))))))))",
+            "        )",
+            "    )",
+            "",
+            "fn table() -> [int]:",
+            "    return [",
+            "        -50, -40, -30, -30, -30, -30, -40, -50,",
+            "        -40, -20, 0, 0, 0, 0, -20, -40,",
+            "        -30, 0, 10, 15, 15, 10, 0, -30,",
+            "        -30, 5, 15, 20, 20, 15, 5, -30",
+            "    ]",
+            "",
+            "fn main():",
+            "    # fmt: off",
+            "    let m = [1,0,",
+            "             0,1]",
+            "    # fmt: on",
+            "    let primes = [",
+            "        2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89,",
+            "        97",
+            "    ]",
+            "    print(f([3] * 4096, 7, 9), len(table()), m[1], len(primes))"
+        ]
+    ) + "\n"
+    write(path, before)
+    let ran = brine(["run", "-q", path])
+    assert ran.code == 0, ran.all()
+    let o = brine(["fmt", path])
+    assert o.code == 0, o.all()
+    assert text(path) == want, text(path)
+    # the same program, and formatting it again changes nothing
+    let again = brine(["run", "-q", path])
+    assert again.out == ran.out, again.all()
+    let check = brine(["fmt", "--check", path])
+    assert check.code == 0, check.all()
 
 test "a new project works out of the box":
     let d = scratch("new")
@@ -853,15 +1601,15 @@ test "the compiler builds itself":
     assert o3.code == 0, o3.all()
     let o4 = exec([s2, "emit-c", "compiler/main.br", "-o", d + "/stage2.c"], {})
     assert o4.code == 0, o4.all()
-    assert text(
-        d + "/stage1.c"
-    ) == text(d + "/stage2.c"), "the self-built compiler generates different C"
+    assert (
+        text(d + "/stage1.c") == text(d + "/stage2.c")
+    ), "the self-built compiler generates different C"
     # a compiler built by the other backend (C, where dev builds are native) agrees
     let s3 = exe(d + "/stage3")
     let o5 = brine_env(["build", "compiler/main.br", "-q", "-o", s3], {"BRINE_BACKEND": "c"})
     assert o5.code == 0, o5.all()
     let o6 = exec([s3, "emit-c", "compiler/main.br", "-o", d + "/stage3.c"], {})
     assert o6.code == 0, o6.all()
-    assert text(
-        d + "/stage1.c"
-    ) == text(d + "/stage3.c"), "the compilers built by the two backends disagree"
+    assert (
+        text(d + "/stage1.c") == text(d + "/stage3.c")
+    ), "the compilers built by the two backends disagree"

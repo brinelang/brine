@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <stddef.h>
+#include <float.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -71,6 +72,7 @@ static void br_ws_start(void) {
 #include <unistd.h>
 #include <time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #else
 #include <pthread.h>
 #include <dlfcn.h>
@@ -78,6 +80,7 @@ static void br_ws_start(void) {
 #include <time.h>
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -86,6 +89,9 @@ static void br_ws_start(void) {
 #include <netdb.h>
 #endif
 
+/* sin, exp, pow, ...: the same bits on every target */
+#include "brine_math.c"
+
 /* generated code hardcodes these (lower.br) */
 _Static_assert(offsetof(brine_arr, data) == 48, "brine_arr layout");
 _Static_assert(offsetof(brine_map, keys) == 48 && sizeof(brine_map) == 88, "brine_map layout");
@@ -93,6 +99,11 @@ _Static_assert(sizeof(brine_map_ty) == 80 && sizeof(brine_sb) == 24, "brine_map_
 
 /* ============================================================ platform layer */
 static void br_heap_exit(void);
+/* Every thread brine code runs on, `main` included, has a stack this big
+ * (reserved, not committed). */
+#define BR_STACK ((size_t)64 << 20)
+static void br_stack_enter(void);
+static void br_stack_leave(void);
 #ifdef _WIN32
 typedef CRITICAL_SECTION br_mutex;
 typedef CONDITION_VARIABLE br_cond;
@@ -108,15 +119,17 @@ typedef struct { void (*fn)(void *); void *arg; } br_tramp;
 static DWORD WINAPI br_thread_main(LPVOID p) {
     br_tramp t = *(br_tramp *)p;
     free(p);
+    br_stack_enter();
     t.fn(t.arg);
     br_heap_exit();
+    br_stack_leave();
     return 0;
 }
 static int br_thread_start(br_thread *th, void (*fn)(void *), void *arg) {
     br_tramp *t = (br_tramp *)malloc(sizeof(br_tramp));
     t->fn = fn;
     t->arg = arg;
-    *th = CreateThread(NULL, 64u << 20, br_thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    *th = CreateThread(NULL, BR_STACK, br_thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     return *th != NULL;
 }
 static void br_thread_join(br_thread th) {
@@ -173,8 +186,10 @@ typedef struct { void (*fn)(void *); void *arg; } br_tramp;
 static void *br_thread_main(void *p) {
     br_tramp t = *(br_tramp *)p;
     free(p);
+    br_stack_enter();
     t.fn(t.arg);
     br_heap_exit();
+    br_stack_leave();
     return NULL;
 }
 static int br_thread_start(br_thread *th, void (*fn)(void *), void *arg) {
@@ -183,7 +198,7 @@ static int br_thread_start(br_thread *th, void (*fn)(void *), void *arg) {
     t->arg = arg;
     pthread_attr_t at;
     pthread_attr_init(&at);
-    pthread_attr_setstacksize(&at, (size_t)64 << 20);
+    pthread_attr_setstacksize(&at, BR_STACK);
     int ok = pthread_create(th, &at, br_thread_main, t) == 0;
     pthread_attr_destroy(&at);
     return ok;
@@ -207,12 +222,26 @@ static br_mutex br_io_mu;
 static int br_argc;
 static char **br_argv;
 static int64_t br_rank = 0, br_size = 1;
+/* how many lower ranks run on this rank's machine (GPUs go one per rank) */
+static int64_t br_local_rank = 0;
 
 /* ============================================================ panics */
 static void br_flush(void) { fflush(stdout); }
 static void br_gpu_settle(void);
 
+/* Set by the first panic. Only that one is reported: a thread that fails
+ * (or prints) after it waits for the exit, so a `par` region failing on many
+ * threads prints one clean message. */
+static int br_panicking;
+static BR_NORETURN void br_park(void) {
+    for (;;) br_sleep_ms(1000);
+}
+static void br_panic_claim(void) {
+    if (__atomic_exchange_n(&br_panicking, 1, __ATOMIC_SEQ_CST)) br_park();
+}
+
 void brine_panic_at(const char *loc, const char *msg) {
+    br_panic_claim();
     /* under the output lock, so other threads' output (the GPU log) can't
      * land in the middle */
     br_lock(&br_io_mu);
@@ -246,9 +275,88 @@ void brine_assert_fail(const char *loc, const char *src, brine_str *msg) {
         br_panicf(loc, "assertion failed: %s\n  message: %.*s", src, (int)msg->len, msg->data);
     br_panicf(loc, "assertion failed: %s", src);
 }
+/* ------------------------------------------------------------ stack overflow */
+/* Deep recursion runs into the guard page under the stack. Instead of dying
+ * silently (and losing what is still buffered for stdout), report it like a
+ * panic. The handler runs on a reserve: on Windows the stack guarantee, on
+ * POSIX an alternate signal stack, both set up for each thread. */
+static BR_NORETURN void br_stack_overflow(void) {
+    br_panic_claim();
+    fflush(stdout);
+    char m[128];
+    if (br_size > 1)
+        snprintf(m, sizeof m, "\npanic (rank %lld): stack overflow (recursion too deep)\n", (long long)br_rank);
+    else
+        snprintf(m, sizeof m, "\npanic: stack overflow (recursion too deep)\n");
+    fputs(m, stderr);
+    fflush(stderr);
+    _exit(101);
+}
+#ifdef _WIN32
+static LONG CALLBACK br_on_exception(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) br_stack_overflow();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static void br_stack_setup(void) { AddVectoredExceptionHandler(1, br_on_exception); }
+static void br_stack_enter(void) {
+    ULONG reserve = 64 << 10;
+    SetThreadStackGuarantee(&reserve);
+}
+static void br_stack_leave(void) {}
+#elif defined(BR_WASM)
+/* The engine traps when its call stack runs out; the runner (brine_wasi.mjs,
+ * brine_web.js) then calls this so the output before it isn't lost. */
+__attribute__((export_name("brine_flush"))) void brine_wasm_flush(void) { fflush(stdout); }
+#else
+#define BR_ALT_STACK ((size_t)64 << 10)
+/* the top of this thread's stack, when it is one of ours */
+static __thread char *br_stack_top;
+static void br_on_segv(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    char *a = (char *)si->si_addr, *top = br_stack_top;
+    /* the stack's own pages are mapped: a fault in its range (or just under
+     * it, from a big frame that skipped the guard page) is an overflow */
+    if (top && a < top && a >= top - BR_STACK - ((size_t)1 << 20)) br_stack_overflow();
+    /* anything else crashes as it would without the handler */
+    signal(sig, SIG_DFL);
+}
+static void br_stack_setup(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = br_on_segv;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+static void br_stack_enter(void) {
+    char here;
+    br_stack_top = &here;
+    stack_t ss;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_size = BR_ALT_STACK > (size_t)SIGSTKSZ ? BR_ALT_STACK : (size_t)SIGSTKSZ;
+    ss.ss_sp = malloc(ss.ss_size);
+    if (ss.ss_sp && sigaltstack(&ss, NULL) != 0) {
+        free(ss.ss_sp);
+        br_stack_top = NULL;
+    }
+}
+static void br_stack_leave(void) {
+    stack_t ss, old;
+    memset(&ss, 0, sizeof ss);
+    ss.ss_flags = SS_DISABLE;
+    br_stack_top = NULL;
+    if (sigaltstack(&ss, &old) == 0 && old.ss_sp) free(old.ss_sp);
+}
+#endif
+
+static void br_world_finish(const char *how);
 void brine_exit(int64_t code) {
     br_flush();
     br_gpu_settle();
+    /* like returning from `main`: every rank waits for the others */
+    br_world_finish("it called `exit`");
+    br_flush();
     exit((int)code);
 }
 void brine_unreachable(void) {
@@ -289,6 +397,11 @@ typedef struct {
     int64_t count[BR_NCLASS];
     char *bump[BR_NCLASS], *end[BR_NCLASS];
     int in_par; /* running a parallel region (br_in_par_get) */
+    /* brine_drop: how deep the frees nest, and the dead objects left for the
+       outermost one (pairs: object, function) */
+    int drop_depth;
+    void **drops;
+    int64_t ndrops, capdrops;
 } br_heap_th;
 #if defined(_WIN32) && !defined(__clang__)
 /* MinGW gcc emulates thread-locals with a library call per access, which
@@ -523,11 +636,56 @@ void brine_str_free(brine_str *s) {
     BR_LIVE(-1);
     free(s);
 }
+/* Freeing an object frees what it holds first, so a deep structure (a long
+   enum list, a tree 100k levels deep) would recurse once per level and
+   overflow the stack. `fn(p)` finishes freeing a dead object; past
+   BR_DROP_DEPTH nested calls the object waits on a list instead, which the
+   outermost call works through. */
+#define BR_DROP_DEPTH 200
+void brine_drop(void *p, void (*fn)(void *)) {
+    br_heap_th *h = br_th_get();
+    if (h->drop_depth >= BR_DROP_DEPTH) {
+        if (h->ndrops + 2 > h->capdrops) {
+            int64_t nc = h->capdrops ? h->capdrops * 2 : 256;
+            void **d = (void **)realloc(h->drops, (size_t)nc * sizeof(void *));
+            if (!d) {
+                fprintf(stderr, "out of memory\n");
+                abort();
+            }
+            h->drops = d;
+            h->capdrops = nc;
+        }
+        h->drops[h->ndrops++] = p;
+        h->drops[h->ndrops++] = (void *)fn;
+        return;
+    }
+    h->drop_depth++;
+    fn(p);
+    if (h->drop_depth == 1 && h->drops) {
+        while (h->ndrops > 0) {
+            h->ndrops -= 2;
+            void (*f)(void *) = (void (*)(void *))h->drops[h->ndrops + 1];
+            f(h->drops[h->ndrops]);
+        }
+        free(h->drops);
+        h->drops = NULL;
+        h->capdrops = 0;
+    }
+    h->drop_depth--;
+}
+static void br_arr_drop(void *p) {
+    brine_arr *a = (brine_arr *)p;
+    for (int64_t i = 0; i < a->len; i++) a->release(a->data + i * a->esz);
+    if (a->data) free(a->data);
+    free(a);
+}
 void brine_arr_free(brine_arr *a) {
     BR_LIVE(-1);
-    if (a->release)
-        for (int64_t i = 0; i < a->len; i++) a->release(a->data + i * a->esz);
-    free(a->data);
+    if (a->release) {
+        brine_drop(a, br_arr_drop);
+        return;
+    }
+    if (a->data) free(a->data);
     free(a);
 }
 void *brine_box_new(int64_t size, int64_t tag) {
@@ -661,11 +819,6 @@ static brine_str *br_sub(brine_str *s, int64_t lo, int64_t hi) {
     if (hi - lo == 1) return (brine_str *)&brine_bytes[(unsigned char)s->data[lo]];
     return brine_str_new(s->data + lo, hi - lo);
 }
-brine_str *brine_str_slice(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
-    if (BR_UNLIKELY(lo < 0 || lo > hi || hi > s->len))
-        br_panicf(loc, "slice [%lld:%lld] is out of bounds for a string of length %lld", (long long)lo, (long long)hi, (long long)s->len);
-    return br_sub(s, lo, hi);
-}
 /* length of the UTF-8 character starting at p (1 for invalid bytes) */
 static int64_t br_utf8_len(const unsigned char *p, int64_t avail) {
     int64_t n = p[0] < 0x80 ? 1 : (p[0] >> 5) == 6 ? 2 : (p[0] >> 4) == 14 ? 3 : (p[0] >> 3) == 30 ? 4 : 1;
@@ -673,6 +826,26 @@ static int64_t br_utf8_len(const unsigned char *p, int64_t avail) {
     for (int64_t i = 1; i < n; i++)
         if ((p[i] & 0xc0) != 0x80) return 1;
     return n;
+}
+/* whether byte i of s is inside a character, not at its start */
+static inline bool br_mid_char(const brine_str *s, int64_t i) {
+    return i > 0 && i < s->len && ((unsigned char)s->data[i] & 0xc0) == 0x80;
+}
+static BR_NORETURN BR_COLD void br_slice_splits(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
+    int64_t b = br_mid_char(s, lo) ? lo : hi, a = b;
+    while (a > 0 && b - a < 3 && br_mid_char(s, a)) a--;
+    int64_t n = br_utf8_len((const unsigned char *)s->data + a, s->len - a);
+    if (a + n <= b)
+        br_panicf(loc, "slice [%lld:%lld] starts or ends inside a character (byte %lld)", (long long)lo, (long long)hi, (long long)b);
+    br_panicf(loc, "slice [%lld:%lld] splits the character \"%.*s\" (bytes %lld..%lld)", (long long)lo, (long long)hi, (int)n,
+              s->data + a, (long long)a, (long long)(a + n));
+}
+/* Strings are UTF-8, so a slice must not cut a character in two. */
+brine_str *brine_str_slice(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
+    if (BR_UNLIKELY(lo < 0 || lo > hi || hi > s->len))
+        br_panicf(loc, "slice [%lld:%lld] is out of bounds for a string of length %lld", (long long)lo, (long long)hi, (long long)s->len);
+    if (BR_UNLIKELY(br_mid_char(s, lo) || br_mid_char(s, hi))) br_slice_splits(s, lo, hi, loc);
+    return br_sub(s, lo, hi);
 }
 int64_t brine_ord(brine_str *s, const char *loc) {
     const unsigned char *p = (const unsigned char *)s->data;
@@ -714,6 +887,16 @@ static int64_t br_find(brine_str *s, brine_str *sub, int64_t from) {
 int64_t brine_s_find(brine_str *s, brine_str *sub, const char *loc) {
     (void)loc;
     return br_find(s, sub, 0);
+}
+int64_t brine_s_find_from(brine_str *s, brine_str *sub, int64_t start, const char *loc) {
+    if (start < 0 || start > s->len)
+        br_panicf(loc, "find() start %lld is out of range for a string of %lld bytes", (long long)start, (long long)s->len);
+    return br_find(s, sub, start);
+}
+int64_t brine_start_chk(int64_t start, int64_t len, const char *loc) {
+    if (start < 0 || start > len)
+        br_panicf(loc, "index() start %lld is out of range for an array of length %lld", (long long)start, (long long)len);
+    return start;
 }
 /* a `[str]`: its elements are pointer slots (BR_PSLOT, brine_rt.h) */
 static brine_arr *br_strs(void) { return brine_arr_new(0, BR_PSLOT, brine_rt_str, brine_rl_str, ""); }
@@ -1349,16 +1532,10 @@ int brine_str_cmp(brine_str *a, brine_str *b) {
     if (c) return c;
     return a->len < b->len ? -1 : (a->len > b->len ? 1 : 0);
 }
-int64_t brine_parse_i64(brine_str *s, const char *loc) {
-    char *end;
-    errno = 0;
-    long long v = strtoll(s->data, &end, 10);
-    while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
-    if (s->len == 0 || errno || end != s->data + s->len)
-        br_panicf(loc, "invalid integer: \"%.*s\"", (int)s->len, s->data);
-    return (int64_t)v;
-}
-/* 128-bit parsing by hand: the C library stops at 64 bits */
+/* Integer text as `int()` reads it: blanks around it, a sign, decimal digits,
+ * and `_` between two digits, as in literals (`1_000`). By hand: the C
+ * library stops at 64 bits and knows no `_`. False if it isn't one or
+ * doesn't fit in 128 bits. */
 static bool br_parse_128(brine_str *s, bool *neg, brine_u128 *out) {
     const char *p = (const char *)s->data, *e = p + s->len;
     while (p < e && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++;
@@ -1366,14 +1543,51 @@ static bool br_parse_128(brine_str *s, bool *neg, brine_u128 *out) {
     *neg = false;
     if (p < e && (*p == '+' || *p == '-')) *neg = *p++ == '-';
     if (p == e) return false;
-    brine_u128 v = 0;
+    const char *first = p;
+    uint64_t v = 0;
     for (; p < e; p++) {
+        if (*p == '_' && p > first && p + 1 < e && p[1] >= '0' && p[1] <= '9') continue;
+        if (*p < '0' || *p > '9') return false;
+        if (v > (UINT64_MAX - 9) / 10) break;
+        v = v * 10 + (uint64_t)(*p - '0');
+    }
+    brine_u128 w = v;
+    for (; p < e; p++) {
+        if (*p == '_' && p + 1 < e && p[1] >= '0' && p[1] <= '9') continue;
         if (*p < '0' || *p > '9') return false;
         unsigned d = (unsigned)(*p - '0');
-        if (v > (BR_U128_MAX - d) / 10) return false;
-        v = v * 10 + d;
+        if (w > (BR_U128_MAX - d) / 10) return false;
+        w = w * 10 + d;
     }
-    *out = v;
+    *out = w;
+    return true;
+}
+int64_t brine_parse_i64(brine_str *s, const char *loc) {
+    bool neg;
+    brine_u128 u;
+    if (!br_parse_128(s, &neg, &u) || u > (brine_u128)INT64_MAX + (neg ? 1 : 0))
+        br_panicf(loc, "invalid integer: \"%.*s\"", (int)s->len, s->data);
+    return neg ? (int64_t)(0 - (uint64_t)u) : (int64_t)u;
+}
+bool brine_try_parse_int(brine_str *s, int64_t bits, bool sgn, void *out) {
+    bool neg;
+    brine_u128 u;
+    if (!br_parse_128(s, &neg, &u)) return false;
+    brine_u128 max = bits >= 128 ? BR_U128_MAX : ((brine_u128)1 << bits) - 1;
+    if (sgn) max >>= 1;
+    if (neg ? (sgn ? u > max + 1 : u != 0) : u > max) return false;
+    brine_u128 v = neg ? 0 - u : u;
+    uint8_t b8 = (uint8_t)v;
+    uint16_t b16 = (uint16_t)v;
+    uint32_t b32 = (uint32_t)v;
+    uint64_t b64 = (uint64_t)v;
+    switch (bits) {
+    case 8: memcpy(out, &b8, 1); break;
+    case 16: memcpy(out, &b16, 2); break;
+    case 32: memcpy(out, &b32, 4); break;
+    case 64: memcpy(out, &b64, 8); break;
+    default: memcpy(out, &v, 16); break;
+    }
     return true;
 }
 brine_i128 brine_parse_i128(brine_str *s, const char *loc) {
@@ -1389,13 +1603,119 @@ brine_u128 brine_parse_u128(brine_str *s, const char *loc) {
     if (!br_parse_128(s, &neg, &u) || (neg && u != 0)) br_panicf(loc, "invalid integer: \"%.*s\"", (int)s->len, s->data);
     return u;
 }
+/* Exact powers of ten: a double holds 10^k exactly up to 10^22. */
+static const double br_pow10[23] = {1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
+                                    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+/* m * 10^e when both m and 10^e are exact doubles, so one multiply or divide
+ * rounds once and the result is correctly rounded (Clinger's fast path).
+ * False when that doesn't hold. */
+static bool br_dec_fast(uint64_t m, int e, double *out) {
+    if (m > ((uint64_t)1 << 53)) return false;
+    double d = (double)m;
+    if (e > 22 && e <= 22 + 15) {
+        /* 1234e25 is 1234000e22: move zeros into m while it stays exact */
+        for (; e > 22; e--) {
+            if (m > ((uint64_t)1 << 53) / 10) return false;
+            m *= 10;
+        }
+        d = (double)m;
+    }
+    if (e < -22 || e > 22) return false;
+    *out = e < 0 ? d / br_pow10[-e] : d * br_pow10[e];
+    return true;
+}
+/* Plain decimals (`-12.5`, `3e-7`) with at most 19 significant digits that
+ * the fast path takes, else false: strtod handles the rest. */
+static bool br_parse_f64_fast(const char *p, const char *end, double *out) {
+    bool neg = false;
+    if (p < end && (*p == '-' || *p == '+')) neg = *p++ == '-';
+    uint64_t m = 0;
+    int nd = 0, e = 0;
+    bool any = false;
+    for (; p < end && *p >= '0' && *p <= '9'; p++) {
+        any = true;
+        if (m == 0 && *p == '0') continue;
+        if (++nd > 19) return false;
+        m = m * 10 + (uint64_t)(*p - '0');
+    }
+    if (p < end && *p == '.') {
+        for (p++; p < end && *p >= '0' && *p <= '9'; p++) {
+            any = true;
+            e--;
+            if (m == 0 && *p == '0') continue;
+            if (++nd > 19) return false;
+            m = m * 10 + (uint64_t)(*p - '0');
+        }
+    }
+    if (!any) return false;
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        p++;
+        bool eneg = false;
+        if (p < end && (*p == '-' || *p == '+')) eneg = *p++ == '-';
+        if (p == end || *p < '0' || *p > '9') return false;
+        int x = 0;
+        for (; p < end && *p >= '0' && *p <= '9'; p++) {
+            if (x > 10000) return false;
+            x = x * 10 + (*p - '0');
+        }
+        e += eneg ? -x : x;
+    }
+    while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++;
+    if (p != end) return false;
+    double v = 0;
+    if (m != 0 && !br_dec_fast(m, e, &v)) return false;
+    *out = neg ? -v : v;
+    return true;
+}
+static bool br_is_digit(char c) { return c >= '0' && c <= '9'; }
+/* Float text as `float()` reads it (`_` between digits too); false if it isn't one. */
+static bool br_parse_float(brine_str *s, double *out) {
+    const char *p = s->data;
+    int64_t n = s->len;
+    char *tmp = NULL;
+    if (n && memchr(p, '_', (size_t)n)) {
+        tmp = (char *)brine_alloc(n + 1);
+        int64_t m = 0;
+        for (int64_t i = 0; i < n; i++) {
+            if (p[i] != '_') {
+                tmp[m++] = p[i];
+                continue;
+            }
+            if (i == 0 || i + 1 == n || !br_is_digit(p[i - 1]) || !br_is_digit(p[i + 1])) {
+                free(tmp);
+                return false;
+            }
+        }
+        tmp[m] = 0;
+        p = tmp;
+        n = m;
+    }
+    double v = 0;
+    bool ok = br_parse_f64_fast(p, p + n, &v);
+    if (!ok) {
+        char *end;
+        v = strtod(p, &end);
+        while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
+        ok = n != 0 && end == p + n;
+    }
+    free(tmp);
+    *out = v;
+    return ok;
+}
 double brine_parse_f64(brine_str *s, const char *loc) {
-    char *end;
-    errno = 0;
-    double v = strtod(s->data, &end);
-    while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
-    if (s->len == 0 || end != s->data + s->len) br_panicf(loc, "invalid float: \"%.*s\"", (int)s->len, s->data);
+    double v;
+    if (!br_parse_float(s, &v)) br_panicf(loc, "invalid float: \"%.*s\"", (int)s->len, s->data);
     return v;
+}
+bool brine_try_parse_float(brine_str *s, bool f32, void *out) {
+    double v;
+    if (!br_parse_float(s, &v)) return false;
+    if (f32) {
+        float f = (float)v;
+        memcpy(out, &f, 4);
+    } else
+        memcpy(out, &v, 8);
+    return true;
 }
 
 /* ============================================================ arrays */
@@ -1409,6 +1729,21 @@ brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_
     a->esz = esz;
     a->retain = rt;
     a->release = rl;
+    if (len == 0) {
+        /* no data until the first push: `xs[i] = []`, which takes an inner
+           array out to change it, then costs one allocation, not two */
+        a->data = NULL;
+        return a;
+    }
+    if (esz > 0 && len <= BR_SMALL / esz) {
+        /* small: a block of our heap, whose spare room the first pushes use
+           (`[]` then `push` doesn't reallocate) */
+        size_t bytes = (size_t)((len > 0 ? len : 1) * esz);
+        a->data = (char *)br_alloc(bytes);
+        memset(a->data, 0, bytes);
+        if (br_in_heap(a->data)) a->cap = (int64_t)br_class_size(br_class_of(bytes)) / esz;
+        return a;
+    }
     a->data = (char *)calloc(len > 0 ? (size_t)len : 1, (size_t)esz);
     if (!a->data) {
         fprintf(stderr, "out of memory\n");
@@ -1532,6 +1867,32 @@ void brine_arr_extend(brine_arr **pa, brine_arr *b) {
     a->len += n;
     brine_arr_release(b);
 }
+/* a `str` argument of an `extern fn`: a NUL-terminated copy for the call */
+char *brine_cstr(brine_str *s, const char *loc) {
+    const char *z = (const char *)memchr(s->data, 0, (size_t)s->len);
+    if (BR_UNLIKELY(z != NULL))
+        br_panicf(loc, "a string passed to an extern function contains a NUL byte (at %lld)",
+                  (long long)(z - s->data));
+    char *p = (char *)brine_alloc(s->len + 1);
+    memcpy(p, s->data, (size_t)s->len);
+    p[s->len] = 0;
+    return p;
+}
+void brine_cstr_free(char *p) { free(p); }
+/* `a + b`: a new array (or a shared one when a side is empty) */
+brine_arr *brine_arr_concat(brine_arr *a, brine_arr *b, const char *loc) {
+    if (a->len == 0 || b->len == 0) {
+        brine_arr *r = a->len == 0 ? b : a;
+        brine_arr_retain(r);
+        return r;
+    }
+    brine_arr *r = brine_arr_new(a->len + b->len, a->esz, a->retain, a->release, loc);
+    memcpy(r->data, a->data, (size_t)(a->len * a->esz));
+    memcpy(r->data + a->len * a->esz, b->data, (size_t)(b->len * b->esz));
+    if (r->retain)
+        for (int64_t i = 0; i < r->len; i++) r->retain(r->data + i * r->esz);
+    return r;
+}
 void brine_arr_reverse(brine_arr **pa) {
     brine_arr_unique(pa);
     brine_arr *a = *pa;
@@ -1603,8 +1964,8 @@ brine_map *brine_map_new(const brine_map_ty *ty) {
     m->ty = ty;
     return m;
 }
-void brine_map_free(brine_map *m) {
-    BR_LIVE(-1);
+static void br_map_drop(void *p) {
+    brine_map *m = (brine_map *)p;
     const brine_map_ty *t = m->ty;
     for (int64_t i = 0; i < m->used; i++) {
         if (!m->live[i]) continue;
@@ -1617,6 +1978,14 @@ void brine_map_free(brine_map *m) {
     free(m->live);
     free(m->index);
     free(m);
+}
+void brine_map_free(brine_map *m) {
+    BR_LIVE(-1);
+    if (m->ty->krelease || m->ty->vrelease) {
+        brine_drop(m, br_map_drop);
+        return;
+    }
+    br_map_drop(m);
 }
 static void br_map_reindex(brine_map *m) {
     int64_t n = 8;
@@ -1868,7 +2237,7 @@ void brine_sb_i128(brine_sb *sb, brine_i128 v) {
 void brine_sb_fmt_u128(brine_sb *sb, brine_u128 v, int kind) {
     if (kind == 'x' || kind == 'b')
         br_sb_u128_base(sb, v, kind == 'x' ? 16 : 2);
-    else if (kind == 'f' || kind == 'e')
+    else if (kind == 'f' || kind == 'e' || kind == 'g')
         brine_sb_fmt_f64(sb, (double)v, -1, kind);
     else
         brine_sb_u128(sb, v);
@@ -1877,14 +2246,38 @@ void brine_sb_fmt_i128(brine_sb *sb, brine_i128 v, int kind) {
     if (kind == 'x' || kind == 'b') {
         if (v < 0) brine_sb_cat(sb, "-", 1);
         br_sb_u128_base(sb, v < 0 ? (brine_u128)(-(v + 1)) + 1 : (brine_u128)v, kind == 'x' ? 16 : 2);
-    } else if (kind == 'f' || kind == 'e')
+    } else if (kind == 'f' || kind == 'e' || kind == 'g')
         brine_sb_fmt_f64(sb, (double)v, -1, kind);
     else
         brine_sb_i128(sb, v);
 }
-/* shortest round-trip representation, Python style */
-static void br_fmt_float(brine_sb *sb, double v, int maxprec, int is_f32) {
-    char e[64], buf[400];
+/* |v| rounded to p significant digits: the digits go to d, the result is the
+ * decimal exponent. Whether they read back as v is in *back. */
+static int br_digits(double v, int p, char *d, int is_f32, bool *back) {
+    char e[40];
+    snprintf(e, sizeof e, "%.*e", p - 1, v);
+    const char *q = e + (e[0] == '-');
+    uint64_t m = 0;
+    int n = 0;
+    for (; *q != 'e'; q++)
+        if (*q != '.') {
+            d[n++] = *q;
+            m = m * 10 + (uint64_t)(*q - '0');
+        }
+    int x = atoi(q + 1);
+    double r;
+    if (!(p <= 15 && br_dec_fast(m, x - (p - 1), &r))) r = fabs(strtod(e, NULL));
+    double a = fabs(v);
+    *back = is_f32 ? (float)r == (float)a : r == a;
+    return x;
+}
+/* The shortest representation that reads back as v, Python style (repr):
+ * 0.1, 1e+16, 2.5e-08. A decimal of up to 15 digits (6 for an f32) reads
+ * back as a normal double that prints as itself at that precision, so when
+ * the 15 digits read back the shortest is them without their trailing
+ * zeros; otherwise it takes 16 or 17. Subnormals, with fewer bits, search
+ * from 1 digit up. */
+static void br_fmt_float(brine_sb *sb, double v, int is_f32) {
     if (isnan(v)) {
         br_sb_cstr(sb, "nan");
         return;
@@ -1893,28 +2286,48 @@ static void br_fmt_float(brine_sb *sb, double v, int maxprec, int is_f32) {
         br_sb_cstr(sb, v < 0 ? "-inf" : "inf");
         return;
     }
-    int p;
-    for (p = 1; p <= maxprec; p++) {
-        snprintf(e, sizeof e, "%.*e", p - 1, v);
-        double back = strtod(e, NULL);
-        if (is_f32 ? ((float)back == (float)v) : (back == v)) break;
+    char d[24], buf[64];
+    int hi = is_f32 ? 9 : 17, lo = is_f32 ? 6 : 15;
+    double a = fabs(v);
+    if (a == 0 || a < (is_f32 ? (double)FLT_MIN : DBL_MIN)) lo = 1;
+    int p = lo, x = 0;
+    bool back = false;
+    for (; p < hi; p++) {
+        x = br_digits(v, p, d, is_f32, &back);
+        if (back) break;
     }
-    if (p > maxprec) p = maxprec;
-    snprintf(e, sizeof e, "%.*e", p - 1, v);
-    char *ep = strchr(e, 'e');
-    int x = ep ? atoi(ep + 1) : 0;
+    if (!back) x = br_digits(v, p = hi, d, is_f32, &back);
+    while (p > 1 && d[p - 1] == '0') p--;
+    int n = 0;
+    if (signbit(v)) buf[n++] = '-';
     if (x >= -4 && x < 16) {
-        int dec = p - 1 - x;
-        if (dec < 0) dec = 0;
-        snprintf(buf, sizeof buf, "%.*f", dec, v);
-        if (!strchr(buf, '.')) strcat(buf, ".0");
-        br_sb_cstr(sb, buf);
+        if (x < 0) {
+            buf[n++] = '0';
+            buf[n++] = '.';
+            for (int i = 0; i < -x - 1; i++) buf[n++] = '0';
+            for (int i = 0; i < p; i++) buf[n++] = d[i];
+        } else if (is_f32 && p <= x) {
+            /* a big f32 integer prints all its digits: 16777216.0, not 16777220.0
+             * (for a double below 10^16 the two are the same) */
+            n += snprintf(buf + n, sizeof buf - (size_t)n, "%.0f.0", a);
+        } else {
+            for (int i = 0; i <= x; i++) buf[n++] = i < p ? d[i] : '0';
+            buf[n++] = '.';
+            if (p <= x + 1) buf[n++] = '0';
+            for (int i = x + 1; i < p; i++) buf[n++] = d[i];
+        }
     } else {
-        br_sb_cstr(sb, e);
+        buf[n++] = d[0];
+        if (p > 1) {
+            buf[n++] = '.';
+            for (int i = 1; i < p; i++) buf[n++] = d[i];
+        }
+        n += snprintf(buf + n, sizeof buf - (size_t)n, "e%c%02d", x < 0 ? '-' : '+', x < 0 ? -x : x);
     }
+    brine_sb_cat(sb, buf, n);
 }
-void brine_sb_f64(brine_sb *sb, double v) { br_fmt_float(sb, v, 17, 0); }
-void brine_sb_f32(brine_sb *sb, float v) { br_fmt_float(sb, (double)v, 9, 1); }
+void brine_sb_f64(brine_sb *sb, double v) { br_fmt_float(sb, v, 0); }
+void brine_sb_f32(brine_sb *sb, float v) { br_fmt_float(sb, (double)v, 1); }
 void brine_sb_bool(brine_sb *sb, bool v) { br_sb_cstr(sb, v ? "true" : "false"); }
 static void br_sb_bin(brine_sb *sb, uint64_t v) {
     char b[65];
@@ -1937,7 +2350,7 @@ void brine_sb_fmt_i64(brine_sb *sb, int64_t v, int kind) {
             br_sb_bin(sb, u);
         return;
     }
-    if (kind == 'f' || kind == 'e') {
+    if (kind == 'f' || kind == 'e' || kind == 'g') {
         brine_sb_fmt_f64(sb, (double)v, -1, kind);
         return;
     }
@@ -1950,21 +2363,46 @@ void brine_sb_fmt_u64(brine_sb *sb, uint64_t v, int kind) {
         br_sb_cstr(sb, b);
     } else if (kind == 'b')
         br_sb_bin(sb, v);
-    else if (kind == 'f' || kind == 'e')
+    else if (kind == 'f' || kind == 'e' || kind == 'g')
         brine_sb_fmt_f64(sb, (double)v, -1, kind);
     else
         brine_sb_u64(sb, v);
 }
 void brine_sb_fmt_f64(brine_sb *sb, double v, int prec, int kind) {
     char b[400];
-    if (kind == 'f') {
+    /* spelled the same everywhere (C libraries print `-nan(ind)`, `nan`, ...) */
+    if (isnan(v) || isinf(v)) {
+        brine_sb_f64(sb, v);
+    } else if (kind == 'f') {
         snprintf(b, sizeof b, "%.*f", prec < 0 ? 6 : prec, v);
         br_sb_cstr(sb, b);
     } else if (kind == 'e') {
         snprintf(b, sizeof b, "%.*e", prec < 0 ? 6 : prec, v);
         br_sb_cstr(sb, b);
+    } else if (kind == 'g') {
+        snprintf(b, sizeof b, "%.*g", prec < 0 ? 6 : prec, v);
+        br_sb_cstr(sb, b);
     } else
         brine_sb_f64(sb, v);
+}
+/* `{x:,}`: commas between groups of three digits in the integer part of the
+ * number written from `start` on */
+void brine_sb_group(brine_sb *sb, int64_t start) {
+    int64_t a = start;
+    if (a < sb->len && (sb->p[a] == '-' || sb->p[a] == '+')) a++;
+    int64_t b = a;
+    while (b < sb->len && sb->p[b] >= '0' && sb->p[b] <= '9') b++;
+    int64_t n = b - a, k = (n - 1) / 3;
+    if (n <= 3) return;
+    br_sb_reserve(sb, k);
+    memmove(sb->p + b + k, sb->p + b, (size_t)(sb->len - b));
+    sb->len += k;
+    /* from the right: copy digits, a comma after every third */
+    int64_t from = b - 1, to = b + k - 1;
+    for (int64_t i = 0; from >= a; i++) {
+        if (i > 0 && i % 3 == 0) sb->p[to--] = ',';
+        sb->p[to--] = sb->p[from--];
+    }
 }
 void brine_sb_pad(brine_sb *sb, int64_t start, int64_t width, bool left, bool zero) {
     int64_t n = sb->len - start;
@@ -1987,21 +2425,48 @@ brine_str *brine_sb_finish(brine_sb *sb) {
     sb->p = NULL;
     return s;
 }
+/* stdout going to a terminal or a pipe is flushed at the end of each line,
+ * since something may be reading it as it comes (a person, or a program
+ * talking a line protocol); to a file it's written when the buffer fills.
+ * (C's line buffering would do, but the Windows C library has none.) */
+static int br_out_lines;
+static int br_stdout_streams(void) {
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h == NULL || h == INVALID_HANDLE_VALUE) return 0;
+    DWORD t = GetFileType(h), mode;
+    /* NUL is a character device too, but not a console */
+    return t == FILE_TYPE_PIPE || (t == FILE_TYPE_CHAR && GetConsoleMode(h, &mode));
+#else
+    struct stat st;
+    if (fstat(1, &st) != 0) return 0;
+    return S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) || isatty(1);
+#endif
+}
 /* write a finished builder (and free it); `print` adds its own `end` */
 void brine_out_sb(brine_sb *sb) {
+    if (BR_UNLIKELY(__atomic_load_n(&br_panicking, __ATOMIC_RELAXED))) br_park();
     br_lock(&br_io_mu);
     fwrite(sb->p, 1, (size_t)sb->len, stdout);
+    if (br_out_lines && memchr(sb->p, '\n', (size_t)sb->len)) fflush(stdout);
     br_unlock(&br_io_mu);
     free(sb->p);
     sb->p = NULL;
 }
 void brine_err_sb(brine_sb *sb) {
+    if (BR_UNLIKELY(__atomic_load_n(&br_panicking, __ATOMIC_RELAXED))) br_park();
     br_lock(&br_io_mu);
     fflush(stdout);
     fwrite(sb->p, 1, (size_t)sb->len, stderr);
+    fflush(stderr);
     br_unlock(&br_io_mu);
     free(sb->p);
     sb->p = NULL;
+}
+void brine_flush(void) {
+    br_lock(&br_io_mu);
+    fflush(stdout);
+    br_unlock(&br_io_mu);
 }
 void brine_print_sb(brine_sb *sb) {
     brine_sb_cat(sb, "\n", 1);
@@ -2067,6 +2532,8 @@ static int br_in_par_get(void) {
 }
 static void br_in_par_set(int v) { br_th_get()->in_par = v; }
 static int64_t br_task_budget = 0;
+/* see brine_rt.h */
+int brine_mt = 0;
 
 static int br_threads(void) {
     if (br_pool.nthreads == 0) {
@@ -2145,6 +2612,8 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
         br_run_chunks(&job);
         return;
     }
+    /* (before the workers can see the job, after they are done below) */
+    __atomic_add_fetch(&brine_mt, 1, __ATOMIC_SEQ_CST);
     if (!br_pool.started) {
         br_pool.started = 1;
         for (int i = 0; i < br_pool.nthreads - 1; i++) {
@@ -2170,7 +2639,20 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
         __atomic_store_n(&br_pool.main_waits, 0, __ATOMIC_SEQ_CST);
         br_unlock(&br_pool.mu);
     }
+    __atomic_sub_fetch(&brine_mt, 1, __ATOMIC_SEQ_CST);
     br_unlock(&br_pool.job_lock);
+}
+
+int64_t brine_par_chunks(int64_t n) { return brine_par_plan(n); }
+
+bool brine_first_stopped(const int64_t *stop, int64_t chunk) {
+    return __atomic_load_n(stop, __ATOMIC_RELAXED) < chunk;
+}
+
+void brine_first_found(int64_t *stop, int64_t chunk) {
+    int64_t cur = __atomic_load_n(stop, __ATOMIC_RELAXED);
+    while (chunk < cur && !__atomic_compare_exchange_n(stop, &cur, chunk, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
 }
 
 typedef struct {
@@ -2195,6 +2677,7 @@ void brine_par_tasks(int64_t k, brine_task_fn fn, void *ctx) {
         tasks[i].idx = i;
         spawned[i] = 0;
     }
+    __atomic_add_fetch(&brine_mt, 1, __ATOMIC_SEQ_CST);
     /* spawn all but the last task while thread budget remains */
     for (int64_t i = 0; i + 1 < k; i++) {
         if (__atomic_sub_fetch(&br_task_budget, 1, __ATOMIC_SEQ_CST) >= 0) {
@@ -2213,6 +2696,7 @@ void brine_par_tasks(int64_t k, brine_task_fn fn, void *ctx) {
             br_thread_join(ths[i]);
             __atomic_add_fetch(&br_task_budget, 1, __ATOMIC_SEQ_CST);
         }
+    __atomic_sub_fetch(&brine_mt, 1, __ATOMIC_SEQ_CST);
     free(tasks);
     free(ths);
     free(spawned);
@@ -2374,7 +2858,25 @@ typedef struct {
     const char *loc;
     char *vals; /* per task: the node of its subtree */
     bool *has;
+    /* any/all: the value that decides the result (else -1), and the lowest
+     * leaf (or element) known to have it */
+    int decide;
+    int64_t stop;
 } br_reduce_job;
+
+/* `any` and `all` are decided by the first element that is true (false):
+ * leaves after one that has it needn't run. The ones before it still do, so
+ * a panic the sequential loop would reach still happens. */
+static int br_decided(br_reduce_job *j, int64_t at) {
+    return j->decide >= 0 && __atomic_load_n(&j->stop, __ATOMIC_RELAXED) < at;
+}
+
+static void br_decide(br_reduce_job *j, int64_t at, const void *v, bool h) {
+    if (j->decide < 0 || !h || *(const bool *)v != (bool)j->decide) return;
+    int64_t cur = __atomic_load_n(&j->stop, __ATOMIC_RELAXED);
+    while (at < cur && !__atomic_compare_exchange_n(&j->stop, &cur, at, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
 
 static void br_reduce_task(void *ctx, int64_t chunk, int64_t lo, int64_t hi) {
     (void)chunk;
@@ -2385,18 +2887,54 @@ static void br_reduce_task(void *ctx, int64_t chunk, int64_t lo, int64_t hi) {
         br_fold_init(&f, j->comb, j->size, j->loc);
         int64_t l0 = t * j->task_leaves;
         int64_t l1 = l0 + j->task_leaves < j->nleaves ? l0 + j->task_leaves : j->nleaves;
-        for (int64_t l = l0; l < l1; l++) {
+        for (int64_t l = l0; l < l1 && !br_decided(j, l); l++) {
             int64_t a = l * BRINE_LEAF;
             int64_t b = a + BRINE_LEAF < j->n ? a + BRINE_LEAF : j->n;
             bool h = false;
             j->fn(j->ctx, l, a, b, v, &h);
+            br_decide(j, l, v, h);
             br_fold_push(&f, 0, v, h);
         }
         j->has[t] = br_fold_finish(&f, j->vals + t * 16);
     }
 }
 
-static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, void *ctx, int64_t op, int64_t vk, void *val, bool *has, const char *loc) {
+/* Few leaves for the threads: each element is a task of its own (`efn`
+ * gives its value, unfolded), and the leaves are folded from those values
+ * afterwards, in the same order as the leaf function would. */
+static void br_reduce_elem(void *ctx, int64_t chunk, int64_t lo, int64_t hi) {
+    (void)chunk;
+    br_reduce_job *j = (br_reduce_job *)ctx;
+    for (int64_t e = lo; e < hi; e++) {
+        j->has[e] = false;
+        if (br_decided(j, e)) continue;
+        j->fn(j->ctx, e / BRINE_LEAF, e, e + 1, j->vals + e * 16, &j->has[e]);
+        br_decide(j, e, j->vals + e * 16, j->has[e]);
+    }
+}
+
+static void br_reduce_elems(br_reduce_job *j, br_fold *f, int64_t op, const void *start) {
+    brine_par_run(0, j->n, j->n, br_reduce_elem, j);
+    /* sum and product start from 0 (1) like the leaf function: 0.0 + -0.0 is 0.0 */
+    int from_start = op != BRINE_RED_MIN && op != BRINE_RED_MAX;
+    for (int64_t l = 0; l < j->nleaves; l++) {
+        _Alignas(16) char acc[16];
+        memcpy(acc, start, (size_t)j->size);
+        bool h = false;
+        int64_t b = (l + 1) * BRINE_LEAF < j->n ? (l + 1) * BRINE_LEAF : j->n;
+        for (int64_t e = l * BRINE_LEAF; e < b; e++) {
+            if (!j->has[e]) continue;
+            if (h || from_start)
+                j->comb(acc, j->vals + e * 16, j->loc);
+            else
+                memcpy(acc, j->vals + e * 16, (size_t)j->size);
+            h = true;
+        }
+        br_fold_push(f, 0, acc, h);
+    }
+}
+
+static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *ctx, int64_t op, int64_t vk, void *val, bool *has, const char *loc) {
     if (n <= 0) return;
     br_reduce_job j;
     j.fn = fn;
@@ -2406,6 +2944,20 @@ static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, void *ctx, int64_t op, in
     j.comb = br_comb_pick(op, vk);
     j.size = br_vk_size[vk];
     j.loc = loc;
+    j.decide = op == BRINE_RED_ANY ? 1 : (op == BRINE_RED_ALL ? 0 : -1);
+    j.stop = INT64_MAX;
+    if (efn && n > 1 && j.nleaves < 4 * (int64_t)br_threads() && br_threads() > 1 && !br_in_par_get()) {
+        j.fn = efn;
+        j.vals = (char *)brine_alloc(n * 16);
+        j.has = (bool *)brine_alloc(n);
+        br_fold f;
+        br_fold_init(&f, j.comb, j.size, loc);
+        br_reduce_elems(&j, &f, op, val);
+        if (br_fold_finish(&f, val)) *has = true;
+        free(j.vals);
+        free(j.has);
+        return;
+    }
     /* tasks of 2^h leaves, several per thread for balance; the result doesn't
      * depend on the split, since every task is a whole subtree */
     int64_t want = (int64_t)br_threads() * 8;
@@ -2510,11 +3062,20 @@ static void br_gpu_logf(const char *fmt, ...) {
     va_start(ap, fmt);
     br_lock(&br_io_mu);
     fputs("brine gpu: ", stderr);
+    if (br_size > 1) fprintf(stderr, "rank %lld: ", (long long)br_rank);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     fflush(stderr);
     br_unlock(&br_io_mu);
     va_end(ap);
+}
+
+/* "; cpu estimate X ms" for the log, or nothing when the CPU time isn't known
+ * yet (BRINE_GPU=on sends work to the GPU before the CPU has run any) */
+static const char *br_gpu_cpu_est(char *buf, double cpu_s) {
+    if (cpu_s <= 0) return "";
+    snprintf(buf, 48, "; cpu estimate %.3f ms", cpu_s * 1e3);
+    return buf;
 }
 
 /* ------------------------------------------------------------ devices */
@@ -2523,6 +3084,19 @@ static void br_gpu_logf(const char *fmt, ...) {
  * as they are. */
 static int br_dev_open(const char *code, char *why, size_t nwhy);
 static const char *br_dev_err(br_gpu_res r);
+
+/* Which of the machine's n GPUs this rank uses, or -1. Ranks sharing a GPU
+ * would queue for it and each run slower than the CPU it gave up, so in
+ * auto mode the k-th rank on a machine gets GPU k, and the ranks beyond the
+ * GPUs stay on the CPU; BRINE_GPU=on shares them out round-robin. */
+static int br_gpu_ordinal(int n, char *why, size_t nwhy) {
+    if (n <= 0) return -1;
+    if (br_local_rank < n) return (int)br_local_rank;
+    if (br_gpu.mode == BR_GPU_ON) return (int)(br_local_rank % n);
+    snprintf(why, nwhy, "%d lower rank%s on this machine use%s its %d GPU%s (one rank per GPU; BRINE_GPU=on shares them)",
+             (int)br_local_rank, br_local_rank == 1 ? "" : "s", br_local_rank == 1 ? "s" : "", n, n == 1 ? "" : "s");
+    return -1;
+}
 /* makes the device current on this thread */
 static br_gpu_res br_dev_bind(void);
 static br_gpu_res br_dev_alloc(br_gpu_ptr *p, size_t n);
@@ -2610,6 +3184,7 @@ static int br_dev_open(const char *code, char *why, size_t nwhy) {
         return 0;
     }
     br_mtl.stack = strtoull(code + 24, NULL, 10);
+    if (br_gpu_ordinal(1, why, nwhy) < 0) return 0;
     void *objc = dlopen("/usr/lib/libobjc.A.dylib", RTLD_NOW | RTLD_LOCAL);
     void *fnd = dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_NOW | RTLD_LOCAL);
     void *mtl = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_NOW | RTLD_LOCAL);
@@ -2959,8 +3534,14 @@ static int br_dev_open(const char *ptx, char *why, size_t nwhy) {
         snprintf(why, nwhy, "cuInit: %s", br_dev_err(r));
         return 0;
     }
-    if (n <= 0 || c->DeviceGet(&dev, 0) != 0) {
+    if (n <= 0) {
         snprintf(why, nwhy, "no CUDA device");
+        return 0;
+    }
+    int ord = br_gpu_ordinal(n, why, nwhy);
+    if (ord < 0) return 0;
+    if (c->DeviceGet(&dev, ord) != 0) {
+        snprintf(why, nwhy, "no CUDA device %d", ord);
         return 0;
     }
     int major = 0, minor = 0;
@@ -3096,6 +3677,9 @@ typedef struct {
     int64_t node;
     uint64_t hoff, doff, bytes;
     int written, read, staged;
+    /* BRINE_GA_DENSE: iteration k writes element first + k only */
+    int dense;
+    int64_t first;
 } br_garr;
 
 typedef struct {
@@ -3106,6 +3690,8 @@ typedef struct {
     int64_t *tab; /* open addressing, index + 1 */
     int64_t tcap;
     uint64_t stage, direct;
+    /* the iterations the device runs */
+    int64_t lo, hi;
     int ok;
 } br_gplan;
 
@@ -3142,7 +3728,7 @@ static void br_gplan_grow(br_gplan *p) {
     }
 }
 
-static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int written, int read, int depth) {
+static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int written, int read, int dense, int64_t first, int depth) {
     if (!p->ok || !a) return;
     if (depth > 16) {
         p->ok = 0;
@@ -3157,6 +3743,10 @@ static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int writ
     if (i >= 0) {
         p->a[i].written |= written;
         p->a[i].read |= read;
+        if (p->a[i].dense != dense || p->a[i].first != first) {
+            p->a[i].dense = 0;
+            p->a[i].read = 1;
+        }
         return;
     }
     if (p->na == p->acap) {
@@ -3180,6 +3770,8 @@ static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int writ
     g->bytes = (uint64_t)a->len * (uint64_t)esz;
     g->written = written;
     g->read = read;
+    g->dense = dense;
+    g->first = first;
     g->hoff = p->stage;
     p->stage += 64;
     g->staged = nsub > 0 || g->bytes <= BR_GPU_SMALL;
@@ -3194,7 +3786,7 @@ static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int writ
     for (int64_t e = 0; e < a->len && nsub > 0; e++)
         for (int64_t s = 0; s < nsub; s++) {
             const brine_arr *c = *(brine_arr *const *)(a->data + e * esz + nd[2 + 2 * s]);
-            br_gplan_add(p, c, nd[3 + 2 * s], 0, 1, depth + 1);
+            br_gplan_add(p, c, nd[3 + 2 * s], 0, 1, 0, 0, depth + 1);
         }
 }
 
@@ -3209,7 +3801,10 @@ static int br_gplan_make(br_gplan *p, const brine_kernel *k, const void *ctx) {
     for (int64_t f = 0; f < nf; f++) {
         const int64_t *fd = k->ptrs + 1 + 3 * f;
         const brine_arr *a = *(brine_arr *const *)((const char *)ctx + fd[0]);
-        br_gplan_add(p, a, fd[2], (fd[1] & 1) != 0, (fd[1] & 2) == 0, 0);
+        int64_t fl = fd[1], first = 0;
+        if (fl >> 8) memcpy(&first, (const char *)ctx + (fl >> 8) - 1, 8);
+        int dense = (fl & BRINE_GA_DENSE) != 0;
+        br_gplan_add(p, a, fd[2], (fl & BRINE_GA_WRITTEN) != 0, !dense, dense, first, 0);
     }
     for (int64_t i = 0; i < p->na; i++)
         if (!p->a[i].staged) p->a[i].doff += BR_ALIGN(p->stage, 256);
@@ -3223,10 +3818,30 @@ static void br_gplan_free(br_gplan *p) {
 
 static uint64_t br_gplan_size(const br_gplan *p) { return BR_ALIGN(p->stage, 256) + p->direct; }
 
+/* The bytes of g that go back: all of them, or the elements the device's
+ * iterations write. */
+static void br_garr_out(const br_gplan *p, const br_garr *g, uint64_t *off, uint64_t *bytes) {
+    *off = 0;
+    *bytes = g->bytes;
+    if (!g->dense) return;
+    int64_t esz = p->nodes[g->node], len = g->host->len;
+    int64_t a = g->first + p->lo, b = g->first + p->hi;
+    if (a < 0) a = 0;
+    if (b > len) b = len;
+    if (b < a) b = a;
+    *off = (uint64_t)(a * esz);
+    *bytes = (uint64_t)((b - a) * esz);
+}
+
 static uint64_t br_gplan_bytes(const br_gplan *p) {
     uint64_t b = p->stage;
-    for (int64_t i = 0; i < p->na; i++)
-        if (!p->a[i].staged) b += (p->a[i].read ? p->a[i].bytes : 0) + (p->a[i].written ? p->a[i].bytes : 0);
+    for (int64_t i = 0; i < p->na; i++) {
+        const br_garr *g = &p->a[i];
+        uint64_t off = 0, out = 0;
+        br_garr_out(p, g, &off, &out);
+        if (!g->staged && g->read) b += g->bytes;
+        if (g->written) b += out;
+    }
     return b;
 }
 
@@ -3317,7 +3932,9 @@ static br_gpu_res br_gpu_copy_out(br_gplan *p) {
     br_gpu_res r = 0;
     for (int64_t i = 0; i < p->na && r == 0; i++) {
         br_garr *g = &p->a[i];
-        if (g->written && g->bytes > 0) r = br_dev_dtoh(g->host->data, br_gpu.buf + g->doff, (size_t)g->bytes);
+        uint64_t off = 0, n = 0;
+        br_garr_out(p, g, &off, &n);
+        if (g->written && n > 0) r = br_dev_dtoh(g->host->data + off, br_gpu.buf + g->doff + off, (size_t)n);
     }
     return r;
 }
@@ -3483,11 +4100,13 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
         *why = "out of memory";
         return done;
     }
-    /* the arrays go back whole, so the elements the probe wrote must be on
-     * the device too */
+    /* arrays that go back whole need the elements the probe wrote on the
+     * device too */
+    p.lo = done;
+    p.hi = n;
     if (done > 0)
         for (int64_t i = 0; i < p.na; i++)
-            if (p.a[i].written) p.a[i].read = 1;
+            if (p.a[i].written && !p.a[i].dense) p.a[i].read = 1;
     br_lock(&br_gpu.mu);
     br_gpu_choice c = br_gpu_choose(k, st, n - done, br_gplan_bytes(&p), 1 + (int64_t)((n - done) / ((int64_t)1 << 22)));
     br_unlock(&br_gpu.mu);
@@ -3536,9 +4155,11 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
         br_gpu.bw = 0.5 * (br_gpu.bw + (double)bytes / copy);
         br_unlock(&br_gpu.mu);
     }
-    if (br_gpu.log)
-        br_gpu_logf("%s %s n=%lld -> gpu %.3f ms (kernel %.3f ms, copies %.3f ms, %.1f MB; cpu estimate %.3f ms)", k->where,
-                    br_gpu_kind(k), (long long)n, (t3 - t0) * 1e3, kern * 1e3, copy * 1e3, (double)bytes / 1e6, c.cpu_s * 1e3);
+    if (br_gpu.log) {
+        char est[48];
+        br_gpu_logf("%s %s n=%lld -> gpu %.3f ms (kernel %.3f ms, copies %.3f ms, %.1f MB%s)", k->where, br_gpu_kind(k),
+                    (long long)n, (t3 - t0) * 1e3, kern * 1e3, copy * 1e3, (double)bytes / 1e6, br_gpu_cpu_est(est, c.cpu_s));
+    }
     return n;
 }
 
@@ -3710,13 +4331,16 @@ static int br_gpu_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx
         if (bytes > (1 << 20) && t1 > t0) br_gpu.bw = 0.5 * (br_gpu.bw + (double)bytes / (t1 - t0));
         br_unlock(&br_gpu.mu);
     }
-    if (br_gpu.log)
-        br_gpu_logf("%s %s n=%lld -> gpu %.3f ms (kernels %.3f ms, copies %.3f ms, %.1f MB; cpu estimate %.3f ms)", k->where,
-                    br_gpu_kind(k), (long long)n, (t2 - t0) * 1e3, (t2 - t1) * 1e3, (t1 - t0) * 1e3, (double)bytes / 1e6, c.cpu_s * 1e3);
+    if (br_gpu.log) {
+        char est[48];
+        br_gpu_logf("%s %s n=%lld -> gpu %.3f ms (kernels %.3f ms, copies %.3f ms, %.1f MB%s)", k->where, br_gpu_kind(k),
+                    (long long)n, (t2 - t0) * 1e3, (t2 - t1) * 1e3, (t1 - t0) * 1e3, (double)bytes / 1e6,
+                    br_gpu_cpu_est(est, c.cpu_s));
+    }
     return 1;
 }
 
-void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, void *val, bool *has, const char *loc) {
+void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *ctx, void *val, bool *has, const char *loc) {
     if (n <= 0) return;
     br_fold f;
     br_fold_init(&f, br_comb_pick(k->op, k->vk), br_vk_size[k->vk], loc);
@@ -3727,31 +4351,71 @@ void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, v
         return;
     }
     double t0 = brine_clock();
-    br_reduce_cpu(n, fn, ctx, k->op, k->vk, val, has, loc);
+    br_reduce_cpu(n, fn, efn, ctx, k->op, k->vk, val, has, loc);
     double dt = brine_clock() - t0;
     if (k->ptx && !br_in_par_get() && n >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n, dt);
     if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt);
 }
 
 /* ============================================================ world: transport */
-enum { BR_CH_USER = 0, BR_CH_COLL = 1 };
-enum { BR_K_EMPTY = 0, BR_K_I64 = 1, BR_K_F64 = 2, BR_K_BOOL = 3, BR_K_STR = 4, BR_K_AI64 = 5, BR_K_AF64 = 6, BR_K_MSG = 7 };
+enum { BR_K_EMPTY = 0, BR_K_I64 = 1, BR_K_F64 = 2, BR_K_MSG = 7 };
 static const char *br_kind_name(int64_t k) {
     switch (k) {
+    case BR_K_EMPTY: return "nothing";
     case BR_K_I64: return "int";
     case BR_K_F64: return "float";
-    case BR_K_BOOL: return "bool";
-    case BR_K_STR: return "str";
-    case BR_K_AI64: return "[int]";
-    case BR_K_AF64: return "[float]";
     case BR_K_MSG: return "message";
     default: return "(internal)";
     }
 }
 
+/* Which collective a message belongs to. Every rank makes the same calls in
+ * the same order (the compiler checks this), so each message carries its
+ * call (operation, call site, and how many calls this rank made before it),
+ * and the receiver checks that it is in the same one: a mismatch is a clear
+ * panic instead of a hang or a silently wrong result. */
+enum {
+    BR_OP_BARRIER = 1,
+    BR_OP_SHIFT,
+    BR_OP_EXCHANGE,
+    BR_OP_BCAST,
+    BR_OP_GATHER,
+    BR_OP_SUM,
+    BR_OP_MIN,
+    BR_OP_MAX,
+    BR_OP_ANY,
+    BR_OP_ALL,
+    BR_OP_FINISH
+};
+static const char *br_op_name(int64_t op) {
+    switch (op) {
+    case BR_OP_BARRIER: return "`world.barrier`";
+    case BR_OP_SHIFT: return "`world.shift`";
+    case BR_OP_EXCHANGE: return "`world.exchange`";
+    case BR_OP_BCAST: return "`world.broadcast`";
+    case BR_OP_GATHER: return "`world.gather_all`";
+    case BR_OP_SUM: return "`world.sum`";
+    case BR_OP_MIN: return "`world.min`";
+    case BR_OP_MAX: return "`world.max`";
+    case BR_OP_ANY: return "`world.any`";
+    case BR_OP_ALL: return "`world.all`";
+    case BR_OP_FINISH: return "the end of the program";
+    default: return "(internal)";
+    }
+}
+/* the call this rank is in (collectives only run on the main thread) */
+static int64_t br_cur_op, br_cur_seq;
+static const char *br_cur_site = "";
+static void br_coll(int64_t op, const char *loc) {
+    br_cur_op = op;
+    br_cur_site = loc;
+    br_cur_seq++;
+}
+
 typedef struct br_msg {
     struct br_msg *next;
-    int64_t chan, kind, len;
+    int64_t kind, len, op, seq, slen;
+    /* `len` bytes of payload, then the sender's call site (`slen` bytes) */
     char data[];
 } br_msg;
 
@@ -3761,6 +4425,8 @@ typedef struct {
     br_cond cv;
     br_msg *head, *tail;
     int closed;
+    char *rbuf; /* the receiver's read buffer */
+    int64_t rpos, rend;
     int64_t rank;
 } br_peer;
 
@@ -3770,6 +4436,7 @@ static br_peer *br_peers;
 /* one rank: no peers to talk to */
 static int br_write_all(br_sock s, const char *p, int64_t n) { return (void)s, (void)p, (void)n, 0; }
 static int br_read_all(br_sock s, char *p, int64_t n) { return (void)s, (void)p, (void)n, 0; }
+static int64_t br_read_some(br_sock s, char *p, int64_t n) { return (void)s, (void)p, (void)n, 0; }
 #else
 static int br_write_all(br_sock s, const char *p, int64_t n) {
     while (n > 0) {
@@ -3811,6 +4478,19 @@ static int br_read_all(br_sock s, char *p, int64_t n) {
     }
     return 1;
 }
+/* what has arrived, at least one byte: 0 when the connection is closed */
+static int64_t br_read_some(br_sock s, char *p, int64_t n) {
+    int chunk = n > (1 << 30) ? (1 << 30) : (int)n;
+    for (;;) {
+#ifdef _WIN32
+        int r = recv(s, p, chunk, 0);
+#else
+        ssize_t r = recv(s, p, (size_t)chunk, 0);
+        if (r < 0 && errno == EINTR) continue;
+#endif
+        return r > 0 ? (int64_t)r : 0;
+    }
+}
 
 #endif
 
@@ -3826,24 +4506,48 @@ static void br_enqueue(br_peer *pr, br_msg *m) {
     br_unlock(&pr->mu);
 }
 
+/* The receiver reads through a buffer: one `recv` usually brings in several
+   small messages, or one whole. */
+#define BR_RBUF (1 << 16)
+static int br_rd(br_peer *pr, char *dst, int64_t n) {
+    while (n > 0) {
+        if (pr->rpos == pr->rend) {
+            if (n >= BR_RBUF) return br_read_all(pr->sock, dst, n);
+            int64_t r = br_read_some(pr->sock, pr->rbuf, BR_RBUF);
+            if (r <= 0) return 0;
+            pr->rpos = 0;
+            pr->rend = r;
+        }
+        int64_t k = pr->rend - pr->rpos < n ? pr->rend - pr->rpos : n;
+        memcpy(dst, pr->rbuf + pr->rpos, (size_t)k);
+        pr->rpos += k;
+        dst += k;
+        n -= k;
+    }
+    return 1;
+}
+
 static void br_receiver(void *arg) {
     br_peer *pr = (br_peer *)arg;
+    pr->rbuf = (char *)brine_alloc(BR_RBUF);
     for (;;) {
-        int64_t hdr[3];
-        if (!br_read_all(pr->sock, (char *)hdr, sizeof hdr)) break;
-        if (hdr[2] < 0) break;
-        br_msg *m = (br_msg *)brine_alloc((int64_t)sizeof(br_msg) + hdr[2]);
-        m->chan = hdr[0];
-        m->kind = hdr[1];
-        m->len = hdr[2];
-        if (hdr[2] && !br_read_all(pr->sock, m->data, hdr[2])) {
+        int64_t hdr[5];
+        if (!br_rd(pr, (char *)hdr, sizeof hdr)) break;
+        if (hdr[1] < 0 || hdr[4] < 0 || hdr[4] > 4096) break;
+        br_msg *m = (br_msg *)brine_alloc((int64_t)sizeof(br_msg) + hdr[1] + hdr[4]);
+        m->kind = hdr[0];
+        m->len = hdr[1];
+        m->op = hdr[2];
+        m->seq = hdr[3];
+        m->slen = hdr[4];
+        if (hdr[1] + hdr[4] && !br_rd(pr, m->data, hdr[1] + hdr[4])) {
             free(m);
             break;
         }
         br_enqueue(pr, m);
     }
     br_lock(&pr->mu);
-    pr->closed = 1;
+    __atomic_store_n(&pr->closed, 1, __ATOMIC_RELEASE);
     br_cond_broadcast(&pr->cv);
     br_unlock(&pr->mu);
 }
@@ -3853,55 +4557,102 @@ static void br_check_rank(int64_t r, const char *what, const char *loc) {
         br_panicf(loc, "%s rank %lld is out of range (world size is %lld)", what, (long long)r, (long long)br_size);
 }
 
-static void br_send(int64_t dest, int64_t chan, int64_t kind, const void *data, int64_t len, const char *loc) {
-    br_check_rank(dest, "destination", loc);
+/* A peer is gone. Usually it failed and printed why: give `brine run` time to
+ * stop this rank quietly, so that message is the one people see. */
+static BR_NORETURN void br_peer_lost(int64_t r, const char *loc) {
+    br_flush();
+    br_sleep_ms(1000);
+    br_panicf(loc, "rank %lld stopped before taking part in %s (it finished or failed: see its messages)", (long long)r,
+              br_op_name(br_cur_op));
+}
+
+static void br_send(int64_t dest, int64_t kind, const void *data, int64_t len, const char *loc) {
     /* what this rank printed so far comes out before anything another rank
        prints after hearing from it (ranks share stdout, each with its own buffer) */
     br_lock(&br_io_mu);
     fflush(stdout);
     br_unlock(&br_io_mu);
     br_peer *pr = &br_peers[dest];
+    int64_t slen = (int64_t)strlen(br_cur_site);
+    if (slen > 4096) slen = 4096;
     if (dest == br_rank) {
-        br_msg *m = (br_msg *)brine_alloc((int64_t)sizeof(br_msg) + len);
-        m->chan = chan;
+        br_msg *m = (br_msg *)brine_alloc((int64_t)sizeof(br_msg) + len + slen);
         m->kind = kind;
         m->len = len;
+        m->op = br_cur_op;
+        m->seq = br_cur_seq;
+        m->slen = slen;
         if (len) memcpy(m->data, data, (size_t)len);
+        memcpy(m->data + len, br_cur_site, (size_t)slen);
         br_enqueue(pr, m);
         return;
     }
-    int64_t hdr[3] = {chan, kind, len};
-    br_lock(&pr->send_mu);
-    int ok = br_write_all(pr->sock, (const char *)hdr, sizeof hdr) && (len == 0 || br_write_all(pr->sock, (const char *)data, len));
-    br_unlock(&pr->send_mu);
-    if (!ok) br_panicf(loc, "failed to send to rank %lld (did it exit?)", (long long)dest);
+    int64_t hdr[5] = {kind, len, br_cur_op, br_cur_seq, slen};
+    int ok;
+    if (len <= BR_RBUF) {
+        /* one `send`: each one costs a system call and often a packet */
+        char *buf = (char *)brine_alloc((int64_t)sizeof hdr + len + slen);
+        memcpy(buf, hdr, sizeof hdr);
+        if (len) memcpy(buf + sizeof hdr, data, (size_t)len);
+        memcpy(buf + sizeof hdr + len, br_cur_site, (size_t)slen);
+        br_lock(&pr->send_mu);
+        ok = br_write_all(pr->sock, buf, (int64_t)sizeof hdr + len + slen);
+        br_unlock(&pr->send_mu);
+        free(buf);
+    } else {
+        br_lock(&pr->send_mu);
+        ok = br_write_all(pr->sock, (const char *)hdr, sizeof hdr) && br_write_all(pr->sock, (const char *)data, len) &&
+             (slen == 0 || br_write_all(pr->sock, br_cur_site, slen));
+        br_unlock(&pr->send_mu);
+    }
+    if (!ok) br_peer_lost(dest, loc);
 }
 
-static br_msg *br_recv(int64_t src, int64_t chan, int64_t kind, const char *loc) {
-    br_check_rank(src, "source", loc);
+/* The other rank is in a different call than this one. */
+static BR_NORETURN void br_mismatch(int64_t src, br_msg *m, const char *loc) {
+    const char *site = m->data + m->len;
+    int sl = (int)m->slen;
+    if (m->op == BR_OP_FINISH)
+        br_panicf(loc, "rank %lld has already finished (%.*s), but this rank is in %s", (long long)src, sl, site, br_op_name(br_cur_op));
+    if (br_cur_op == BR_OP_FINISH)
+        br_panicf(loc, "this rank has finished, but rank %lld is still communicating: %s at %.*s", (long long)src, br_op_name(m->op), sl,
+                  site);
+    if (m->op == br_cur_op && (int64_t)strlen(br_cur_site) == m->slen && memcmp(site, br_cur_site, (size_t)sl) == 0)
+        br_panicf(loc,
+                  "mismatched communication: rank %lld is in a different call of %s here (its communication #%lld, this rank's "
+                  "#%lld)",
+                  (long long)src, br_op_name(m->op), (long long)m->seq, (long long)br_cur_seq);
+    br_panicf(loc, "mismatched communication: this rank is in %s, but rank %lld is in %s at %.*s", br_op_name(br_cur_op), (long long)src,
+              br_op_name(m->op), sl, site);
+}
+
+static br_msg *br_recv(int64_t src, int64_t kind, const char *loc) {
     br_peer *pr = &br_peers[src];
+    /* the message usually comes within microseconds: wait for it awake,
+       as waking a sleeping thread takes longer */
+    for (int i = 0; i < BR_SPINS && !__atomic_load_n(&pr->head, __ATOMIC_ACQUIRE) && !__atomic_load_n(&pr->closed, __ATOMIC_ACQUIRE); i++)
+        BR_RELAX();
     br_lock(&pr->mu);
-    for (;;) {
-        br_msg *prev = NULL;
-        for (br_msg *m = pr->head; m; prev = m, m = m->next) {
-            if (m->chan != chan) continue;
-            if (prev)
-                prev->next = m->next;
-            else
-                pr->head = m->next;
-            if (pr->tail == m) pr->tail = prev;
-            br_unlock(&pr->mu);
-            if (m->kind != kind)
-                br_panicf(loc, "type mismatch: rank %lld sent a value of type %s, but this receive expects %s", (long long)src,
-                          br_kind_name(m->kind), br_kind_name(kind));
-            return m;
-        }
+    while (!pr->head) {
         if (pr->closed) {
             br_unlock(&pr->mu);
-            br_panicf(loc, "rank %lld exited before sending the expected message", (long long)src);
+            br_peer_lost(src, loc);
         }
         br_cond_wait(&pr->cv, &pr->mu);
     }
+    br_msg *m = pr->head;
+    pr->head = m->next;
+    if (pr->tail == m) pr->tail = NULL;
+    br_unlock(&pr->mu);
+    /* returning from `main` and `exit` are the same call */
+    bool same = m->op == BR_OP_FINISH ? br_cur_op == BR_OP_FINISH
+                                      : m->op == br_cur_op && m->seq == br_cur_seq && m->slen == (int64_t)strlen(br_cur_site) &&
+                                            memcmp(m->data + m->len, br_cur_site, (size_t)m->slen) == 0;
+    if (!same) br_mismatch(src, m, loc);
+    if (m->kind != kind)
+        br_panicf(loc, "type mismatch: rank %lld sent %s, but this rank expects %s", (long long)src, br_kind_name(m->kind),
+                  br_kind_name(kind));
+    return m;
 }
 
 #ifdef BR_WASM
@@ -3936,6 +4687,32 @@ static br_sock br_connect(const char *host, const char *port) {
 static void br_nodelay(br_sock s) {
     int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+    int big = 4 << 20;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&big, sizeof big);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&big, sizeof big);
+}
+
+#include <signal.h>
+/* stderr is buffered with several ranks: what `abort` would lose */
+static void br_abort_flush(int sig) {
+    (void)sig;
+    fflush(stderr);
+}
+
+static bool br_loopback(const char *h) { return strncmp(h, "127.", 4) == 0 || strcmp(h, "localhost") == 0; }
+
+static bool br_same_host(const char *a, const char *b) { return strcmp(a, b) == 0 || (br_loopback(a) && br_loopback(b)); }
+
+/* Processes this rank starts (`run`, `os.spawn`) are not part of its world. */
+static void br_unsetenv(const char *name) {
+#ifdef _WIN32
+    char buf[64];
+    snprintf(buf, sizeof buf, "%s=", name);
+    _putenv(buf);
+    SetEnvironmentVariableA(name, NULL);
+#else
+    unsetenv(name);
+#endif
 }
 
 static void br_world_init(void) {
@@ -3943,11 +4720,20 @@ static void br_world_init(void) {
     if (!er || !es || !ep) return;
     br_rank = atoll(er);
     br_size = atoll(es);
+    char *list = strdup(ep);
+    br_unsetenv("BRINE_RANK");
+    br_unsetenv("BRINE_WORLD_SIZE");
+    br_unsetenv("BRINE_PEERS");
     if (br_size <= 1) {
         br_size = 1;
         br_rank = 0;
+        free(list);
         return;
     }
+    /* ranks share stderr: write each message whole (panics and `eprint` flush) */
+    static char errbuf[1 << 14];
+    setvbuf(stderr, errbuf, _IOFBF, sizeof errbuf);
+    signal(SIGABRT, br_abort_flush);
 #ifdef _WIN32
     br_ws_start();
 #else
@@ -3956,7 +4742,6 @@ static void br_world_init(void) {
     br_peers = (br_peer *)calloc((size_t)br_size, sizeof(br_peer));
     char **hosts = (char **)calloc((size_t)br_size, sizeof(char *));
     char **ports = (char **)calloc((size_t)br_size, sizeof(char *));
-    char *list = strdup(ep);
     char *p = list;
     for (int64_t i = 0; i < br_size; i++) {
         char *comma = strchr(p, ',');
@@ -3971,6 +4756,8 @@ static void br_world_init(void) {
         ports[i] = colon + 1;
         p = comma ? comma + 1 : p + strlen(p);
     }
+    for (int64_t i = 0; i < br_rank; i++)
+        if (br_same_host(hosts[i], hosts[br_rank])) br_local_rank++;
     for (int64_t i = 0; i < br_size; i++) {
         br_mutex_init(&br_peers[i].mu);
         br_mutex_init(&br_peers[i].send_mu);
@@ -3986,7 +4773,7 @@ static void br_world_init(void) {
        outside can reach it, and firewalls don't ask about it */
     bool local = true;
     for (int64_t i = 0; i < br_size; i++)
-        if (strncmp(hosts[i], "127.", 4) != 0 && strcmp(hosts[i], "localhost") != 0) local = false;
+        if (!br_loopback(hosts[i])) local = false;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
@@ -4045,28 +4832,35 @@ static void br_world_init(void) {
 int64_t brine_world_rank(void) { return br_rank; }
 int64_t brine_world_size(void) { return br_size; }
 
-void brine_world_barrier(void) {
-    if (br_size <= 1) return;
-    const char *loc = "<barrier>";
-    if (br_rank == 0) {
-        for (int64_t r = 1; r < br_size; r++) free(br_recv(r, BR_CH_COLL, BR_K_EMPTY, loc));
-        for (int64_t r = 1; r < br_size; r++) br_send(r, BR_CH_COLL, BR_K_EMPTY, NULL, 0, loc);
-    } else {
-        br_send(0, BR_CH_COLL, BR_K_EMPTY, NULL, 0, loc);
-        free(br_recv(0, BR_CH_COLL, BR_K_EMPTY, loc));
+/* Dissemination barrier: log2(size) rounds, no rank in the middle. */
+static void br_barrier(const char *loc) {
+    for (int64_t k = 1; k < br_size; k <<= 1) {
+        br_send((br_rank + k) % br_size, BR_K_EMPTY, NULL, 0, loc);
+        free(br_recv((br_rank - k + br_size) % br_size, BR_K_EMPTY, loc));
     }
 }
 
-static int64_t br_get8(br_msg *m) {
-    int64_t v;
-    memcpy(&v, m->data, 8);
-    free(m);
-    return v;
+void brine_world_barrier(const char *loc) {
+    if (br_size <= 1) return;
+    br_coll(BR_OP_BARRIER, loc);
+    br_barrier(loc);
 }
+
+/* The end of the program (returning from `main`, or `exit`): wait until
+ * every rank gets there, so no rank leaves while others still talk to it. */
+static void br_world_finish(const char *how) {
+    static bool done = false;
+    if (br_size <= 1 || done) return;
+    done = true;
+    br_coll(BR_OP_FINISH, how);
+    br_barrier("<end of the program>");
+}
+
 /* Messages are encoded from a type description string, which the compiler
- * derives from the static type:  i = int, f = float, b = bool, s = str,
- * a<T> = array of <T>.  Every rank reaches the same collective call (the
- * compiler checks this), so both sides always agree on the description. */
+ * derives from the static type:  i = 64-bit int, 1/2/4/h = 8/16/32/128-bit
+ * int, f = float, g = f32, b = bool, s = str, a<T> = array of <T>.  Every
+ * rank reaches the same collective call (the compiler checks this), so both
+ * sides always agree on the description. */
 typedef struct {
     char *p;
     int64_t len, cap;
@@ -4084,14 +4878,21 @@ static void br_buf_put(br_buf *b, const void *data, int64_t n) {
     b->len += n;
 }
 
+/* bytes per element in memory, and whether it is plain data sent as is */
 static int64_t br_desc_size(const char *d) {
     switch (*d) {
     case 'b': return (int64_t)sizeof(bool);
+    case '1': return 1;
+    case '2': return 2;
+    case '4':
+    case 'g': return 4;
+    case 'h': return 16;
     case 's':
     case 'a': return BR_PSLOT;
     default: return 8;
     }
 }
+static bool br_desc_plain(const char *d) { return *d != 's' && *d != 'a' && *d != 'b'; }
 static void br_desc_fns(const char *d, brine_elem_fn *rt, brine_elem_fn *rl) {
     if (*d == 's') {
         *rt = brine_rt_str;
@@ -4107,8 +4908,6 @@ static void br_desc_fns(const char *d, brine_elem_fn *rt, brine_elem_fn *rl) {
 
 static void br_encode(br_buf *b, const char *d, const void *v) {
     switch (*d) {
-    case 'i':
-    case 'f': br_buf_put(b, v, 8); break;
     case 'b': {
         char c = *(const bool *)v ? 1 : 0;
         br_buf_put(b, &c, 1);
@@ -4124,23 +4923,19 @@ static void br_encode(br_buf *b, const char *d, const void *v) {
         const brine_arr *a = *(brine_arr *const *)v;
         br_buf_put(b, &a->len, 8);
         const char *e = d + 1;
-        if (*e == 'i' || *e == 'f')
-            br_buf_put(b, a->data, a->len * 8);
+        if (br_desc_plain(e))
+            br_buf_put(b, a->data, a->len * br_desc_size(e));
         else
             for (int64_t i = 0; i < a->len; i++) br_encode(b, e, a->data + i * a->esz);
         break;
     }
+    default: br_buf_put(b, v, br_desc_size(d)); break;
     }
 }
 
 /* decode one value at *p into `out` (an owned reference for str/arrays) */
 static void br_decode(const char **p, const char *d, void *out, const char *loc) {
     switch (*d) {
-    case 'i':
-    case 'f':
-        memcpy(out, *p, 8);
-        *p += 8;
-        break;
     case 'b':
         *(bool *)out = **p != 0;
         *p += 1;
@@ -4161,13 +4956,19 @@ static void br_decode(const char **p, const char *d, void *out, const char *loc)
         brine_elem_fn rt, rl;
         br_desc_fns(e, &rt, &rl);
         brine_arr *a = brine_arr_new(n, br_desc_size(e), rt, rl, loc);
-        if (*e == 'i' || *e == 'f') {
-            memcpy(a->data, *p, (size_t)(n * 8));
-            *p += n * 8;
+        if (br_desc_plain(e)) {
+            memcpy(a->data, *p, (size_t)(n * br_desc_size(e)));
+            *p += n * br_desc_size(e);
         } else {
             for (int64_t i = 0; i < n; i++) br_decode(p, e, a->data + i * a->esz, loc);
         }
         *(brine_arr **)out = a;
+        break;
+    }
+    default: {
+        int64_t n = br_desc_size(d);
+        memcpy(out, *p, (size_t)n);
+        *p += n;
         break;
     }
     }
@@ -4186,17 +4987,22 @@ static void br_copy_val(const char *d, const void *v, void *out) {
 static void br_put(int64_t dest, const char *d, const void *v, const char *loc) {
     br_buf b = {0};
     br_encode(&b, d, v);
-    br_send(dest, BR_CH_COLL, BR_K_MSG, b.p, b.len, loc);
+    br_send(dest, BR_K_MSG, b.p, b.len, loc);
     free(b.p);
 }
 static void br_take(int64_t src, const char *d, void *out, const char *loc) {
-    br_msg *m = br_recv(src, BR_CH_COLL, BR_K_MSG, loc);
+    br_msg *m = br_recv(src, BR_K_MSG, loc);
     const char *p = m->data;
     br_decode(&p, d, out, loc);
     free(m);
 }
 
 void brine_world_shift(const char *d, const void *v, void *out, int64_t by, const char *loc) {
+    if (br_size <= 1) {
+        br_copy_val(d, v, out);
+        return;
+    }
+    br_coll(BR_OP_SHIFT, loc);
     int64_t k = by % br_size;
     if (k < 0) k += br_size;
     if (k == 0) {
@@ -4207,6 +5013,26 @@ void brine_world_shift(const char *d, const void *v, void *out, int64_t by, cons
     br_take((br_rank - k + br_size) % br_size, d, out, loc);
 }
 
+/* `world.shift(v, by, edge)`: no wrapping around; a rank with no rank `by`
+ * before it (rank - by is outside the world) gets `edge`. */
+void brine_world_shift_edge(const char *d, const void *v, void *out, int64_t by, const void *edge, const char *loc) {
+    if (br_size > 1) br_coll(BR_OP_SHIFT, loc);
+    if (by == 0) {
+        br_copy_val(d, v, out);
+        return;
+    }
+    if (by >= br_size || by <= -br_size) {
+        br_copy_val(d, edge, out);
+        return;
+    }
+    int64_t to = br_rank + by, from = br_rank - by;
+    if (to >= 0 && to < br_size) br_put(to, d, v, loc);
+    if (from >= 0 && from < br_size)
+        br_take(from, d, out, loc);
+    else
+        br_copy_val(d, edge, out);
+}
+
 brine_arr *brine_world_exchange(const char *ed, brine_arr *xs, const char *loc) {
     if (xs->len != br_size)
         br_panicf(loc, "world.exchange needs one element per rank: got %lld elements, but the world size is %lld", (long long)xs->len,
@@ -4214,83 +5040,240 @@ brine_arr *brine_world_exchange(const char *ed, brine_arr *xs, const char *loc) 
     brine_elem_fn rt, rl;
     br_desc_fns(ed, &rt, &rl);
     brine_arr *res = brine_arr_new(br_size, br_desc_size(ed), rt, rl, loc);
-    for (int64_t j = 0; j < br_size; j++)
-        if (j != br_rank) br_put(j, ed, xs->data + j * xs->esz, loc);
+    if (br_size > 1) br_coll(BR_OP_EXCHANGE, loc);
+    /* everyone sends to a different rank at each step */
+    for (int64_t k = 1; k < br_size; k++) {
+        int64_t j = (br_rank + k) % br_size;
+        br_put(j, ed, xs->data + j * xs->esz, loc);
+    }
     br_copy_val(ed, xs->data + br_rank * xs->esz, res->data + br_rank * res->esz);
-    for (int64_t j = 0; j < br_size; j++)
-        if (j != br_rank) br_take(j, ed, res->data + j * res->esz, loc);
+    for (int64_t k = 1; k < br_size; k++) {
+        int64_t j = (br_rank - k + br_size) % br_size;
+        br_take(j, ed, res->data + j * res->esz, loc);
+    }
     return res;
+}
+
+/* Binomial tree from `root`: log2(size) rounds; the encoded bytes are
+ * forwarded as they are. Takes `*data` (malloc'ed) at the root, returns the
+ * bytes everywhere (the caller frees them). */
+static char *br_bcast_bytes(int64_t root, char *data, int64_t *len, const char *loc) {
+    int64_t vr = (br_rank - root + br_size) % br_size;
+    int64_t mask = 1;
+    br_msg *got = NULL;
+    while (mask < br_size) {
+        if (vr & mask) {
+            got = br_recv((br_rank - mask + br_size) % br_size, BR_K_MSG, loc);
+            break;
+        }
+        mask <<= 1;
+    }
+    if (got) {
+        *len = got->len;
+        data = (char *)brine_alloc(got->len ? got->len : 1);
+        memcpy(data, got->data, (size_t)got->len);
+        free(got);
+    }
+    for (mask >>= 1; mask > 0; mask >>= 1)
+        if (vr + mask < br_size) br_send((br_rank + mask) % br_size, BR_K_MSG, data, *len, loc);
+    return data;
 }
 
 void brine_world_bcast(const char *d, const void *v, void *out, int64_t root, const char *loc) {
     br_check_rank(root, "root", loc);
+    if (br_size <= 1) {
+        br_copy_val(d, v, out);
+        return;
+    }
+    br_coll(BR_OP_BCAST, loc);
+    br_buf b = {0};
+    if (br_rank == root) br_encode(&b, d, v);
+    int64_t len = b.len;
+    char *data = br_bcast_bytes(root, b.p, &len, loc);
     if (br_rank == root) {
-        for (int64_t r = 0; r < br_size; r++)
-            if (r != root) br_put(r, d, v, loc);
         br_copy_val(d, v, out);
     } else {
-        br_take(root, d, out, loc);
+        const char *p = data;
+        br_decode(&p, d, out, loc);
     }
+    free(data);
 }
 
-/* every rank gets [v from rank 0, v from rank 1, ...] */
+/* every rank gets [v from rank 0, v from rank 1, ...]. Each rank encodes
+ * its value once. Strings and arrays (which can be large) go straight to
+ * every other rank, staggered so no rank is sent to by all at once: the
+ * data moves over all connections at the same time. Fixed-size values,
+ * where the number of messages matters more, use Bruck's algorithm: in
+ * round k each rank sends all it has (up to 2^k values) to the rank 2^k
+ * below and gets as much from the rank 2^k above, so log2(size) rounds.
+ * The choice depends on the type only, so every rank makes the same one. */
 brine_arr *brine_world_gather(const char *ed, const void *v, const char *loc) {
     brine_elem_fn rt, rl;
     br_desc_fns(ed, &rt, &rl);
     brine_arr *res = brine_arr_new(br_size, br_desc_size(ed), rt, rl, loc);
-    for (int64_t j = 0; j < br_size; j++)
-        if (j != br_rank) br_put(j, ed, v, loc);
-    br_copy_val(ed, v, res->data + br_rank * res->esz);
-    for (int64_t j = 0; j < br_size; j++)
-        if (j != br_rank) br_take(j, ed, res->data + j * res->esz, loc);
+    if (br_size <= 1) {
+        br_copy_val(ed, v, res->data);
+        return res;
+    }
+    br_coll(BR_OP_GATHER, loc);
+    if (*ed == 's' || *ed == 'a') {
+        br_copy_val(ed, v, res->data + br_rank * res->esz);
+        br_buf one = {0};
+        br_encode(&one, ed, v);
+        for (int64_t k = 1; k < br_size; k++) br_send((br_rank + k) % br_size, BR_K_MSG, one.p, one.len, loc);
+        free(one.p);
+        for (int64_t k = 1; k < br_size; k++) {
+            int64_t j = (br_rank - k + br_size) % br_size;
+            br_take(j, ed, res->data + j * res->esz, loc);
+        }
+        return res;
+    }
+    /* Bruck: rank r collects the values of ranks r, r+1, ... (mod size) */
+    br_buf b = {0};
+    br_encode(&b, ed, v);
+    /* where each collected value starts in b; offs[n] is the end */
+    int64_t *offs = (int64_t *)brine_alloc((br_size + 1) * 8);
+    offs[0] = 0;
+    offs[1] = b.len;
+    int64_t n = 1;
+    for (int64_t d = 1; d < br_size; d <<= 1) {
+        int64_t c = d < br_size - d ? d : br_size - d;
+        /* the first c values: their lengths, then their bytes */
+        br_buf out = {0};
+        for (int64_t i = 0; i < c; i++) {
+            int64_t l = offs[i + 1] - offs[i];
+            br_buf_put(&out, &l, 8);
+        }
+        br_buf_put(&out, b.p, offs[c]);
+        br_send((br_rank - d + br_size) % br_size, BR_K_MSG, out.p, out.len, loc);
+        free(out.p);
+        br_msg *m = br_recv((br_rank + d) % br_size, BR_K_MSG, loc);
+        int64_t got = m->len - c * 8;
+        for (int64_t i = 0; i < c && got >= 0; i++) {
+            int64_t l;
+            memcpy(&l, m->data + i * 8, 8);
+            got -= l;
+            offs[n + i + 1] = offs[n + i] + l;
+        }
+        if (got != 0) br_panicf(loc, "`world.gather_all`: malformed message from rank %lld", (long long)((br_rank + d) % br_size));
+        br_buf_put(&b, m->data + c * 8, m->len - c * 8);
+        free(m);
+        n += c;
+    }
+    for (int64_t i = 0; i < br_size; i++) {
+        const char *p = b.p + offs[i];
+        br_decode(&p, ed, res->data + ((br_rank + i) % br_size) * res->esz, loc);
+    }
+    free(offs);
+    free(b.p);
     return res;
 }
 
-/* reductions: gather to rank 0 in rank order (deterministic), combine, broadcast */
+/* ---- reductions
+ * Recursive doubling: in each round, partners combine (lower ranks' part,
+ * upper ranks' part) in that order, so every rank computes exactly the same
+ * operations and ends with bit-identical results. With a world size that
+ * isn't a power of two, the ranks above it first hand their value to a
+ * partner below and get the result back at the end. */
+static int64_t br_red_op(int op) {
+    static const int64_t ops[] = {BR_OP_SUM, BR_OP_MIN, BR_OP_MAX, BR_OP_ANY, BR_OP_ALL};
+    return op >= 0 && op < 5 ? ops[op] : BR_OP_SUM;
+}
+
+/* out[i] = lo[i] (op) hi[i]; `fl`: doubles, else int64 */
+static void br_combine(int op, bool fl, const char *lo, const char *hi, char *out, int64_t n, const char *loc) {
+    for (int64_t i = 0; i < n; i++) {
+        if (fl) {
+            double a, b, r;
+            memcpy(&a, lo + i * 8, 8);
+            memcpy(&b, hi + i * 8, 8);
+            if (op == 0)
+                r = a + b;
+            else if (op == 1)
+                r = b < a ? b : a;
+            else
+                r = b > a ? b : a;
+            memcpy(out + i * 8, &r, 8);
+        } else {
+            int64_t a, b, r;
+            memcpy(&a, lo + i * 8, 8);
+            memcpy(&b, hi + i * 8, 8);
+            if (op == 0)
+                r = brine_add_i64(a, b, loc);
+            else if (op == 1 || op == 4)
+                r = b < a ? b : a;
+            else
+                r = b > a ? b : a;
+            memcpy(out + i * 8, &r, 8);
+        }
+    }
+}
+
+/* combine `n` elements at `acc` across all ranks, in place */
+static void br_allreduce(char *acc, int64_t n, bool fl, int op, const char *loc) {
+    int64_t kind = fl ? BR_K_F64 : BR_K_I64, bytes = n * 8;
+    int64_t p2 = 1;
+    while (p2 * 2 <= br_size) p2 *= 2;
+    int64_t extra = br_size - p2;
+    char *tmp = (char *)brine_alloc(bytes ? bytes : 1);
+#define BR_TAKE(src)                                                                                                                     \
+    do {                                                                                                                                 \
+        br_msg *m_ = br_recv((src), kind, loc);                                                                                          \
+        if (m_->len != bytes)                                                                                                            \
+            br_panicf(loc, "%s: rank %lld has %lld elements, but this rank has %lld (arrays must be the same length on every rank)",   \
+                      br_op_name(br_cur_op), (long long)(src), (long long)(m_->len / 8), (long long)n);                                 \
+        memcpy(tmp, m_->data, (size_t)bytes);                                                                                            \
+        free(m_);                                                                                                                        \
+    } while (0)
+    if (br_rank >= p2) {
+        br_send(br_rank - p2, kind, acc, bytes, loc);
+        BR_TAKE(br_rank - p2);
+        memcpy(acc, tmp, (size_t)bytes);
+        free(tmp);
+        return;
+    }
+    if (br_rank < extra) {
+        BR_TAKE(br_rank + p2);
+        br_combine(op, fl, acc, tmp, acc, n, loc);
+    }
+    for (int64_t mask = 1; mask < p2; mask <<= 1) {
+        int64_t partner = br_rank ^ mask;
+        br_send(partner, kind, acc, bytes, loc);
+        BR_TAKE(partner);
+        if (br_rank < partner)
+            br_combine(op, fl, acc, tmp, acc, n, loc);
+        else
+            br_combine(op, fl, tmp, acc, acc, n, loc);
+    }
+    if (br_rank < extra) br_send(br_rank + p2, kind, acc, bytes, loc);
+#undef BR_TAKE
+    free(tmp);
+}
+
+/* op: 0 sum, 1 min, 2 max, 3 any, 4 all (on 0/1) */
 int64_t brine_world_reduce_i64(int64_t v, int op, const char *loc) {
     if (br_size <= 1) return v;
-    if (br_rank == 0) {
-        int64_t acc = v;
-        for (int64_t r = 1; r < br_size; r++) {
-            int64_t x = br_get8(br_recv(r, BR_CH_COLL, BR_K_I64, loc));
-            if (op == 0)
-                acc = brine_add_i64(acc, x, loc);
-            else if (op == 1)
-                acc = x < acc ? x : acc;
-            else
-                acc = x > acc ? x : acc;
-        }
-        for (int64_t r = 1; r < br_size; r++) br_send(r, BR_CH_COLL, BR_K_I64, &acc, 8, loc);
-        return acc;
-    }
-    br_send(0, BR_CH_COLL, BR_K_I64, &v, 8, loc);
-    return br_get8(br_recv(0, BR_CH_COLL, BR_K_I64, loc));
+    br_coll(br_red_op(op), loc);
+    br_allreduce((char *)&v, 1, false, op, loc);
+    return v;
 }
 double brine_world_reduce_f64(double v, int op, const char *loc) {
     if (br_size <= 1) return v;
-    double acc = v;
-    if (br_rank == 0) {
-        for (int64_t r = 1; r < br_size; r++) {
-            br_msg *m = br_recv(r, BR_CH_COLL, BR_K_F64, loc);
-            double x;
-            memcpy(&x, m->data, 8);
-            free(m);
-            if (op == 0)
-                acc += x;
-            else if (op == 1)
-                acc = x < acc ? x : acc;
-            else
-                acc = x > acc ? x : acc;
-        }
-        for (int64_t r = 1; r < br_size; r++) br_send(r, BR_CH_COLL, BR_K_F64, &acc, 8, loc);
-        return acc;
-    }
-    br_send(0, BR_CH_COLL, BR_K_F64, &v, 8, loc);
-    br_msg *m = br_recv(0, BR_CH_COLL, BR_K_F64, loc);
-    memcpy(&acc, m->data, 8);
-    free(m);
-    return acc;
+    br_coll(br_red_op(op), loc);
+    br_allreduce((char *)&v, 1, true, op, loc);
+    return v;
 }
+
+/* element by element over `[int]` (ed "i") or `[float]` (ed "f"); a new array */
+brine_arr *brine_world_reduce_arr(const char *ed, brine_arr *xs, int op, const char *loc) {
+    brine_arr *res = brine_arr_new(xs->len, 8, NULL, NULL, loc);
+    if (xs->len) memcpy(res->data, xs->data, (size_t)(xs->len * 8));
+    if (br_size <= 1) return res;
+    br_coll(br_red_op(op), loc);
+    br_allreduce(res->data, xs->len, *ed == 'f', op, loc);
+    return res;
+}
+
 /* ============================================================ init / shutdown */
 #ifdef _WIN32
 #include <io.h>
@@ -4378,7 +5361,34 @@ static void br_utf8_args(void) {
 }
 #endif
 
+#ifndef BR_WASM
+/* The OS gives the first thread a small stack (1 MB on Windows, 8 MB on
+ * Linux) while `par` threads get BR_STACK: so that code that works in `par`
+ * works outside it too, `main` runs again on a thread of ours. */
+extern int main(int argc, char **argv);
+static int br_main_argc;
+static char **br_main_argv;
+static void br_main_thread(void *p) {
+    (void)p;
+    exit(main(br_main_argc, br_main_argv));
+}
+#endif
+
 void brine_rt_init(int argc, char **argv) {
+#ifndef BR_WASM
+    static int on_our_thread;
+    if (!on_our_thread) {
+        on_our_thread = 1;
+        br_stack_setup();
+        br_main_argc = argc;
+        br_main_argv = argv;
+        br_thread th;
+        if (br_thread_start(&th, br_main_thread, NULL)) {
+            br_thread_join(th);
+            exit(0); /* not reached: the thread exits the process */
+        }
+    }
+#endif
     br_leakcheck = getenv("BRINE_LEAKCHECK") != NULL;
     br_heap_init();
     br_argc = argc;
@@ -4398,6 +5408,7 @@ void brine_rt_init(int argc, char **argv) {
     br_gpu_setup();
     static char outbuf[1 << 16];
     setvbuf(stdout, outbuf, _IOFBF, sizeof outbuf);
+    br_out_lines = br_stdout_streams();
     br_world_init();
 }
 
@@ -4407,7 +5418,7 @@ void brine_rt_shutdown(void) {
     br_procs_free();
     br_flush();
     br_gpu_settle();
-    if (br_size > 1) brine_world_barrier();
+    br_world_finish("it returned from `main`");
     br_flush();
     if (br_leakcheck) fprintf(stderr, "brine: %lld live objects at exit\n", (long long)__atomic_load_n(&br_live, __ATOMIC_RELAXED));
 }
@@ -4451,7 +5462,8 @@ static brine_str *br_strf(const char *fmt, ...) {
     return brine_str_new(buf, n);
 }
 
-static int br_valid_utf8(const unsigned char *p, int64_t n) {
+/* the index of the first byte that starts no UTF-8 character, or -1 */
+static int64_t br_utf8_bad(const unsigned char *p, int64_t n) {
     int64_t i = 0;
     while (i < n) {
         if (p[i] < 0x80) {
@@ -4459,10 +5471,38 @@ static int br_valid_utf8(const unsigned char *p, int64_t n) {
             continue;
         }
         int64_t k = br_utf8_len(p + i, n - i);
-        if (k == 1) return 0;
+        if (k == 1) return i;
         i += k;
     }
-    return 1;
+    return -1;
+}
+static int br_valid_utf8(const unsigned char *p, int64_t n) { return br_utf8_bad(p, n) < 0; }
+
+bool brine_str_from_utf8(brine_arr *a, brine_str **out) {
+    int64_t bad = br_utf8_bad((const unsigned char *)a->data, a->len);
+    if (bad >= 0) {
+        *out = br_strf("invalid UTF-8: byte %lld (0x%02x) starts no character", (long long)bad,
+                       (unsigned)(unsigned char)a->data[bad]);
+        return false;
+    }
+    *out = brine_str_new(a->data, a->len);
+    return true;
+}
+
+/* text read from outside as a string: bytes that aren't UTF-8 become U+FFFD */
+static brine_str *br_lossy_str(const char *p, int64_t n) {
+    if (br_utf8_bad((const unsigned char *)p, n) < 0) return brine_str_new(p, n);
+    brine_sb sb;
+    brine_sb_init(&sb);
+    for (int64_t i = 0; i < n;) {
+        int64_t k = ((unsigned char)p[i] < 0x80) ? 1 : br_utf8_len((const unsigned char *)p + i, n - i);
+        if (k == 1 && (unsigned char)p[i] >= 0x80)
+            brine_sb_cat(&sb, "\xef\xbf\xbd", 3);
+        else
+            brine_sb_cat(&sb, p + i, k);
+        i += k;
+    }
+    return brine_sb_finish(&sb);
 }
 
 #ifdef _WIN32
@@ -4487,82 +5527,243 @@ static FILE *br_open(const char *path, const char *mode) {
 #endif
 }
 
-bool brine_read_file(brine_str *path, brine_str **out) {
+/* All of the file at `path` (malloc'd, in *buf and *len), or false with the
+ * message in *err. */
+static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
-        *out = br_strf("cannot read a path containing a NUL byte");
+        *err = br_strf("cannot read a path containing a NUL byte");
         return false;
     }
     FILE *f = br_open(p, "rb");
     if (!f) {
-        *out = br_strf("cannot read %s: %s", p, strerror(errno));
+        *err = br_strf("cannot read %s: %s", p, strerror(errno));
         free(p);
         return false;
     }
-    char *buf = NULL;
-    size_t len = 0, cap = 0;
+    char *b = NULL;
+    size_t n = 0, cap = 0;
     for (;;) {
-        if (len == cap) {
+        if (n == cap) {
             cap = cap ? cap * 2 : 65536;
-            buf = (char *)br_grow(buf, cap);
+            b = (char *)br_grow(b, cap);
         }
-        size_t got = fread(buf + len, 1, cap - len, f);
-        len += got;
+        size_t got = fread(b + n, 1, cap - n, f);
+        n += got;
         if (got == 0) break;
     }
     int bad = ferror(f);
     fclose(f);
     if (bad) {
-        *out = br_strf("cannot read %s: read error", p);
-    } else if (!br_valid_utf8((const unsigned char *)buf, (int64_t)len)) {
-        *out = br_strf("cannot read %s: the file is not valid UTF-8 text", p);
-        bad = 1;
+        *err = br_strf("cannot read %s: read error", p);
+        free(b);
     } else {
+        *buf = b;
+        *len = n;
+    }
+    free(p);
+    return !bad;
+}
+
+bool brine_read_file(brine_str *path, brine_str **out) {
+    char *buf;
+    size_t len;
+    if (!br_slurp(path, &buf, &len, out)) return false;
+    bool ok = br_valid_utf8((const unsigned char *)buf, (int64_t)len);
+    if (ok) {
         *out = brine_str_new(buf, (int64_t)len);
+    } else {
+        char *p = br_cstr(path);
+        *out = br_strf("cannot read %s: the file is not valid UTF-8 text", p);
+        free(p);
     }
     free(buf);
+    return ok;
+}
+
+bool brine_os_read_bytes(brine_str *path, brine_arr **out, brine_str **err) {
+    char *buf;
+    size_t len;
+    if (!br_slurp(path, &buf, &len, err)) return false;
+    brine_arr *a = brine_arr_new((int64_t)len, 1, NULL, NULL, "");
+    if (len) memcpy(a->data, buf, len);
+    free(buf);
+    *out = a;
+    return true;
+}
+
+/* writes (mode "wb") or appends ("ab") n bytes to the file at `path` */
+static bool br_put_file(brine_str *path, const char *data, int64_t n, const char *mode, brine_str **err) {
+    const char *verb = mode[0] == 'a' ? "append to" : "write";
+    char *p = br_cstr(path);
+    if (!p) {
+        *err = br_strf("cannot %s a path containing a NUL byte", verb);
+        return false;
+    }
+    FILE *f = br_open(p, mode);
+    if (!f) {
+        *err = br_strf("cannot %s %s: %s", verb, p, strerror(errno));
+        free(p);
+        return false;
+    }
+    size_t put = n ? fwrite(data, 1, (size_t)n, f) : 0;
+    int bad = put != (size_t)n;
+    if (fclose(f) != 0) bad = 1;
+    if (bad) *err = br_strf("cannot %s %s: write error (is the disk full?)", verb, p);
     free(p);
     return !bad;
 }
 
 bool brine_write_file(brine_str *path, brine_str *text, brine_str **err) {
-    char *p = br_cstr(path);
-    if (!p) {
-        *err = br_strf("cannot write a path containing a NUL byte");
-        return false;
-    }
-    FILE *f = br_open(p, "wb");
-    if (!f) {
-        *err = br_strf("cannot write %s: %s", p, strerror(errno));
-        free(p);
-        return false;
-    }
-    size_t put = text->len ? fwrite(text->data, 1, (size_t)text->len, f) : 0;
-    int bad = put != (size_t)text->len;
-    if (fclose(f) != 0) bad = 1;
-    if (bad) *err = br_strf("cannot write %s: write error (is the disk full?)", p);
-    free(p);
-    return !bad;
+    return br_put_file(path, text->data, text->len, "wb", err);
+}
+bool brine_append_file(brine_str *path, brine_str *text, brine_str **err) {
+    return br_put_file(path, text->data, text->len, "ab", err);
+}
+bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err) {
+    return br_put_file(path, data->data, data->len, "wb", err);
+}
+bool brine_os_append_bytes(brine_str *path, brine_arr *data, brine_str **err) {
+    return br_put_file(path, data->data, data->len, "ab", err);
 }
 
-bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err) {
-    char *p = br_cstr(path);
-    if (!p) {
-        *err = br_strf("cannot write a path containing a NUL byte");
+/* ============================================================ stdin */
+/* Read with read() / ReadFile, which return what has arrived, so a program
+ * talking a line protocol through a pipe gets each line as it comes (C's
+ * fread would wait for a full buffer). A Windows console is read as UTF-16
+ * (ReadConsoleW), so typed text arrives as UTF-8 whatever the code page. */
+static struct {
+    char *p;
+    int64_t len, pos, cap;
+    bool eof;
+    int err;
+} br_in;
+#ifdef _WIN32
+static int br_in_console = -1;
+static wchar_t br_in_hi; /* a high surrogate whose pair comes in the next read */
+#endif
+/* reads more of stdin into br_in.p[len..]; false at its end or on an error */
+static bool br_in_fill(void) {
+    if (br_in.eof) return false;
+    if (br_in.pos > 0) {
+        memmove(br_in.p, br_in.p + br_in.pos, (size_t)(br_in.len - br_in.pos));
+        br_in.len -= br_in.pos;
+        br_in.pos = 0;
+    }
+    if (br_in.cap - br_in.len < 16384) {
+        br_in.cap = br_in.cap ? br_in.cap * 2 : 65536;
+        br_in.p = (char *)br_grow(br_in.p, (size_t)br_in.cap);
+    }
+    int64_t room = br_in.cap - br_in.len, got = 0;
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (h == NULL || h == INVALID_HANDLE_VALUE) {
+        br_in.eof = true;
         return false;
     }
-    FILE *f = br_open(p, "wb");
-    if (!f) {
-        *err = br_strf("cannot write %s: %s", p, strerror(errno));
-        free(p);
+    if (br_in_console < 0) {
+        DWORD mode;
+        br_in_console = GetConsoleMode(h, &mode) ? 1 : 0;
+    }
+    if (br_in_console) {
+        /* at most 3 UTF-8 bytes per UTF-16 unit (a pair makes 4) */
+        wchar_t w[4096];
+        DWORD k = br_in_hi ? 1 : 0, n = 0;
+        w[0] = br_in_hi;
+        br_in_hi = 0;
+        DWORD want = (DWORD)(room / 3 - 1 < 4095 ? room / 3 - 1 : 4095) - k;
+        if (!ReadConsoleW(h, w + k, want, &n, NULL)) {
+            br_in.err = EIO;
+            br_in.eof = true;
+            return false;
+        }
+        n += k;
+        /* Ctrl+Z at the start of a line ends the input, as in the C library */
+        if (n == 0 || w[0] == 0x1a) {
+            br_in.eof = true;
+            return false;
+        }
+        if (w[n - 1] >= 0xd800 && w[n - 1] < 0xdc00) br_in_hi = w[--n];
+        int b = n ? WideCharToMultiByte(CP_UTF8, 0, w, (int)n, br_in.p + br_in.len, (int)room, NULL, NULL) : 0;
+        /* the console ends lines with \r\n */
+        char *q = br_in.p + br_in.len;
+        int m = 0;
+        for (int i = 0; i < b; i++)
+            if (!(q[i] == '\r' && i + 1 < b && q[i + 1] == '\n')) q[m++] = q[i];
+        got = m;
+        if (got == 0) return br_in_fill();
+    } else {
+        DWORD n = 0;
+        if (!ReadFile(h, br_in.p + br_in.len, (DWORD)(room < (1 << 30) ? room : (1 << 30)), &n, NULL)) {
+            DWORD e = GetLastError();
+            if (e != ERROR_BROKEN_PIPE && e != ERROR_HANDLE_EOF) br_in.err = EIO;
+            br_in.eof = true;
+            return false;
+        }
+        got = (int64_t)n;
+    }
+#else
+    ssize_t n;
+    do n = read(0, br_in.p + br_in.len, (size_t)room);
+    while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        br_in.err = errno;
+        br_in.eof = true;
         return false;
     }
-    size_t put = data->len ? fwrite(data->data, 1, (size_t)data->len, f) : 0;
-    int bad = put != (size_t)data->len;
-    if (fclose(f) != 0) bad = 1;
-    if (bad) *err = br_strf("cannot write %s: write error (is the disk full?)", p);
-    free(p);
-    return !bad;
+    got = (int64_t)n;
+#endif
+    if (got == 0) {
+        br_in.eof = true;
+        return false;
+    }
+    br_in.len += got;
+    return true;
+}
+brine_str *brine_input(brine_str *prompt) {
+    br_lock(&br_io_mu);
+    if (prompt && prompt->len) fwrite(prompt->data, 1, (size_t)prompt->len, stdout);
+    /* what was printed before (a prompt with `end=""`) shows before the wait */
+    fflush(stdout);
+    br_unlock(&br_io_mu);
+    int64_t seen = 0, n;
+    for (;;) {
+        const char *at = br_in.p + br_in.pos;
+        int64_t have = br_in.len - br_in.pos;
+        const char *nl = have > seen ? (const char *)memchr(at + seen, '\n', (size_t)(have - seen)) : NULL;
+        if (nl) {
+            n = nl - at;
+            break;
+        }
+        seen = have;
+        if (!br_in_fill()) {
+            if (br_in.len == br_in.pos) return NULL;
+            n = br_in.len - br_in.pos;
+            break;
+        }
+    }
+    const char *line = br_in.p + br_in.pos;
+    br_in.pos += n < br_in.len - br_in.pos ? n + 1 : n;
+    if (n > 0 && line[n - 1] == '\r') n--;
+    return br_lossy_str(line, n);
+}
+bool brine_read_stdin(brine_str **out) {
+    brine_flush();
+    while (br_in_fill()) {
+    }
+    if (br_in.err) {
+        *out = br_strf("cannot read stdin: %s", strerror(br_in.err));
+        return false;
+    }
+    const char *p = br_in.p + br_in.pos;
+    int64_t n = br_in.len - br_in.pos;
+    br_in.pos = br_in.len;
+    if (!br_valid_utf8((const unsigned char *)p, n)) {
+        *out = br_strf("cannot read stdin: the input is not valid UTF-8 text");
+        return false;
+    }
+    *out = brine_str_new(n ? p : "", n);
+    return true;
 }
 
 bool brine_file_exists(brine_str *path) {
@@ -4644,6 +5845,8 @@ static void br_quote_arg(brine_sb *sb, const char *a) {
 /* Run a program and wait for it. false (with *err set) if it couldn't be started. */
 bool brine_run(brine_arr *argv, int64_t *code, brine_str **err) {
     *code = 0;
+    /* the child writes to the same stdout: what we printed comes first */
+    brine_flush();
     if (argv->len == 0) {
         *err = br_strf("run() needs a program name, but the command list is empty");
         return false;
@@ -5242,6 +6445,7 @@ int64_t brine_os_cpu_count(void) {
     int n = br_ncpu();
     return n > 0 ? n : 1;
 }
+int64_t brine_os_thread_count(void) { return br_threads(); }
 
 void brine_os_sleep(double seconds) {
     if (!(seconds > 0)) return;
@@ -5792,6 +6996,7 @@ static bool br_start(br_proc *rec, char **cv, int64_t n, char **ek, char **ev, i
 
 bool brine_os_spawn(brine_arr *cmd, brine_map *env, bool capture, bool in, int64_t *handle, brine_str **err) {
     *handle = 0;
+    if (!capture) brine_flush();
     if (!br_proc_mu_ready) {
         br_mutex_init(&br_proc_mu);
         br_proc_mu_ready = 1;
@@ -5968,6 +7173,9 @@ void brine_x_box_retain(void *p) { brine_box_retain(p); }
 bool brine_x_box_dec(void *p) { return brine_box_dec(p); }
 void brine_x_map_retain(brine_map *m) { brine_map_retain(m); }
 void brine_x_map_release(brine_map *m) { brine_map_release(m); }
+void brine_x_arr_push_in(brine_arr **pa, const void *elem, int64_t esz) { brine_arr_push_in(pa, elem, esz); }
+void brine_x_arr_pop_in(brine_arr **pa, void *out, int64_t esz, const char *loc) { brine_arr_pop_in(pa, out, esz, loc); }
+void brine_x_arr_clear_in(brine_arr **pa) { brine_arr_clear_in(pa); }
 brine_str *brine_x_str_at(brine_str *s, int64_t i, const char *loc) { return brine_str_at(s, i, loc); }
 brine_str *brine_x_str_byte(brine_str *s, int64_t i) { return brine_str_byte(s, i); }
 void brine_x_str_add(brine_str **ps, brine_str *b) { brine_str_add(ps, b); }
@@ -6010,13 +7218,36 @@ BR_X_MATH1(sqrt)
 BR_X_MATH1(sin)
 BR_X_MATH1(cos)
 BR_X_MATH1(tan)
+BR_X_MATH1(asin)
+BR_X_MATH1(acos)
+BR_X_MATH1(atan)
+BR_X_MATH1(sinh)
+BR_X_MATH1(cosh)
+BR_X_MATH1(tanh)
 BR_X_MATH1(exp)
+BR_X_MATH1(exp2)
+BR_X_MATH1(expm1)
 BR_X_MATH1(log)
+BR_X_MATH1(log2)
+BR_X_MATH1(log10)
+BR_X_MATH1(log1p)
+BR_X_MATH1(cbrt)
 BR_X_MATH1(floor)
 BR_X_MATH1(ceil)
 BR_X_MATH1(round)
 BR_X_MATH1(fabs)
 double brine_x_f_pow(double a, double b) { return brine_f_pow(a, b); }
+double brine_x_f_atan2(double y, double x) { return brine_f_atan2(y, x); }
+double brine_x_f_hypot(double x, double y) { return brine_f_hypot(x, y); }
+float brine_x_f_powf(float a, float b) { return brine_f_powf(a, b); }
+float brine_x_f_atan2f(float y, float x) { return brine_f_atan2f(y, x); }
+float brine_x_f_hypotf(float x, float y) { return brine_f_hypotf(x, y); }
+int64_t brine_x_popcnt_u64(uint64_t x) { return brine_popcnt_u64(x); }
+int64_t brine_x_clz_u64(uint64_t x) { return brine_clz_u64(x); }
+int64_t brine_x_ctz_u64(uint64_t x) { return brine_ctz_u64(x); }
+int64_t brine_x_popcnt_u128(const brine_u128 *x) { return brine_popcnt_u128(*x); }
+int64_t brine_x_clz_u128(const brine_u128 *x) { return brine_clz_u128(*x); }
+int64_t brine_x_ctz_u128(const brine_u128 *x) { return brine_ctz_u128(*x); }
 double brine_x_f_fmod(double a, double b) { return brine_f_fmod(a, b); }
 float brine_x_f_fmodf(float a, float b) { return brine_f_fmodf(a, b); }
 double brine_x_f_fmin(double a, double b) { return brine_f_fmin(a, b); }

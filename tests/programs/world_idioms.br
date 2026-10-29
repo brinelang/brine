@@ -1,0 +1,66 @@
+# Safe `world` idioms the deadlock checker must accept.
+struct Block:
+    rank: int
+    px: int
+
+fn halo(b: Block, v: float) -> float:
+    return world.shift(v, b.px)
+
+fn local_residual(it: int) -> float:
+    return 1.0 / float(it + world.rank() + 1)
+
+# Ok/Err is agreed on by every rank; only the payload differs.
+fn local_work() -> Result[int, str]:
+    let mine = world.rank() * 10
+    let failed = world.max(0)
+    if failed == 1:
+        return Err("some rank failed")
+    return Ok(mine)
+
+fn total() -> Result[int, str]:
+    let v = local_work()?
+    return Ok(world.sum(v))
+
+fn main():
+    let p = world.size()
+    # flow-sensitive: a later rank-dependent assignment doesn't taint earlier uses
+    var n = p
+    for i in 0..n:
+        world.barrier()
+    n = world.rank()
+    # the convergence loop that reuses one variable
+    var err = 1.0
+    var it = 0
+    while err > 0.01:
+        err = local_residual(it)
+        err = world.max(err)
+        it += 1
+    # "rank 0 decides, then broadcasts"
+    var cfg = "3"
+    if world.rank() == 0:
+        cfg = "2"
+    cfg = world.broadcast(0, cfg)
+    for i in 0..int(cfg):
+        world.barrier()
+    # tuples and struct fields are tracked separately
+    let (r, size) = (world.rank(), world.size())
+    for i in 0..size:
+        world.barrier()
+    let b = Block(rank=r, px=p)
+    let h = halo(b, float(r))
+    # the length of what `exchange` returns is always the world size
+    let inbox = world.exchange([r] * p)
+    for i in 0..len(inbox):
+        world.barrier()
+    # a rank-dependent `continue` doesn't stop anyone from evaluating the condition
+    var k = 0
+    var skipped = 0
+    while world.sum(1) * k < 3 * p:
+        k += 1
+        if world.rank() == 0:
+            skipped += 1
+            continue
+    let t = total()
+    let all = world.gather_all(n + int(h) + skipped)
+    if world.rank() == 0:
+        print(it, cfg, inbox, t, all)

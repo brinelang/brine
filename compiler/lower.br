@@ -12,12 +12,13 @@
 # parameters and aggregate parameters) the caller's memory behind a pointer.
 #
 # Memory layouts are C's (the runtime is C and shares them):
-# tuples and structs are C structs, enums with payload are boxes
-# `{rc, tag, union of variant structs}`, other enums are int32.
+# tuples and structs are C structs; enums with payload are `{tag, union of
+# variant structs}` in place when small and not recursive, else boxes
+# `{rc, tag, union}` (see `BoxLay`); other enums are int32.
 from diag import Span, SourceMap
-from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, LocalKind, int_ty
+from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, LocalKind, int_ty, NumM
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
-from ast import FmtSpec, parse_fmt_spec, children, stmt_exprs, stmt_blocks, local_of
+from ast import FmtSpec, parse_fmt_spec, children, stmt_exprs, stmt_blocks, local_of, lvalue_root
 from info import ProgramInfo, ConstVal, TryKind, try_kind, mangle_module, PRELUDE
 from num import u128_bits
 from ir import K, Op, Func, Data, Reloc, Module, FB, new_func, le_bytes, str_bytes, f64_bits, f32_bits
@@ -55,6 +56,8 @@ struct Owned:
     v: int
     ty: Ty
     home: bool
+    # the local whose home this is, else -1
+    lid: int
 
 # For `x / 2^k` and `x % 2^k` on a signed integer, k (else -1): floor division
 # by a power of two is an arithmetic shift and the floored remainder a mask.
@@ -96,6 +99,10 @@ struct FnCx:
     scopes: [[Owned]]
     loops: [Loop]
     par_writes: {int: bool}
+    # local arrays kept in the stack frame (see `stack_arrays`)
+    stack_arrs: {int: bool}
+    # the loop variable of the `par for` this body was lifted from (else -1)
+    par_var: int
     # arrays no enclosing loop can share, grow or replace: their pointers
     # are loaded once before the loop (and made unique if the loop writes them)
     arrc: {int: ArrCache}
@@ -147,6 +154,29 @@ struct FnCx:
     # string variables a loop appends bytes to through an appender
     # (`open_apps`): the appender's address
     apps: {int: int}
+    # index values evaluated ahead of their place (`pre_index`), by span
+    pre_idx: {str: int}
+    # the keys in `arrc` (negative) of the array fields loops cache, by path
+    fkeys: {str: int}
+    # `var`s that only ever borrow (see `borrow_let`): assigning one
+    # neither retains the new value nor releases the old
+    borrowed: {int: bool}
+    # parameters this body owns (an `__own` clone, see `own_call`) and the
+    # depth of the scope of the body's own statements
+    own_params: {int: bool}
+    body_depth: int
+    # the next call_fn call takes argument `own_arg` moved from `own_slot`
+    # and calls the clone that owns it
+    own_arg: int
+    own_slot: int
+    own_mask: int
+    # a `__br` clone: results are returned borrowed (see `bret_ok`)
+    bret: bool
+    # in the fast copy of a loop `bounds_version` made: the index checks
+    # (and the additions computing those indexes) it showed can't fail, by
+    # span; and the loops being versioned
+    nochk: {str: bool}
+    bv_keys: {str: bool}
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -172,6 +202,8 @@ fn new_cx(f: Func) -> FnCx:
         scopes=[],
         loops=[],
         par_writes={},
+        stack_arrs={},
+        par_var=-1,
         arrc={},
         lslot={},
         lptr={},
@@ -195,7 +227,18 @@ fn new_cx(f: Func) -> FnCx:
         hit_key=-1,
         hit_e=-1,
         reset={},
-        apps={}
+        apps={},
+        pre_idx={},
+        fkeys={},
+        borrowed={},
+        own_params={},
+        body_depth=-1,
+        own_arg=-1,
+        own_slot=-1,
+        own_mask=0,
+        bret=false,
+        nochk={},
+        bv_keys={}
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -207,12 +250,16 @@ struct Lay:
     size: int
     align: int
 
-# Where the fields of an enum box are.
+# Where the fields of an enum with payloads are: in a box `{rc, tag (i64),
+# union}`, or (`inline`) in the value itself, `{tag (i32), union}`, handled
+# like a struct.
 struct BoxLay:
+    inline: bool
     # offset of the union of variant structs
     uoff: int
-    # size of the whole box
+    # size of the whole box (or the inline value)
     size: int
+    align: int
     # per variant: its size (to the end of its struct) and its field offsets
     vsize: [int]
     voffs: [[int]]
@@ -263,8 +310,10 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         soffs=[],
         sdone=[],
         blays=[],
+        edone=[],
         done={},
         strs={},
+        carrs={},
         cstrs={},
         nlifts={},
         dnames={},
@@ -279,6 +328,14 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         clones=[],
         cloned={},
         nc_body=false,
+        odecls={},
+        own_clones=[],
+        own_seen={},
+        own_body=0,
+        bret={},
+        br_clones=[],
+        br_seen={},
+        br_body=false,
         khints={},
         kernels=[]
     )
@@ -296,9 +353,12 @@ struct Lower:
     soffs: [[int]]
     sdone: [bool]
     blays: [BoxLay]
+    edone: [bool]
     done: {str: bool}
     # string literal objects and plain C strings, by text
     strs: {str: str}
+    # array constants in the data section, by constant
+    carrs: {int: str}
     cstrs: {str: str}
     nlifts: {str: int}
     dnames: {str: bool}
@@ -319,6 +379,19 @@ struct Lower:
     cloned: {int: bool}
     # the body being lowered is such a clone
     nc_body: bool
+    # every brine function by id, the clones that own some by-value
+    # parameters (`own_call`: id and a mask of parameters), and the mask of
+    # the body being lowered
+    odecls: {int: FnDecl}
+    own_clones: [(int, int)]
+    own_seen: {str: bool}
+    own_body: int
+    # functions that may return borrowed results (see `bret_ok`), and the
+    # `__br` clones to make
+    bret: {int: bool}
+    br_clones: [int]
+    br_seen: {int: bool}
+    br_body: bool
     # the array lengths callers pass (kernel.br), and the kernels made
     khints: {int: [int]}
     kernels: [str]
@@ -337,18 +410,37 @@ struct Lower:
         for m in prog.modules:
             for f in m.fns:
                 if not f.is_extern:
+                    self.odecls[f.id] = f
+        for m in prog.modules:
+            for f in m.fns:
+                if not f.is_extern:
                     self.gen_body(f, self.info.fns[f.id].c_name, false)
         if self.opts.tests:
             self.gen_tests()
         else:
             self.gen_main()
         var ci = 0
-        while ci < len(self.clones):
-            let f = self.fdecls[self.clones[ci]]
-            self.nc_body = true
-            self.gen_body(f, self.info.fns[f.id].c_name + "__nc", false)
-            self.nc_body = false
-            ci += 1
+        var oi = 0
+        var bi = 0
+        while ci < len(self.clones) or oi < len(self.own_clones) or bi < len(self.br_clones):
+            if bi < len(self.br_clones):
+                let id = self.br_clones[bi]
+                self.br_body = true
+                self.gen_body(self.odecls[id], self.info.fns[id].c_name + "__br", false)
+                self.br_body = false
+                bi += 1
+            elif ci < len(self.clones):
+                let f = self.fdecls[self.clones[ci]]
+                self.nc_body = true
+                self.gen_body(f, self.info.fns[f.id].c_name + "__nc", false)
+                self.nc_body = false
+                ci += 1
+            else:
+                let (id, mask) = self.own_clones[oi]
+                self.own_body = mask
+                self.gen_body(self.odecls[id], own_name(self.info.fns[id].c_name, mask), false)
+                self.own_body = 0
+                oi += 1
         var externs: [Func] = []
         var seen: {str: bool} = {}
         for sig in self.info.fns:
@@ -396,10 +488,14 @@ struct Lower:
         self.flocals = f.locals
         self.cx = new_cx(new_func(name, ks, has, rk))
         self.cx.nc = self.nc_body
+        self.cx.bret = self.br_body
         if self.opts.debug:
             self.dbg_func(f, is_test)
         elif self.opts.fast:
             self.cx.packed = pack.find(f.body, f.locals)
+        if not self.opts.debug:
+            self.cx.stack_arrs = self.stack_arrays(f.body)
+        var owned: [(int, int, Ty)] = []
         if not is_test:
             let sig = self.info.fns[f.id]
             var pi = 0
@@ -411,7 +507,16 @@ struct Lower:
                     continue
                 let v = pi + i
                 let id = f.param_locals[i]
-                if p.by_ref or self.agg(p.ty):
+                if not p.by_ref and owns_param(self.own_body, i):
+                    # an `__own` clone: the parameter is this body's to release
+                    let a = self.new_local(id, p.ty)
+                    if self.agg(p.ty):
+                        self.cx.fb.copy(a, v, self.lay(p.ty).size)
+                    else:
+                        self.cx.fb.store(a, 0, v)
+                    self.cx.own_params[id] = true
+                    owned.push((a, id, p.ty))
+                elif p.by_ref or self.agg(p.ty):
                     self.cx.lptr[id] = v
                     self.dbg_ptr_var(id, v, true)
                 else:
@@ -419,11 +524,25 @@ struct Lower:
                     self.cx.fb.store(a, 0, v)
             if self.tracks_caller(f.id):
                 self.cx.loc = len(ks) - 1
-            elif f.id in self.khints and not self.nc_body:
+            elif (
+                f.id in self.khints and not self.nc_body and not self.br_body and self.own_body == 0
+            ):
                 self.kernel_entry(f, name)
         var nw = narrow.Narrow(arrs={}, guards=[])
-        if self.opts.fast and not self.opts.debug:
+        if self.opts.fast and not self.opts.debug and self.own_body == 0:
             nw = narrow.find(f.body, f.locals)
+        # (an array kept as bits or bytes isn't a stack array)
+        for l in nw.arrs:
+            if l in self.cx.stack_arrs:
+                self.cx.stack_arrs.remove(l)
+        for l in self.cx.packed:
+            if l in self.cx.stack_arrs:
+                self.cx.stack_arrs.remove(l)
+        if len(owned) > 0:
+            self.push_scope()
+            for a, id, t in owned:
+                self.add_local_home(a, t, id)
+            self.cx.body_depth = len(self.cx.scopes) + 1
         if len(nw.arrs) > 0 and len(nw.guards) > 0:
             # bytes only while the parameters allow it, else plain arrays
             let slow = self.cx.fb.label()
@@ -440,6 +559,8 @@ struct Lower:
         else:
             self.cx.narrow = nw.arrs
         self.block(f.body)
+        if len(owned) > 0:
+            self.pop_scope()
         self.end_body(has)
         self.funcs.push(self.cx.fb.f)
 
@@ -542,20 +663,34 @@ struct Lower:
                     code = self.cx.fb.konst(K.I32, 0)
                 else:
                     match try_kind(self.info, sig.ret):
-                        case Some(TryKind.Res(_, err_v, _, err)):
-                            # `main() -> Result[(), E]`: an `Err` prints "error: ..." and exits with 1
-                            let r = self.cx.fb.call(K.Ptr, sym, [])
+                        case Some(TryKind.Res(ok_v, err_v, ok, err)):
+                            # `main() -> Result[(), E]`: an `Err` prints "error: ..." and exits
+                            # with 1; `Result[int, E]`: `Ok(n)` exits with n
+                            let eid = cg_enum_id(sig.ret)
+                            var r = -1
+                            if self.agg(sig.ret):
+                                let lay = self.lay(sig.ret)
+                                r = self.cx.fb.temp_mem(lay.size, lay.align)
+                                self.cx.fb.call_void(sym, [r])
+                            else:
+                                r = self.cx.fb.call(K.Ptr, sym, [])
                             code = self.cx.fb.vreg(K.I32)
                             let zero = self.cx.fb.konst(K.I32, 0)
                             self.cx.fb.mov(code, zero)
-                            let tag = self.cx.fb.load(K.I64, r, 8)
-                            let ev = self.cx.fb.konst(K.I64, err_v)
+                            let tag = self.etag(eid, r)
+                            let ev = self.cx.fb.konst(self.tagk(eid), err_v)
                             let is_err = self.cx.fb.cmp(Op.Eq, tag, ev)
+                            if ok != Ty.Unit:
+                                let after_ok = self.cx.fb.label()
+                                self.cx.fb.br(is_err, after_ok)
+                                let n = self.ld(r, self.vfield_off(eid, ok_v, 0), ok)
+                                let n32 = self.cx.fb.conv(K.I32, n)
+                                self.cx.fb.mov(code, n32)
+                                self.cx.fb.place(after_ok)
                             let skip = self.cx.fb.label()
                             self.cx.fb.brnot(is_err, skip)
                             let sb = self.sb_new()
                             self.sb_lit(sb, "error: ")
-                            let eid = cg_enum_id(sig.ret)
                             let fv = self.ld(r, self.vfield_off(eid, err_v, 0), err)
                             self.fmt_code(sb, fv, err, false)
                             self.cx.fb.call_void("brine_eprint_sb", [sb])
@@ -762,6 +897,67 @@ struct Lower:
                 self.data.push(Data(name=sym, align=8, bytes=b, relocs=[], readonly=false))
         return self.cx.fb.global(sym)
 
+    # An array constant of numbers or bools: one array in the data section,
+    # never freed (its count starts too high to reach 0) and copied before
+    # any change like any shared array. Each use borrows it.
+    fn const_arr(ref self, e: Expr) -> Option[int]:
+        var id = 0
+        match e.res:
+            case Res.Const(c):
+                id = c
+            case _:
+                return None
+        match self.carrs.get(id):
+            case Some(sym):
+                return Some(self.cx.fb.global(sym))
+            case None:
+                pass
+        let el = e.ty.elem()
+        let esz = self.lay(el).size
+        var es: [Expr] = []
+        match e.kind:
+            case ExprKind.Array(xs):
+                es = xs
+            case _:
+                return None
+        var body: [u8] = []
+        for x in es:
+            match (el, x.kind):
+                case (Ty.Int(k), ExprKind.Int(n)):
+                    if k.bits() > 64:
+                        return None
+                    le_bytes(ref body, int(n), esz)
+                case (Ty.Float(FloatTy.F32), ExprKind.Float(f)):
+                    le_bytes(ref body, f32_bits(f), esz)
+                case (Ty.Float(_), ExprKind.Float(f)):
+                    le_bytes(ref body, f64_bits(f), esz)
+                case (Ty.Bool, ExprKind.Bool(b)):
+                    le_bytes(ref body, 1 if b else 0, esz)
+                case _:
+                    return None
+        var b: [u8] = []
+        # the layout of `brine_arr`: rc, len, cap, esz, retain, release, data
+        le_bytes(ref b, 1 << 62, 8)
+        le_bytes(ref b, len(es), 8)
+        le_bytes(ref b, len(es), 8)
+        le_bytes(ref b, esz, 8)
+        le_bytes(ref b, 0, 24)
+        b.extend(body)
+        while len(b) % 8 != 0 or len(b) == 56:
+            b.push(u8(0))
+        let sym = self.data_name("br_ca", self.info.consts[id].name)
+        self.data.push(
+            Data(
+                name=sym,
+                align=8,
+                bytes=b,
+                relocs=[Reloc(off=48, sym=sym, add=56)],
+                readonly=false
+            )
+        )
+        self.carrs[id] = sym
+        return Some(self.cx.fb.global(sym))
+
     fn push_frame(ref self):
         self.cx.frames.push([])
 
@@ -827,13 +1023,37 @@ struct Lower:
     fn add_home(ref self, p: int, ty: Ty):
         if self.managed(ty):
             let k = len(self.cx.scopes) - 1
-            self.cx.scopes[k].push(Owned(v=p, ty=ty, home=true))
+            self.cx.scopes[k].push(Owned(v=p, ty=ty, home=true, lid=-1))
+
+    # The home of local `id`, which the current scope releases unless its
+    # value is moved out (`drop_home`).
+    fn add_local_home(ref self, p: int, ty: Ty, id: int):
+        if self.managed(ty):
+            let k = len(self.cx.scopes) - 1
+            self.cx.scopes[k].push(Owned(v=p, ty=ty, home=true, lid=id))
+
+    fn has_home(self, id: int) -> bool:
+        for sc in self.cx.scopes:
+            for o in sc:
+                if o.lid == id:
+                    return true
+        return false
+
+    # Local `id`'s value was moved out: no exit from here on releases it.
+    fn drop_home(ref self, id: int):
+        for i in 0..len(self.cx.scopes):
+            var j = 0
+            while j < len(self.cx.scopes[i]):
+                if self.cx.scopes[i][j].lid == id:
+                    self.cx.scopes[i].pop(j)
+                else:
+                    j += 1
 
     # An owned value that the current scope releases.
     fn add_owned(ref self, v: int, ty: Ty):
         if self.managed(ty):
             let k = len(self.cx.scopes) - 1
-            self.cx.scopes[k].push(Owned(v=v, ty=ty, home=false))
+            self.cx.scopes[k].push(Owned(v=v, ty=ty, home=false, lid=-1))
 
     fn release_scopes_from(ref self, depth: int):
         var i = len(self.cx.scopes) - 1
@@ -869,6 +1089,17 @@ struct Lower:
         self.retain(v, ty)
         return v
 
+    # A plain aggregate (no counted parts) in memory of its own. Owning it
+    # takes nothing, so `v` may still point into a temp the frame is about to
+    # release (`match mk()[0]`), or into a variable that changes meanwhile.
+    fn detach(ref self, v: int, ty: Ty) -> int:
+        if not self.agg(ty) or self.managed(ty):
+            return v
+        let lay = self.lay(ty)
+        let t = self.cx.fb.temp_mem(lay.size, lay.align)
+        self.cx.fb.copy(t, v, lay.size)
+        return t
+
     # Owned values of several expressions. All are evaluated before any is
     # claimed, so a `?` in a later one can't leak an earlier one.
     fn owned_all(ref self, es: [Expr]) -> [int]:
@@ -894,24 +1125,60 @@ struct Lower:
             case Ty.Struct(sid):
                 return any(self.managed(f.1) for f in self.info.structs[sid].fields)
             case Ty.Enum(eid):
+                if self.inl_e(eid):
+                    for v in self.info.enums[eid].variants:
+                        if any(self.managed(fd.1) for fd in v.fields):
+                            return true
+                    return false
                 return self.info.enums[eid].has_payload()
             case _:
                 return false
 
+    # An enum stored in shared boxes (see `BoxLay`).
     fn boxed(self, t: Ty) -> bool:
+        match t:
+            case Ty.Enum(eid):
+                return self.info.enums[eid].has_payload() and not self.inl_e(eid)
+            case _:
+                return false
+
+    # An enum with payloads stored in the value itself (see `BoxLay`).
+    fn inl(self, t: Ty) -> bool:
+        match t:
+            case Ty.Enum(eid):
+                return self.inl_e(eid)
+            case _:
+                return false
+
+    fn inl_e(self, eid: int) -> bool:
+        return eid < len(self.blays) and self.blays[eid].inline
+
+    # Does enum type `t` have a variant with fields?
+    fn payload(self, t: Ty) -> bool:
         match t:
             case Ty.Enum(eid):
                 return self.info.enums[eid].has_payload()
             case _:
                 return false
 
-    # Tuples and structs: values in memory, handled through pointers.
+    # The kind of the tag of an enum with payloads, and the tag of the value at p.
+    fn tagk(self, eid: int) -> K:
+        return K.I32 if self.inl_e(eid) else K.I64
+
+    fn etag(ref self, eid: int, p: int) -> int:
+        if self.inl_e(eid):
+            return self.cx.fb.load(K.I32, p, 0)
+        return self.cx.fb.load(K.I64, p, 8)
+
+    # Tuples, structs and inline enums: values in memory, handled through pointers.
     fn agg(self, t: Ty) -> bool:
         match t:
             case Ty.Tuple(ts):
                 return len(ts) > 0
             case Ty.Struct(_):
                 return true
+            case Ty.Enum(eid):
+                return self.inl_e(eid)
             case _:
                 return false
 
@@ -989,6 +1256,9 @@ struct Lower:
             case Ty.Bool | Ty.Unit:
                 return Lay(size=1, align=1)
             case Ty.Enum(eid):
+                if self.inl_e(eid):
+                    let bl = self.blays[eid]
+                    return Lay(size=bl.size, align=bl.align)
                 if self.info.enums[eid].has_payload():
                     return Lay(size=8, align=8)
                 return Lay(size=4, align=4)
@@ -1032,18 +1302,29 @@ struct Lower:
     fn vfield_off(self, eid: int, vi: int, fi: int) -> int:
         return self.blays[eid].voffs[vi][fi]
 
-    # Struct layouts depend on the layouts of the structs they contain, so they
-    # are computed once, up front, inner structs first.
+    # Struct and inline enum layouts depend on the layouts of the structs and
+    # enums they contain, so they are computed once, up front, inner ones
+    # first. An enum that can hold itself is boxed (its size is a pointer's),
+    # which breaks every cycle.
     fn prep_layouts(ref self):
         let ns = len(self.info.structs)
         self.slays = [Lay(size=1, align=1)] * ns
         let none: [int] = []
         self.soffs = [none] * ns
         self.sdone = [false] * ns
+        let ne = len(self.info.enums)
+        let nb: [int] = []
+        let nvo: [[int]] = []
+        self.blays = [BoxLay(inline=false, uoff=16, size=16, align=8, vsize=nb, voffs=nvo)] * ne
+        self.edone = [false] * ne
+        for eid in 0..ne:
+            self.prep_enum(eid)
         for sid in 0..ns:
             self.prep_struct(sid)
-        for eid in 0..len(self.info.enums):
-            self.blays.push(self.make_box_lay(eid))
+        # boxes only now: their payloads may hold structs that hold the enum
+        for eid in 0..ne:
+            if not self.blays[eid].inline:
+                self.blays[eid] = self.make_box_lay(eid, false)
 
     fn prep_ty(ref self, t: Ty):
         match t:
@@ -1052,8 +1333,29 @@ struct Lower:
             case Ty.Tuple(ts):
                 for x in ts:
                     self.prep_ty(x)
+            case Ty.Enum(eid):
+                self.prep_enum(eid)
             case _:
                 pass
+
+    # An enum with payloads of at most 64 bytes that can't hold itself is
+    # stored inline: `Some(i)` needs no allocation and no reference count.
+    fn prep_enum(ref self, eid: int):
+        if self.edone[eid]:
+            return
+        self.edone[eid] = true
+        let en = self.info.enums[eid]
+        if not en.has_payload():
+            return
+        var seen: {str: bool} = {}
+        if self.self_holding(Ty.Enum(eid), eid, ref seen):
+            return
+        for v in en.variants:
+            for fd in v.fields:
+                self.prep_ty(fd.1)
+        let bl = self.make_box_lay(eid, true)
+        if bl.size - bl.uoff <= 64:
+            self.blays[eid] = bl
 
     fn prep_struct(ref self, sid: int):
         if self.sdone[sid]:
@@ -1066,7 +1368,7 @@ struct Lower:
         self.slays[sid] = r.0
         self.soffs[sid] = r.1
 
-    fn make_box_lay(self, eid: int) -> BoxLay:
+    fn make_box_lay(self, eid: int, inline: bool) -> BoxLay:
         let en = self.info.enums[eid]
         var ual = 1
         var usz = 0
@@ -1077,8 +1379,8 @@ struct Lower:
             if len(v.fields) > 0:
                 ual = max(ual, r.0.align)
                 usz = max(usz, r.0.size)
-        let uoff = align_up(16, ual)
-        let bal = max(8, ual)
+        let uoff = align_up(4 if inline else 16, ual)
+        let bal = max(4 if inline else 8, ual)
         var vsize: [int] = []
         var voffs: [[int]] = []
         for i, v in enumerate(en.variants):
@@ -1086,8 +1388,10 @@ struct Lower:
             vsize.push(uoff + (r.0.size if len(v.fields) > 0 else 0))
             voffs.push([uoff + o for o in r.1])
         return BoxLay(
+            inline=inline,
             uoff=uoff,
             size=align_up(uoff + align_up(usz, ual), bal),
+            align=bal,
             vsize=vsize,
             voffs=voffs
         )
@@ -1320,8 +1624,9 @@ struct Lower:
                 # a box: {rc, tag, the union of the variants with fields}
                 let int = self.dty(int_ty())
                 let bl = self.blays[eid]
+                let tk = self.tagk(eid)
                 let tag = self.dty_add(
-                    DType(tag=DT_ENUM, name=name + ".tag", size=8, k=K.I64, to=-1, fields=vals)
+                    DType(tag=DT_ENUM, name=name + ".tag", size=tk.size(), k=tk, to=-1, fields=vals)
                 )
                 var vs: [DField] = []
                 for vi, v in enumerate(en.variants):
@@ -1333,8 +1638,21 @@ struct Lower:
                     let vt = self.dty_add(dstruct(en.variant_label(vi), bl.vsize[vi] - bl.uoff, fs))
                     vs.push(dfield(v.name, vt, 0))
                 let u = self.dty_add(
-                    DType(tag=DT_UNION, name=name + ".variants", size=bl.size - bl.uoff, k=K.I64, to=-1, fields=vs)
+                    DType(
+                        tag=DT_UNION,
+                        name=name + ".variants",
+                        size=bl.size - bl.uoff,
+                        k=K.I64,
+                        to=-1,
+                        fields=vs
+                    )
                 )
+                if bl.inline:
+                    return dstruct(
+                        name,
+                        bl.size,
+                        [dfield("tag", tag, 0), dfield("variant", u, bl.uoff)]
+                    )
                 let fs = [
                     dfield("rc", int, 0),
                     dfield("tag", tag, 8),
@@ -1357,6 +1675,9 @@ struct Lower:
             case Ty.Enum(_):
                 if self.boxed(t):
                     self.cx.fb.rt_void("brine_box_retain", [v])
+                elif self.managed(t):
+                    let m = self.need_rc(t)
+                    self.cx.fb.call_void("br_retain_" + m, [v])
             case Ty.Tuple(_) | Ty.Struct(_):
                 if self.managed(t):
                     let m = self.need_rc(t)
@@ -1397,30 +1718,114 @@ struct Lower:
         let m = self.mangle(t)
         if not self.mark_done("rc_" + m):
             return m
+        if self.inl(t):
+            # the fields of the variant the tag names
+            let eid = cg_enum_id(t)
+            for which in 0..2:
+                let s1 = self.start_helper(
+                    ("br_retain_" if which == 0 else "br_release_") + m,
+                    [K.Ptr],
+                    false,
+                    K.I64
+                )
+                let tag = self.etag(eid, 0)
+                let out = self.cx.fb.label()
+                for vi, v in enumerate(self.info.enums[eid].variants):
+                    if not any(self.managed(fd.1) for fd in v.fields):
+                        continue
+                    let next = self.cx.fb.label()
+                    let vv = self.cx.fb.konst(K.I32, vi)
+                    let hit = self.cx.fb.cmp(Op.Eq, tag, vv)
+                    self.cx.fb.brnot(hit, next)
+                    for fi, fd in enumerate(v.fields):
+                        if self.managed(fd.1):
+                            let x = self.ld(0, self.vfield_off(eid, vi, fi), fd.1)
+                            if which == 0:
+                                self.retain(x, fd.1)
+                            else:
+                                self.release(x, fd.1)
+                    self.cx.fb.jmp(out)
+                    self.cx.fb.place(next)
+                self.cx.fb.place(out)
+                self.finish_helper(s1)
+            let s7 = self.start_helper("br_rtp_" + m, [K.Ptr], false, K.I64)
+            self.cx.fb.call_void("br_retain_" + m, [0])
+            self.finish_helper(s7)
+            let s8 = self.start_helper("br_rlp_" + m, [K.Ptr], false, K.I64)
+            self.cx.fb.call_void("br_release_" + m, [0])
+            self.finish_helper(s8)
+            return m
         match t:
             case Ty.Enum(eid):
                 let variants = self.info.enums[eid].variants
                 let s1 = self.start_helper("br_retain_" + m, [K.Ptr], false, K.I64)
                 self.cx.fb.rt_void("brine_box_retain", [0])
                 self.finish_helper(s1)
-                let s2 = self.start_helper("br_release_" + m, [K.Ptr], false, K.I64)
-                let dead = self.cx.fb.rt(K.Bool, "brine_box_dec", [0])
+                # an enum that can hold itself (a list, a tree) may be deep:
+                # its dead boxes are freed through `brine_drop`, which doesn't
+                # recurse without bound
+                var seen: {str: bool} = {}
+                let deep = self.self_holding(t, eid, ref seen)
+                if deep:
+                    let s0 = self.start_helper("br_release_" + m, [K.Ptr], false, K.I64)
+                    let dead0 = self.cx.fb.rt(K.Bool, "brine_box_dec", [0])
+                    let out0 = self.cx.fb.label()
+                    self.cx.fb.brnot(dead0, out0)
+                    let f = self.fn_ptr("br_drop_" + m)
+                    self.cx.fb.call_void("brine_drop", [0, f])
+                    self.cx.fb.place(out0)
+                    self.finish_helper(s0)
+                let s2 = self.start_helper(
+                    ("br_drop_" if deep else "br_release_") + m,
+                    [K.Ptr],
+                    false,
+                    K.I64
+                )
                 let out = self.cx.fb.label()
-                self.cx.fb.brnot(dead, out)
-                let tag = self.cx.fb.load(K.I64, 0, 8)
+                if not deep:
+                    let dead = self.cx.fb.rt(K.Bool, "brine_box_dec", [0])
+                    self.cx.fb.brnot(dead, out)
+                # a variant's last field of this enum (a list's tail) is freed
+                # by looping, so a chain needs one `brine_drop`, not one a box
+                let cur = self.cx.fb.copy_of(0)
+                let f0 = self.cx.fb.konst(K.Bool, 0)
+                let more = self.cx.fb.copy_of(f0)
+                let nx = self.cx.fb.copy_of(0)
+                let head = self.cx.fb.label()
+                var looped = false
+                self.cx.fb.place(head)
+                let tag = self.cx.fb.load(K.I64, cur, 8)
                 for vi, v in enumerate(variants):
                     if not any(self.managed(fd.1) for fd in v.fields):
                         continue
+                    var tail = -1
+                    if deep:
+                        for fi, fd in enumerate(v.fields):
+                            if fd.1 == t:
+                                tail = fi
                     let next = self.cx.fb.label()
                     let vv = self.cx.fb.konst(K.I64, vi)
                     let hit = self.cx.fb.cmp(Op.Eq, tag, vv)
                     self.cx.fb.brnot(hit, next)
                     for fi, fd in enumerate(v.fields):
-                        if self.managed(fd.1):
-                            let x = self.ld(0, self.vfield_off(eid, vi, fi), fd.1)
+                        if fi == tail:
+                            let x = self.ld(cur, self.vfield_off(eid, vi, fi), fd.1)
+                            self.cx.fb.mov(nx, x)
+                            let f1 = self.cx.fb.konst(K.Bool, 1)
+                            self.cx.fb.mov(more, f1)
+                            looped = true
+                        elif self.managed(fd.1):
+                            let x = self.ld(cur, self.vfield_off(eid, vi, fi), fd.1)
                             self.release(x, fd.1)
                     self.cx.fb.place(next)
-                self.cx.fb.call_void("brine_box_free", [0])
+                self.cx.fb.call_void("brine_box_free", [cur])
+                if looped:
+                    self.cx.fb.brnot(more, out)
+                    self.cx.fb.mov(more, f0)
+                    let dead1 = self.cx.fb.rt(K.Bool, "brine_box_dec", [nx])
+                    self.cx.fb.brnot(dead1, out)
+                    self.cx.fb.mov(cur, nx)
+                    self.cx.fb.jmp(head)
                 self.cx.fb.place(out)
                 self.finish_helper(s2)
                 let s3 = self.start_helper("br_rtp_" + m, [K.Ptr], false, K.I64)
@@ -1456,6 +1861,31 @@ struct Lower:
         self.finish_helper(s8)
         return m
 
+    # Can a value of type `t` hold a value of enum `eid` (in a field, an
+    # element or a payload)? `seen`: the types already looked into.
+    fn self_holding(self, t: Ty, eid: int, ref seen: {str: bool}) -> bool:
+        var inner: [Ty] = []
+        match t:
+            case Ty.Enum(e):
+                for v in self.info.enums[e].variants:
+                    for fd in v.fields:
+                        inner.push(fd.1)
+            case Ty.Struct(_) | Ty.Tuple(_):
+                inner = self.field_tys(t)
+            case Ty.Array(x):
+                inner = [x]
+            case Ty.Map(k, v):
+                inner = [k, v]
+            case _:
+                return false
+        seen[self.mangle(t)] = true
+        for x in inner:
+            if x == Ty.Enum(eid):
+                return true
+            if self.mangle(x) not in seen and self.self_holding(x, eid, ref seen):
+                return true
+        return false
+
     # The element retain/release functions arrays of `t` use (or "" for none).
     fn elem_fns(ref self, t: Ty) -> (str, str):
         match t:
@@ -1477,6 +1907,101 @@ struct Lower:
         if sym == "":
             return self.cx.fb.konst(K.Ptr, 0)
         return self.cx.fb.global(sym)
+
+    # The locals of a function body (without `par`) made by `[x] * n`, with n a
+    # literal and x a scalar, of at most STACK_ARR bytes, and then only
+    # indexed, assigned at an index and measured: nothing can hold such an
+    # array but its variable, so it can live in the stack frame, header and
+    # all, and is never retained, released or reallocated.
+    fn stack_arrays(self, body: Block) -> {int: bool}:
+        var su = StackUse(made={}, bad={}, par=false)
+        su.block(body)
+        var out: {int: bool} = {}
+        if su.par:
+            return out
+        # (in declaration order, up to STACK_FN bytes in all: recursion
+        # keeps most of its depth)
+        var ls: [int] = []
+        for l in su.made:
+            ls.push(l)
+        ls.sort()
+        var total = 0
+        for l in ls:
+            if l in su.bad:
+                continue
+            let n = su.made[l]
+            match self.flocals[l].ty:
+                case Ty.Array(el):
+                    let bytes = n * self.lay(el).size
+                    if (
+                        not self.managed(el)
+                        and not self.agg(el)
+                        and bytes <= STACK_ARR
+                        and total + bytes <= STACK_FN
+                    ):
+                        out[l] = true
+                        total += bytes
+                case _:
+                    pass
+        return out
+
+    # `var a = [x] * n` for a `stack_arrays` local: the header and elements in
+    # a slot (the layout of brine_arr), filled with x.
+    fn stack_let(ref self, id: int, init: Expr):
+        var n = 0
+        var elem = init
+        match init.kind:
+            case ExprKind.Repeat(x, count):
+                elem = x
+                match count.kind:
+                    case ExprKind.Int(v):
+                        n = int(v)
+                    case _:
+                        panic("stack_let: not a literal length")
+            case _:
+                panic("stack_let: not `[x] * n`")
+        let ty = self.flocals[id].ty
+        let el = ty.elem()
+        let sz = self.lay(el).size
+        self.push_frame()
+        let v0 = self.expr(elem)
+        let v = self.detach(v0, el)
+        self.pop_frame()
+        # (elements 16-byte aligned, as malloc's: i128 needs it)
+        let a = self.cx.fb.temp_mem(64 + n * sz, 16)
+        let one = self.cx.fb.konst(K.I64, 1)
+        let nv = self.cx.fb.konst(K.I64, n)
+        let szv = self.cx.fb.konst(K.I64, sz)
+        let z = self.cx.fb.konst(K.I64, 0)
+        self.cx.fb.store(a, 0, one)
+        self.cx.fb.store(a, 8, nv)
+        self.cx.fb.store(a, 16, nv)
+        self.cx.fb.store(a, 24, szv)
+        self.cx.fb.store(a, 32, z)
+        self.cx.fb.store(a, 40, z)
+        let data = self.cx.fb.offset(a, 64)
+        self.cx.fb.store(a, 48, data)
+        if zero_lit(elem):
+            self.cx.fb.zero(data, n * sz)
+            let home0 = self.new_local(id, ty)
+            self.cx.fb.store(home0, 0, a)
+            return
+        let k = self.cx.fb.konst(K.I64, 0)
+        let step = self.cx.fb.konst(K.I64, 1)
+        let head = self.cx.fb.label()
+        let out = self.cx.fb.label()
+        self.cx.fb.place(head)
+        let more = self.cx.fb.cmp(Op.Lt, k, nv)
+        self.cx.fb.brnot(more, out)
+        let p = self.cx.fb.elem(data, k, sz)
+        self.st(p, 0, el, v)
+        let k2 = self.cx.fb.bin(Op.Add, K.I64, k, step)
+        self.cx.fb.mov(k, k2)
+        self.cx.fb.jmp(head)
+        self.cx.fb.place(out)
+        # (no home in a scope: nothing to release)
+        let home = self.new_local(id, ty)
+        self.cx.fb.store(home, 0, a)
 
     # brine_arr_new(n, sizeof(elem), retain, release, loc)
     fn new_arr(ref self, elem: Ty, n: int, loc: int) -> int:
@@ -1631,11 +2156,11 @@ struct Lower:
                 let boxed = en.has_payload()
                 var tag = v
                 if boxed:
-                    tag = self.cx.fb.load(K.I64, v, 8)
+                    tag = self.etag(eid, v)
                 let out = self.cx.fb.label()
                 for vi, var_ in enumerate(en.variants):
                     let next = self.cx.fb.label()
-                    let vv = self.cx.fb.konst(K.I64 if boxed else K.I32, vi)
+                    let vv = self.cx.fb.konst(self.tagk(eid) if boxed else K.I32, vi)
                     let hit = self.cx.fb.cmp(Op.Eq, tag, vv)
                     self.cx.fb.brnot(hit, next)
                     let head = en.variant_label(vi) + ("" if len(var_.fields) == 0 else "(")
@@ -1674,7 +2199,7 @@ struct Lower:
                 let f = self.need_eq(t)
                 return self.cx.fb.call(K.Bool, f, [a, b])
             case Ty.Enum(_):
-                if self.boxed(t):
+                if self.payload(t):
                     let f = self.need_eq(t)
                     return self.cx.fb.call(K.Bool, f, [a, b])
                 return self.cx.fb.cmp(Op.Eq, a, b)
@@ -1727,15 +2252,15 @@ struct Lower:
                 let lyes = self.cx.fb.label()
                 let same = self.cx.fb.cmp(Op.Eq, a, b)
                 self.cx.fb.br(same, lyes)
-                let ta = self.cx.fb.load(K.I64, a, 8)
-                let tb = self.cx.fb.load(K.I64, b, 8)
+                let ta = self.etag(eid, a)
+                let tb = self.etag(eid, b)
                 let dt = self.cx.fb.cmp(Op.Ne, ta, tb)
                 self.cx.fb.br(dt, lno)
                 for vi, v in enumerate(variants):
                     if len(v.fields) == 0:
                         continue
                     let next = self.cx.fb.label()
-                    let vv = self.cx.fb.konst(K.I64, vi)
+                    let vv = self.cx.fb.konst(self.tagk(eid), vi)
                     let hit = self.cx.fb.cmp(Op.Eq, ta, vv)
                     self.cx.fb.brnot(hit, next)
                     for fi, fd in enumerate(v.fields):
@@ -1774,7 +2299,7 @@ struct Lower:
                 let x = self.cx.fb.conv(K.U64, v)
                 return self.cx.fb.rt(K.U64, "brine_hash_u64", [x])
             case Ty.Enum(_):
-                if not self.boxed(t):
+                if not self.payload(t):
                     let x = self.cx.fb.conv(K.U64, v)
                     return self.cx.fb.rt(K.U64, "brine_hash_u64", [x])
                 let f = self.need_hash(t)
@@ -1821,7 +2346,7 @@ struct Lower:
                 self.cx.fb.mov(h, h3)
             case Ty.Enum(eid):
                 let variants = self.info.enums[eid].variants
-                let tag = self.cx.fb.load(K.I64, v, 8)
+                let tag = self.etag(eid, v)
                 let tu = self.cx.fb.conv(K.U64, tag)
                 let h1 = self.cx.fb.rt(K.U64, "brine_hash_mix", [h, tu])
                 self.cx.fb.mov(h, h1)
@@ -1830,7 +2355,7 @@ struct Lower:
                     if len(var_.fields) == 0:
                         continue
                     let next = self.cx.fb.label()
-                    let vv = self.cx.fb.konst(K.I64, vi)
+                    let vv = self.cx.fb.konst(self.tagk(eid), vi)
                     let hit = self.cx.fb.cmp(Op.Eq, tag, vv)
                     self.cx.fb.brnot(hit, next)
                     for fi, fd in enumerate(var_.fields):
@@ -1851,7 +2376,8 @@ struct Lower:
         self.finish_helper(saved)
         return name
 
-    # `int cmp(const void *, const void *)` ordering values of `t` (for sorting).
+    # `int cmp(const void *, const void *)` ordering values of `t` (for sorting):
+    # tuples and structs part by part, NaN after every number.
     fn need_cmp(ref self, t: Ty) -> str:
         let m = self.mangle(t)
         let name = "br_cmp_" + m
@@ -1861,30 +2387,94 @@ struct Lower:
         let x = self.ld(0, 0, t)
         let y = self.ld(1, 0, t)
         match t:
-            case Ty.Str:
-                let r = self.cx.fb.call(K.I32, "brine_str_cmp", [x, y])
-                self.cx.fb.ret(r)
+            case Ty.Tuple(_) | Ty.Struct(_):
+                let zero = self.cx.fb.konst(K.I32, 0)
+                for i, ft in enumerate(self.field_tys(t)):
+                    let off = self.field_off(t, i)
+                    let xi = self.ld(x, off, ft)
+                    let yi = self.ld(y, off, ft)
+                    let c = self.cmp3(xi, yi, ft)
+                    let same = self.cx.fb.cmp(Op.Eq, c, zero)
+                    let next = self.cx.fb.label()
+                    self.cx.fb.br(same, next)
+                    self.cx.fb.ret(c)
+                    self.cx.fb.place(next)
+                self.cx.fb.ret(zero)
             case _:
-                if t.is_float():
-                    # NaN sorts after every number
-                    let xn = self.cx.fb.cmp(Op.Ne, x, x)
-                    let yn = self.cx.fb.cmp(Op.Ne, y, y)
-                    let any_nan = self.cx.fb.bin(Op.Or, K.Bool, xn, yn)
-                    let plain = self.cx.fb.label()
-                    self.cx.fb.brnot(any_nan, plain)
-                    let a = self.cx.fb.conv(K.I32, xn)
-                    let b = self.cx.fb.conv(K.I32, yn)
-                    let d = self.cx.fb.bin(Op.Sub, K.I32, a, b)
-                    self.cx.fb.ret(d)
-                    self.cx.fb.place(plain)
-                let gt = self.cx.fb.cmp(Op.Gt, x, y)
-                let lt = self.cx.fb.cmp(Op.Lt, x, y)
-                let g = self.cx.fb.conv(K.I32, gt)
-                let l = self.cx.fb.conv(K.I32, lt)
-                let r = self.cx.fb.bin(Op.Sub, K.I32, g, l)
+                let r = self.cmp3(x, y, t)
                 self.cx.fb.ret(r)
         self.finish_helper(saved)
         return name
+
+    # -1, 0 or 1 (an i32) as `x` orders before, like or after `y`.
+    fn cmp3(ref self, x: int, y: int, t: Ty) -> int:
+        match t:
+            case Ty.Str:
+                return self.cx.fb.call(K.I32, "brine_str_cmp", [x, y])
+            case Ty.Tuple(_) | Ty.Struct(_):
+                let f = self.need_cmp(t)
+                return self.cx.fb.call(K.I32, f, [x, y])
+            case _:
+                pass
+        let gt = self.cx.fb.cmp(Op.Gt, x, y)
+        let lt = self.cx.fb.cmp(Op.Lt, x, y)
+        let g = self.cx.fb.conv(K.I32, gt)
+        let l = self.cx.fb.conv(K.I32, lt)
+        let r0 = self.cx.fb.bin(Op.Sub, K.I32, g, l)
+        if not t.is_float():
+            return r0
+        # NaN sorts after every number
+        let r = self.cx.fb.copy_of(r0)
+        let xn = self.cx.fb.cmp(Op.Ne, x, x)
+        let yn = self.cx.fb.cmp(Op.Ne, y, y)
+        let any_nan = self.cx.fb.bin(Op.Or, K.Bool, xn, yn)
+        let done = self.cx.fb.label()
+        self.cx.fb.brnot(any_nan, done)
+        let a = self.cx.fb.conv(K.I32, xn)
+        let b = self.cx.fb.conv(K.I32, yn)
+        let d = self.cx.fb.bin(Op.Sub, K.I32, a, b)
+        self.cx.fb.mov(r, d)
+        self.cx.fb.place(done)
+        return r
+
+    # `a < b` (or `a <= b` with `le`) for tuples and structs, as in Python:
+    # the first part that differs decides, and a NaN there makes it false.
+    fn need_lt(ref self, t: Ty, le: bool) -> str:
+        let name = ("br_le_" if le else "br_lt_") + self.mangle(t)
+        if not self.mark_done(name):
+            return name
+        let saved = self.start_helper(name, [K.Ptr, K.Ptr], true, K.Bool)
+        let yes = self.cx.fb.konst(K.Bool, 1)
+        let no = self.cx.fb.konst(K.Bool, 0)
+        for i, ft in enumerate(self.field_tys(t)):
+            let off = self.field_off(t, i)
+            let x = self.ld(0, off, ft)
+            let y = self.ld(1, off, ft)
+            let lt = self.cmp_code(CmpOp.Lt, x, y, ft)
+            let l1 = self.cx.fb.label()
+            self.cx.fb.brnot(lt, l1)
+            self.cx.fb.ret(yes)
+            self.cx.fb.place(l1)
+            let eq = self.cmp_code(CmpOp.Eq, x, y, ft)
+            let l2 = self.cx.fb.label()
+            self.cx.fb.br(eq, l2)
+            self.cx.fb.ret(no)
+            self.cx.fb.place(l2)
+        self.cx.fb.ret(yes if le else no)
+        self.finish_helper(saved)
+        return name
+
+    # `<`, `<=`, `>` or `>=` on tuples, structs and enums without data.
+    fn order_code(ref self, op: CmpOp, a: int, b: int, t: Ty) -> int:
+        match t:
+            case Ty.Tuple(_) | Ty.Struct(_):
+                let f = self.need_lt(t, op == CmpOp.Le or op == CmpOp.Ge)
+                if op == CmpOp.Lt or op == CmpOp.Le:
+                    return self.cx.fb.call(K.Bool, f, [a, b])
+                return self.cx.fb.call(K.Bool, f, [b, a])
+            case _:
+                # an enum without data is its variant's number
+                return self.cx.fb.cmp(cmp_op(op), a, b)
 
     # The `brine_map_ty` descriptor for map type `t` (its address).
     fn map_ty(ref self, t: Ty) -> int:
@@ -1961,7 +2551,7 @@ struct Lower:
             case Ty.Bool:
                 return self.cx.fb.konst(K.Bool, 1)
             case Ty.Enum(_):
-                return self.cx.fb.konst(K.Bool, 0 if self.boxed(t) else 1)
+                return self.cx.fb.konst(K.Bool, 0 if self.payload(t) else 1)
             case Ty.Str:
                 let n = self.cx.fb.load(K.I64, v, 8)
                 let eight = self.cx.fb.konst(K.I64, 8)
@@ -1977,16 +2567,25 @@ struct Lower:
         return dflt
 
     # A new box for variant `vi` of enum `eid` (fields unset).
+    # (An inline enum: new stack memory with the tag set.)
     fn box_new(ref self, eid: int, vi: int, full: bool) -> int:
         let bl = self.box_lay(eid)
+        if bl.inline:
+            let p = self.cx.fb.temp_mem(bl.size, bl.align)
+            let tg = self.cx.fb.konst(K.I32, vi)
+            self.cx.fb.store(p, 0, tg)
+            return p
         let size = bl.size if full else bl.vsize[vi]
         let sz = self.cx.fb.konst(K.I64, size)
         let tg = self.cx.fb.konst(K.I64, vi)
         return self.cx.fb.call(K.Ptr, "brine_box_new", [sz, tg])
 
-    # A variant without fields: a static immortal box, or (no payloads) a number.
+    # A variant without fields: a static immortal box, or (no payloads) a
+    # number, or (inline) new stack memory with the tag set.
     fn variant_const(ref self, t: Ty, vi: int) -> int:
         let eid = cg_enum_id(t)
+        if self.inl(t):
+            return self.box_new(eid, vi, true)
         if self.boxed(t):
             let ct = self.info.enums[eid].c_name
             let name = f"br_ev_{ct}_{vi}"
@@ -2004,6 +2603,19 @@ struct Lower:
         let eid = cg_enum_id(oty)
         let some = self.variant_index(eid, "Some", 0)
         let none = self.variant_index(eid, "None", 1)
+        if self.inl(oty):
+            let p = self.box_new(eid, none, true)
+            let skip0 = self.cx.fb.label()
+            self.cx.fb.brnot(present, skip0)
+            let tg = self.cx.fb.konst(K.I32, some)
+            self.cx.fb.store(p, 0, tg)
+            let off0 = self.vfield_off(eid, some, 0)
+            let val0 = self.ld(vp, 0, vt)
+            self.st(p, off0, vt, val0)
+            let fv0 = self.ld(p, off0, vt)
+            self.retain(fv0, vt)
+            self.cx.fb.place(skip0)
+            return self.temp(p, oty)
         let t = self.cx.fb.vreg(K.Ptr)
         let nc = self.variant_const(oty, none)
         self.cx.fb.mov(t, nc)
@@ -2024,6 +2636,19 @@ struct Lower:
         let eid = cg_enum_id(rty)
         let okv = self.variant_index(eid, "Ok", 0)
         let errv = self.variant_index(eid, "Err", 1)
+        if self.inl(rty):
+            let p = self.box_new(eid, okv, true)
+            let lerr0 = self.cx.fb.label()
+            let done0 = self.cx.fb.label()
+            self.cx.fb.brnot(ok, lerr0)
+            self.st(p, self.vfield_off(eid, okv, 0), vty, val)
+            self.cx.fb.jmp(done0)
+            self.cx.fb.place(lerr0)
+            let tg = self.cx.fb.konst(K.I32, errv)
+            self.cx.fb.store(p, 0, tg)
+            self.cx.fb.store(p, self.vfield_off(eid, errv, 0), err)
+            self.cx.fb.place(done0)
+            return self.temp(p, rty)
         let t = self.cx.fb.vreg(K.Ptr)
         let lerr = self.cx.fb.label()
         let done = self.cx.fb.label()
@@ -2080,6 +2705,16 @@ struct Lower:
         self.push_scope()
         var k = 0
         while k < len(b.stmts):
+            if self.take_at(b.stmts, k):
+                k += 2
+                continue
+            if (
+                self.put_back(b.stmts, k)
+                or self.move_let(b.stmts, k)
+                or self.borrow_let(b.stmts, k)
+            ):
+                k += 1
+                continue
             self.stmt(b.stmts[k])
             if self.rot_after(b.stmts, k):
                 k += 3
@@ -2113,6 +2748,9 @@ struct Lower:
                             return
                         case _:
                             pass
+                if len(s.locals) == 1 and s.locals[0] in self.cx.stack_arrs:
+                    self.stack_let(s.locals[0], init)
+                    return
                 self.push_frame()
                 self.cx.bits_init = len(s.locals) > 0 and s.locals[0] in self.cx.packed
                 self.cx.narrow_init = len(s.locals) > 0 and s.locals[0] in self.cx.narrow
@@ -2123,7 +2761,7 @@ struct Lower:
                         let ty = self.flocals[id].ty
                         let p = self.new_local(id, ty)
                         self.st(p, 0, ty, v)
-                        self.add_home(p, ty)
+                        self.add_local_home(p, ty, id)
                     case LetPat.Tuple(_):
                         for i, id in enumerate(s.locals):
                             let ty = self.flocals[id].ty
@@ -2206,6 +2844,8 @@ struct Lower:
                     self.par_for(iter, s.local, s.caps, s.writes, body, s.span)
                 elif self.opts.fast and not self.cx.lifted and self.version_for(s, iter, body):
                     pass
+                elif self.opts.fast and not self.cx.lifted and self.bounds_version(s, iter, body):
+                    pass
                 elif self.opts.fast and not self.cx.lifted and self.jam_for(iter, s.local, body):
                     pass
                 else:
@@ -2229,7 +2869,8 @@ struct Lower:
                 match value:
                     case Some(e):
                         self.push_frame()
-                        let v = self.owned(e)
+                        # (a `__br` clone returns a part of a parameter, borrowed)
+                        let v = self.expr(e) if self.cx.bret else self.owned(e)
                         var r = -1
                         if self.cx.sret >= 0:
                             let lay = self.lay(e.ty)
@@ -2394,12 +3035,340 @@ struct Lower:
             self.cx.fb.place(end)
         return true
 
+    # Moving an array between a variable and a place instead of retaining it
+    # and releasing what it replaces: only in plain straight-line lowering.
+    fn moves_ok(self) -> bool:
+        return not self.cx.lifted and self.moves_ok_lifted()
+
+    # the same, but in a lifted body too (for its own elements, `par_elem`)
+    fn moves_ok_lifted(self) -> bool:
+        return (
+            not self.opts.debug
+            and len(self.cx.jx.act) == 0
+            and self.cx.twin == 0
+            and not self.cx.fb.ends()
+        )
+
+    # Is `t` a place inside `out[i]`, out an array this `par for i` body writes?
+    fn par_elem(self, t: Expr) -> bool:
+        match t.kind:
+            case ExprKind.Index(b, i):
+                match local_of(b):
+                    case Some(w):
+                        return (
+                            w in self.cx.par_writes
+                            and self.cx.par_var >= 0
+                            and local_of(i) == Some(self.cx.par_var)
+                        )
+                    case None:
+                        return self.par_elem(b)
+            case ExprKind.Field(b, _, _):
+                return self.par_elem(b)
+            case _:
+                return false
+
+    fn movable(self, id: int) -> bool:
+        let lc = self.flocals[id]
+        if lc.kind != LocalKind.Var and lc.kind != LocalKind.Let:
+            return false
+        if (
+            id in self.cx.packed
+            or id in self.cx.narrow
+            or id in self.cx.reset
+            or id in self.cx.apps
+        ):
+            return false
+        match lc.ty:
+            case Ty.Array(_):
+                return true
+            case _:
+                return false
+
+    # `var w = p` then `p = []`, for an array place `p` (the "take" idiom):
+    # move the array out of `p` into `w`. Nothing runs between the two, so
+    # `w` holds the reference `p` held, as a retain then a release would leave it.
+    fn take_at(ref self, stmts: [Stmt], k: int) -> bool:
+        if k + 1 >= len(stmts) or not self.moves_ok():
+            return false
+        match take_pair(stmts[k], stmts[k + 1]):
+            case Some((id, place, empty)):
+                if not self.movable(id):
+                    return false
+                match place_path(place):
+                    case Some((root, _)):
+                        if root in self.cx.packed or root in self.cx.narrow:
+                            return false
+                    case None:
+                        return false
+                let ty = self.flocals[id].ty
+                self.push_frame()
+                let lp = self.lvalue(place)
+                let w = self.cx.fb.load(K.Ptr, lp, 0)
+                let e = self.owned(empty)
+                self.cx.fb.store(lp, 0, e)
+                self.pop_frame()
+                let home = self.new_local(id, ty)
+                self.st(home, 0, ty, w)
+                self.add_local_home(home, ty, id)
+                self.cx.hit_e = -1
+                return true
+            case None:
+                return false
+
+    # `var t = s` as the last use of `s`, a variable this block declared or a
+    # parameter this body owns: `t` takes over the value instead of sharing
+    # it, so changing `t` doesn't copy it.
+    fn move_let(ref self, stmts: [Stmt], k: int) -> bool:
+        if not self.moves_ok():
+            return false
+        let s = stmts[k]
+        match s.kind:
+            case StmtKind.Let(_, pat, _, init, is_ref):
+                if is_ref or len(s.locals) != 1 or not is_name(pat):
+                    return false
+                match local_of(init):
+                    case Some(src):
+                        let t = s.locals[0]
+                        let ty = self.flocals[t].ty
+                        if (
+                            not self.managed(ty)
+                            or self.flocals[src].ty != ty
+                            or not self.has_home(src)
+                        ):
+                            return false
+                        if not self.plain_local(t) or not self.plain_local(src):
+                            return false
+                        let param = (
+                            src in self.cx.own_params and len(self.cx.scopes) == self.cx.body_depth
+                        )
+                        if not param and src in self.cx.own_params:
+                            return false
+                        if not last_use_from(stmts, k, src, param):
+                            return false
+                        let v = self.read_local(src)
+                        let home = self.new_local(t, ty)
+                        self.st(home, 0, ty, v)
+                        self.add_local_home(home, ty, t)
+                        self.drop_home(src)
+                        return true
+                    case None:
+                        return false
+            case _:
+                return false
+
+    # `let d = r.f` or `let d = r[i].g`, where nothing in the rest of the
+    # block can change `r` or move it: `d` borrows the value, which `r` keeps
+    # alive, instead of retaining it and releasing it at the end. A `var d`
+    # too, when all it is ever given is such places (`d = q.f`) and nothing
+    # else changes it.
+    fn borrow_let(ref self, stmts: [Stmt], k: int) -> bool:
+        if not self.moves_ok():
+            return false
+        let s = stmts[k]
+        match s.kind:
+            case StmtKind.Let(mutable, pat, _, init, is_ref):
+                if is_ref or len(s.locals) != 1 or not is_name(pat) or not borrow_place(init):
+                    return false
+                let d = s.locals[0]
+                let ty = self.flocals[d].ty
+                if not self.managed(ty) or init.ty != ty or not self.plain_local(d):
+                    return false
+                var roots = [place_path(init).unwrap().0]
+                if mutable:
+                    for i in k + 1..len(stmts):
+                        if not self.only_borrows(stmts[i], d, ref roots):
+                            return false
+                    match self.fnd:
+                        case Some(f):
+                            for t in f.body.stmts:
+                                if ref_alias(t, d):
+                                    return false
+                        case None:
+                            return false
+                for r in roots:
+                    if r == d or not self.keeps_alive(stmts, k, r):
+                        return false
+                self.push_frame()
+                let v = self.expr(init)
+                let own = self.claim(v)
+                let home = self.new_local(d, ty)
+                self.st(home, 0, ty, v)
+                if own:
+                    self.add_local_home(home, ty, d)
+                elif mutable:
+                    self.cx.borrowed[d] = true
+                self.pop_frame()
+                return true
+            case _:
+                return false
+
+    # Does variable `r` keep what is borrowed from it alive through the
+    # statements after `stmts[k]`?
+    fn keeps_alive(self, stmts: [Stmt], k: int, r: int) -> bool:
+        let rk = self.flocals[r].kind
+        if rk == LocalKind.Var or rk == LocalKind.Let:
+            if (
+                r in self.cx.lptr
+                or r in self.cx.packed
+                or r in self.cx.narrow
+                or r in self.cx.borrowed
+            ):
+                return false
+        elif rk != LocalKind.Param and rk != LocalKind.RefParam:
+            return false
+        for i in k + 1..len(stmts):
+            if not self.keeps_root(stmts[i], r):
+                return false
+        match self.fnd:
+            case Some(f):
+                for t in f.body.stmts:
+                    if ref_alias(t, r):
+                        return false
+                return true
+            case None:
+                return false
+
+    # Is `var d` in statement `s` only read, or given a place to borrow
+    # (`d = q.f`, whose root is added to `roots`)?
+    fn only_borrows(self, s: Stmt, d: int, ref roots: [int]) -> bool:
+        match s.kind:
+            case StmtKind.Assign(t, op, v):
+                if local_of(t) == Some(d):
+                    if op.is_some() or not borrow_place(v) or mentions_local(v, d):
+                        return false
+                    roots.push(place_path(v).unwrap().0)
+                    return self.keeps_root_in(v, d)
+            case _:
+                pass
+        if not self.keeps_root_flat(s, d):
+            return false
+        for b in stmt_blocks(s):
+            for t in b.stmts:
+                if not self.only_borrows(t, d, ref roots):
+                    return false
+        return true
+
+    # Does statement `s` leave the value of variable `r` (and all it holds)
+    # alone: no write, `ref` or changing method through it, and no read of
+    # the whole variable a move could take (`var t = r`, `p = r`)?
+    fn keeps_root(self, s: Stmt, r: int) -> bool:
+        if not self.keeps_root_flat(s, r):
+            return false
+        for b in stmt_blocks(s):
+            for t in b.stmts:
+                if not self.keeps_root(t, r):
+                    return false
+        return true
+
+    # `keeps_root` for `s` itself, not the blocks in it
+    fn keeps_root_flat(self, s: Stmt, r: int) -> bool:
+        match s.kind:
+            case StmtKind.Let(_, _, _, init, is_ref):
+                if local_of(init) == Some(r) or is_ref and mentions_local(init, r):
+                    return false
+            case StmtKind.Assign(t, _, v):
+                if mentions_local(t, r) or local_of(v) == Some(r):
+                    return false
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            if not self.keeps_root_in(e, r):
+                return false
+        return true
+
+    fn keeps_root_in(self, e: Expr, r: int) -> bool:
+        match e.kind:
+            case ExprKind.MethodCall(recv, _, _, args):
+                var changes = true
+                match e.cres:
+                    case CallRes.Builtin(b):
+                        changes = b.mutates_recv()
+                    case CallRes.Method(id):
+                        let ps = self.info.fns[id].params
+                        changes = len(ps) == 0 or ps[0].by_ref
+                    case CallRes.Fn(_):
+                        changes = false
+                    case _:
+                        pass
+                if changes and mentions_local(recv, r):
+                    return false
+                for a in args:
+                    if a.by_ref and mentions_local(a.expr, r):
+                        return false
+            case ExprKind.Call(_, args):
+                for a in args:
+                    if a.by_ref and mentions_local(a.expr, r):
+                        return false
+            case _:
+                pass
+        for c in children(e):
+            if not self.keeps_root_in(c, r):
+                return false
+        return true
+
+    # A variable kept in its home as itself (not as bits, bytes or an appender).
+    fn plain_local(self, id: int) -> bool:
+        let lc = self.flocals[id]
+        if lc.kind != LocalKind.Var and lc.kind != LocalKind.Let and lc.kind != LocalKind.Param:
+            return false
+        return not (
+            id in self.cx.packed
+            or id in self.cx.narrow
+            or id in self.cx.reset
+            or id in self.cx.apps
+            or id in self.cx.lptr
+        )
+
+    # `p = w` with `w` an array variable this block declared and never uses
+    # again: swap the two, so `p` takes w's reference and the scope frees
+    # what `p` held, instead of a retain and a release.
+    fn put_back(ref self, stmts: [Stmt], j: int) -> bool:
+        if not self.moves_ok():
+            return false
+        match stmts[j].kind:
+            case StmtKind.Assign(t, op, v):
+                if op.is_some() or t.ty != v.ty or not array_place(t):
+                    return false
+                match local_of(v):
+                    case Some(w):
+                        if (
+                            not self.movable(w)
+                            or not self.has_home(w)
+                            or mentions_local(t, w)
+                            or not last_use(stmts, j, w)
+                        ):
+                            return false
+                        match place_path(t):
+                            case Some((root, _)):
+                                if root in self.cx.packed or root in self.cx.narrow:
+                                    return false
+                            case None:
+                                return false
+                        self.push_frame()
+                        let lp = self.lvalue(t)
+                        let home = self.local_ptr(w)
+                        let nv = self.cx.fb.load(K.Ptr, home, 0)
+                        let old = self.cx.fb.load(K.Ptr, lp, 0)
+                        self.cx.fb.store(lp, 0, nv)
+                        self.cx.fb.store(home, 0, old)
+                        self.pop_frame()
+                        self.cx.hit_e = -1
+                        return true
+                    case None:
+                        return false
+            case _:
+                return false
+
     # A loop idiom.twin_body allows, in two copies. Returns false having
     # emitted nothing when it doesn't qualify.
     fn twin_while(ref self, s: Stmt, cond: Expr, body: Block) -> bool:
-        if not self.opts.fast or self.opts.debug or self.cx.lifted or len(
-            self.cx.jx.act
-        ) > 0 or self.cx.twin != 0:
+        if (
+            not self.opts.fast
+            or self.opts.debug
+            or self.cx.lifted
+            or len(self.cx.jx.act) > 0
+            or self.cx.twin != 0
+        ):
             return false
         if not idiom.twin_body(body, self.flocals):
             return false
@@ -2575,6 +3544,147 @@ struct Lower:
                 self.cx.fb.place(end)
                 return true
             case None:
+                return false
+
+    # Does index (or index addition) `e` need its check? Not in the fast copy
+    # of a loop `bounds_version` checked up front.
+    fn idx_chk(self, e: Expr) -> bool:
+        if not e.checked:
+            return false
+        return len(self.cx.nochk) == 0 or ranges.key(e.span) not in self.cx.nochk
+
+    # `for j in lo..hi` indexing arrays at `j + x`, `x + j`, `j - x` or `j`
+    # (x a variable the loop doesn't change, or a literal) when the loop
+    # can't change those arrays' lengths: one test before the loop that the
+    # first and last index are in bounds picks a copy of the loop without
+    # those checks (so the C compiler can vectorize it), else the loop runs
+    # checked. Returns false, having emitted nothing, when nothing qualifies.
+    fn bounds_version(ref self, s: Stmt, iter: Expr, body: Block) -> bool:
+        let key = ranges.key(s.span)
+        if len(self.cx.jx.act) > 0 or key in self.cx.bv_keys:
+            return false
+        var lo_e = iter
+        var hi_e = iter
+        var incl = false
+        match iter.kind:
+            case ExprKind.Range(lo, hi, inclusive):
+                lo_e = lo
+                hi_e = hi
+                incl = inclusive
+            case _:
+                return false
+        if (
+            self.flocals[s.local].ty != int_ty()
+            or not self.plain_expr(lo_e)
+            or not self.plain_expr(hi_e)
+        ):
+            return false
+        var bv = BoundsUse(j=s.local, decl={}, found=[], bad={}, par=false, calls=false)
+        bv.block(body)
+        # two copies of a call keep the C compiler from inlining it, and a loop
+        # with a call it doesn't inline won't vectorize anyway
+        if bv.par or bv.calls:
+            return false
+        var cands: [IdxCand] = []
+        for c in bv.found:
+            # (locals are numbered in order: those of the body come after j)
+            if c.arr in bv.bad or c.arr in bv.decl or c.x in bv.decl or c.x in bv.bad:
+                continue
+            if c.arr >= s.local or c.x >= s.local:
+                continue
+            if c.arr in self.cx.packed or c.arr in self.cx.narrow:
+                continue
+            match self.flocals[c.arr].ty:
+                case Ty.Array(_):
+                    pass
+                case _:
+                    continue
+            let ak = self.flocals[c.arr].kind
+            if ak != LocalKind.Let and ak != LocalKind.Var and ak != LocalKind.Param:
+                continue
+            if c.x >= 0 and not self.bv_fixed(c.x):
+                continue
+            cands.push(c)
+        if len(cands) == 0:
+            return false
+        # any `ref` alias of a variable could change it behind our back
+        match self.fnd:
+            case Some(f):
+                for c in cands:
+                    for t in f.body.stmts:
+                        if ref_alias(t, c.arr) or c.x >= 0 and ref_alias(t, c.x):
+                            return false
+            case None:
+                return false
+        let slow = self.cx.fb.label()
+        let end = self.cx.fb.label()
+        let lo = self.expr(lo_e)
+        let hi = self.expr(hi_e)
+        let one = self.cx.fb.konst(K.I64, 1)
+        var last = hi
+        if not incl:
+            last = self.cx.fb.bin(Op.Sub, K.I64, hi, one)
+        # an empty loop needs no checks; else every value is kept within
+        # 2^61 so the sums below can't overflow
+        let fast = self.cx.fb.label()
+        let empty = self.cx.fb.cmp(Op.Gt, lo, last)
+        self.cx.fb.br(empty, fast)
+        let big = self.cx.fb.konst(K.I64, 1 << 61)
+        let nbig = self.cx.fb.konst(K.I64, -(1 << 61))
+        let lok = self.cx.fb.cmp(Op.Ge, lo, nbig)
+        self.cx.fb.brnot(lok, slow)
+        let hok = self.cx.fb.cmp(Op.Le, last, big)
+        self.cx.fb.brnot(hok, slow)
+        let zero = self.cx.fb.konst(K.I64, 0)
+        for c in cands:
+            var x = zero
+            if c.x >= 0:
+                let xv = self.read_local(c.x)
+                x = self.cx.fb.conv(K.I64, xv)
+                let xl = self.cx.fb.cmp(Op.Ge, x, nbig)
+                self.cx.fb.brnot(xl, slow)
+                let xh = self.cx.fb.cmp(Op.Le, x, big)
+                self.cx.fb.brnot(xh, slow)
+            elif c.lit != 0:
+                x = self.cx.fb.konst(K.I64, c.lit)
+            let a = self.read_local(c.arr)
+            let n = self.cx.fb.load(K.I64, a, 8)
+            let op = Op.Sub if c.neg else Op.Add
+            let first = self.cx.fb.bin(op, K.I64, lo, x)
+            let f0 = self.cx.fb.cmp(Op.Ge, first, zero)
+            self.cx.fb.brnot(f0, slow)
+            let top = self.cx.fb.bin(op, K.I64, last, x)
+            let t0 = self.cx.fb.cmp(Op.Lt, top, n)
+            self.cx.fb.brnot(t0, slow)
+        self.cx.fb.place(fast)
+        let saved = self.cx.nochk
+        for c in cands:
+            self.cx.nochk[c.idx] = true
+            if c.add != "":
+                self.cx.nochk[c.add] = true
+        self.cx.bv_keys[key] = true
+        self.stmt(s)
+        self.cx.nochk = saved
+        if not self.cx.fb.ends():
+            self.cx.fb.jmp(end)
+        self.cx.fb.place(slow)
+        self.stmt(s)
+        self.cx.bv_keys.remove(key)
+        self.cx.fb.place(end)
+        return true
+
+    # Can't variable `x`, declared before a loop and not assigned in it, change during the loop?
+    fn bv_fixed(self, x: int) -> bool:
+        match self.flocals[x].ty:
+            case Ty.Int(k):
+                if k.bits() > 64 or not k.signed() and k.bits() == 64:
+                    return false
+            case _:
+                return false
+        match self.flocals[x].kind:
+            case LocalKind.Let | LocalKind.Var | LocalKind.Param | LocalKind.ForVar:
+                return true
+            case _:
                 return false
 
     # Is `op` on a `ty` checked, `checked` being what the source asks for? A
@@ -2968,7 +4078,16 @@ struct Lower:
     # loaded once, and those it writes are made unique once. Returns the old set.
     fn loop_arrays(ref self, head: [Expr], body: Block) -> {int: ArrCache}:
         let saved = self.cx.arrc
-        var u = IndexUse(info=self.info, seen={}, written={}, bad={}, decl={})
+        var u = IndexUse(
+            info=self.info,
+            seen={},
+            written={},
+            bad={},
+            decl={},
+            fseen={},
+            fwritten={},
+            whole=[]
+        )
         for e in head:
             u.expr(e)
         u.block(body)
@@ -2988,7 +4107,7 @@ struct Lower:
             match info.ty:
                 case Ty.Array(_):
                     let p = self.local_ptr(l)
-                    if l in u.written:
+                    if l in u.written and l not in self.cx.stack_arrs:
                         self.cx.fb.call_void("brine_arr_unique", [p])
                     let a = self.cx.fb.load(K.Ptr, p, 0)
                     let n = self.cx.fb.load(K.I64, a, 8)
@@ -2996,15 +4115,60 @@ struct Lower:
                     self.cx.arrc[l] = ArrCache(arr=a, data=d, len=n)
                 case _:
                     pass
+        # array fields (`self.stack`), when the loop uses nothing that holds
+        # them in any other way: a `self.f()` or `self.stack.push(x)` could
+        # replace or grow the array
+        for k in u.fseen:
+            let base = u.fseen[k]
+            let (l, p) = field_path(base).unwrap()
+            if l in u.decl or l in self.cx.par_writes:
+                continue
+            if not (l in self.cx.lslot or l in self.cx.lptr):
+                continue
+            if any(w.0 == l and steps_overlap(w.1, p) for w in u.whole):
+                continue
+            if k in u.fwritten:
+                match self.flocals[l].kind:
+                    case LocalKind.Var | LocalKind.RefParam:
+                        pass
+                    case _:
+                        continue
+            match base.ty:
+                case Ty.Array(_):
+                    pass
+                case _:
+                    continue
+            if not (k in self.cx.fkeys):
+                self.cx.fkeys[k] = -1 - len(self.cx.fkeys)
+            let key = self.cx.fkeys[k]
+            if key in self.cx.arrc:
+                continue
+            let fp = self.lvalue(base)
+            if k in u.fwritten:
+                self.cx.fb.call_void("brine_arr_unique", [fp])
+            let a = self.cx.fb.load(K.Ptr, fp, 0)
+            let n = self.cx.fb.load(K.I64, a, 8)
+            let d = self.cx.fb.load(K.Ptr, a, 48)
+            self.cx.arrc[key] = ArrCache(arr=a, data=d, len=n)
         return saved
 
-    # The local array `e` names, when an enclosing loop cached it.
+    # The local array or array field `e` names, when an enclosing loop cached it.
     fn cached_arr(self, e: Expr) -> Option[ArrCache]:
         match local_of(e):
             case Some(l):
                 return self.cx.arrc.get(l)
             case None:
-                return None
+                if len(self.cx.fkeys) == 0:
+                    return None
+                match field_path(e):
+                    case Some((l, p)):
+                        match self.cx.fkeys.get(path_key(l, p)):
+                            case Some(key):
+                                return self.cx.arrc.get(key)
+                            case None:
+                                return None
+                    case None:
+                        return None
 
     # The type an array's elements are stored as: bytes for narrow.br's
     # arrays (the program sees `t`).
@@ -3162,6 +4326,31 @@ struct Lower:
 
     fn assign(ref self, target: Expr, op: Option[BinOp], value: Expr, checked: bool, span: Span):
         let ty = target.ty
+        # `s = s + a + b`: append in place, as `s += a` then `s += b`, when
+        # the parts don't read `s` (else rebuilding the string is quadratic)
+        if op.is_none() and (ty == Ty.Str or ty.elem() != Ty.Error):
+            match self_append(target, value):
+                case Some(parts):
+                    for p in parts:
+                        self.assign(target, Some(BinOp.Add), p, checked, span)
+                    return
+                case None:
+                    pass
+        if op.is_none() and len(self.cx.borrowed) > 0:
+            match local_of(target):
+                case Some(l):
+                    if l in self.cx.borrowed:
+                        # see `borrow_let`: `value` is a place, never a temp
+                        let v = self.expr(value)
+                        if self.claim(v):
+                            panic("lowering: a borrowing variable was given an owned value")
+                        let home = self.local_ptr(l)
+                        self.st(home, 0, ty, v)
+                        return
+                case None:
+                    pass
+        if op.is_none() and self.own_call(target, value):
+            return
         match target.kind:
             case ExprKind.Index(b0, i0):
                 if self.is_bits(b0):
@@ -3190,8 +4379,20 @@ struct Lower:
                         if op.is_none():
                             # `m[k] = v` inserts
                             let vks = self.owned_all([value, i0])
-                            let vs = self.addr_of(vks[0], ty)
-                            let ks = self.addr_of(vks[1], i0.ty)
+                            # the map may grow: copy plain data read from it
+                            var vv = vks[0]
+                            var kv = vks[1]
+                            match place_path(b0):
+                                case Some(pp):
+                                    if reaches(value, [pp]):
+                                        vv = self.snapshot(vv, ty)
+                                    if reaches(i0, [pp]):
+                                        kv = self.snapshot(kv, i0.ty)
+                                case None:
+                                    vv = self.snapshot(vv, ty)
+                                    kv = self.snapshot(kv, i0.ty)
+                            let vs = self.addr_of(vv, ty)
+                            let ks = self.addr_of(kv, i0.ty)
                             let b = self.lvalue(b0)
                             self.cx.fb.call_void("brine_map_set", [b, ks, vs])
                             return
@@ -3216,7 +4417,7 @@ struct Lower:
                     self.cx.fb.store(lp, 0, v)
                     self.release(old, ty)
             case Some(o2):
-                if ty == Ty.Str:
+                if ty == Ty.Str and o2 == BinOp.Add:
                     let c = self.str_byte(value)
                     if c >= 0:
                         let lp = self.lvalue(target)
@@ -3228,12 +4429,119 @@ struct Lower:
                         return
                 let v = self.expr(value)
                 let lp = self.lvalue(target)
-                if ty == Ty.Str:
+                if ty == Ty.Str and o2 == BinOp.Mul:
+                    # `s *= n`
+                    let n = self.cx.fb.conv(K.I64, v)
+                    let loc = self.loc(span)
+                    let old = self.cx.fb.load(K.Ptr, lp, 0)
+                    let c = self.cx.fb.call(K.Ptr, "brine_s_repeat", [old, n, loc])
+                    self.cx.fb.store(lp, 0, c)
+                    self.release(old, Ty.Str)
+                elif ty == Ty.Str:
                     self.cx.fb.rt_void("brine_str_add", [lp, v])
+                elif ty.elem() != Ty.Error:
+                    # `xs += ys` extends `xs` in place
+                    self.cx.fb.call_void("brine_arr_extend", [lp, v])
                 else:
                     let cur = self.cx.fb.load(self.kind(ty), lp, 0)
                     let c = self.arith(o2, cur, v, ty, checked, span)
                     self.cx.fb.store(lp, 0, c)
+
+    # `x = f(x)` (or `x = x.step()`), `x` a variable or a place in one, where
+    # f starts a variable with that parameter: move x's value into a clone of
+    # f that owns the parameter, and store the result without releasing the
+    # old value (the clone did), so f changes it in place instead of copying.
+    # Nothing else in the call may read x, which is stale until the store.
+    # In a `par for i` body that also works for `out[i] = f(out[i])`: no
+    # other iteration may touch out[i] (E0502).
+    fn own_call(ref self, target: Expr, value: Expr) -> bool:
+        let pe = self.cx.lifted and self.par_elem(target)
+        if not self.managed(target.ty) or not array_place(target):
+            return false
+        if not self.moves_ok() and not (pe and self.moves_ok_lifted()):
+            return false
+        var id = -1
+        var recv: Option[Expr] = None
+        var args: [Arg] = []
+        match value.kind:
+            case ExprKind.Call(_, a):
+                match value.cres:
+                    case CallRes.Fn(fid):
+                        id = fid
+                        args = a
+                    case _:
+                        return false
+            case ExprKind.MethodCall(r, _, _, a):
+                match value.cres:
+                    case CallRes.Fn(fid):
+                        id = fid
+                        args = a
+                    case CallRes.Method(fid):
+                        id = fid
+                        recv = Some(r)
+                        args = a
+                    case _:
+                        return false
+            case _:
+                return false
+        if id not in self.odecls:
+            return false
+        let sig = self.info.fns[id]
+        if (
+            sig.ret != target.ty
+            or len(self.cx.nc_calls) > 0 and ranges.key(value.span) in self.cx.nc_calls
+        ):
+            return false
+        var items: [Expr] = []
+        match recv:
+            case Some(r):
+                items.push(r)
+            case None:
+                pass
+        for a in args:
+            items.push(a.expr)
+        if len(items) > len(sig.params):
+            return false
+        var root = -1
+        match place_path(target):
+            case Some((l, _)):
+                root = l
+            case None:
+                return false
+        if (
+            root in self.cx.packed
+            or root in self.cx.narrow
+            or root in self.cx.lptr and self.flocals[root].kind != LocalKind.RefParam and not pe
+        ):
+            return false
+        var ai = -1
+        for i, x in enumerate(items):
+            if has_try(x):
+                return false
+            if (
+                ai < 0
+                and not sig.params[i].by_ref
+                and sig.params[i].ty == target.ty
+                and same_place(x, target)
+            ):
+                ai = i
+            elif mentions_local(x, root):
+                return false
+        if ai < 0 or not consumes(self.odecls[id], ai):
+            return false
+        let mask = 1 << ai
+        let key = f"{id}:{mask}"
+        if key not in self.own_seen:
+            self.own_seen[key] = true
+            self.own_clones.push((id, mask))
+        let lp = self.lvalue(items[ai])
+        self.cx.own_arg = ai
+        self.cx.own_slot = lp
+        self.cx.own_mask = mask
+        let r = self.call_fn(id, recv, args, value.span)
+        self.claim(r)
+        self.st(lp, 0, target.ty, r)
+        return true
 
     # ------------------------------------------------------------ match
     fn match_stmt(ref self, scrut: Expr, cases: [Case]):
@@ -3241,12 +4549,42 @@ struct Lower:
         self.push_scope()
         self.push_frame()
         var v = -1
+        var parts: [Expr] = []
+        match scrut.kind:
+            case ExprKind.Tuple(es):
+                if len(es) > 0 and any(self.fixed_local(x) for x in es):
+                    parts = es
+            case _:
+                pass
         if self.fixed_local(scrut):
             # the variable keeps the value alive for the whole match: borrow it
             v = self.expr(scrut)
             self.pop_frame()
+        elif len(parts) > 0:
+            # `match (a, b)`: a tuple only for the match borrows the variables
+            # in it, and owns the rest (all evaluated first, see `owned_all`)
+            var vals: [int] = []
+            for x in parts:
+                vals.push(self.expr(x))
+            let ts = self.field_tys(ty)
+            var mine: [bool] = []
+            for i, x in enumerate(parts):
+                let fixed = self.fixed_local(x)
+                mine.push(not fixed)
+                if not fixed:
+                    vals[i] = self.own(vals[i], ts[i])
+            let lay = self.lay(ty)
+            v = self.cx.fb.temp_mem(lay.size, lay.align)
+            for i, x in enumerate(ts):
+                self.st(v, self.field_off(ty, i), x, vals[i])
+            self.pop_frame()
+            for i, x in enumerate(ts):
+                if mine[i]:
+                    let xv = self.ld(v, self.field_off(ty, i), x)
+                    self.add_owned(xv, x)
         else:
-            v = self.owned(scrut)
+            let o = self.owned(scrut)
+            v = self.detach(o, ty)
             self.pop_frame()
             self.add_owned(v, ty)
         let end = self.cx.fb.label()
@@ -3270,13 +4608,13 @@ struct Lower:
         self.cx.fb.place(end)
         self.pop_scope()
 
-    # A `let` variable or a by-value parameter: nothing can change it while
-    # it is in scope.
+    # A `let` variable, a by-value parameter or the element of a `for` loop:
+    # nothing can change it while it is in scope.
     fn fixed_local(self, e: Expr) -> bool:
         match local_of(e):
             case Some(l):
                 match self.flocals[l].kind:
-                    case LocalKind.Let | LocalKind.Param:
+                    case LocalKind.Let | LocalKind.Param | LocalKind.ForElem:
                         return true
                     case _:
                         return false
@@ -3346,14 +4684,14 @@ struct Lower:
             case PatKind.Variant(_, _):
                 match p.vres:
                     case Some((eid, vi)):
-                        if not self.boxed(ty):
+                        if not self.payload(ty):
                             let k = self.cx.fb.konst(K.I32, vi)
                             let c = self.cx.fb.cmp(Op.Eq, v, k)
                             self.cx.fb.brnot(c, fail)
                             return
                         let fts = self.info.enums[eid].variants[vi].fields
-                        let tag = self.cx.fb.load(K.I64, v, 8)
-                        let k = self.cx.fb.konst(K.I64, vi)
+                        let tag = self.etag(eid, v)
+                        let k = self.cx.fb.konst(self.tagk(eid), vi)
                         let c = self.cx.fb.cmp(Op.Eq, tag, k)
                         self.cx.fb.brnot(c, fail)
                         for i in 0..min(len(p.fields), len(fts)):
@@ -3407,7 +4745,7 @@ struct Lower:
             case ExprKind.Index(base, idx):
                 match base.ty:
                     case Ty.Map(_, _):
-                        let k = self.expr(idx)
+                        let k = self.index_val(idx)
                         let kp = self.addr_of(k, idx.ty)
                         let b = self.lvalue(base)
                         let loc = self.loc(e.span)
@@ -3420,11 +4758,11 @@ struct Lower:
                         return self.cx.fb.rt(K.Ptr, "brine_map_val_mut", [b, en, kp, vsz, loc])
                     case _:
                         pass
-                let i = self.expr(idx)
+                let i = self.index_val(idx)
                 let et = self.elem_ty(base, e.ty)
                 match self.cached_arr(base):
                     case Some(c):
-                        return self.cached_elem_ptr(c, i, et, e.checked, e.span)
+                        return self.cached_elem_ptr(c, i, et, self.idx_chk(e), e.span)
                     case None:
                         pass
                 let b = self.lvalue(base)
@@ -3433,7 +4771,8 @@ struct Lower:
                     case ExprKind.Ident(_):
                         match base.res:
                             case Res.Local(l):
-                                skip = l in self.cx.par_writes
+                                # (a stack array is only ever its variable's)
+                                skip = l in self.cx.par_writes or l in self.cx.stack_arrs
                             case _:
                                 pass
                     case _:
@@ -3441,7 +4780,7 @@ struct Lower:
                 if not skip:
                     self.cx.fb.call_void("brine_arr_unique", [b])
                 let a = self.cx.fb.load(K.Ptr, b, 0)
-                return self.arr_elem_ptr(a, i, et, e.checked, e.span)
+                return self.arr_elem_ptr(a, i, et, self.idx_chk(e), e.span)
             case _:
                 pass
         let v = self.expr(e)
@@ -3508,7 +4847,9 @@ struct Lower:
                     case UnOp.Neg:
                         match e.ty:
                             case Ty.Int(k):
-                                if k.signed() and not (self.cx.nc and ranges.handled(e.ty).is_some()):
+                                if k.signed() and not (
+                                    self.cx.nc and ranges.handled(e.ty).is_some()
+                                ):
                                     let loc = self.loc(e.span)
                                     return self.cx.fb.rt(
                                         int_kind(k),
@@ -3542,8 +4883,21 @@ struct Lower:
                     let b = self.expr(r)
                     let c = self.cx.fb.call(K.Ptr, "brine_str_concat", [a, b])
                     return self.temp(c, Ty.Str)
+                if op == BinOp.Mul and e.ty == Ty.Str:
+                    let a = self.expr(l)
+                    let n0 = self.expr(r)
+                    let n = self.cx.fb.conv(K.I64, n0)
+                    let loc = self.loc(e.span)
+                    let c = self.cx.fb.call(K.Ptr, "brine_s_repeat", [a, n, loc])
+                    return self.temp(c, Ty.Str)
+                if op == BinOp.Add and e.ty.elem() != Ty.Error:
+                    let a = self.expr(l)
+                    let b = self.expr(r)
+                    let loc = self.loc(e.span)
+                    let c = self.cx.fb.call(K.Ptr, "brine_arr_concat", [a, b, loc])
+                    return self.temp(c, e.ty)
                 let a = self.expr(l)
-                let chk = self.op_checked(Some(op), e.ty, e.checked)
+                let chk = self.op_checked(Some(op), e.ty, e.checked) and self.idx_chk(e)
                 let sh = -1 if chk else pow2_shift(op, r, e.ty)
                 if sh > 0:
                     let kk = self.kind(e.ty)
@@ -3590,14 +4944,18 @@ struct Lower:
                 let end = self.cx.fb.label()
                 self.cx.fb.brnot(c, lels)
                 self.push_frame()
-                let v1 = self.owned(then) if m else self.expr(then)
+                var v1 = self.owned(then) if m else self.expr(then)
+                if not m:
+                    v1 = self.detach(v1, e.ty)
                 if then.ty != Ty.Never:
                     self.cx.fb.mov(t, v1)
                 self.pop_frame()
                 self.cx.fb.jmp(end)
                 self.cx.fb.place(lels)
                 self.push_frame()
-                let v2 = self.owned(els) if m else self.expr(els)
+                var v2 = self.owned(els) if m else self.expr(els)
+                if not m:
+                    v2 = self.detach(v2, e.ty)
                 if els.ty != Ty.Never:
                     self.cx.fb.mov(t, v2)
                 self.pop_frame()
@@ -3702,11 +5060,11 @@ struct Lower:
                 match self.cached_arr(base):
                     case Some(c):
                         let i = self.expr(idx)
-                        p = self.cached_elem_ptr(c, i, et, e.checked, e.span)
+                        p = self.cached_elem_ptr(c, i, et, self.idx_chk(e), e.span)
                     case None:
                         let b = self.expr(base)
                         let i = self.expr(idx)
-                        p = self.arr_elem_ptr(b, i, et, e.checked, e.span)
+                        p = self.arr_elem_ptr(b, i, et, self.idx_chk(e), e.span)
                 let x = self.ld(p, 0, et)
                 if et != e.ty:
                     return self.cx.fb.conv(self.kind(e.ty), x)
@@ -3737,13 +5095,19 @@ struct Lower:
                     case Ty.Str:
                         tst = self.cx.fb.call(K.Bool, "brine_str_contains", [c, x])
                     case _:
-                        let ix = self.find_elem(c, x, coll.ty.elem())
+                        let z0 = self.cx.fb.konst(K.I64, 0)
+                        let ix = self.find_elem(c, x, coll.ty.elem(), z0)
                         let zero = self.cx.fb.konst(K.I64, 0)
                         tst = self.cx.fb.cmp(Op.Ge, ix, zero)
                 if neg:
                     return self.cx.fb.un(Op.Not, K.Bool, tst)
                 return tst
             case ExprKind.Array(es):
+                match self.const_arr(e):
+                    case Some(t):
+                        return t
+                    case None:
+                        pass
                 let el = e.ty.elem()
                 let vals = self.owned_all(es)
                 let loc = self.loc(e.span)
@@ -3781,18 +5145,7 @@ struct Lower:
                 else:
                     t = self.new_arr(el, n, loc)
                 self.register(t, e.ty)
-                var zero = false
-                match elem.kind:
-                    case ExprKind.Int(z):
-                        zero = z == 0
-                    case ExprKind.Bool(z):
-                        zero = not z
-                    case ExprKind.Float(z):
-                        let zs = f"{z}"
-                        zero = z == 0.0 and not zs.starts_with("-")
-                    case _:
-                        pass
-                if not zero:
+                if not zero_lit(elem):
                     let data = self.cx.fb.load(K.Ptr, t, 48)
                     let k = self.cx.fb.konst(K.I64, 0)
                     let one = self.cx.fb.konst(K.I64, 1)
@@ -3837,9 +5190,9 @@ struct Lower:
         return self.temp(r, Ty.Str)
 
     # I64: the index of the first element of array `a` equal to `x`, or -1.
-    fn find_elem(ref self, a: int, x: int, el: Ty) -> int:
+    fn find_elem(ref self, a: int, x: int, el: Ty, start: int) -> int:
         let r = self.cx.fb.konst(K.I64, -1)
-        let i = self.cx.fb.konst(K.I64, 0)
+        let i = self.cx.fb.copy_of(start)
         let one = self.cx.fb.konst(K.I64, 1)
         let n = self.cx.fb.load(K.I64, a, 8)
         let data = self.cx.fb.load(K.Ptr, a, 48)
@@ -3863,10 +5216,10 @@ struct Lower:
 
     fn fmt_spec(ref self, sb: int, v: int, t: Ty, fs: FmtSpec):
         var start = -1
-        if fs.width > 0:
+        if fs.width > 0 or fs.group:
             start = self.cx.fb.load(K.I64, sb, 8)
         let k = fs.kind.unwrap_or("")
-        if k == "f" or k == "e":
+        if k == "f" or k == "e" or k == "g":
             let p = self.cx.fb.konst(K.I32, fs.prec.unwrap_or(-1))
             let kc = self.cx.fb.konst(K.I32, ord(k))
             let x = self.cx.fb.conv(K.F64, v)
@@ -3890,6 +5243,8 @@ struct Lower:
                     self.cx.fb.call_void("brine_sb_fmt_u64", [sb, x, kc])
         else:
             self.fmt_code(sb, v, t, false)
+        if fs.group:
+            self.cx.fb.call_void("brine_sb_group", [sb, start])
         if fs.width > 0:
             let w = self.cx.fb.konst(K.I64, fs.width)
             let left = self.cx.fb.konst(K.Bool, 1 if fs.left else 0)
@@ -3970,6 +5325,8 @@ struct Lower:
                         let z = self.cx.fb.konst(K.I32, 0)
                         return self.cx.fb.cmp(cmp_op(op), c, z)
             case Ty.Array(_) | Ty.Map(_, _) | Ty.Tuple(_) | Ty.Struct(_) | Ty.Enum(_):
+                if op != CmpOp.Eq and op != CmpOp.Ne:
+                    return self.order_code(op, a, b, t)
                 let q = self.eq_code(a, b, t)
                 if op == CmpOp.Ne:
                     return self.cx.fb.un(Op.Not, K.Bool, q)
@@ -3981,42 +5338,216 @@ struct Lower:
         var sig = self.info.fns[id]
         if len(self.cx.nc_calls) > 0 and ranges.key(span) in self.cx.nc_calls:
             sig.c_name = sig.c_name + "__nc"
-        # With a `ref` parameter, by-value arguments may read the variable the call
-        # changes; holding a reference of their own makes copy-on-write protect them.
-        let has_ref = any(p.by_ref for p in sig.params)
+        # set by `own_call` for this call only, not for calls in its arguments
+        let own_arg = self.cx.own_arg
+        let own_slot = self.cx.own_slot
+        self.cx.own_arg = -1
+        if own_arg >= 0:
+            sig.c_name = own_name(sig.c_name, self.cx.own_mask)
+        var items: [(Expr, bool)] = []
+        match recv:
+            case Some(r):
+                items.push((r, sig.params[0].by_ref))
+            case None:
+                pass
+        let pi = len(items)
+        for i, a in enumerate(args):
+            if pi + i >= len(sig.params):
+                break
+            items.push((a.expr, sig.params[pi + i].by_ref))
+        let hold = self.held_args(items)
+        # A `ref` to an array element made before a held argument would point
+        # into the array that argument then shares: make it after them all.
+        var late: [bool] = []
+        for i, it in enumerate(items):
+            var lt = false
+            if it.1:
+                match place_path(it.0):
+                    case Some(pp):
+                        if -1 in pp.1:
+                            for j in i + 1..len(items):
+                                if hold[j] and reaches(items[j].0, [pp]):
+                                    lt = true
+                    case None:
+                        pass
+            late.push(lt)
         var cargs: [int] = []
         var sret = -1
         if self.agg(sig.ret):
             let lay = self.lay(sig.ret)
             sret = self.cx.fb.temp_mem(lay.size, lay.align)
             cargs.push(sret)
-        var pi = 0
-        match recv:
-            case Some(r):
-                if sig.params[0].by_ref:
-                    cargs.push(self.lvalue(r))
-                else:
-                    cargs.push(self.value_arg(r, has_ref))
-                pi = 1
-            case None:
-                pass
-        for i, a in enumerate(args):
-            if pi + i >= len(sig.params):
-                break
-            if sig.params[pi + i].by_ref:
-                cargs.push(self.lvalue(a.expr))
+        let base = len(cargs)
+        for i, it in enumerate(items):
+            if i == own_arg:
+                cargs.push(self.ld(own_slot, 0, it.0.ty))
+            elif late[i]:
+                self.pre_index(it.0)
+                cargs.push(-1)
+            elif it.1:
+                cargs.push(self.lvalue(it.0))
             else:
-                cargs.push(self.value_arg(a.expr, has_ref))
+                cargs.push(self.value_arg(it.0, hold[i]))
+        for i, it in enumerate(items):
+            if late[i]:
+                cargs[base + i] = self.lvalue(it.0)
         if self.tracks_caller(id):
             cargs.push(self.loc(span))
+        # a string reaches C as a NUL-terminated copy, freed after the call
+        var cstrs: [int] = []
+        if sig.is_extern:
+            for i, it in enumerate(items):
+                if it.0.ty == Ty.Str:
+                    let loc = self.loc(it.0.span)
+                    let c = self.cx.fb.call(K.Ptr, "brine_cstr", [cargs[base + i], loc])
+                    cargs[base + i] = c
+                    cstrs.push(c)
+        # a result borrowed from the arguments, which live to the end of
+        # the statement: read like a field of a temp, not released
+        var br = false
+        if own_arg < 0 and sig.c_name == self.info.fns[id].c_name and self.bret_ok(id):
+            br = true
+            if id not in self.br_seen:
+                self.br_seen[id] = true
+                self.br_clones.push(id)
+            sig.c_name = sig.c_name + "__br"
         if sret >= 0:
             self.cx.fb.call_void(sig.c_name, cargs)
+            if br:
+                return sret
             return self.temp(sret, sig.ret)
         if not self.ret_has(sig.ret):
             self.cx.fb.call_void(sig.c_name, cargs)
+            for c in cstrs:
+                self.cx.fb.call_void("brine_cstr_free", [c])
             return self.unit()
         let r = self.cx.fb.call(self.kind(sig.ret), sig.c_name, cargs)
+        for c in cstrs:
+            self.cx.fb.call_void("brine_cstr_free", [c])
+        if br:
+            return r
         return self.temp(r, sig.ret)
+
+    # Can function `id` return its result borrowed (a `__br` clone)? When
+    # every `return` gives a part of a by-value parameter, which the caller
+    # keeps alive to the end of the statement, or a constant, the caller can
+    # read the result like a field of a temp: `case Lit(v): return v` then
+    # costs no retain in the callee and no release in the caller (atomic,
+    # and contended when threads share the value).
+    fn bret_ok(ref self, id: int) -> bool:
+        match self.bret.get(id):
+            case Some(b):
+                return b
+            case None:
+                pass
+        var ok = false
+        if id in self.odecls and not self.opts.debug:
+            let f = self.odecls[id]
+            let sig = self.info.fns[id]
+            ok = self.managed(sig.ret) and not any(p.by_ref for p in sig.params)
+            if ok:
+                var roots: {int: bool} = {}
+                for l in f.param_locals:
+                    roots[l] = true
+                var rets = 0
+                ok = self.bret_block(f.body, ref roots, ref rets) and rets > 0
+        self.bret[id] = ok
+        return ok
+
+    # Are the returns in `b` borrowable (see `bret_ok`)? `roots`: the locals
+    # holding parts of parameters; `rets` counts the returns.
+    fn bret_block(self, b: Block, ref roots: {int: bool}, ref rets: int) -> bool:
+        for s in b.stmts:
+            for e in stmt_exprs(s):
+                if has_try(e):
+                    return false
+            match s.kind:
+                case StmtKind.Return(value):
+                    match value:
+                        case Some(e):
+                            rets += 1
+                            if not self.bret_place(e, roots) and not self.const_expr(e):
+                                return false
+                        case None:
+                            return false
+                case StmtKind.Let(mutable, pat, _, init, is_ref):
+                    if (
+                        not mutable
+                        and not is_ref
+                        and is_name(pat)
+                        and len(s.locals) == 1
+                        and self.bret_place(init, roots)
+                    ):
+                        roots[s.locals[0]] = true
+                case StmtKind.Match(scrut, cases):
+                    if self.bret_place(scrut, roots):
+                        for c in cases:
+                            pat_locals(c.pat, ref roots)
+                case StmtKind.For(_, _, _, iter, _, _, is_par):
+                    match iter.ty:
+                        case Ty.Array(_):
+                            if not is_par and self.bret_place(iter, roots):
+                                roots[s.local] = true
+                        case _:
+                            pass
+                case _:
+                    pass
+            for sb in stmt_blocks(s):
+                if not self.bret_block(sb, ref roots, ref rets):
+                    return false
+        return true
+
+    # `e` names a part of a root (fields, tuple fields and array elements).
+    fn bret_place(self, e: Expr, roots: {int: bool}) -> bool:
+        match e.kind:
+            case ExprKind.Ident(_):
+                match local_of(e):
+                    case Some(l):
+                        return l in roots
+                    case None:
+                        return false
+            case ExprKind.Field(b, _, _):
+                match b.ty:
+                    case Ty.Struct(_) | Ty.Tuple(_):
+                        return self.bret_place(b, roots)
+                    case _:
+                        return false
+            case ExprKind.Index(b, _):
+                match b.ty:
+                    case Ty.Array(_):
+                        return self.bret_place(b, roots)
+                    case _:
+                        return false
+            case _:
+                return false
+
+    # A value that holds no reference anyone must release: scalars, literal
+    # strings (immortal), variants without fields, and structs, tuples and
+    # inline variants of those.
+    fn const_expr(self, e: Expr) -> bool:
+        match e.kind:
+            case ExprKind.Int(
+                _
+            ) | ExprKind.UInt(_) | ExprKind.Float(_) | ExprKind.Bool(_) | ExprKind.Str(_):
+                return true
+            case ExprKind.Tuple(es):
+                return all(self.const_expr(x) for x in es)
+            case ExprKind.Ident(_) | ExprKind.Field(_, _, _):
+                match e.res:
+                    case Res.Variant(_, _):
+                        return true
+                    case _:
+                        return false
+            case ExprKind.Call(_, args):
+                match e.cres:
+                    case CallRes.Ctor(_):
+                        return all(self.const_expr(a.expr) for a in args)
+                    case CallRes.Variant(eid, _):
+                        return self.inl_e(eid) and all(self.const_expr(a.expr) for a in args)
+                    case _:
+                        return false
+            case _:
+                return false
 
     # `x?`: return `None`/`Err` from the function, or continue with the value inside.
     fn try_expr(ref self, x: Expr, e: Expr) -> int:
@@ -4033,13 +5564,13 @@ struct Lower:
             case TryKind.Res(okv, errv, _, _):
                 fail_v = errv
                 ok_v = okv
-        let tag = self.cx.fb.load(K.I64, v, 8)
-        let fv = self.cx.fb.konst(K.I64, fail_v)
+        let xe = cg_enum_id(x.ty)
+        let tag = self.etag(xe, v)
+        let fv = self.cx.fb.konst(self.tagk(xe), fail_v)
         let failed = self.cx.fb.cmp(Op.Eq, tag, fv)
         let ok = self.cx.fb.label()
         self.cx.fb.brnot(failed, ok)
         var ret = -1
-        let xe = cg_enum_id(x.ty)
         let rk = try_kind(self.info, rty)
         match (kind, rk):
             case (TryKind.Res(_, _, _, err), Some(TryKind.Res(_, rerr_v, _, _))):
@@ -4055,6 +5586,9 @@ struct Lower:
                 ret = self.variant_const(rty, none)
             case _:
                 panic("`?` in a function that doesn't return Option/Result")
+        if self.cx.sret >= 0:
+            self.cx.fb.copy(self.cx.sret, ret, self.lay(rty).size)
+            ret = -1
         # leave the function: release this statement's temps and every local
         var temps: [Temp] = []
         for fr in self.cx.frames:
@@ -4065,13 +5599,88 @@ struct Lower:
         self.cx.fb.place(ok)
         return self.ld(v, self.vfield_off(xe, ok_v, 0), e.ty)
 
-    # A by-value argument; `hold` keeps a reference until the end of the statement.
+    # By-value arguments are snapshots taken before the call. Which of `items`
+    # (argument, by `ref`) are memory a `ref` argument reaches, so the callee
+    # could change or free them? Those are held (a shared array or string is
+    # copied before a write), or copied when they are plain data.
+    fn held_args(self, items: [(Expr, bool)]) -> [bool]:
+        var refs: [(int, [int])] = []
+        var any_ref = false
+        var known = true
+        for x, by_ref in items:
+            if by_ref:
+                any_ref = true
+                match place_path(x):
+                    case Some(pp):
+                        refs.push(pp)
+                    case None:
+                        known = false
+        var out: [bool] = []
+        for x, by_ref in items:
+            out.push(any_ref and not by_ref and (not known or reaches(x, refs)))
+        return out
+
+    # A by-value argument; `hold` keeps a reference until the end of the
+    # statement, or for plain data in memory, a copy.
     fn value_arg(ref self, e: Expr, hold: bool) -> int:
-        if not hold or not self.managed(e.ty):
+        if not hold:
             return self.expr(e)
+        if self.managed(e.ty):
+            let v = self.owned(e)
+            self.register(v, e.ty)
+            return v
+        let v = self.expr(e)
+        return self.snapshot(v, e.ty)
+
+    # A copy of the plain data in memory at `v` (other values are returned as is).
+    fn snapshot(ref self, v: int, ty: Ty) -> int:
+        if not self.agg(ty) or self.managed(ty):
+            return v
+        let lay = self.lay(ty)
+        let t = self.cx.fb.temp_mem(lay.size, lay.align)
+        self.cx.fb.copy(t, v, lay.size)
+        return t
+
+    # The owned value of `e`, to be stored into the place `dest`, which may
+    # move (an array or map that grows): plain data read from it is copied.
+    fn owned_for(ref self, e: Expr, dest: Expr) -> int:
         let v = self.owned(e)
-        self.register(v, e.ty)
-        return v
+        match place_path(dest):
+            case Some(pp):
+                if not reaches(e, [pp]):
+                    return v
+            case None:
+                pass
+        return self.snapshot(v, e.ty)
+
+    # Evaluate the indexes in the place `e` now, for an `lvalue(e)` later.
+    fn pre_index(ref self, e: Expr):
+        match e.kind:
+            case ExprKind.Field(b, _, _):
+                self.pre_index(b)
+            case ExprKind.Index(b, i):
+                # in `lvalue`'s order: a map's key before its base
+                match b.ty:
+                    case Ty.Map(_, _):
+                        self.cx.pre_idx[ranges.key(i.span)] = self.expr(i)
+                        self.pre_index(b)
+                    case _:
+                        self.pre_index(b)
+                        self.cx.pre_idx[ranges.key(i.span)] = self.expr(i)
+            case _:
+                pass
+
+    # The value of an index in a place, unless `pre_index` has it.
+    fn index_val(ref self, i: Expr) -> int:
+        if len(self.cx.pre_idx) > 0:
+            let k = ranges.key(i.span)
+            match self.cx.pre_idx.get(k):
+                case Some(v):
+                    self.cx.pre_idx.remove(k)
+                    return v
+                case None:
+                    pass
+        return self.expr(i)
 
     # The positions of named arguments among `fields`.
     fn arg_slots(self, args: [Arg], fields: [(str, Ty)]) -> [int]:
@@ -4261,6 +5870,8 @@ struct Lower:
                 let a = self.expr(args[0].expr)
                 let c = self.expr(args[1].expr)
                 let mn = b == Builtin.Min
+                if not e.ty.is_numeric():
+                    return self.pick_ordered(mn, a, c, e.ty)
                 match e.ty:
                     case Ty.Float(fk):
                         let suf = "f" if fk == FloatTy.F32 else ""
@@ -4298,12 +5909,88 @@ struct Lower:
                         n = "round"
                 let suf = "f" if e.ty == Ty.Float(FloatTy.F32) else ""
                 return self.cx.fb.rt(self.kind(e.ty), f"brine_f_{n}{suf}", [v])
-            case Builtin.Pow:
+            case Builtin.Pow | Builtin.Math2(_):
                 let a = self.expr(args[0].expr)
                 let c = self.expr(args[1].expr)
-                return self.cx.fb.rt(K.F64, "brine_f_pow", [a, c])
+                var n = "pow"
+                match b:
+                    case Builtin.Math2(m):
+                        n = m
+                    case _:
+                        pass
+                let suf = "f" if e.ty == Ty.Float(FloatTy.F32) else ""
+                return self.cx.fb.rt(self.kind(e.ty), f"brine_f_{n}{suf}", [a, c])
+            case Builtin.Math1(n):
+                let v = self.expr(args[0].expr)
+                let suf = "f" if e.ty == Ty.Float(FloatTy.F32) else ""
+                return self.cx.fb.rt(self.kind(e.ty), f"brine_f_{n}{suf}", [v])
+            case Builtin.Num(m):
+                return self.num_method(m, recv.unwrap(), args, e)
+            case Builtin.FromBits:
+                let u = self.expr(args[0].expr)
+                let k = self.kind(e.ty)
+                let p = self.cx.fb.temp_mem(k.size(), k.size())
+                self.cx.fb.store(p, 0, u)
+                return self.cx.fb.load(k, p, 0)
+            case Builtin.FromUtf8:
+                let a = self.expr(args[0].expr)
+                let outp = self.null_slot()
+                let ok = self.cx.fb.call(K.Bool, "brine_str_from_utf8", [a, outp])
+                let o = self.cx.fb.load(K.Ptr, outp, 0)
+                return self.make_result(e.ty, ok, o, Ty.Str, o)
+            case Builtin.ToInt | Builtin.ToFloat:
+                let s = self.expr(recv.unwrap())
+                var vt = int_ty()
+                match try_kind(self.info, e.ty):
+                    case Some(TryKind.Opt(_, _, inner)):
+                        vt = inner
+                    case _:
+                        pass
+                let lay = self.lay(vt)
+                let p = self.cx.fb.temp_mem(lay.size, lay.align)
+                var ok = -1
+                match vt:
+                    case Ty.Int(k):
+                        let bits = self.cx.fb.konst(K.I64, k.bits())
+                        let sg = self.cx.fb.konst(K.Bool, 1 if k.signed() else 0)
+                        ok = self.cx.fb.call(K.Bool, "brine_try_parse_int", [s, bits, sg, p])
+                    case _:
+                        let small = 1 if vt == Ty.Float(FloatTy.F32) else 0
+                        let f32 = self.cx.fb.konst(K.Bool, small)
+                        ok = self.cx.fb.call(K.Bool, "brine_try_parse_float", [s, f32, p])
+                return self.make_option(e.ty, ok, p, vt)
+            case Builtin.Input:
+                var pr = self.cx.fb.konst(K.Ptr, 0)
+                if len(args) == 1:
+                    pr = self.expr(args[0].expr)
+                let g = self.cx.fb.call(K.Ptr, "brine_input", [pr])
+                let null = self.cx.fb.konst(K.Ptr, 0)
+                let present = self.cx.fb.cmp(Op.Ne, g, null)
+                let gp = self.addr_of(g, Ty.Str)
+                let o = self.make_option(e.ty, present, gp, Ty.Str)
+                let skip = self.cx.fb.label()
+                self.cx.fb.brnot(present, skip)
+                self.release(g, Ty.Str)
+                self.cx.fb.place(skip)
+                return o
+            case Builtin.ReadStdin:
+                let outp = self.null_slot()
+                let ok = self.cx.fb.call(K.Bool, "brine_read_stdin", [outp])
+                let o = self.cx.fb.load(K.Ptr, outp, 0)
+                return self.make_result(e.ty, ok, o, Ty.Str, o)
+            case Builtin.AppendFile:
+                let p = self.expr(args[0].expr)
+                let t = self.expr(args[1].expr)
+                let errp = self.null_slot()
+                let ok = self.cx.fb.call(K.Bool, "brine_append_file", [p, t, errp])
+                let err = self.cx.fb.load(K.Ptr, errp, 0)
+                let u = self.unit()
+                return self.make_result(e.ty, ok, u, Ty.Unit, err)
             case Builtin.Clock:
                 return self.cx.fb.call(K.F64, "brine_clock", [])
+            case Builtin.Flush:
+                self.cx.fb.call_void("brine_flush", [])
+                return self.unit()
             case Builtin.Args:
                 let r = self.cx.fb.call(K.Ptr, "brine_args", [])
                 return self.temp(r, e.ty)
@@ -4320,10 +6007,11 @@ struct Lower:
             case Builtin.Push:
                 let r = recv.unwrap()
                 let el = r.ty.elem()
-                let v = self.owned(args[0].expr)
+                let v = self.owned_for(args[0].expr, r)
                 let tp = self.addr_of(v, el)
                 let lp = self.lvalue(r)
-                self.cx.fb.call_void("brine_arr_push", [lp, tp])
+                let esz = self.cx.fb.konst(K.I64, self.lay(el).size)
+                self.cx.fb.rt_void("brine_arr_push_in", [lp, tp, esz])
                 return self.unit()
             case Builtin.Pop | Builtin.PopAt:
                 let r = recv.unwrap()
@@ -4338,14 +6026,15 @@ struct Lower:
                 if idx >= 0:
                     self.cx.fb.call_void("brine_arr_pop_at", [lp, idx, out, loc])
                 else:
-                    self.cx.fb.call_void("brine_arr_pop", [lp, out, loc])
+                    let esz = self.cx.fb.konst(K.I64, lay.size)
+                    self.cx.fb.rt_void("brine_arr_pop_in", [lp, out, esz, loc])
                 let v = self.ld(out, 0, e.ty)
                 return self.temp(v, e.ty)
             case Builtin.Insert:
                 let r = recv.unwrap()
                 let i0 = self.expr(args[0].expr)
                 let i = self.cx.fb.conv(K.I64, i0)
-                let v = self.owned(args[1].expr)
+                let v = self.owned_for(args[1].expr, r)
                 let tp = self.addr_of(v, r.ty.elem())
                 let lp = self.lvalue(r)
                 let loc = self.loc(e.span)
@@ -4363,17 +6052,24 @@ struct Lower:
                 if b == Builtin.Reverse:
                     self.cx.fb.call_void("brine_arr_reverse", [lp])
                 elif b == Builtin.Clear:
-                    self.cx.fb.call_void("brine_arr_clear", [lp])
+                    self.cx.fb.rt_void("brine_arr_clear_in", [lp])
                 else:
                     let c = self.need_cmp(r.ty.elem())
                     let fp = self.cx.fb.global(c)
                     self.cx.fb.call_void("brine_arr_sort", [lp, fp])
                 return self.unit()
-            case Builtin.IndexOf:
+            case Builtin.IndexOf | Builtin.IndexFrom:
                 let r = recv.unwrap()
                 let a = self.expr(r)
                 let x = self.expr(args[0].expr)
-                let ix = self.find_elem(a, x, r.ty.elem())
+                var start = self.cx.fb.konst(K.I64, 0)
+                if b == Builtin.IndexFrom:
+                    let s0 = self.expr(args[1].expr)
+                    let s = self.cx.fb.conv(K.I64, s0)
+                    let n = self.cx.fb.load(K.I64, a, 8)
+                    let loc = self.loc(e.span)
+                    start = self.cx.fb.call(K.I64, "brine_start_chk", [s, n, loc])
+                let ix = self.find_elem(a, x, r.ty.elem(), start)
                 let zero = self.cx.fb.konst(K.I64, 0)
                 let present = self.cx.fb.cmp(Op.Ge, ix, zero)
                 let ip = self.addr_of(ix, int_ty())
@@ -4384,7 +6080,7 @@ struct Lower:
                 for a in args:
                     vals.push(self.expr(a.expr))
                 vals.push(self.loc(e.span))
-                if m == StrM.Find:
+                if m == StrM.Find or m == StrM.FindFrom:
                     let ix = self.cx.fb.call(K.I64, m.c_name(), vals)
                     let zero = self.cx.fb.konst(K.I64, 0)
                     let present = self.cx.fb.cmp(Op.Ge, ix, zero)
@@ -4475,6 +6171,87 @@ struct Lower:
                 let r = self.cx.fb.call(K.Ptr, "brine_chr", [v, loc])
                 return self.temp(r, Ty.Str)
 
+    # Methods of numbers: plain IR, nothing to check. Wrapping arithmetic is the
+    # IR's own (it wraps); rotations and bit counts work on the unsigned bits.
+    fn num_method(ref self, m: NumM, r: Expr, args: [Arg], e: Expr) -> int:
+        let x = self.expr(r)
+        if r.ty.is_float():
+            # `to_bits`: the same bytes, read as an unsigned integer
+            let k = self.kind(e.ty)
+            let p = self.cx.fb.temp_mem(k.size(), k.size())
+            self.cx.fb.store(p, 0, x)
+            return self.cx.fb.load(k, p, 0)
+        var ik = IntTy.I64
+        match r.ty:
+            case Ty.Int(k):
+                ik = k
+            case _:
+                pass
+        let kk = int_kind(ik)
+        let w = ik.bits()
+        var uk = K.U64
+        match w:
+            case 8:
+                uk = K.U8
+            case 16:
+                uk = K.U16
+            case 32:
+                uk = K.U32
+            case 128:
+                uk = K.U128
+            case _:
+                pass
+        match m:
+            case NumM.WrappingAdd | NumM.WrappingSub | NumM.WrappingMul:
+                let y = self.expr(args[0].expr)
+                var o = Op.Add
+                if m == NumM.WrappingSub:
+                    o = Op.Sub
+                elif m == NumM.WrappingMul:
+                    o = Op.Mul
+                return self.cx.fb.bin(o, kk, x, y)
+            case NumM.WrappingNeg:
+                return self.cx.fb.un(Op.Neg, kk, x)
+            case NumM.RotateLeft | NumM.RotateRight:
+                let n0 = self.expr(args[0].expr)
+                let u = self.cx.fb.conv(uk, x) if kk != uk else x
+                # the amount modulo the width (a power of two), so a negative
+                # amount turns the other way: `rotate_left(-1)` is `rotate_right(1)`
+                let n = self.cx.fb.conv(uk, n0)
+                let mask = self.cx.fb.konst(uk, w - 1)
+                let s = self.cx.fb.bin(Op.And, uk, n, mask)
+                let wk = self.cx.fb.konst(uk, w)
+                let t0 = self.cx.fb.bin(Op.Sub, uk, wk, s)
+                # w - s, or 0 when s is 0 (a shift by the width is not allowed)
+                let t = self.cx.fb.bin(Op.And, uk, t0, mask)
+                let left = m == NumM.RotateLeft
+                let a = self.cx.fb.bin(Op.Shl if left else Op.Shr, uk, u, s)
+                let c = self.cx.fb.bin(Op.Shr if left else Op.Shl, uk, u, t)
+                let res = self.cx.fb.bin(Op.Or, uk, a, c)
+                return self.cx.fb.conv(kk, res) if kk != uk else res
+            case _:
+                # count_ones, leading_zeros, trailing_zeros; all `w` for 0
+                var nm = "popcnt"
+                if m == NumM.LeadingZeros:
+                    nm = "clz"
+                elif m == NumM.TrailingZeros:
+                    nm = "ctz"
+                let u = self.cx.fb.conv(uk, x) if kk != uk else x
+                if w == 128:
+                    return self.cx.fb.rt(K.I64, f"brine_{nm}_u128", [u])
+                var z = u
+                if w < 64:
+                    z = self.cx.fb.conv(K.U64, u)
+                    if m == NumM.TrailingZeros:
+                        # a bit just above the value stops the count at `w`
+                        let top = self.cx.fb.konst(K.U64, 1 << w)
+                        z = self.cx.fb.bin(Op.Or, K.U64, z, top)
+                let c = self.cx.fb.rt(K.I64, f"brine_{nm}_u64", [z])
+                if m == NumM.LeadingZeros and w < 64:
+                    let d = self.cx.fb.konst(K.I64, 64 - w)
+                    return self.cx.fb.bin(Op.Sub, K.I64, c, d)
+                return c
+
     # The address of a new 8-byte stack slot holding 0 (an out-parameter).
     fn null_slot(ref self) -> int:
         let p = self.cx.fb.temp_mem(8, 8)
@@ -4516,6 +6293,9 @@ struct Lower:
                 let x = self.cx.fb.conv(K.F64, v)
                 return self.cx.fb.rt(int_kind(k), f"brine_conv_{k.suffix()}_from_f64", [x, loc])
             case (Ty.Int(k), Ty.Bool):
+                return self.cx.fb.conv(int_kind(k), v)
+            # an enum without data is its variant's number
+            case (Ty.Int(k), Ty.Enum(_)):
                 return self.cx.fb.conv(int_kind(k), v)
             case (Ty.Int(k), Ty.Str):
                 let loc = self.loc(e.span)
@@ -4599,6 +6379,10 @@ struct Lower:
                 return self.os_with_err("set_cwd", None, a, e)
             case OsOp.WriteBytes:
                 return self.os_with_err("write_bytes", None, a, e)
+            case OsOp.AppendBytes:
+                return self.os_with_err("append_bytes", None, a, e)
+            case OsOp.ReadBytes:
+                return self.os_with_err("read_bytes", Some(K.Ptr), a, e)
             case OsOp.ExePath:
                 let r = self.cx.fb.call(K.Ptr, "brine_os_exe_path", [])
                 return self.temp(r, Ty.Str)
@@ -4625,6 +6409,8 @@ struct Lower:
                 return self.cx.fb.call(K.I64, "brine_os_pid", [])
             case OsOp.CpuCount:
                 return self.cx.fb.call(K.I64, "brine_os_cpu_count", [])
+            case OsOp.ThreadCount:
+                return self.cx.fb.call(K.I64, "brine_os_thread_count", [])
             case OsOp.Wait:
                 let loc = self.loc(e.span)
                 return self.cx.fb.call(K.I64, "brine_os_wait", [a[0], loc])
@@ -4683,16 +6469,22 @@ struct Lower:
             case WorldOp.Size:
                 return self.cx.fb.call(K.I64, "brine_world_size", [])
             case WorldOp.Barrier:
-                self.cx.fb.call_void("brine_world_barrier", [])
+                let loc = self.loc(e.span)
+                self.cx.fb.call_void("brine_world_barrier", [loc])
                 return self.unit()
             case WorldOp.Shift:
-                let x0 = self.expr(args[0].expr)
-                let v = self.wval(x0, e.ty)
+                let v = self.expr(args[0].expr)
                 let by0 = self.expr(args[1].expr)
                 let by = self.cx.fb.conv(K.I64, by0)
                 let de = self.cstr(world_desc(e.ty))
                 let loc = self.loc(e.span)
-                let r = self.world_move("brine_world_shift", e.ty, de, v, by, loc)
+                if len(args) == 3:
+                    # no wrapping around: the ranks at the edge get this value
+                    let ed = self.expr(args[2].expr)
+                    let ep = self.world_ptr(ed, e.ty)
+                    let r = self.world_move("brine_world_shift_edge", e.ty, de, v, [by, ep, loc])
+                    return self.temp(r, e.ty)
+                let r = self.world_move("brine_world_shift", e.ty, de, v, [by, loc])
                 return self.temp(r, e.ty)
             case WorldOp.Exchange:
                 let xs = self.expr(args[0].expr)
@@ -4703,22 +6495,37 @@ struct Lower:
             case WorldOp.Broadcast:
                 let root0 = self.expr(args[0].expr)
                 let root = self.cx.fb.conv(K.I64, root0)
-                let x0 = self.expr(args[1].expr)
-                let v = self.wval(x0, e.ty)
+                let v = self.expr(args[1].expr)
                 let de = self.cstr(world_desc(e.ty))
                 let loc = self.loc(e.span)
-                let r = self.world_move("brine_world_bcast", e.ty, de, v, root, loc)
+                let r = self.world_move("brine_world_bcast", e.ty, de, v, [root, loc])
                 return self.temp(r, e.ty)
-            case WorldOp.Sum | WorldOp.Min | WorldOp.Max:
+            case WorldOp.Sum | WorldOp.Min | WorldOp.Max | WorldOp.Any | WorldOp.All:
                 let x0 = self.expr(args[0].expr)
-                let v = self.wval(x0, e.ty)
+                # the runtime's codes: 0 sum, 1 min, 2 max, 3 any, 4 all
                 var code = 2
                 if op == WorldOp.Sum:
                     code = 0
                 elif op == WorldOp.Min:
                     code = 1
+                elif op == WorldOp.Any:
+                    code = 3
+                elif op == WorldOp.All:
+                    code = 4
                 let c = self.cx.fb.konst(K.I32, code)
                 let loc = self.loc(e.span)
+                match e.ty:
+                    case Ty.Array(el):
+                        let de = self.cstr(world_desc(el))
+                        let r = self.cx.fb.call(K.Ptr, "brine_world_reduce_arr", [de, x0, c, loc])
+                        return self.temp(r, e.ty)
+                    case Ty.Bool:
+                        let b = self.cx.fb.conv(K.I64, x0)
+                        let r = self.cx.fb.call(K.I64, "brine_world_reduce_i64", [b, c, loc])
+                        return self.cx.fb.conv(K.Bool, r)
+                    case _:
+                        pass
+                let v = self.wval(x0, e.ty)
                 let r = self.cx.fb.call(
                     self.wkind(e.ty),
                     f"brine_world_reduce_{world_suffix(e.ty)}",
@@ -4727,25 +6534,29 @@ struct Lower:
                 return self.cx.fb.conv(self.kind(e.ty), r)
             case WorldOp.GatherAll:
                 let t = args[0].expr.ty
-                let x0 = self.expr(args[0].expr)
-                let v = self.wval(x0, t)
+                let v = self.expr(args[0].expr)
                 let de = self.cstr(world_desc(t))
                 let loc = self.loc(e.span)
-                let wk = self.wkind(t)
-                let vp = self.cx.fb.temp_mem(wk.size(), wk.size())
-                self.cx.fb.store(vp, 0, v)
+                let vp = self.world_ptr(v, t)
                 let r = self.cx.fb.call(K.Ptr, "brine_world_gather", [de, vp, loc])
                 return self.temp(r, e.ty)
 
+    # a value in memory, for the runtime to read (at the width of its type)
+    fn world_ptr(ref self, v: int, t: Ty) -> int:
+        let k = self.kind(t)
+        let p = self.cx.fb.temp_mem(k.size(), k.size())
+        self.cx.fb.store(p, 0, v)
+        return p
+
     # shift and broadcast pass the value and the result by pointer
-    fn world_move(ref self, f: str, t: Ty, de: int, v: int, n: int, loc: int) -> int:
-        let wk = self.wkind(t)
-        let vp = self.cx.fb.temp_mem(wk.size(), wk.size())
-        self.cx.fb.store(vp, 0, v)
-        let op = self.cx.fb.temp_mem(wk.size(), wk.size())
-        self.cx.fb.call_void(f, [de, vp, op, n, loc])
-        let r = self.cx.fb.load(wk, op, 0)
-        return self.cx.fb.conv(self.kind(t), r)
+    fn world_move(ref self, f: str, t: Ty, de: int, v: int, rest: [int]) -> int:
+        let k = self.kind(t)
+        let vp = self.world_ptr(v, t)
+        let op = self.cx.fb.temp_mem(k.size(), k.size())
+        var xs = [de, vp, op]
+        xs.extend(rest)
+        self.cx.fb.call_void(f, xs)
+        return self.cx.fb.load(k, op, 0)
 
     # ============================================================ loops and comprehensions
     fn domain(ref self, iter: Expr, stmt: bool) -> Dom:
@@ -4801,6 +6612,10 @@ struct Lower:
                     v = self.cx.fb.call(K.Ptr, "brine_map_keys", [m])
                     ty = Ty.Array(kt)
                 case _:
+                    if self.fixed_local(iter):
+                        # the variable keeps the array alive and unchanged
+                        # for the whole loop: borrow it
+                        return Dom.Arr(self.expr(iter), ty.elem())
                     v = self.owned(iter)
         if stmt:
             self.add_owned(v, ty)
@@ -5014,8 +6829,14 @@ struct Lower:
     fn reduce(ref self, r: Reducer, arg: Expr, e: Expr) -> int:
         match arg.kind:
             case ExprKind.Comp(c):
+                if r == Reducer.First:
+                    if c.par:
+                        return self.par_first(c, e, arg.local, arg.caps)
+                    return self.seq_first(c, e, arg.local)
                 if c.par:
                     return self.par_reduce(r, c, e, arg.local, arg.caps)
+                if (r == Reducer.Min or r == Reducer.Max) and not e.ty.is_numeric():
+                    return self.reduce_ordered(r, c, e, arg.local)
                 let (acc, has) = self.reduce_init(r, e.ty)
                 let dom = self.domain(c.iter, false)
                 let lc = self.loop_open(dom, arg.local)
@@ -5025,6 +6846,90 @@ struct Lower:
                 return acc
             case _:
                 return self.cx.fb.konst(K.I64, 0)
+
+    # `min(a, b)` / `max(a, b)` of strings, tuples, structs or enums. The
+    # second wins only when strictly better: ties keep the first, as in Python.
+    fn pick_ordered(ref self, mn: bool, a: int, c: int, t: Ty) -> int:
+        let take = self.cmp_code(CmpOp.Lt if mn else CmpOp.Gt, c, a, t)
+        if not self.managed(t):
+            let res = self.cx.fb.copy_of(a)
+            let skip = self.cx.fb.label()
+            self.cx.fb.brnot(take, skip)
+            self.cx.fb.mov(res, c)
+            self.cx.fb.place(skip)
+            return res
+        let res = self.cx.fb.vreg(self.kind(t))
+        let first = self.cx.fb.label()
+        let end = self.cx.fb.label()
+        self.cx.fb.brnot(take, first)
+        let vc = self.copy_owned(c, t)
+        self.cx.fb.mov(res, vc)
+        self.cx.fb.jmp(end)
+        self.cx.fb.place(first)
+        let va = self.copy_owned(a, t)
+        self.cx.fb.mov(res, va)
+        self.cx.fb.place(end)
+        return self.temp(res, t)
+
+    # A retained copy of value `v` (an aggregate is copied to new memory).
+    fn copy_owned(ref self, v: int, t: Ty) -> int:
+        if self.agg(t):
+            let lay = self.lay(t)
+            let m = self.cx.fb.temp_mem(lay.size, lay.align)
+            self.cx.fb.copy(m, v, lay.size)
+            self.retain(m, t)
+            return m
+        self.retain(v, t)
+        return v
+
+    # `min(... for ...)` / `max(...)` of strings, tuples, structs or enums: the
+    # best value so far is kept as an owned copy.
+    fn reduce_ordered(ref self, r: Reducer, c: Comp, e: Expr, local: int) -> int:
+        let t = e.ty
+        let managed = self.managed(t)
+        let agg = self.agg(t)
+        var acc = -1
+        if agg:
+            let lay = self.lay(t)
+            acc = self.cx.fb.temp_mem(lay.size, lay.align)
+        else:
+            acc = self.zero_of(self.kind(t), 0)
+        let has = self.cx.fb.konst(K.Bool, 0)
+        let dom = self.domain(c.iter, false)
+        let lc = self.loop_open(dom, local)
+        match c.filter:
+            case Some(f):
+                self.emit_filter(f, lc.cont)
+            case None:
+                pass
+        self.push_frame()
+        let v = self.expr(c.body)
+        let take = self.cx.fb.label()
+        let skip = self.cx.fb.label()
+        self.cx.fb.brnot(has, take)
+        let better = self.cmp_code(CmpOp.Lt if r == Reducer.Min else CmpOp.Gt, v, acc, t)
+        self.cx.fb.brnot(better, skip)
+        self.cx.fb.place(take)
+        if managed:
+            let fresh = self.cx.fb.label()
+            self.cx.fb.brnot(has, fresh)
+            self.release(acc, t)
+            self.cx.fb.place(fresh)
+        if agg:
+            self.cx.fb.copy(acc, v, self.lay(t).size)
+        else:
+            self.cx.fb.mov(acc, v)
+        if managed:
+            self.retain(acc, t)
+        let yes = self.cx.fb.konst(K.Bool, 1)
+        self.cx.fb.mov(has, yes)
+        self.cx.fb.place(skip)
+        self.pop_frame()
+        self.loop_close(dom, lc)
+        self.reduce_finish(r, has, e.span)
+        if managed:
+            return self.temp(acc, t)
+        return acc
 
     fn reduce_init(ref self, r: Reducer, ty: Ty) -> (int, int):
         let k = self.kind(ty)
@@ -5038,6 +6943,9 @@ struct Lower:
                 acc = self.cx.fb.konst(K.Bool, 0)
             case Reducer.All:
                 acc = self.cx.fb.konst(K.Bool, 1)
+            case Reducer.First:
+                # lowered by `seq_first` / `par_first`
+                acc = self.cx.fb.konst(K.Ptr, 0)
         let has = self.cx.fb.konst(K.Bool, 0)
         return (acc, has)
 
@@ -5107,6 +7015,129 @@ struct Lower:
                 self.cx.fb.mov(has, t)
                 self.cx.fb.jmp(brk)
                 self.cx.fb.place(skip)
+            case Reducer.First:
+                pass
+
+    # `first(...)`: the first `Some` of the generator, or `None`.
+    fn seq_first(ref self, c: Comp, e: Expr, local: int) -> int:
+        let out = self.first_none(e.ty)
+        let dom = self.domain(c.iter, false)
+        let lc = self.loop_open(dom, local)
+        self.first_step(c, e.ty, out, lc, -1)
+        self.loop_close(dom, lc)
+        return self.temp(out, e.ty)
+
+    # One element of `first`: evaluate it and, when it is `Some`, move it to
+    # `out` and leave the loop (after telling the runtime, for `par first`,
+    # with `stopp` the context's stop word).
+    fn first_step(ref self, c: Comp, ty: Ty, out: int, lc: LoopCtl, stopp: int):
+        match c.filter:
+            case Some(f):
+                self.emit_filter(f, lc.cont)
+            case None:
+                pass
+        self.push_frame()
+        let v0 = self.owned(c.body)
+        let v = self.detach(v0, ty)
+        self.pop_frame()
+        let is = self.is_some(v, ty)
+        let miss = self.cx.fb.label()
+        self.cx.fb.brnot(is, miss)
+        self.first_set(out, v, ty)
+        if stopp >= 0:
+            self.cx.fb.call_void("brine_first_found", [stopp, 1])
+        self.cx.fb.jmp(lc.brk)
+        self.cx.fb.place(miss)
+        self.release(v, ty)
+
+    # `None` of option type `t`, in a value of its own that `first_set` can change.
+    fn first_none(ref self, t: Ty) -> int:
+        let none = self.variant_const(t, self.variant_index(cg_enum_id(t), "None", 1))
+        if self.agg(t):
+            # (inline: new stack memory already)
+            return none
+        let out = self.cx.fb.vreg(K.Ptr)
+        self.cx.fb.mov(out, none)
+        return out
+
+    # `out = v`, moving the option `v` (boxed: a pointer; inline: its bytes).
+    fn first_set(ref self, out: int, v: int, t: Ty):
+        if self.agg(t):
+            self.cx.fb.copy(out, v, self.lay(t).size)
+        else:
+            self.cx.fb.mov(out, v)
+
+    # Is the option `v` a `Some`?
+    fn is_some(ref self, v: int, t: Ty) -> int:
+        let eid = cg_enum_id(t)
+        let tag = self.etag(eid, v)
+        let sv = self.cx.fb.konst(self.tagk(eid), self.variant_index(eid, "Some", 0))
+        return self.cx.fb.cmp(Op.Eq, tag, sv)
+
+    # `par first(...)`: the elements are split into chunks like a `par for`;
+    # each chunk stores its first `Some` (or `None`) in its slot of an array,
+    # and the lowest slot with a value is the result, whatever the thread
+    # count. Chunks after one that found a value stop early.
+    fn par_first(ref self, c: Comp, e: Expr, local: int, captures: [int]) -> int:
+        let loc = self.loc(e.span)
+        let dom = self.domain(c.iter, false)
+        let n = self.dom_count(dom, e.span)
+        let k = self.cx.fb.call(K.I64, "brine_par_chunks", [n])
+        let res = self.new_arr(e.ty, k, loc)
+        self.register(res, Ty.Array(e.ty))
+        var extra = self.dom_fields(dom)
+        extra.push(("res", Ty.Str, res))
+        extra.push(("stop", Ty.Int(IntTy.I64), self.cx.fb.konst(K.I64, 9223372036854775807)))
+        let pc = self.par_ctx(captures, extra)
+        let fp = self.cx.fb.global(f"br_par_{pc.id}")
+        let zero = self.cx.fb.konst(K.I64, 0)
+        self.cx.fb.call_void("brine_par_run", [zero, n, k, fp, pc.ctx])
+
+        # the lowest slot holding a value
+        let out = self.first_none(e.ty)
+        let esize = self.lay(e.ty).size
+        let data = self.cx.fb.load(K.Ptr, res, 48)
+        let i = self.cx.fb.copy_of(zero)
+        let one = self.cx.fb.konst(K.I64, 1)
+        let head = self.cx.fb.label()
+        let done = self.cx.fb.label()
+        let next = self.cx.fb.label()
+        self.cx.fb.place(head)
+        let more = self.cx.fb.cmp(Op.Lt, i, k)
+        self.cx.fb.brnot(more, done)
+        let p = self.cx.fb.elem(data, i, esize)
+        let v = self.ld(p, 0, e.ty)
+        let hit = self.is_some(v, e.ty)
+        self.cx.fb.brnot(hit, next)
+        self.retain(v, e.ty)
+        self.first_set(out, v, e.ty)
+        self.cx.fb.jmp(done)
+        self.cx.fb.place(next)
+        let i2 = self.cx.fb.bin(Op.Add, K.I64, i, one)
+        self.cx.fb.mov(i, i2)
+        self.cx.fb.jmp(head)
+        self.cx.fb.place(done)
+
+        let saved = self.lift_enter(
+            f"br_par_{pc.id}",
+            [K.Ptr, K.I64, K.I64, K.I64],
+            pc,
+            captures,
+            []
+        )
+        let found = self.first_none(e.ty)
+        let stopp = self.cx.fb.offset(0, pc.off("stop"))
+        let lc = self.chunk_open(dom, pc, local)
+        let stopped = self.cx.fb.call(K.Bool, "brine_first_stopped", [stopp, 1])
+        self.cx.fb.br(stopped, lc.brk)
+        self.first_step(c, e.ty, found, lc, stopp)
+        self.chunk_close(lc)
+        let r = self.cx.fb.load(K.Ptr, 0, pc.off("res"))
+        let rdata = self.cx.fb.load(K.Ptr, r, 48)
+        let slot = self.cx.fb.elem(rdata, 1, self.lay(e.ty).size)
+        self.st(slot, 0, e.ty, found)
+        self.lift_exit(saved)
+        return self.temp(out, e.ty)
 
     fn reduce_finish(ref self, r: Reducer, has: int, span: Span):
         if r == Reducer.Min or r == Reducer.Max:
@@ -5221,7 +7252,10 @@ struct Lower:
 
     # The descriptor `br_gk_<id>` of a parallel construct, for the runtime to
     # run it on a GPU (`gpu_emit` fills it in). `real` overrides context field
-    # types, with flags: 1 written by the body, 2 only written (not read).
+    # types, with flags (BRINE_GA_* in brine_rt.h): 1 written by the body,
+    # 2 iteration k writes exactly element `first + k` and nothing reads the
+    # array (`first` is 0, or the u64 at offset (flags >> 8) - 1 in the
+    # context).
     fn gpu_site(
         ref self,
         pc: ParCtx,
@@ -5231,10 +7265,19 @@ struct Lower:
         real: [(str, Ty, int)],
         span: Span
     ) -> int:
-        let ptrs = self.gpu_ptrs(pc, real)
+        let (ptrs, why) = self.gpu_ptrs(pc, real)
         let wh = self.cstr_sym(self.sm.loc(span))
         self.gsites.push(
-            GpuSite(id=pc.id, kind=kind, op=op, vk=vk, where_sym=wh, ctx_size=pc.size, ptrs=ptrs)
+            GpuSite(
+                id=pc.id,
+                kind=kind,
+                op=op,
+                vk=vk,
+                where_sym=wh,
+                ctx_size=pc.size,
+                ptrs=ptrs,
+                why=why
+            )
         )
         return self.cx.fb.global(f"br_gk_{pc.id}")
 
@@ -5242,8 +7285,9 @@ struct Lower:
     # device: [nfields, (offset, flags, node)*, nodes...]. A node describes an
     # array: [element size, n, (offset in the element, node)*] for the arrays
     # inside each element; nodes are numbered from the first node's position.
-    # Empty: something in the context can't be copied (strings, maps, boxes).
-    fn gpu_ptrs(self, pc: ParCtx, real: [(str, Ty, int)]) -> [int]:
+    # Empty, with the reason: something in the context can't be copied
+    # (strings, maps, boxes).
+    fn gpu_ptrs(self, pc: ParCtx, real: [(str, Ty, int)]) -> ([int], str):
         var fields: [int] = []
         var nodes: [int] = []
         var nf = 0
@@ -5255,16 +7299,18 @@ struct Lower:
                     ty = x.1
                     flags = x.2
             var subs: [(int, Ty)] = []
-            if not self.gpu_plain(ty, pc.offs[i], ref subs):
-                return []
+            let what = self.gpu_what(ty, pc.offs[i], ref subs)
+            if what != "":
+                return ([], self.gpu_field(name, ty, what))
             for sub in subs:
-                let node = self.gpu_node(sub.1, ref nodes, 0)
+                var why = ""
+                let node = self.gpu_node(sub.1, ref nodes, 0, ref why)
                 if node < 0:
-                    return []
+                    return ([], self.gpu_field(name, ty, why))
                 let top = sub.0 == pc.offs[i]
                 # arrays written on the device are copied back: no pointers in them
                 if flags != 0 and (not top or nodes[node + 1] != 0):
-                    return []
+                    return ([], self.gpu_field(name, ty, "arrays"))
                 fields.push(sub.0)
                 fields.push(flags if top else 0)
                 fields.push(node)
@@ -5272,11 +7318,49 @@ struct Lower:
         var out = [nf]
         out.extend(fields)
         out.extend(nodes)
-        return out
+        return (out, "")
 
-    fn gpu_node(self, elem: Ty, ref nodes: [int], depth: int) -> int:
+    # Why a construct whose context field `name` (of type `ty`) holds `what`
+    # can't run on a GPU.
+    fn gpu_field(self, name: str, ty: Ty, what: str) -> str:
+        if name == "res":
+            match ty:
+                case Ty.Array(e):
+                    var subs: [(int, Ty)] = []
+                    if (
+                        self.gpu_what(e, 0, ref subs) == what
+                        or (what == "arrays" and len(subs) == 1 and subs[0].0 == 0)
+                    ):
+                        return f"its results are {what}"
+                case _:
+                    pass
+            return f"its results hold {what}"
+        if name == "darr":
+            return f"it loops over an array that holds {what}"
+        if name.starts_with("c"):
+            let n = self.flocals[int(name[1:])].name
+            if what == "arrays":
+                return f"it writes `{n}`, whose elements hold arrays"
+            let tn = self.info.ty_name(ty)
+            var subs: [(int, Ty)] = []
+            match ty:
+                case Ty.Str:
+                    return f"it reads `{n}`, a string"
+                case Ty.Map(_, _):
+                    return f"it reads `{n}`, a map"
+                case Ty.Array(_) | Ty.Tuple(_) | Ty.Struct(_):
+                    return f"it reads `{n}`, whose type `{tn}` holds {what}"
+                case _:
+                    return f"it reads `{n}`, a `{tn}`"
+        return f"its context holds {what}"
+
+    fn gpu_node(self, elem: Ty, ref nodes: [int], depth: int, ref why: str) -> int:
         var subs: [(int, Ty)] = []
-        if depth > 8 or not self.gpu_plain(elem, 0, ref subs):
+        if depth > 8:
+            why = "arrays nested too deeply"
+            return -1
+        why = self.gpu_what(elem, 0, ref subs)
+        if why != "":
             return -1
         let at = len(nodes)
         nodes.push(self.lay(elem).size)
@@ -5285,31 +7369,39 @@ struct Lower:
             nodes.push(0)
             nodes.push(0)
         for j, sub in enumerate(subs):
-            let child = self.gpu_node(sub.1, ref nodes, depth + 1)
+            let child = self.gpu_node(sub.1, ref nodes, depth + 1, ref why)
             if child < 0:
                 return -1
             nodes[at + 2 + 2 * j] = sub.0
             nodes[at + 3 + 2 * j] = child
         return at
 
-    # Is a value of type t plain data and arrays of it? `subs` gets the
-    # offsets (from `base`) and element types of the arrays in it.
-    fn gpu_plain(self, t: Ty, base: int, ref subs: [(int, Ty)]) -> bool:
+    # "" if a value of type t is plain data and arrays of it, otherwise what
+    # it holds that isn't. `subs` gets the offsets (from `base`) and element
+    # types of the arrays in it.
+    fn gpu_what(self, t: Ty, base: int, ref subs: [(int, Ty)]) -> str:
         match t:
             case Ty.Int(_) | Ty.Float(_) | Ty.Bool | Ty.Unit:
-                return true
+                return ""
+            case Ty.Str:
+                return "strings"
+            case Ty.Map(_, _):
+                return "maps"
             case Ty.Enum(eid):
-                return not self.info.enums[eid].has_payload()
+                if self.info.enums[eid].has_payload():
+                    return "enums with payloads"
+                return ""
             case Ty.Array(e):
                 subs.push((base, e))
-                return true
+                return ""
             case Ty.Tuple(_) | Ty.Struct(_):
                 for i, x in enumerate(self.field_tys(t)):
-                    if not self.gpu_plain(x, base + self.field_off(t, i), ref subs):
-                        return false
-                return true
+                    let w = self.gpu_what(x, base + self.field_off(t, i), ref subs)
+                    if w != "":
+                        return w
+                return ""
             case _:
-                return false
+                return self.info.ty_name(t) + " values"
 
     # The GPU code of the program's parallel constructs, and their descriptors
     # (`brine_kernel` in brine_rt.h).
@@ -5362,7 +7454,7 @@ struct Lower:
             if not ok:
                 var w = code.why[i]
                 if len(g.ptrs) == 0:
-                    w = "its context holds strings, maps or enums with payloads"
+                    w = g.why
                 rel.push(Reloc(off=96, sym=self.cstr_sym(w), add=0))
             if len(g.ptrs) > 0:
                 var pb: [u8] = []
@@ -5437,7 +7529,16 @@ struct Lower:
         let pc = self.par_ctx(captures, extra)
         var real = self.dom_tys(dom)
         for w in par_writes:
-            real.push((f"c{w}", self.flocals[w].ty, 1))
+            var flags = 1
+            match dom:
+                case Dom.Range(IntTy.I64, _, _, _, step):
+                    # iteration k writes element lo + k, and nothing reads it:
+                    # the device needn't get the array's old elements
+                    if step < 0 and write_only(body, w, local):
+                        flags = 3 | ((pc.off("dlo") + 1) << 8)
+                case _:
+                    pass
+            real.push((f"c{w}", self.flocals[w].ty, flags))
         self.par_launch(pc, 0, n, real, span)
         self.pop_scope()
 
@@ -5448,6 +7549,7 @@ struct Lower:
             captures,
             par_writes
         )
+        self.cx.par_var = local
         let lc = self.chunk_open(dom, pc, local)
         self.cx.loops.push(Loop(depth=len(self.cx.scopes), brk=lc.brk, cont=lc.cont))
         self.block(body)
@@ -5499,9 +7601,10 @@ struct Lower:
         let extra = self.dom_fields(dom)
         let pc = self.par_ctx(captures, extra)
         let fp = self.cx.fb.global(f"br_par_{pc.id}")
+        let efp = self.cx.fb.global(f"br_pel_{pc.id}")
         let kd = self.gpu_site(pc, 2, reducer_code(r), self.kind(ty), self.dom_tys(dom), e.span)
         let loc = self.loc(e.span)
-        self.cx.fb.call_void("brine_par_reduce", [kd, n, fp, pc.ctx, accp, hasp, loc])
+        self.cx.fb.call_void("brine_par_reduce", [kd, n, fp, efp, pc.ctx, accp, hasp, loc])
         self.cx.fb.load_to(acc, accp, 0)
         self.cx.fb.load_to(has, hasp, 0)
         self.reduce_finish(r, has, e.span)
@@ -5520,6 +7623,33 @@ struct Lower:
         self.cx.fb.store(4, 0, a2)
         self.cx.fb.store(5, 0, h2)
         self.lift_exit(saved)
+
+        # the same for one element, giving its own value: with few leaves, the
+        # runtime runs the elements in parallel and folds the leaves itself
+        let saved2 = self.lift_enter(
+            f"br_pel_{pc.id}",
+            [K.Ptr, K.I64, K.I64, K.I64, K.Ptr, K.Ptr],
+            pc,
+            captures,
+            []
+        )
+        let (a3, h3) = self.reduce_init(r, ty)
+        let lc2 = self.chunk_open(dom, pc, local)
+        match c.filter:
+            case Some(f):
+                self.emit_filter(f, lc2.cont)
+            case None:
+                pass
+        self.push_frame()
+        let v = self.expr(c.body)
+        self.pop_frame()
+        self.cx.fb.mov(a3, v)
+        let t = self.cx.fb.konst(K.Bool, 1)
+        self.cx.fb.mov(h3, t)
+        self.chunk_close(lc2)
+        self.cx.fb.store(4, 0, a3)
+        self.cx.fb.store(5, 0, h3)
+        self.lift_exit(saved2)
         return acc
 
     fn par_tuple(ref self, elems: [Expr], captures: [int], e: Expr) -> int:
@@ -5554,6 +7684,64 @@ struct Lower:
         self.lift_exit(saved)
         return res
 
+# Does a `par for` body (loop variable `lv`) write `w[lv]` in every iteration
+# and never read `w`?
+fn write_only(body: Block, w: int, lv: int) -> bool:
+    var found = false
+    for s in body.stmts:
+        if not found:
+            match s.kind:
+                case StmtKind.Assign(t, op, _):
+                    found = op.is_none() and whole_elem(t, w, lv)
+                case _:
+                    pass
+            # an earlier `continue` may skip the write
+            if not found and stmt_continues(s):
+                return false
+        if not only_writes(s, w, lv):
+            return false
+    return found
+
+fn whole_elem(t: Expr, w: int, lv: int) -> bool:
+    match t.kind:
+        case ExprKind.Index(base, idx):
+            return local_of(base) == Some(w) and local_of(idx) == Some(lv)
+        case _:
+            return false
+
+# Is `w` used in `s` only as the target of `w[lv] = ...`?
+fn only_writes(s: Stmt, w: int, lv: int) -> bool:
+    match s.kind:
+        case StmtKind.Assign(t, op, v):
+            if op.is_none() and whole_elem(t, w, lv):
+                return not mentions(v, w)
+        case _:
+            pass
+    for e in stmt_exprs(s):
+        if mentions(e, w):
+            return false
+    for b in stmt_blocks(s):
+        for x in b.stmts:
+            if not only_writes(x, w, lv):
+                return false
+    return true
+
+fn mentions(e: Expr, w: int) -> bool:
+    if local_of(e) == Some(w):
+        return true
+    return any(mentions(c, w) for c in children(e))
+
+fn stmt_continues(s: Stmt) -> bool:
+    match s.kind:
+        case StmtKind.Continue:
+            return true
+        case _:
+            pass
+    for b in stmt_blocks(s):
+        if any(stmt_continues(x) for x in b.stmts):
+            return true
+    return false
+
 struct LoopCtl:
     head: int
     cont: int
@@ -5573,6 +7761,8 @@ struct GpuSite:
     where_sym: str
     ctx_size: int
     ptrs: [int]
+    # why the context can't be copied to a device (`ptrs` is empty)
+    why: str
 
 # A lifted parallel body's context: its fields' names and offsets.
 struct ParCtx:
@@ -5605,6 +7795,8 @@ fn reducer_code(r: Reducer) -> int:
             return 4
         case Reducer.All:
             return 5
+        case Reducer.First:
+            return 6
 
 fn kind_code(k: K) -> int:
     match k:
@@ -5677,11 +7869,23 @@ fn world_suffix(t: Ty) -> str:
         case _:
             return "arr"
 
-# The message type description the runtime's encoder understands.
+# The message type description the runtime's encoder understands: values
+# travel at the width they have in memory.
 fn world_desc(t: Ty) -> str:
     match t:
-        case Ty.Int(_):
+        case Ty.Int(k):
+            let b = k.bits()
+            if b == 8:
+                return "1"
+            elif b == 16:
+                return "2"
+            elif b == 32:
+                return "4"
+            elif b == 128:
+                return "h"
             return "i"
+        case Ty.Float(FloatTy.F32):
+            return "g"
         case Ty.Float(_):
             return "f"
         case Ty.Bool:
@@ -5693,6 +7897,270 @@ fn world_desc(t: Ty) -> str:
         case _:
             return "?"
 
+# A literal whose bytes are all zero (`0`, `false`, `0.0` but not `-0.0`).
+fn zero_lit(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Int(z):
+            return z == 0
+        case ExprKind.Bool(z):
+            return not z
+        case ExprKind.Float(z):
+            let zs = f"{z}"
+            return z == 0.0 and not zs.starts_with("-")
+        case _:
+            return false
+
+# The largest array `stack_arrays` keeps in the stack frame, and the most it
+# keeps for one function, in bytes
+const STACK_ARR = 1024
+const STACK_FN = 4096
+
+# What `stack_arrays` needs from a function body: the locals made by
+# `[x] * n` (n a literal, with n), those used any way but `a[i]`, `a[i] = v`,
+# `a[i] op= v` and `len(a)`, and whether there is any `par`.
+struct StackUse:
+    made: {int: int}
+    bad: {int: bool}
+    par: bool
+
+    fn block(ref self, b: Block):
+        for s in b.stmts:
+            self.stmt(s)
+
+    fn stmt(ref self, s: Stmt):
+        match s.kind:
+            case StmtKind.Let(_, pat, _, init, is_ref):
+                match pat:
+                    case LetPat.Name(_, _):
+                        if not is_ref:
+                            match init.kind:
+                                case ExprKind.Repeat(_, count):
+                                    match count.kind:
+                                        case ExprKind.Int(v):
+                                            if 0 < v < (1 << 20):
+                                                self.made[s.locals[0]] = int(v)
+                                        case _:
+                                            pass
+                                case _:
+                                    pass
+                    case _:
+                        pass
+                if is_ref:
+                    self.root_bad(init)
+            case StmtKind.For(_, _, _, _, _, _, is_par):
+                if is_par:
+                    self.par = true
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            self.expr(e)
+        for b in stmt_blocks(s):
+            self.block(b)
+
+    # an element's address is taken (`ref a[i]`)
+    fn root_bad(ref self, e: Expr):
+        match lvalue_root(e):
+            case Some(r):
+                self.bad[r] = true
+            case None:
+                pass
+
+    fn expr(ref self, e: Expr):
+        match e.kind:
+            case ExprKind.Index(b, i):
+                if local_of(b).is_some():
+                    self.expr(i)
+                    return
+            case ExprKind.Call(_, args):
+                for a in args:
+                    if a.by_ref:
+                        self.root_bad(a.expr)
+                if e.cres == CallRes.Builtin(Builtin.Len) and len(args) == 1 and not args[0].by_ref:
+                    if local_of(args[0].expr).is_some():
+                        return
+            case ExprKind.MethodCall(recv, _, _, args):
+                self.root_bad(recv)
+                for a in args:
+                    if a.by_ref:
+                        self.root_bad(a.expr)
+            case ExprKind.ParTuple(_):
+                self.par = true
+            case ExprKind.Comp(c):
+                if c.par:
+                    self.par = true
+            case ExprKind.Ident(_):
+                match local_of(e):
+                    case Some(l):
+                        self.bad[l] = true
+                    case None:
+                        pass
+                return
+            case _:
+                pass
+        for c in children(e):
+            self.expr(c)
+
+# An index `arr[j + x]` (`x + j`, `j - x` with `neg`, `j`) in a loop over j:
+# its span and the span of the addition ("" for `arr[j]`); x is a variable
+# (else -1, and `lit` a literal).
+struct IdxCand:
+    idx: str
+    add: str
+    arr: int
+    x: int
+    lit: int
+    neg: bool
+
+# What `bounds_version` needs from a loop body over `j`: the indexes of the
+# form `arr[j + x]`, the variables declared in it, and the variables it may
+# change or use in a way that could change an array's length (anything but
+# `a[i]`, `a[i] = v` and `len(a)` for arrays; assigned, for integers).
+struct BoundsUse:
+    j: int
+    decl: {int: bool}
+    found: [IdxCand]
+    bad: {int: bool}
+    par: bool
+    # calls a function of the program
+    calls: bool
+
+    fn block(ref self, b: Block):
+        for s in b.stmts:
+            self.stmt(s)
+
+    fn stmt(ref self, s: Stmt):
+        match s.kind:
+            case StmtKind.Let(_, _, _, init, is_ref):
+                for l in s.locals:
+                    self.decl[l] = true
+                if is_ref:
+                    match lvalue_root(init):
+                        case Some(r):
+                            self.bad[r] = true
+                        case None:
+                            pass
+            case StmtKind.Assign(t, _, _):
+                match t.kind:
+                    case ExprKind.Index(b, _):
+                        if local_of(b).is_none():
+                            self.target(t)
+                    case _:
+                        self.target(t)
+            case StmtKind.For(_, _, _, _, _, _, is_par):
+                self.decl[s.local] = true
+                if is_par:
+                    self.par = true
+            case StmtKind.Match(_, cases):
+                for c in cases:
+                    pat_locals(c.pat, ref self.decl)
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            self.expr(e)
+        for b in stmt_blocks(s):
+            self.block(b)
+
+    # an assigned place: its root variable may change
+    fn target(ref self, t: Expr):
+        match lvalue_root(t):
+            case Some(r):
+                self.bad[r] = true
+            case None:
+                pass
+
+    fn expr(ref self, e: Expr):
+        match e.kind:
+            case ExprKind.Ident(_):
+                match local_of(e):
+                    case Some(l):
+                        # read where its value could go anywhere
+                        if self.flocals_array(e):
+                            self.bad[l] = true
+                    case None:
+                        pass
+                return
+            case ExprKind.Index(b, i):
+                match local_of(b):
+                    case Some(a):
+                        self.index(e, a, i)
+                        self.expr(i)
+                        return
+                    case None:
+                        pass
+            case ExprKind.Call(_, args):
+                if e.cres == CallRes.Builtin(Builtin.Len) and len(args) == 1:
+                    if local_of(args[0].expr).is_some():
+                        return
+                match e.cres:
+                    case CallRes.Fn(_) | CallRes.Method(_):
+                        self.calls = true
+                    case _:
+                        pass
+                for a in args:
+                    if a.by_ref:
+                        self.target(a.expr)
+            case ExprKind.MethodCall(recv, _, _, args):
+                match e.cres:
+                    case CallRes.Method(_):
+                        self.calls = true
+                    case _:
+                        pass
+                # a receiver may be changed in place
+                self.target(recv)
+                for a in args:
+                    if a.by_ref:
+                        self.target(a.expr)
+            case ExprKind.Comp(_):
+                self.par = true
+                return
+            case _:
+                pass
+        for c in children(e):
+            self.expr(c)
+
+    fn flocals_array(self, e: Expr) -> bool:
+        match e.ty:
+            case Ty.Array(_):
+                return true
+            case _:
+                return false
+
+    fn index(ref self, e: Expr, a: int, i: Expr):
+        let ik = ranges.key(e.span)
+        match i.kind:
+            case ExprKind.Ident(_):
+                if local_of(i) == Some(self.j):
+                    self.found.push(IdxCand(idx=ik, add="", arr=a, x=-1, lit=0, neg=false))
+            case ExprKind.Binary(op, l, r):
+                if op != BinOp.Add and op != BinOp.Sub:
+                    return
+                let lj = local_of(l) == Some(self.j)
+                let rj = local_of(r) == Some(self.j)
+                if not lj and not (rj and op == BinOp.Add):
+                    return
+                let other = r if lj else l
+                let ak = ranges.key(i.span)
+                let neg = op == BinOp.Sub
+                match other.kind:
+                    case ExprKind.Int(v):
+                        if -(i128(1) << 40) < v < (i128(1) << 40):
+                            self.found.push(
+                                IdxCand(idx=ik, add=ak, arr=a, x=-1, lit=int(v), neg=neg)
+                            )
+                    case ExprKind.Ident(_):
+                        match local_of(other):
+                            case Some(x):
+                                if x != self.j:
+                                    self.found.push(
+                                        IdxCand(idx=ik, add=ak, arr=a, x=x, lit=0, neg=neg)
+                                    )
+                            case None:
+                                pass
+                    case _:
+                        pass
+            case _:
+                pass
+
 # How a loop uses its local arrays: `seen` indexed, `written` changed through
 # an index (assigned, a receiver, a `ref` argument), `bad` used any other way (copied, passed, reassigned, iterated).
 struct IndexUse:
@@ -5702,6 +8170,11 @@ struct IndexUse:
     bad: {int: bool}
     # declared inside the loop: not there yet when it starts
     decl: {int: bool}
+    # fields (`self.stack`) indexed and written, by `path_key`, and the
+    # places used in any other way (a variable alone: no steps)
+    fseen: {str: Expr}
+    fwritten: {str: bool}
+    whole: [(int, [int])]
 
     fn expr(ref self, e: Expr):
         match e.kind:
@@ -5710,6 +8183,20 @@ struct IndexUse:
                     case Some(l):
                         self.seen[l] = true
                         self.expr(idx)
+                        return
+                    case None:
+                        pass
+                match field_path(base):
+                    case Some((l, p)):
+                        self.fseen[path_key(l, p)] = base
+                        self.expr(idx)
+                        return
+                    case None:
+                        pass
+            case ExprKind.Field(_, _, _):
+                match field_path(e):
+                    case Some(pp):
+                        self.whole.push(pp)
                         return
                     case None:
                         pass
@@ -5737,7 +8224,13 @@ struct IndexUse:
                     case CallRes.Builtin(b):
                         match b:
                             case Builtin.Len:
-                                if len(args) == 1 and local_of(args[0].expr).is_some():
+                                if (
+                                    len(args) == 1
+                                    and (
+                                        local_of(args[0].expr).is_some()
+                                        or field_path(args[0].expr).is_some()
+                                    )
+                                ):
                                     return
                             case _:
                                 pass
@@ -5747,6 +8240,7 @@ struct IndexUse:
                 match local_of(e):
                     case Some(l):
                         self.bad[l] = true
+                        self.whole.push((l, []))
                     case None:
                         pass
                 return
@@ -5800,6 +8294,11 @@ struct IndexUse:
                     case Some(l):
                         self.written[l] = true
                     case None:
+                        match field_path(base):
+                            case Some((l, p)):
+                                self.fwritten[path_key(l, p)] = true
+                            case None:
+                                pass
                         self.target(base)
             case ExprKind.Field(base, _, _):
                 self.target(base)
@@ -5895,3 +8394,311 @@ fn dtypedef(name: str, to: int) -> DType:
 
 fn dfield(name: str, ty: int, off: int) -> DField:
     return DField(name=name, ty=ty, off=off)
+
+# A place (`x`, `x.f`, `x[i].g`) as its root local and the steps to it: a
+# field index, or -1 for an element (of an array or a map).
+fn place_path(e: Expr) -> Option[(int, [int])]:
+    match e.kind:
+        case ExprKind.Ident(_):
+            match local_of(e):
+                case Some(l):
+                    return Some((l, []))
+                case None:
+                    return None
+        case ExprKind.Field(b, _, _):
+            match place_path(b):
+                case Some((l, p)):
+                    var q = p
+                    q.push(e.idx)
+                    return Some((l, q))
+                case None:
+                    return None
+        case ExprKind.Index(b, _):
+            match place_path(b):
+                case Some((l, p)):
+                    var q = p
+                    q.push(-1)
+                    return Some((l, q))
+                case None:
+                    return None
+        case _:
+            return None
+
+# Can two places with the same root share memory? Only when neither leaves
+# the other through a different field (elements may be the same one).
+fn steps_overlap(a: [int], b: [int]) -> bool:
+    let n = min(len(a), len(b))
+    for i in 0..n:
+        if a[i] >= 0 and b[i] >= 0 and a[i] != b[i]:
+            return false
+    return true
+
+fn mentions_local(e: Expr, id: int) -> bool:
+    if local_of(e) == Some(id):
+        return true
+    for c in children(e):
+        if mentions_local(c, id):
+            return true
+    return false
+
+# Can the value of `e` (a by-value argument, evaluated before the call) be
+# memory one of the places `refs` reaches? Then the callee could change or
+# free it through the `ref`. Different variables never share memory a `ref`
+# can change in place: a shared array or string is copied before a write.
+fn reaches(e: Expr, refs: [(int, [int])]) -> bool:
+    match place_path(e):
+        case Some((l, p)):
+            for r in refs:
+                if r.0 == l and steps_overlap(r.1, p):
+                    return true
+            return false
+        case None:
+            for r in refs:
+                if mentions_local(e, r.0):
+                    return true
+            return false
+
+# A place reached through fields only (`self.stack`, `s.a.b`), not a bare variable.
+fn field_path(e: Expr) -> Option[(int, [int])]:
+    match e.kind:
+        case ExprKind.Field(_, _, _):
+            match place_path(e):
+                case Some((l, p)):
+                    if -1 in p:
+                        return None
+                    return Some((l, p))
+                case None:
+                    return None
+        case _:
+            return None
+
+fn path_key(l: int, p: [int]) -> str:
+    return f"{l}:" + ".".join([str(x) for x in p])
+
+# `s = s + a + b` with `s` a variable or a field of one: the parts appended
+# (`[a, b]`), if none reads `s` or can leave the function midway (`?`).
+fn self_append(target: Expr, value: Expr) -> Option[[Expr]]:
+    let tp = place_path(target)
+    match tp:
+        case Some((l, p)):
+            if -1 in p:
+                return None
+            var parts: [Expr] = []
+            var v = value
+            while true:
+                match v.kind:
+                    case ExprKind.Binary(BinOp.Add, a, b):
+                        if mentions_local(b, l) or has_try(b):
+                            return None
+                        parts.insert(0, b)
+                        if place_path(a) == tp:
+                            return Some(parts)
+                        v = a
+                    case _:
+                        return None
+            return None
+        case None:
+            return None
+
+# The locals pattern `p` binds.
+fn pat_locals(p: Pattern, ref out: {int: bool}):
+    match p.kind:
+        case PatKind.Bind(_):
+            out[p.local] = true
+        case PatKind.Tuple(ps):
+            for q in ps:
+                pat_locals(q, ref out)
+        case PatKind.Or(alts):
+            for q in alts:
+                pat_locals(q, ref out)
+        case _:
+            pass
+    for q in p.fields:
+        pat_locals(q, ref out)
+
+fn has_try(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Try(_):
+            return true
+        case _:
+            pass
+    for c in children(e):
+        if has_try(c):
+            return true
+    return false
+
+# `var w = p` then `p = []` (see `take_at`): w's local, `p`, and the `[]`.
+fn take_pair(s: Stmt, t: Stmt) -> Option[(int, Expr, Expr)]:
+    match s.kind:
+        case StmtKind.Let(_, pat, _, init, is_ref):
+            if is_ref or len(s.locals) != 1 or not is_name(pat) or not array_place(init):
+                return None
+            match t.kind:
+                case StmtKind.Assign(target, op, v):
+                    if op.is_some() or not same_place(target, init):
+                        return None
+                    match v.kind:
+                        case ExprKind.Array(es):
+                            if len(es) == 0 and v.ty == init.ty:
+                                return Some((s.locals[0], init, v))
+                        case _:
+                            pass
+                    return None
+                case _:
+                    return None
+        case _:
+            return None
+
+fn is_name(p: LetPat) -> bool:
+    match p:
+        case LetPat.Name(_, _):
+            return true
+        case _:
+            return false
+
+# A variable, or fields and array elements of one at indexes that can be
+# computed again with the same result.
+fn array_place(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Ident(_):
+            return local_of(e).is_some()
+        case ExprKind.Field(b, _, _):
+            return array_place(b)
+        case ExprKind.Index(b, i):
+            match b.ty:
+                case Ty.Array(_):
+                    return pure_index(i) and array_place(b)
+                case _:
+                    return false
+        case _:
+            return false
+
+fn pure_index(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Ident(_):
+            return local_of(e).is_some()
+        case ExprKind.Int(_):
+            return true
+        case ExprKind.Field(b, _, _):
+            return pure_index(b)
+        case ExprKind.Binary(_, l, r):
+            return pure_index(l) and pure_index(r)
+        case _:
+            return false
+
+# The same place, written the same way (see `array_place`).
+fn same_place(a: Expr, b: Expr) -> bool:
+    match a.kind:
+        case ExprKind.Ident(_):
+            return local_of(a).is_some() and local_of(a) == local_of(b)
+        case ExprKind.Int(x):
+            match b.kind:
+                case ExprKind.Int(y):
+                    return x == y and a.ty == b.ty
+                case _:
+                    return false
+        case ExprKind.Field(x, _, _):
+            match b.kind:
+                case ExprKind.Field(y, _, _):
+                    return a.idx == b.idx and same_place(x, y)
+                case _:
+                    return false
+        case ExprKind.Index(x, i):
+            match b.kind:
+                case ExprKind.Index(y, j):
+                    return same_place(x, y) and same_place(i, j)
+                case _:
+                    return false
+        case ExprKind.Binary(o, x, i):
+            match b.kind:
+                case ExprKind.Binary(p, y, j):
+                    return o == p and a.ty == b.ty and same_place(x, y) and same_place(i, j)
+                case _:
+                    return false
+        case _:
+            return false
+
+# Is `stmts[j]` the last use of `w`, a variable an earlier `let`/`var` of
+# this block declared, with no `ref` name for it?
+fn last_use(stmts: [Stmt], j: int, w: int) -> bool:
+    return last_use_from(stmts, j, w, false)
+
+# The same, where `declared` says w is a parameter (declared before them all).
+fn last_use_from(stmts: [Stmt], j: int, w: int, declared0: bool) -> bool:
+    var declared = declared0
+    for i in 0..j:
+        match stmts[i].kind:
+            case StmtKind.Let(_, pat, _, _, is_ref):
+                if not is_ref and is_name(pat) and stmts[i].locals == [w]:
+                    declared = true
+            case _:
+                pass
+    if not declared:
+        return false
+    for i in 0..len(stmts):
+        if ref_alias(stmts[i], w):
+            return false
+        if i > j and stmt_mentions(stmts[i], w):
+            return false
+    return true
+
+fn stmt_mentions(s: Stmt, w: int) -> bool:
+    for e in stmt_exprs(s):
+        if mentions_local(e, w):
+            return true
+    for b in stmt_blocks(s):
+        for t in b.stmts:
+            if stmt_mentions(t, w):
+                return true
+    return false
+
+# `let r = ref ...w...`, here or in a nested block
+fn ref_alias(s: Stmt, w: int) -> bool:
+    match s.kind:
+        case StmtKind.Let(_, _, _, init, is_ref):
+            if is_ref and mentions_local(init, w):
+                return true
+        case _:
+            pass
+    for b in stmt_blocks(s):
+        for t in b.stmts:
+            if ref_alias(t, w):
+                return true
+    return false
+
+fn own_name(c_name: str, mask: int) -> str:
+    return f"{c_name}__own{mask}"
+
+fn owns_param(mask: int, i: int) -> bool:
+    return i < 62 and ((mask >> i) & 1) == 1
+
+# Would a clone of `f` that owns parameter `pi` use it: does the body start
+# a variable with it, as its last use (`var t = p`, or a `mut p` parameter)?
+fn consumes(f: FnDecl, pi: int) -> bool:
+    if pi >= len(f.param_locals):
+        return false
+    let p = f.param_locals[pi]
+    let stmts = f.body.stmts
+    for k in 0..len(stmts):
+        match stmts[k].kind:
+            case StmtKind.Let(_, pat, _, init, is_ref):
+                if not is_ref and is_name(pat) and local_of(init) == Some(p):
+                    return last_use_from(stmts, k, p, true)
+            case _:
+                pass
+    return false
+
+# A field or array element of a variable, at any depth: a place whose value
+# stays put while the variable does (see `borrow_let`).
+fn borrow_place(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Field(b, _, _):
+            return local_of(b).is_some() or borrow_place(b)
+        case ExprKind.Index(b, _):
+            match b.ty:
+                case Ty.Array(_):
+                    return local_of(b).is_some() or borrow_place(b)
+                case _:
+                    return false
+        case _:
+            return false

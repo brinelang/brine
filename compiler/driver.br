@@ -2,13 +2,14 @@
 # and link.
 from diag import Span, Diag, SourceMap
 import diag
-from ast import Module, Program
+from ast import Module, Program, module_name
 from parser import parse_module
 from types import Ty, IntTy
 from info import ProgramInfo, TryKind, try_kind, PRELUDE
 from check import new_checker
 import project
 import uniform
+import pareffects
 import verify
 import lower
 import ir_c
@@ -19,6 +20,8 @@ from verify import Report
 const PRELUDE_SRC = embed("../runtime/prelude.br")
 const RT_H = embed("../runtime/brine_rt.h")
 const RT_C = embed("../runtime/brine_rt.c")
+# the math library, which brine_rt.c includes
+const RT_M = embed("../runtime/brine_math.c")
 const CPU_C = embed("../runtime/brine_cpu.c")
 # runs a WebAssembly build under Node.js (`brine run --target wasm`)
 const WASI_NODE = embed("../runtime/brine_wasi.mjs")
@@ -48,7 +51,8 @@ fn read_source(path: str) -> Result[str, str]:
         case Ok(text):
             return Ok(text.replace("\r\n", "\n"))
         case Err(e):
-            return Err(f"cannot read `{path}`: {e}")
+            # read_file's message already names the file
+            return Err(e)
 
 # Path for messages: relative to the current directory when it's inside it.
 fn display_path(p: str) -> str:
@@ -62,6 +66,31 @@ fn display_path(p: str) -> str:
     if s.starts_with("./"):
         return s[2:]
     return s
+
+# The directory above `d`.
+fn up_dir(d: str) -> str:
+    if d == "." or d == "":
+        return ".."
+    match project.file_name(d):
+        case Some(_):
+            match project.parent(d):
+                case Some(up):
+                    return up if up != "" else "."
+                case None:
+                    pass
+        case None:
+            pass
+    return project.join(d, "..")
+
+# The file `import <path>` loads, from directory `root`.
+fn module_file(root: str, path: [str]) -> str:
+    var p = root
+    for seg in path:
+        if seg == "..":
+            p = up_dir(p)
+        else:
+            p = project.join(p, seg)
+    return p + ".br"
 
 fn dir_of(p: str) -> str:
     match project.parent(p):
@@ -84,7 +113,16 @@ fn parse_found(f: Found) -> (Module, [Diag]):
             return parse_module(src, f.file, f.name)
         case None:
             return (
-                Module(name=f.name, file=f.file, imports=[], fns=[], structs=[], enums=[], consts=[], tests=[]),
+                Module(
+                    name=f.name,
+                    file=f.file,
+                    imports=[],
+                    fns=[],
+                    structs=[],
+                    enums=[],
+                    consts=[],
+                    tests=[]
+                ),
                 []
             )
 
@@ -117,17 +155,14 @@ fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
         while i < first_new:
             var targets: [int] = []
             for imp in prog.modules[i].imports:
-                let name = ".".join(imp.path)
+                let name = module_name(imp.path)
                 match by_name.get(name):
                     case Some(t):
                         targets.push(t)
                         continue
                     case None:
                         pass
-                var p = root
-                for seg in imp.path:
-                    p = project.join(p, seg)
-                p += ".br"
+                let p = module_file(root, imp.path)
                 let idx = first_new + len(found)
                 by_name[name] = idx
                 targets.push(idx)
@@ -137,9 +172,7 @@ fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
                             Found(name=name, src=Some(src), file=sm.add(display_path(p), src))
                         )
                     case Err(_):
-                        diags.push(
-                            diag.error("E0701", f"module `{name}` not found").label(imp.span, "expected a file at `" + display_path(p) + "`").with_help("modules are `.br` files next to the main file; `import a.b` loads `a/b.br`")
-                        )
+                        diags.push(not_found(name, imp.path, imp.span, root, p))
                         # keeps the numbering: an empty module
                         found.push(Found(name=name, src=None, file=prog.modules[i].file))
             prog.import_targets.push(targets)
@@ -157,6 +190,26 @@ fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
         prog.import_targets.push([])
     prog.main_module = 0
     return Some(prog)
+
+# E0701, with the directory above where the module is, if it is in one.
+fn not_found(name: str, path: [str], span: Span, root: str, p: str) -> Diag:
+    var d = diag.error(
+        "E0701",
+        f"module `{name}` not found"
+    ).label(span, "expected a file at `" + display_path(p) + "`")
+    let shown = display_path(root) if root != "." else "."
+    var up = path
+    for _ in 0..8:
+        up.insert(0, "..")
+        let q = module_file(root, up)
+        if os.is_file(q):
+            let fixed = module_name(up)
+            return d.note(
+                f"modules are found from `{shown}`, the main file's directory"
+            ).with_help(f"`{display_path(q)}` exists: import it with `import {fixed}`")
+    return d.note(f"modules are found from `{shown}`, the main file's directory").with_help(
+        "`import a.b` loads `a/b.br` there, and `import ..a` loads `a.br` from the directory above"
+    )
 
 struct FrontOpts:
     verify: bool
@@ -176,7 +229,7 @@ fn main_ok(info: ProgramInfo, id: int) -> bool:
         case _:
             match try_kind(info, sig.ret):
                 case Some(TryKind.Res(_, _, ok, _)):
-                    return ok == Ty.Unit
+                    return ok == Ty.Unit or ok == Ty.Int(IntTy.I64)
                 case _:
                     return false
 
@@ -214,17 +267,28 @@ fn frontend(entry: str, opts: FrontOpts) -> Frontend:
                 break
         if found < 0:
             diags.push(
-                diag.error("E0703", "this program has no `main` function").label(Span(file=m.file, lo=0, hi=0), "add `fn main():` here").with_help("every program starts at `fn main():` in its main file")
+                diag.error("E0703", "this program has no `main` function")
+                .label(Span(file=m.file, lo=0, hi=0), "add `fn main():` here")
+                .with_help("every program starts at `fn main():` in its main file")
             )
         else:
             let f = m.fns[found]
             if len(f.tparams) > 0 or not main_ok(info, f.id):
                 diags.push(
-                    diag.error("E0706", "`main` must take no parameters and return nothing, an `int` exit code, or `Result[(), E]`").label(f.name_span, "this `main`").with_help("command-line arguments come from `args()`; return `Result[(), str]` to use `?` in `main`")
+                    diag.error(
+                        "E0706",
+                        "`main` must take no parameters and return nothing, an `int` exit code, or `Result[(), E]` / `Result[int, E]`"
+                    )
+                    .label(f.name_span, "this `main`")
+                    .with_help(
+                        "command-line arguments come from `args()`; return `Result[(), str]` to use `?` in `main`"
+                    )
                 )
     if not has_errors(diags):
         # deadlock freedom: every rank makes the same `world` calls
         diags.extend(uniform.check(prog, info))
+        # nothing reached from a `par` body writes files or reads input
+        diags.extend(pareffects.check(prog, info))
         t = phase_time(t, "uniform")
     var report: Option[Report] = None
     if opts.verify and not has_errors(diags):
@@ -370,10 +434,13 @@ fn find_wasi_cc() -> Option[str]:
     return None
 
 fn no_wasi_cc_diag() -> Diag:
-    return diag.error(
-        "E0702",
-        "no WebAssembly C toolchain found"
-    ).note("brine builds WebAssembly with the clang and C library of wasi-sdk").with_help("download wasi-sdk from https://github.com/WebAssembly/wasi-sdk/releases and set WASI_SDK_PATH to its folder")
+    return (
+        diag.error("E0702", "no WebAssembly C toolchain found")
+        .note("brine builds WebAssembly with the clang and C library of wasi-sdk")
+        .with_help(
+            "download wasi-sdk from https://github.com/WebAssembly/wasi-sdk/releases and set WASI_SDK_PATH to its folder"
+        )
+    )
 
 fn cc_version(cc: str) -> Option[str]:
     match os.spawn([cc, "--version"], {}, true, false):
@@ -393,10 +460,11 @@ fn no_cc_diag() -> Diag:
         hint = "install one with `winget install LLVM.LLVM` or `scoop install mingw-winlibs`, or set BRINE_CC"
     elif os.name() == "macos":
         hint = "install one with `xcode-select --install`, or set BRINE_CC"
-    return diag.error(
-        "E0702",
-        "no C compiler found"
-    ).note("brine generates C and uses the system C compiler to produce native code").with_help(hint)
+    return (
+        diag.error("E0702", "no C compiler found")
+        .note("brine generates C and uses the system C compiler to produce native code")
+        .with_help(hint)
+    )
 
 # 64-bit FNV-1a.
 fn fnv(data: str) -> u64:
@@ -471,8 +539,10 @@ fn io_diag(e: str) -> Diag:
 
 # Generated code, ready for the system toolchain.
 enum Code:
-    # C translation units, compiled in parallel and cached one by one
-    C(units: [str])
+    # C translation units, compiled in parallel and cached one by one;
+    # `once` are compiled a single time even when `units` are compiled for
+    # several CPU levels (the big data blocks)
+    C(units: [str], once: [str])
     # a native object file (x64.br)
     Obj(bytes: [u8])
 
@@ -483,13 +553,42 @@ fn make_dirs(d: str) -> Result[(), Diag]:
         case Err(e):
             return Err(diag.error("E0704", f"cannot create `{d}`: {e}"))
 
-fn cc_failed(what: str, e: str) -> Diag:
+fn cc_failed(what: str, e: str, out: str) -> Diag:
     let ls = e.strip().lines()
-    let first = ls[:min(30, len(ls))]
-    return diag.error(
-        "E0705",
-        what
-    ).note("this is a bug in the brine compiler, not in your program — please report it").note("\n".join(first))
+    let first = "\n".join(ls[:min(30, len(ls))])
+    let low = e.lower()
+    # the linker can't replace an executable that is running (Windows), or
+    # the folder isn't writable
+    let name = project.file_name(out).unwrap_or("")
+    let busy = any(
+        p in low for p in ["permission denied", "text file busy", "device or resource busy"]
+    )
+    if out != "" and ("output file" in low or (busy and name != "" and name in e)):
+        return diag.error("E0704", f"cannot write `{display_path(out)}`").note(first).with_help(
+            "is the program still running? Stop it and build again, or build somewhere else with `-o`"
+        )
+    if any(
+        p in low for p in [
+            "no space left on device",
+            "out of memory",
+            "cannot allocate memory",
+            "virtual memory exhausted"
+        ]
+    ):
+        return (
+            diag.error("E0704", what)
+            .note(first)
+            .with_help("the C compiler ran out of disk space or memory")
+        )
+    if any(p in low for p in ["undefined reference to", "undefined symbol", "unresolved external"]):
+        return diag.error("E0705", what).note(first).note(
+            "if the missing name is an `extern fn` of your program, it isn't in the C libraries brine links; otherwise this is a bug in brine — please report it"
+        )
+    return (
+        diag.error("E0705", what)
+        .note("this is a bug in the brine compiler, not in your program — please report it")
+        .note(first)
+    )
 
 fn write_or_diag(path: str, text: str) -> Result[(), Diag]:
     match write_file(path, text):
@@ -501,14 +600,14 @@ fn write_or_diag(path: str, text: str) -> Result[(), Diag]:
 # The runtime as an object file, cached by runtime source + C compiler + flags.
 # Returns its directory (it has brine_rt.h) and the object's path.
 fn runtime_object(cc: str, flags: [str], key: str, dir: str) -> Result[(str, str), Diag]:
-    let rt_dir = project.join(dir, "rt-" + hex16(fnv(RT_H + RT_C + key)))
+    let rt_dir = project.join(dir, "rt-" + hex16(fnv(RT_H + RT_C + RT_M + key)))
     let rt_obj = project.join(rt_dir, "brine_rt.o")
     if file_exists(rt_obj):
         return Ok((rt_dir, rt_obj))
     make_dirs(rt_dir)?
     # the directory name is a hash of the contents, so existing files are already right
     # (and rewriting them could collide with a concurrent build reading them)
-    for name, text in [("brine_rt.h", RT_H), ("brine_rt.c", RT_C)]:
+    for name, text in [("brine_rt.h", RT_H), ("brine_rt.c", RT_C), ("brine_math.c", RT_M)]:
         let f = project.join(rt_dir, name)
         var same = false
         match read_file(f):
@@ -574,7 +673,9 @@ fn compile_levels(
     levels: bool
 ) -> Result[bool, Diag]:
     var cc = ""
-    var flags = ["-std=c11", "-fno-strict-aliasing", "-w"]
+    # no fused multiply-adds: a*b+c rounds twice everywhere, so floats come out
+    # the same on every CPU and target (clang fuses by default)
+    var flags = ["-std=c11", "-fno-strict-aliasing", "-ffp-contract=off", "-w"]
     var libs = link_libs()
     if plat.is_wasm():
         match find_wasi_cc():
@@ -583,7 +684,14 @@ fn compile_levels(
             case None:
                 return Err(no_wasi_cc_diag())
         flags.insert(0, "--target=wasm32-wasip1")
-        # brine code recurses like native code does: give it a main thread's stack
+        # 128-bit vectors: in every current browser, Node.js and wasmtime.
+        # Not for straight-line code: packing pairs of floats (a complex
+        # number's two halves) made a Mandelbrot loop 1.7x slower in V8.
+        flags.insert(1, "-msimd128")
+        flags.insert(2, "-fno-slp-vectorize")
+        # brine code recurses like native code does: give it a main thread's
+        # stack (the shadow stack in linear memory; the Node runner gives
+        # WebAssembly's own a big one)
         libs = ["-Wl,-z,stack-size=8388608"]
         # wasi-sdk's C library carries DWARF: without this, 85% of a small module
         if profile != Profile.Debug:
@@ -609,12 +717,16 @@ fn compile_levels(
     var native: [u8] = []
     var hashes: [str] = []
     match code:
-        case Code.C(us):
+        case Code.C(us, once):
             let lv = cpu_levels(profile, plat, len(us)) if levels else []
             # gcc on Windows can't align its stack to 32 bytes, so it spills
             # AVX registers to unaligned slots with aligned moves (gcc bug
             # 54412); the assembler can make every such move unaligned
             let fix_align = os.name() == "windows" and "clang" not in cc
+            # with AVX-512's extra registers, gcc keeps 128-bit integers in
+            # vector registers around BMI2's `mulx`: u128 loops run 2x slower
+            # (other code loses at most a few percent without BMI2)
+            let no_bmi2 = "clang" not in cc
             for u in us:
                 if len(lv) == 0:
                     units.push((u, []))
@@ -622,7 +734,11 @@ fn compile_levels(
                     var e = extra
                     if i > 0 and fix_align:
                         e.push("-Wa,-muse-unaligned-vector-move")
+                    if i == 2 and no_bmi2:
+                        e.push("-mno-bmi2")
                     units.push((u, e))
+            for u in once:
+                units.push((u, []))
             if len(lv) > 0:
                 units.push((CPU_C, []))
             for u, extra in units:
@@ -701,7 +817,7 @@ fn compile_levels(
     if len(units) > 0:
         t = phase_time(t, f"cc ({len(jobs)}/{len(units)})")
     if failure != "":
-        return Err(cc_failed("the C compiler rejected the generated code", failure))
+        return Err(cc_failed("the C compiler rejected the generated code", failure, ""))
     match project.parent(out_exe):
         case Some(d):
             if d != "":
@@ -718,7 +834,7 @@ fn compile_levels(
         case Ok(_):
             pass
         case Err(e):
-            return Err(cc_failed("linking the program failed", e))
+            return Err(cc_failed("linking the program failed", e, out_exe))
     phase_time(t, "link")
     if plat == Platform.Web:
         web_files(dest)?
@@ -761,7 +877,13 @@ fn lowered(fe: Frontend, tests: bool, profile: Profile, plat: Platform) -> lower
         fe.prog.unwrap(),
         fe.info.unwrap(),
         fe.sm,
-        lower.Options(tests=tests, debug=profile == Profile.Debug, gpu=not plat.is_wasm(), fast=profile == Profile.Release, vec=profile == Profile.Release and not plat.is_wasm() and not use_native(profile))
+        lower.Options(
+            tests=tests,
+            debug=profile == Profile.Debug,
+            gpu=not plat.is_wasm(),
+            fast=profile == Profile.Release,
+            vec=profile == Profile.Release and not plat.is_wasm() and not use_native(profile)
+        )
     )
 
 # Native code for dev and debug builds where x64.br or a64.br knows the
@@ -817,9 +939,14 @@ fn gen_code(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> Code
         phase_time(t, "aarch64" if arm else "x86-64")
         return Code.Obj(b)
     let n = unit_count(profile)
-    var units = [ir_c.emit_c(l)] if n == 1 else ir_c.emit_units(l, n)
+    if n > 1:
+        let units = ir_c.emit_units(l, n)
+        phase_time(t, "emit C")
+        return Code.C(units, [])
+    # one unit, maybe compiled once per CPU level: big data goes in its own
+    let (unit, data) = ir_c.emit_c_shared(l, 4096 if len(cpu_levels(profile, plat, 1)) > 0 else -1)
     phase_time(t, "emit C")
-    return Code.C(units)
+    return Code.C([unit], [data] if data != "" else [])
 
 # The program as one C file (`brine emit-c`).
 fn gen_c(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> str:

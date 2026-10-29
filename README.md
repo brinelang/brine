@@ -261,11 +261,13 @@ python3 -m http.server -d demo                         # then open http://localh
 
 A web build is a folder you can put on any static host. `index.html` shows what
 the program prints; replace it with your own page (rebuilding keeps it) and call
-`run` from `brine.js`:
+`runInWorker` from `brine.js`. It runs the program in a Web Worker, so the page
+keeps drawing and the output shows up as it is printed (`run` takes the same
+arguments and runs it on the calling thread, e.g. in a worker of your own):
 
 ```js
-import { run } from "./brine.js";
-const code = await run("program.wasm", { args: ["10"], stdout: (text) => show(text) });
+import { runInWorker } from "./brine.js";
+const code = await runInWorker("program.wasm", { args: ["10"], stdout: (text) => show(text) });
 ```
 
 WebAssembly runs on one thread, so `par` constructs run in order (with the same

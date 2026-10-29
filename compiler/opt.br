@@ -32,6 +32,8 @@ fn reads(x: Inst, nv: int) -> [int]:
         return r
     if x.op == Op.Label or x.op == Op.Jmp or x.op == Op.Line or x.op == Op.Unreachable:
         return r
+    if x.op == Op.Switch:
+        return [x.a]
     if x.a >= 0 and x.a < nv:
         r.push(x.a)
     if x.b >= 0 and x.b < nv:
@@ -141,7 +143,13 @@ fn forward(f: Func) -> Func:
         var found = -1
         while j < n:
             let y = code[j]
-            if y.op == Op.Label or y.op == Op.Jmp or y.op == Op.Br or y.op == Op.BrNot or y.op == Op.Ret:
+            if (
+                y.op == Op.Label
+                or y.op == Op.Jmp
+                or y.op == Op.Br
+                or y.op == Op.BrNot
+                or y.op == Op.Ret
+            ):
                 if y.a == d and (y.op == Op.Br or y.op == Op.BrNot or y.op == Op.Ret):
                     found = j
                 break
@@ -163,8 +171,9 @@ fn forward(f: Func) -> Func:
         if y.b == d:
             y.b = v
         if (
-            y.op == Op.AddO or y.op == Op.SubO or y.op == Op.MulO or y.op == Op.IdxChk
-        ) and y.c == d:
+            (y.op == Op.AddO or y.op == Op.SubO or y.op == Op.MulO or y.op == Op.IdxChk)
+            and y.c == d
+        ):
             y.c = v
         if y.op == Op.Call or y.op == Op.CallInd:
             for k in 0..len(y.args):
@@ -202,3 +211,237 @@ fn forward(f: Func) -> Func:
     var g = f
     g.code = out
     return g
+
+# ================================================================ jump tables
+# `match x:` on integers or enum variants lowers to a chain of tests, `x == k0
+# or go to next0, body0; next0: x == k1 or go to next1, body1; ...`, which
+# native code would go through one by one. A chain of at least SW_MIN tests
+# of the same value on dense constants gets a `Switch` in front of it that
+# jumps straight to the body of the first test the value passes, or to where
+# the chain stops. The tests stay, for a guard that fails (it goes to the
+# next test as before) and for the values the table sends to the end.
+const SW_MIN = 4
+
+# One test of a chain starting at i: the value tested (a vreg, or `Load`
+# number `lv` re-reading the same place), the constant, where it goes when
+# the test fails, and where its body starts.
+struct SwTest:
+    key: int
+    lv: int
+    k: int
+    fail: int
+    body: int
+
+fn sw_kind(k: K) -> bool:
+    match k:
+        case K.I8 | K.I16 | K.I32 | K.I64 | K.U8 | K.U16 | K.U32:
+            return true
+        case _:
+            return false
+
+fn sw_test(f: Func, i0: int, ndef: [int]) -> Option[SwTest]:
+    let n = len(f.code)
+    var i = i0
+    while i < n and f.code[i].op == Op.Line:
+        i += 1
+    var lv = -1
+    if i < n and f.code[i].op == Op.Load:
+        lv = i
+        i += 1
+    if i + 2 >= n:
+        return None
+    let c = f.code[i]
+    let e = f.code[i + 1]
+    let b = f.code[i + 2]
+    if c.op != Op.Const or e.op != Op.Eq or b.op != Op.BrNot or b.a != e.d or e.b != c.d:
+        return None
+    if ndef[c.d] != 1 or ndef[e.d] != 1 or not sw_kind(f.vk[e.a]):
+        return None
+    if lv >= 0 and f.code[lv].d != e.a:
+        return None
+    if c.n < -(1 << 30) or c.n > (1 << 30):
+        return None
+    return Some(SwTest(key=e.a, lv=lv, k=c.n, fail=b.n, body=i + 3))
+
+# Do two tests read the same value: one vreg, or the same load of a pointer
+# that doesn't change in between?
+fn sw_same(f: Func, a: SwTest, b: SwTest) -> bool:
+    if a.lv < 0 or b.lv < 0:
+        return a.lv < 0 and b.lv < 0 and a.key == b.key
+    let x = f.code[a.lv]
+    let y = f.code[b.lv]
+    return x.a == y.a and x.n == y.n and f.vk[x.d] == f.vk[y.d]
+
+fn switches(f: Func) -> Func:
+    let n = len(f.code)
+    let nv = len(f.vk)
+    var ndef = [0] * nv
+    for x in f.code:
+        if x.d >= 0:
+            ndef[x.d] += 1
+    var lat = [-1] * f.nlabels
+    for i in 0..n:
+        if f.code[i].op == Op.Label:
+            lat[f.code[i].n] = i
+    # the tests that start a chain, and the label to put at each body
+    var before: {int: Inst} = {}
+    var body_label: {int: int} = {}
+    var seen: {int: bool} = {}
+    var nl = f.nlabels
+    for i in 0..n:
+        if i in seen:
+            continue
+        match sw_test(f, i, ndef):
+            case Some(t0):
+                var chain = [t0]
+                var at = i
+                while true:
+                    let last = chain[len(chain) - 1]
+                    let l = lat[last.fail]
+                    if l < 0 or l <= at:
+                        break
+                    match sw_test(f, l + 1, ndef):
+                        case Some(t):
+                            if not sw_same(f, t0, t):
+                                break
+                            seen[l + 1] = true
+                            chain.push(t)
+                            at = l
+                        case None:
+                            break
+                if len(chain) < SW_MIN:
+                    continue
+                var lo = chain[0].k
+                var hi = lo
+                for t in chain:
+                    lo = min(lo, t.k)
+                    hi = max(hi, t.k)
+                let span = hi - lo + 1
+                if span > 3 * len(chain) or span > 4096:
+                    continue
+                let dflt = chain[len(chain) - 1].fail
+                var table = [dflt] * span
+                var set = [false] * span
+                for t in chain:
+                    if not set[t.k - lo]:
+                        set[t.k - lo] = true
+                        if t.body in body_label:
+                            table[t.k - lo] = body_label[t.body]
+                        else:
+                            table[t.k - lo] = nl
+                            body_label[t.body] = nl
+                            nl += 1
+                var args = [dflt]
+                args.extend(table)
+                # in front of the first test's constant (after its load)
+                var pos = i
+                while f.code[pos].op == Op.Line or f.code[pos].op == Op.Load:
+                    pos += 1
+                before[pos] = Inst(op=Op.Switch, d=-1, a=t0.key, b=-1, c=-1, n=lo, s="", args=args)
+            case None:
+                pass
+    if len(before) == 0:
+        return f
+    var out: [Inst] = []
+    for i in 0..n:
+        # (a body can start with a switch of its own)
+        match body_label.get(i):
+            case Some(l):
+                out.push(Inst(op=Op.Label, d=-1, a=-1, b=-1, c=-1, n=l, s="", args=[]))
+            case None:
+                pass
+        match before.get(i):
+            case Some(x):
+                out.push(x)
+            case None:
+                pass
+        out.push(f.code[i])
+    var g = f
+    g.code = out
+    g.nlabels = nl
+    return g
+
+# ================================================================ inlining
+# Small functions that call nothing are copied into their callers (native
+# code, not debug builds): the calls of float code made of little helpers
+# (`fmin`, a dot product) cost more than the helpers do.
+const INLINE_MAX = 40
+
+fn inlinable(f: Func) -> bool:
+    if len(f.code) > INLINE_MAX or f.public:
+        return false
+    for x in f.code:
+        if x.op == Op.Call or x.op == Op.CallInd or x.op == Op.Switch:
+            return false
+    return true
+
+fn inline_small(fs: [Func]) -> [Func]:
+    var small: {str: int} = {}
+    for i, f in enumerate(fs):
+        if inlinable(f):
+            small[f.name] = i
+    if len(small) == 0:
+        return fs
+    var out: [Func] = []
+    for f in fs:
+        if not any(x.op == Op.Call and x.b == 0 and x.s in small for x in f.code):
+            out.push(f)
+            continue
+        var g = f
+        var code: [Inst] = []
+        for x in f.code:
+            if x.op == Op.Call and x.b == 0 and x.s in small:
+                let c = fs[small[x.s]]
+                if len(x.args) == c.nparams and c.name != f.name:
+                    inline_call(ref g, ref code, x, c)
+                    continue
+            code.push(x)
+        g.code = code
+        out.push(g)
+    return out
+
+# Appends a copy of `c`'s body for `call` to `code`, with c's vregs, labels
+# and slots after g's.
+fn inline_call(ref g: Func, ref code: [Inst], call: Inst, c: Func):
+    let vb = len(g.vk)
+    g.vk.extend(c.vk)
+    let lb = g.nlabels
+    let end = lb + c.nlabels
+    g.nlabels = end + 1
+    let sb = len(g.slots)
+    g.slots.extend(c.slots)
+    for i in 0..c.nparams:
+        code.push(Inst(op=Op.Mov, d=vb + i, a=call.args[i], b=-1, c=-1, n=0, s="", args=[]))
+    for x in c.code:
+        var y = x
+        if y.d >= 0:
+            y.d += vb
+        match y.op:
+            case Op.Const | Op.FConst | Op.Global | Op.Unreachable:
+                pass
+            case Op.Line:
+                continue
+            case Op.SlotAddr:
+                y.a += sb
+            case Op.Label | Op.Jmp:
+                y.n += lb
+            case Op.Br | Op.BrNot:
+                y.a += vb
+                y.n += lb
+            case Op.Ret:
+                if y.a >= 0 and call.d >= 0:
+                    code.push(Inst(op=Op.Mov, d=call.d, a=y.a + vb, b=-1, c=-1, n=0, s="", args=[]))
+                code.push(Inst(op=Op.Jmp, d=-1, a=-1, b=-1, c=-1, n=end, s="", args=[]))
+                continue
+            case _:
+                if y.a >= 0:
+                    y.a += vb
+                if y.b >= 0:
+                    y.b += vb
+                if (
+                    (y.op == Op.AddO or y.op == Op.SubO or y.op == Op.MulO or y.op == Op.IdxChk)
+                    and y.c >= 0
+                ):
+                    y.c += vb
+        code.push(y)
+    code.push(Inst(op=Op.Label, d=-1, a=-1, b=-1, c=-1, n=end, s="", args=[]))

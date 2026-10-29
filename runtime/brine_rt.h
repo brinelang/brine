@@ -9,6 +9,13 @@
 #include <stddef.h>
 #include <math.h>
 
+/* a*b+c rounds twice, as written, on every target: no fused multiply-adds
+ * (the driver also passes -ffp-contract=off; this covers a C compiler run by
+ * hand on the output of `brine emit-c`) */
+#ifdef __clang__
+#pragma STDC FP_CONTRACT OFF
+#endif
+
 #if defined(__GNUC__) || defined(__clang__)
 #define BR_NORETURN __attribute__((noreturn))
 #define BR_LIKELY(x) __builtin_expect(!!(x), 1)
@@ -131,42 +138,65 @@ void brine_free(void *p);
 void brine_str_free(brine_str *s);
 void brine_arr_free(brine_arr *a);
 
+/* Nonzero while threads other than the one running brine code may touch
+   values (a `par` region or task group is running): only then do reference
+   counts need locked instructions. The thread that starts the others raises
+   it before they start and lowers it once they are done with every value. */
+extern int brine_mt;
+#define BR_ONE_THREAD() __builtin_expect(__atomic_load_n(&brine_mt, __ATOMIC_RELAXED) == 0, 1)
+static inline void br_rc_inc(int64_t *rc) {
+    if (BR_ONE_THREAD())
+        __atomic_store_n(rc, __atomic_load_n(rc, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
+    else
+        __atomic_fetch_add(rc, 1, __ATOMIC_RELAXED);
+}
+/* drops a reference that isn't the last (rc > 1); true if it was after all */
+static inline bool br_rc_dec(int64_t *rc, int64_t was) {
+    if (BR_ONE_THREAD()) {
+        __atomic_store_n(rc, was - 1, __ATOMIC_RELAXED);
+        return false;
+    }
+    return __atomic_sub_fetch(rc, 1, __ATOMIC_ACQ_REL) == 0;
+}
 static inline void brine_str_retain(brine_str *s) {
-    if (__atomic_load_n(&s->rc, __ATOMIC_RELAXED) >= 0) __atomic_fetch_add(&s->rc, 1, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&s->rc, __ATOMIC_RELAXED) >= 0) br_rc_inc(&s->rc);
 }
 /* A count of 1 is our own reference: no other thread holds one to change it,
    so the last release frees without a locked instruction. */
 static inline void brine_str_release(brine_str *s) {
     int64_t rc = __atomic_load_n(&s->rc, __ATOMIC_ACQUIRE);
     if (rc < 0) return;
-    if (rc == 1 || __atomic_sub_fetch(&s->rc, 1, __ATOMIC_ACQ_REL) == 0) brine_str_free(s);
+    if (rc == 1 || br_rc_dec(&s->rc, rc)) brine_str_free(s);
 }
-static inline void brine_arr_retain(brine_arr *a) { __atomic_fetch_add(&a->rc, 1, __ATOMIC_RELAXED); }
+static inline void brine_arr_retain(brine_arr *a) { br_rc_inc(&a->rc); }
 static inline void brine_arr_release(brine_arr *a) {
-    if (__atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1 || __atomic_sub_fetch(&a->rc, 1, __ATOMIC_ACQ_REL) == 0)
-        brine_arr_free(a);
+    int64_t rc = __atomic_load_n(&a->rc, __ATOMIC_ACQUIRE);
+    if (rc == 1 || br_rc_dec(&a->rc, rc)) brine_arr_free(a);
 }
 void *brine_box_new(int64_t size, int64_t tag);
 void brine_box_free(void *p);
+/* fn(p) finishes freeing the dead object p; deep structures go iteratively */
+void brine_drop(void *p, void (*fn)(void *));
 static inline void brine_box_retain(void *p) {
     brine_box *b = (brine_box *)p;
-    if (__atomic_load_n(&b->rc, __ATOMIC_RELAXED) >= 0) __atomic_fetch_add(&b->rc, 1, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&b->rc, __ATOMIC_RELAXED) >= 0) br_rc_inc(&b->rc);
 }
 /* drops one reference; true when the box must be freed */
 static inline bool brine_box_dec(void *p) {
     brine_box *b = (brine_box *)p;
     int64_t rc = __atomic_load_n(&b->rc, __ATOMIC_ACQUIRE);
     if (rc < 0) return false;
-    return rc == 1 || __atomic_sub_fetch(&b->rc, 1, __ATOMIC_ACQ_REL) == 0;
+    return rc == 1 || br_rc_dec(&b->rc, rc);
 }
 void brine_rt_str(void *p);
 void brine_rl_str(void *p);
 void brine_rt_arr(void *p);
 void brine_rl_arr(void *p);
 void brine_map_free(brine_map *m);
-static inline void brine_map_retain(brine_map *m) { __atomic_fetch_add(&m->rc, 1, __ATOMIC_RELAXED); }
+static inline void brine_map_retain(brine_map *m) { br_rc_inc(&m->rc); }
 static inline void brine_map_release(brine_map *m) {
-    if (__atomic_sub_fetch(&m->rc, 1, __ATOMIC_ACQ_REL) == 0) brine_map_free(m);
+    int64_t rc = __atomic_load_n(&m->rc, __ATOMIC_ACQUIRE);
+    if (rc == 1 || br_rc_dec(&m->rc, rc)) brine_map_free(m);
 }
 void brine_rt_map(void *p);
 void brine_rl_map(void *p);
@@ -373,11 +403,20 @@ int64_t brine_s_count(brine_str *s, brine_str *sub, const char *loc);
 brine_arr *brine_s_bytes(brine_str *s, const char *loc);
 brine_arr *brine_s_chars(brine_str *s, const char *loc);
 brine_str *brine_s_repeat(brine_str *s, int64_t n, const char *loc);
+int64_t brine_s_find_from(brine_str *s, brine_str *sub, int64_t start, const char *loc);
 int brine_str_cmp(brine_str *a, brine_str *b);
 int64_t brine_parse_i64(brine_str *s, const char *loc);
 brine_i128 brine_parse_i128(brine_str *s, const char *loc);
 brine_u128 brine_parse_u128(brine_str *s, const char *loc);
 double brine_parse_f64(brine_str *s, const char *loc);
+/* `s.to_int()` / `s.to_float()`: false for text that isn't a number of the
+ * type; otherwise the value (`bits` wide; an f32 if `f32`) goes to *out */
+bool brine_try_parse_int(brine_str *s, int64_t bits, bool sgn, void *out);
+bool brine_try_parse_float(brine_str *s, bool f32, void *out);
+/* `str.from_utf8(bytes)` */
+bool brine_str_from_utf8(brine_arr *a, brine_str **out);
+/* `xs.index(x, start)`: start, when 0 <= start <= len */
+int64_t brine_start_chk(int64_t start, int64_t len, const char *loc);
 
 /* ------------------------------------------------------------ arrays */
 brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_fn rl, const char *loc);
@@ -514,8 +553,40 @@ void brine_arr_pop_at(brine_arr **pa, int64_t i, void *out, const char *loc);
 /* takes ownership of *elem */
 void brine_arr_insert(brine_arr **pa, int64_t i, const void *elem, const char *loc);
 void brine_arr_extend(brine_arr **pa, brine_arr *b);
+brine_arr *brine_arr_concat(brine_arr *a, brine_arr *b, const char *loc);
+char *brine_cstr(brine_str *s, const char *loc);
+void brine_cstr_free(char *p);
 void brine_arr_reverse(brine_arr **pa);
 void brine_arr_clear(brine_arr **pa);
+/* push, pop and clear with their common case inline: the array is this
+   variable's alone and, for a push, has room. `esz` is the element size, a
+   constant the compiler passes so the copy becomes a store. */
+static inline void brine_arr_push_in(brine_arr **pa, const void *elem, int64_t esz) {
+    brine_arr *a = *pa;
+    if (BR_LIKELY(a->len < a->cap && __atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1)) {
+        __builtin_memcpy(a->data + a->len * esz, elem, (size_t)esz);
+        a->len++;
+        return;
+    }
+    brine_arr_push(pa, elem);
+}
+static inline void brine_arr_pop_in(brine_arr **pa, void *out, int64_t esz, const char *loc) {
+    brine_arr *a = *pa;
+    if (BR_LIKELY(a->len > 0 && __atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1)) {
+        a->len--;
+        __builtin_memcpy(out, a->data + a->len * esz, (size_t)esz);
+        return;
+    }
+    brine_arr_pop(pa, out, loc);
+}
+static inline void brine_arr_clear_in(brine_arr **pa) {
+    brine_arr *a = *pa;
+    if (BR_LIKELY(a->release == NULL && __atomic_load_n(&a->rc, __ATOMIC_ACQUIRE) == 1)) {
+        a->len = 0;
+        return;
+    }
+    brine_arr_clear(pa);
+}
 /* stable sort; cmp returns <0, 0 or >0 */
 void brine_arr_sort(brine_arr **pa, int (*cmp)(const void *, const void *));
 brine_arr *brine_arr_slice(brine_arr *a, int64_t lo, int64_t hi, const char *loc);
@@ -617,6 +688,7 @@ void brine_sb_fmt_i128(brine_sb *sb, brine_i128 v, int kind);
 void brine_sb_fmt_u128(brine_sb *sb, brine_u128 v, int kind);
 void brine_sb_fmt_f64(brine_sb *sb, double v, int prec, int kind);
 void brine_sb_pad(brine_sb *sb, int64_t start, int64_t width, bool left, bool zero);
+void brine_sb_group(brine_sb *sb, int64_t start);
 brine_str *brine_sb_finish(brine_sb *sb);
 void brine_out_sb(brine_sb *sb);
 void brine_err_sb(brine_sb *sb);
@@ -646,6 +718,13 @@ brine_str *brine_os_cwd(void);
 bool brine_os_set_cwd(brine_str *path, brine_str **err);
 /* writes the bytes of a `[u8]` */
 bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err);
+bool brine_os_append_bytes(brine_str *path, brine_arr *data, brine_str **err);
+bool brine_os_read_bytes(brine_str *path, brine_arr **out, brine_str **err);
+bool brine_append_file(brine_str *path, brine_str *text, brine_str **err);
+/* stdin: `input(prompt)` is a line without its end (NULL at the end of the
+ * input), `read_stdin()` all that is left */
+brine_str *brine_input(brine_str *prompt);
+bool brine_read_stdin(brine_str **out);
 brine_str *brine_os_exe_path(void);
 brine_str *brine_os_temp_dir(void);
 bool brine_os_abs_path(brine_str *path, brine_str **out, brine_str **err);
@@ -653,6 +732,7 @@ brine_str *brine_os_name(void);
 brine_str *brine_os_arch(void);
 int64_t brine_os_pid(void);
 int64_t brine_os_cpu_count(void);
+int64_t brine_os_thread_count(void);
 void brine_os_sleep(double seconds);
 bool brine_os_is_terminal(int64_t fd);
 void brine_os_enable_ansi(void);
@@ -662,33 +742,80 @@ int64_t brine_os_wait(int64_t handle, const char *loc);
 bool brine_os_poll(int64_t handle, int64_t *code, const char *loc);
 void brine_os_kill(int64_t handle, const char *loc);
 void brine_os_output(int64_t handle, brine_str **out, brine_str **err, const char *loc);
+void brine_flush(void);
 void brine_rt_init(int argc, char **argv);
 void brine_rt_shutdown(void);
 
-/* math wrappers (generated code never calls libm names directly) */
+/* math wrappers (generated code never calls libm names directly). The exact
+ * operations (sqrt, rounding, fabs, fmod) are the C library's: IEEE fixes
+ * their results. The others come from brine_math.c, the same code on every
+ * target, since C libraries round them differently; f32 goes through f64. */
 #define BR_MATH1(name) \
     static inline double brine_f_##name(double x) { return name(x); } \
     static inline float brine_f_##name##f(float x) { return name##f(x); }
 BR_MATH1(sqrt)
-BR_MATH1(sin)
-BR_MATH1(cos)
-BR_MATH1(tan)
-BR_MATH1(exp)
-BR_MATH1(log)
 BR_MATH1(floor)
 BR_MATH1(ceil)
 BR_MATH1(round)
 BR_MATH1(fabs)
-static inline double brine_f_pow(double a, double b) { return pow(a, b); }
+#define BR_MMATH1(name) \
+    double brine_m_##name(double x); \
+    static inline double brine_f_##name(double x) { return brine_m_##name(x); } \
+    static inline float brine_f_##name##f(float x) { return (float)brine_m_##name((double)x); }
+BR_MMATH1(sin)
+BR_MMATH1(cos)
+BR_MMATH1(tan)
+BR_MMATH1(asin)
+BR_MMATH1(acos)
+BR_MMATH1(atan)
+BR_MMATH1(sinh)
+BR_MMATH1(cosh)
+BR_MMATH1(tanh)
+BR_MMATH1(exp)
+BR_MMATH1(exp2)
+BR_MMATH1(expm1)
+BR_MMATH1(log)
+BR_MMATH1(log2)
+BR_MMATH1(log10)
+BR_MMATH1(log1p)
+BR_MMATH1(cbrt)
+double brine_m_pow(double a, double b);
+double brine_m_atan2(double y, double x);
+double brine_m_hypot(double x, double y);
+static inline double brine_f_pow(double a, double b) { return brine_m_pow(a, b); }
+static inline double brine_f_atan2(double y, double x) { return brine_m_atan2(y, x); }
+static inline double brine_f_hypot(double x, double y) { return brine_m_hypot(x, y); }
+static inline float brine_f_powf(float a, float b) { return (float)brine_m_pow((double)a, (double)b); }
+static inline float brine_f_atan2f(float y, float x) { return (float)brine_m_atan2((double)y, (double)x); }
+static inline float brine_f_hypotf(float x, float y) { return (float)brine_m_hypot((double)x, (double)y); }
 /* float `%` also takes the sign of the divisor, like Python */
 static inline double brine_f_fmod(double a, double b) { double r = fmod(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
 static inline float brine_f_fmodf(float a, float b) { float r = fmodf(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
 /* float min and max: a NaN loses to a number, and -0.0 is less than 0.0 (C's
  * fmin may return either zero), so the result is the same on every platform
- * and on a GPU (ptx.br) */
-#define BR_MINMAX(T, S)                                                             static inline T brine_f_fmin##S(T a, T b) {                                       if (a < b || b != b) return a;                                                 if (b < a || a != a) return b;                                                 return signbit(a) ? a : b;                                                 }                                                                              static inline T brine_f_fmax##S(T a, T b) {                                       if (a > b || b != b) return a;                                                 if (b > a || a != a) return b;                                                 return signbit(a) ? b : a;                                                 }
+ * and on a GPU (ptx.br). Branches, not selects: in `lo = min(lo, x)` a select
+ * waits for the last result, a predicted branch doesn't (3.5x faster). */
+#define BR_MINMAX(T, S)                                                         static inline T brine_f_fmin##S(T a, T b) {                                         if (a < b || b != b) return a;                                                  if (b < a || a != a) return b;                                                  return signbit(a) ? a : b;                                                  }                                                                               static inline T brine_f_fmax##S(T a, T b) {                                         if (a > b || b != b) return a;                                                  if (b > a || a != a) return b;                                                  return signbit(a) ? b : a;                                                  }
 BR_MINMAX(double, )
 BR_MINMAX(float, f)
+
+/* ------------------------------------------------------------ bit counts */
+/* `x.count_ones()`, `leading_zeros()`, `trailing_zeros()` of the bits
+ * zero-extended to 64 (or 128); the counts of 0 are the width */
+static inline int64_t brine_popcnt_u64(uint64_t x) { return __builtin_popcountll(x); }
+static inline int64_t brine_clz_u64(uint64_t x) { return x ? __builtin_clzll(x) : 64; }
+static inline int64_t brine_ctz_u64(uint64_t x) { return x ? __builtin_ctzll(x) : 64; }
+static inline int64_t brine_popcnt_u128(brine_u128 x) {
+    return brine_popcnt_u64((uint64_t)x) + brine_popcnt_u64((uint64_t)(x >> 64));
+}
+static inline int64_t brine_clz_u128(brine_u128 x) {
+    uint64_t hi = (uint64_t)(x >> 64);
+    return hi ? brine_clz_u64(hi) : 64 + brine_clz_u64((uint64_t)x);
+}
+static inline int64_t brine_ctz_u128(brine_u128 x) {
+    uint64_t lo = (uint64_t)x;
+    return lo ? brine_ctz_u64(lo) : 64 + brine_ctz_u64((uint64_t)(x >> 64));
+}
 
 /* ------------------------------------------------------------ checked integer arithmetic */
 /* r = a * b; true when it overflows. Clang turns a signed 128-bit overflow
@@ -845,6 +972,12 @@ static inline int64_t brine_par_plan(int64_t n) { return n <= 0 ? 0 : (n < 256 ?
 void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, void *ctx);
 void brine_par_tasks(int64_t k, brine_task_fn fn, void *ctx);
 
+/* `par first(...)`: chunk c of brine_par_run stops once a lower chunk found a
+ * value. *stop (INT64_MAX at first) is the lowest chunk that did. */
+int64_t brine_par_chunks(int64_t n);
+bool brine_first_stopped(const int64_t *stop, int64_t chunk);
+void brine_first_found(int64_t *stop, int64_t chunk);
+
 /* Parallel reductions (`par sum(...)` etc.) have one combination order, which
  * depends only on the element count n: elements are split into leaves of
  * BRINE_LEAF consecutive elements, each folded left to right by the leaf
@@ -874,7 +1007,8 @@ typedef struct brine_kernel {
     int64_t ctx_size;
     /* the arrays in the context: [nfields, (offset, flags, node)*, nodes...],
      * a node [element size, n, (offset in an element, node)*], nodes numbered
-     * from the first; flags 1: written by the body, 2: not read */
+     * from the first; flags BRINE_GA_*, and (flags >> 8) - 1 the context
+     * offset of `first` (a u64; 0 when flags >> 8 is 0) */
     BR_P(const int64_t *, ptrs);
     int64_t cost, cost64;       /* estimated instructions per element (f64 ones) */
     BR_P(const char *, comb);   /* reductions: the combine kernel */
@@ -882,20 +1016,27 @@ typedef struct brine_kernel {
     BR_P(const char *, why);    /* why it can't run on a GPU */
 } brine_kernel;
 
+/* written by the body; iteration k writes exactly element first + k and
+ * nothing reads the array (so its old elements needn't go to the device) */
+enum { BRINE_GA_WRITTEN = 1, BRINE_GA_DENSE = 2 };
+
 /* Runs fn over [0, n) on the thread pool, or on a GPU when that pays. */
 void brine_par_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn fn);
-/* *val and *has: the accumulator (the reducer's start value, false); set when an element had a value */
-void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx, void *val, bool *has, const char *loc);
+/* *val and *has: the accumulator (the reducer's start value, false); set when an element had a value.
+ * efn is like fn, but called for one element: it stores the element's own value. */
+void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *ctx, void *val, bool *has, const char *loc);
 
 /* ------------------------------------------------------------ world (multi-process) */
 int64_t brine_world_rank(void);
 int64_t brine_world_size(void);
-void brine_world_barrier(void);
+void brine_world_barrier(const char *loc);
+void brine_world_shift_edge(const char *d, const void *v, void *out, int64_t by, const void *edge, const char *loc);
 void brine_world_shift(const char *d, const void *v, void *out, int64_t by, const char *loc);
 brine_arr *brine_world_exchange(const char *ed, brine_arr *xs, const char *loc);
 void brine_world_bcast(const char *d, const void *v, void *out, int64_t root, const char *loc);
 brine_arr *brine_world_gather(const char *ed, const void *v, const char *loc);
 int64_t brine_world_reduce_i64(int64_t v, int op, const char *loc);
 double brine_world_reduce_f64(double v, int op, const char *loc);
+brine_arr *brine_world_reduce_arr(const char *ed, brine_arr *xs, int op, const char *loc);
 
 #endif
