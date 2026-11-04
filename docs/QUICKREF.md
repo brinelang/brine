@@ -700,6 +700,56 @@ fn index_of(xs: [int], target: int) -> int:
   It also counts the runtime checks left before and after. Run it in CI against
   the base branch, so a reviewer sees each weaker spec.
 
+## Rules: RULES.br, what the program promises
+
+`RULES.br` (next to the main file, or at the project root) says what the program
+must do. People write it; agents write the code that keeps it. **Every build,
+run, test and check proves every rule, or nothing is built.**
+
+```python
+# RULES.br
+from pump import Pump, new_pump, dose_for     # the code the rules check
+from rules.dosing import Settings             # rules/dosing.br: owned with the rules
+
+rule "a dose is never negative and never more than one bolus" for p: Pump, reading: int:
+    let d = dose_for(p, reading)
+    prove 0 <= d <= p.settings.max_bolus
+
+rule "a new pump has delivered nothing" for s: Settings:
+    requires s.daily_limit > 0                # the inputs the rule is about
+    let p = new_pump(s)                       # a claim can't call a function,
+    prove p.delivered_today == 0              # so name the result first
+
+rule "dosing never touches files, the network, processes or the clock":
+    effects pump: none            # or `effects pump: console, clock`
+
+rule "a sensor glitch can never crash the controller":
+    proven pump.dose_for          # a module, `m.f`, or a method `m.Type.f`
+```
+* A rule is a block like a `test` whose inputs (`for x: T, ...`) can be any
+  value of their types that meets its `requires`; struct invariants hold for
+  them, as everywhere. Its body is checked and proven like a function's.
+* **The code a rule covers can't stop the program.** That is everything its body
+  and its `proven` lines call, directly or not: every runtime check there must be
+  proven away (E0607), and it can't reach `panic`, `exit` or `unwrap()` (E0611).
+* `effects m: ...` is decided over everything `m` calls (E0612). The effects
+  are `files`, `console`, `processes`, `clock`, `environment`, `network`, `world`
+  and `extern` (C code); `none` allows none of them.
+* `brine rules approve` records the owner's approval in RULES.lock: a hash of
+  each rule, of RULES.br's own definitions and of each file in `rules/`. An
+  approved rule or file that changes or goes away stops the build (E0613) until
+  it's approved again; a new rule only warns (W0003). Put RULES.br, `rules/` and
+  RULES.lock under CODEOWNERS, so only the owner can approve.
+* Imports of `rules.x` load `rules/x.br` next to RULES.br, from every module, so
+  the code can use the owner's types (`Settings`) too.
+* `brine rules` lists every rule as proven or not and approved or not (`--json`
+  for tools). `--explain` renders the rules in plain English, mechanically, for
+  the owner to check they say what was meant. `--receipt` writes a summary for a
+  pull request, and `--base main` adds what the change approved.
+* What's not covered: a rule holds whenever the code it runs returns (loops and
+  recursion aren't proven to end yet), and running out of memory or stack.
+  `extern fn` C code is trusted, and the receipt lists what each rule reaches.
+
 ## Modules
 
 ```python

@@ -57,6 +57,7 @@ fn main():
 <table>
 <tr><td>⚡ <b>Natively parallel</b></td><td><code>par</code> loops, maps, reductions and fork-join, data-race free by construction. Deterministic reductions. Automatic GPU offload (CUDA, Metal). MPI-style multi-process with the <code>world</code> module.</td></tr>
 <tr><td>🔒 <b>Rules can't be broken</b></td><td><code>requires</code>, <code>ensures</code>, <code>invariant</code> and <code>prove</code> are checked at compile time. Overflow, bad indexes and division by zero always stop the program with a clear message, unless the compiler proved they can't happen; then the check is removed. There is no <code>unsafe</code> and no flag to turn checks off.</td></tr>
+<tr><td>📜 <b>Rules the agent can't break</b></td><td><code>RULES.br</code> says what the program must do, in rules its owner writes and approves. Every build proves every rule, or nothing is built, and the code a rule covers can't crash. An approved rule that changes stops the build until its owner agrees.</td></tr>
 <tr><td>🚀 <b>Fast</b></td><td>Native code, no garbage collector, no VM. Values are copy-on-write and memory is freed deterministically. Dev builds on Linux and Windows go straight to machine code; <code>--release</code> builds go through an optimizing C compiler.</td></tr>
 <tr><td>🐍 <b>Easy to read</b></td><td>Python-like syntax, static types with local inference, structs, enums with <code>match</code>, generics, <code>Option</code>/<code>Result</code> with <code>?</code>. One obvious way to write things.</td></tr>
 <tr><td>🤖 <b>Made for humans and agents</b></td><td>One CLI. Every error has a code, a precise span, the reason and a fix. <code>--json</code> output for tools, <code>brine explain &lt;code&gt;</code>, and <code>brine guide</code> prints the whole language on one page.</td></tr>
@@ -385,6 +386,58 @@ error[E0602]: cannot prove the postcondition of `last_index`
   = help: strengthen the function's `requires`, add a loop `invariant`, or check the claim with `assert` before returning
 ```
 
+### RULES.br: what the program promises
+
+Contracts say what each function does. `RULES.br` says what the whole program
+must do, in a file its owner writes and every build proves. When an agent writes
+the code, a rule that isn't proven means nothing is built: the agent can't ship
+code that breaks one, and it can't make a proof pass by stopping the program,
+because the code a rule covers can't `panic`, `exit` or fail a runtime check.
+
+```python
+# RULES.br
+from pump import Pump, new_pump, dose_for
+from rules.dosing import Settings     # rules/dosing.br: the owner's definitions
+
+rule "a day's insulin never goes over the daily limit" for p: Pump, reading: int:
+    let d = dose_for(p, reading)
+    prove p.delivered_today + d <= p.settings.daily_limit
+
+rule "a sensor glitch can never crash the controller":
+    proven pump.dose_for
+
+rule "dosing never touches files, the network, processes or the clock":
+    effects pump: none
+```
+
+```text
+$ brine build
+error[E0605]: cannot prove this claim
+ --> RULES.br:7:11
+  |
+7 |     prove p.delivered_today + d <= p.settings.daily_limit
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the prover could not show this is always true
+  |
+  = note: rule "a day's insulin never goes over the daily limit" isn't proven, so nothing is built
+  = note: values the prover can't rule out: p.settings.daily_limit = 0, p.delivered_today = 0, d = 1
+  = help: change the code the rule covers (or add `ensures`, `invariant` and `requires` lines there) until this follows; don't change the rule unless its owner agrees
+```
+
+The owner approves the rules with `brine rules approve`, which records them in
+`RULES.lock`; a rule (or a file in `rules/`) that changes after that stops the
+build until they approve it again. `brine rules --explain` renders the rules in
+plain English so the owner can check they say what was meant, and `brine rules`
+shows which are proven:
+
+```text
+$ brine rules
+RULES.br: 3 rules, 3 proven
+  ✓ proven      a day's insulin never goes over the daily limit
+  ✓ proven      a sensor glitch can never crash the controller
+  ✓ proven      dosing never touches files, the network, processes or the clock
+done: yes, every rule is proven
+```
+
 ### Structs, enums and errors as values
 
 ```python
@@ -449,6 +502,7 @@ test result: ok. 2 passed; 0 failed; finished in 0.03s
 | `brine check` | type-check and prove without building (`--report` lists remaining runtime checks) |
 | `brine test [filter]` | run `test "...":` blocks in parallel |
 | `brine fmt` | format sources (`--check`) |
+| `brine rules` | which rules in RULES.br are proven and approved (`approve`, `--explain`, `--receipt`) |
 | `brine spec-diff` | which `requires`/`ensures`/`invariant`s got weaker since a git revision (`--base main`) |
 | `brine debug` | debug build, then launch gdb or lldb |
 | `brine explain E0601` | explain an error code |
@@ -456,7 +510,7 @@ test result: ok. 2 passed; 0 failed; finished in 0.03s
 | `brine doctor` | check your toolchain |
 
 Building, checking and testing take `--json` for machine-readable output, one
-JSON object per line. New projects come with an `AGENTS.md`, so coding agents know how to work in
+JSON object per line. New projects come with a starter `RULES.br` and an `AGENTS.md`, so coding agents know how to work in
 them from the start.
 
 ## Examples

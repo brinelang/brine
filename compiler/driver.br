@@ -16,6 +16,8 @@ import ir_c
 import x64
 import a64
 from verify import Report
+import rules
+from rules import Rules
 
 const PRELUDE_SRC = embed("../runtime/prelude.br")
 const RT_H = embed("../runtime/brine_rt.h")
@@ -37,6 +39,8 @@ struct Frontend:
     prog: Option[Program]
     info: Option[ProgramInfo]
     report: Option[Report]
+    # what RULES.br promises, once the program is checked
+    rules: Option[Rules]
 
     fn has_errors(self) -> bool:
         return any(d.is_error() for d in self.diags)
@@ -160,10 +164,28 @@ fn parse_found(f: Found) -> (Module, [Diag]):
 fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
     return load_from(entry, on_disk(), ref sm, ref diags)
 
+# Where the rules are for a program whose main file is in `root`: the project
+# root above it (`src/main.br`) first, so a RULES.br next to the main file can't
+# stand in for the project's, else next to the main file. A RULES.lock counts,
+# so deleting RULES.br doesn't drop the approved rules. "" if nowhere.
+fn rules_dir(root0: str) -> str:
+    let root = root0 if root0 != "" else "."
+    let up = up_dir(root)
+    if file_exists(project.join(up, "brine.toml")) and has_rules(up):
+        return up
+    if has_rules(root):
+        return root
+    return ""
+
+fn has_rules(d: str) -> bool:
+    return file_exists(project.join(d, rules.FILE)) or file_exists(project.join(d, rules.LOCK))
+
 fn load_from(entry: str, at: Source, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
     var root = dir_of(entry)
     if root == "":
         root = "."
+    # RULES.br, and its vocabulary in rules/ (also when other modules import it)
+    let rdir = rules_dir(root)
     var text = ""
     match read_at(entry, at.rev):
         case Ok(t):
@@ -178,6 +200,17 @@ fn load_from(entry: str, at: Source, ref sm: SourceMap, ref diags: [Diag]) -> Op
     diags.extend(d)
     by_name["main"] = 0
     prog.modules.push(m)
+    if rdir != "":
+        let rp = project.join(rdir, rules.FILE)
+        match read_at(rp, at.rev):
+            case Ok(rt):
+                let rf = sm.add(display_path(rp), rt)
+                let (rm, rd) = parse_module(rt, rf, rules.MODULE)
+                diags.extend(rd)
+                by_name[rules.MODULE] = len(prog.modules)
+                prog.modules.push(rm)
+            case Err(_):
+                pass
     # Breadth first, a wave at a time: scanning the modules found so far
     # numbers the new imports in the order they're seen, then the new files
     # are parsed in parallel and appended in that order, so the numbering
@@ -196,7 +229,8 @@ fn load_from(entry: str, at: Source, ref sm: SourceMap, ref diags: [Diag]) -> Op
                         continue
                     case None:
                         pass
-                let p = module_file(root, imp.path)
+                let base = rdir if rdir != "" and imp.path[0] == rules.VOCAB else root
+                let p = module_file(base, imp.path)
                 let idx = first_new + len(found)
                 by_name[name] = idx
                 targets.push(idx)
@@ -296,7 +330,7 @@ fn frontend_at(entry: str, opts: FrontOpts, at: Source) -> Frontend:
     let loaded = load_from(entry, at, ref sm, ref diags)
     t = phase_time(t, "parse")
     if loaded.is_none() or has_errors(diags):
-        return Frontend(sm=sm, diags=diags, prog=loaded, info=None, report=None)
+        return Frontend(sm=sm, diags=diags, prog=loaded, info=None, report=None, rules=None)
     var prog = loaded.unwrap()
     var ck = new_checker()
     ck.typed = opts.typed
@@ -339,14 +373,30 @@ fn frontend_at(entry: str, opts: FrontOpts, at: Source) -> Frontend:
         # nothing reached from a `par` body writes files or reads input
         diags.extend(pareffects.check(prog, info))
         t = phase_time(t, "uniform")
+    # what the rules cover, which must not be able to stop the program
+    var rl: Option[Rules] = None
+    var covered: [str] = []
+    var stops: [bool] = []
+    if not has_errors(diags):
+        let main_dir = dir_of(entry)
+        let r = rules.analyze(prog, info, sm, rules_dir(main_dir), main_dir, at.rev.is_none())
+        covered = r.covered
+        stops = r.stops
+        rl = Some(r)
     var report: Option[Report] = None
     if opts.verify and not has_errors(diags):
-        let r = verify.verify_program(ref prog, info, sm, opts.proven)
+        let r = verify.verify_program(ref prog, info, sm, opts.proven, covered, stops)
         diags.extend(r.diags)
         report = Some(r)
         t = phase_time(t, "verify")
+    # after verifying, so a rule problem doesn't hide what the prover found
+    match rl:
+        case Some(r):
+            diags.extend(r.diags)
+        case None:
+            pass
     sort_diags(ref diags)
-    return Frontend(sm=sm, diags=diags, prog=Some(prog), info=Some(info), report=report)
+    return Frontend(sm=sm, diags=diags, prog=Some(prog), info=Some(info), report=report, rules=rl)
 
 # Deterministic order: by file, then position, then code (stable).
 fn sort_diags(ref ds: [Diag]):

@@ -7,10 +7,25 @@ from ast import TypeExpr, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Unpack,
 from ast import LetPat, Pattern, PatKind, Case, ContractKind, Stmt, StmtKind, Block, stmt, pattern
 from types import I128_MAX
 from ast import Param, FnDecl, FieldDecl, StructDecl, VariantDecl, EnumDecl, ConstDecl, Import, Module
+from ast import RuleInfo, EffectsLine
 
 fn is_int(t: Tok) -> bool:
     match t:
         case Tok.Int(_):
+            return true
+        case _:
+            return false
+
+fn is_str(t: Tok) -> bool:
+    match t:
+        case Tok.Str(_):
+            return true
+        case _:
+            return false
+
+fn is_ident(t: Tok) -> bool:
+    match t:
+        case Tok.Ident(_):
             return true
         case _:
             return false
@@ -212,6 +227,9 @@ struct Parser:
             # `test` is only a keyword here, at the start of a top-level line
             case Tok.Ident(s) if s == "test":
                 m.tests.push(self.test_decl()?)
+            # so is `rule`, before its name
+            case Tok.Ident(s) if s == "rule" and is_str(self.peek_at(1)):
+                m.tests.push(self.rule_decl()?)
             case Tok.Keyword(Kw.Extern):
                 m.fns.push(self.extern_decl()?)
             case Tok.Indent:
@@ -500,6 +518,7 @@ struct Parser:
                 method_of=method_of,
                 tparams=tparams,
                 test_name=None,
+                rule=None,
                 id=0,
                 locals=[],
                 param_locals=[],
@@ -532,6 +551,7 @@ struct Parser:
                 method_of=None,
                 tparams=[],
                 test_name=None,
+                rule=None,
                 id=0,
                 locals=[],
                 param_locals=[],
@@ -566,12 +586,130 @@ struct Parser:
                 method_of=None,
                 tparams=[],
                 test_name=Some(name),
+                rule=None,
                 id=0,
                 locals=[],
                 param_locals=[],
                 result_local=None
             )
         )
+
+    # `rule "name" for x: T, y: U:` and a body like a test's, which may also say
+    # `effects m: none` and `proven m.f`. The inputs are the parameters.
+    fn rule_decl(ref self) -> Result[FnDecl, ()]:
+        let start = self.bump()
+        var name = ""
+        match self.peek():
+            case Tok.Str(s):
+                self.bump()
+                name = s
+            case _:
+                pass
+        var params: [Param] = []
+        if self.eat_kw(Kw.For):
+            while true:
+                let (pn, ps) = self.expect_ident("the name of an input")?
+                if not self.at(Tok.Colon):
+                    let d = self.error_here(
+                        "E0110",
+                        f"rule input `{pn}` needs a type",
+                        "expected `: type`"
+                    )
+                    self.diags.push(d.with_help(f"write `for {pn}: int:` (or another type)"))
+                    return Err(())
+                self.bump()
+                let ty = self.type_expr()?
+                params.push(Param(name=pn, span=ps, ty=Some(ty), by_ref=false, mutable=false))
+                if not self.eat(Tok.Comma):
+                    break
+        let span = start.to(self.prev_span())
+        self.expect(Tok.Colon, "`:`")?
+        if not self.at(Tok.Newline):
+            self.report("E0110", "a rule's body goes on the lines below it", "expected a new line")
+            return Err(())
+        self.bump()
+        if not self.eat(Tok.Indent):
+            let d = self.error_here(
+                "E0103",
+                "expected an indented block",
+                "this should be indented"
+            )
+            self.diags.push(d.with_help("indent the body of the rule by 4 spaces"))
+            return Err(())
+        var stmts: [Stmt] = []
+        var effects: [EffectsLine] = []
+        var proven: [([str], Span)] = []
+        while not self.at(Tok.Dedent) and not self.at(Tok.Eof):
+            # `effects m: ...` and `proven m.f`: a name and then another name
+            let line = self.peek()
+            let two_names = is_ident(self.peek_at(1))
+            if line == Tok.Ident("effects") and two_names:
+                match self.effects_line():
+                    case Ok(e):
+                        effects.push(e)
+                    case Err(_):
+                        self.sync_line()
+            elif line == Tok.Ident("proven") and two_names:
+                let ls = self.bump()
+                match self.module_path():
+                    case Ok(path):
+                        proven.push((path, ls.to(self.prev_span())))
+                        if self.end_stmt().is_err():
+                            self.sync_line()
+                    case Err(_):
+                        self.sync_line()
+            else:
+                match self.stmt():
+                    case Ok(st):
+                        stmts.push(st)
+                        self.take_pending(ref stmts)
+                    case Err(_):
+                        self.pending = []
+                        self.sync_line()
+            self.skip_newlines()
+        let whole = start.to(self.prev_span())
+        self.eat(Tok.Dedent)
+        let (body, contracts) = self.split_contracts(
+            stmts,
+            Block(stmts=[], span=whole),
+            [ContractKind.Requires]
+        )
+        return Ok(
+            FnDecl(
+                name="rule_0",
+                name_span=span,
+                params=params,
+                ret=None,
+                requires=[e for _, e in contracts],
+                ensures=[],
+                body=body,
+                span=span,
+                is_extern=false,
+                method_of=None,
+                tparams=[],
+                test_name=Some(name),
+                rule=Some(RuleInfo(name=name, effects=effects, proven=proven, whole=whole)),
+                id=0,
+                locals=[],
+                param_locals=[],
+                result_local=None
+            )
+        )
+
+    # `effects m: none` or `effects m: files, console`
+    fn effects_line(ref self) -> Result[EffectsLine, ()]:
+        let start = self.bump()
+        let path = self.module_path()?
+        self.expect(Tok.Colon, "`:` and what the module may do (`none`, or e.g. `files, console`)")?
+        var allowed: [str] = []
+        while true:
+            let (w, _) = self.expect_ident("an effect (`none`, `files`, `console`, ...)")?
+            allowed.push(w)
+            if not self.eat(Tok.Comma):
+                break
+        let span = start.to(self.prev_span())
+        self.end_stmt()?
+        return Ok(EffectsLine(module=path, allowed=allowed, span=span))
 
     # ------------------------------------------------------------ types
     # Optional type parameters: `[T, U]`.
@@ -684,7 +822,16 @@ struct Parser:
                 self.skip_newlines()
             self.eat(Tok.Dedent)
         let span = start.to(self.prev_span())
-        # pull out leading contracts
+        return Ok(self.split_contracts(stmts, Block(stmts=[], span=span), allow))
+
+    # The leading contract statements of the allowed kinds, taken out of `stmts`;
+    # the rest go into `into`.
+    fn split_contracts(
+        ref self,
+        stmts: [Stmt],
+        into: Block,
+        allow: [ContractKind]
+    ) -> (Block, [(ContractKind, Expr)]):
         var contracts: [(ContractKind, Expr)] = []
         var leading = true
         var kept: [Stmt] = []
@@ -711,7 +858,7 @@ struct Parser:
                 case _:
                     leading = false
                     kept.push(s)
-        return Ok((Block(stmts=kept, span=span), contracts))
+        return (Block(stmts=kept, span=into.span), contracts)
 
     fn stmt(ref self) -> Result[Stmt, ()]:
         let start = self.span()

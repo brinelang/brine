@@ -1229,6 +1229,184 @@ test "spec-diff finds specs that promise less":
     let bad = brine(["spec-diff", f, "--base", "nope"])
     assert bad.code == 2 and "could not read" in bad.err, bad.all()
 
+# `code@file:line` for each error and warning in `--json` output.
+fn diag_codes(o: Out) -> [str]:
+    var out: [str] = []
+    for l in o.out.lines():
+        if "\"severity\":\"error\"" in l or "\"severity\":\"warning\"" in l:
+            let parts = field(l, "file").replace("\\\\", "/").split("/")
+            let file = parts[len(parts) - 1]
+            out.push(field(l, "code") + "@" + file + ":" + field(l, "line"))
+    return out
+
+const PUMP_SETTINGS = "struct Settings:\n    target: int\n    sensitivity: int\n    max_bolus: int\n    daily_limit: int\n    invariant 70 <= self.target <= 200\n    invariant 10 <= self.sensitivity <= 400\n    invariant 0 <= self.max_bolus <= 25_000\n    invariant 0 <= self.daily_limit <= 200_000\n"
+
+const PUMP_RULES = "from pump import Pump, new_pump, dose_for\nfrom rules.dosing import Settings\n\nrule \"a dose is never more than one bolus\" for p: Pump, reading: int:\n    let d = dose_for(p, reading)\n    prove 0 <= d <= p.settings.max_bolus\n\nrule \"a day's insulin never goes over the daily limit\" for p: Pump, reading: int:\n    let d = dose_for(p, reading)\n    prove p.delivered_today + d <= p.settings.daily_limit\n\nrule \"a new pump has delivered nothing\" for s: Settings:\n    let p = new_pump(s)\n    prove p.delivered_today == 0\n\nrule \"dosing has no effects\":\n    effects pump: none\n"
+
+# `dose_for` with `extra` lines before its return; `room` false drops the
+# daily-limit clamp (and the `ensures` that says so).
+fn pump_src(room: bool, extra: str) -> str:
+    var s = "from rules.dosing import Settings\n\nstruct Pump:\n    settings: Settings\n    delivered_today: int\n    invariant 0 <= self.delivered_today <= self.settings.daily_limit\n\n"
+    s += "fn new_pump(s: Settings) -> Pump:\n    ensures result.delivered_today == 0\n    return Pump(settings=s, delivered_today=0)\n\n"
+    s += "fn dose_for(p: Pump, reading: int) -> int:\n    ensures 0 <= result <= p.settings.max_bolus\n"
+    if room:
+        s += "    ensures p.delivered_today + result <= p.settings.daily_limit\n"
+    s += "    if reading < 40 or reading > 600:\n        return 0\n    let s = p.settings\n"
+    s += "    var q = (reading - s.target) * 1000 / s.sensitivity\n    if q < 0:\n        q = 0\n    if q > s.max_bolus:\n        q = s.max_bolus\n"
+    if room:
+        s += "    let room = s.daily_limit - p.delivered_today\n    if q > room:\n        q = room\n"
+    return s + extra + "    return q\n"
+
+test "rules are proven on every build":
+    let d = scratch("rules")
+    for sub in ["/src", "/rules"]:
+        match os.make_dir(d + sub):
+            case _:
+                pass
+    write(d + "/brine.toml", "[package]\nname = \"pump\"\n")
+    write(d + "/rules/dosing.br", PUMP_SETTINGS)
+    write(d + "/RULES.br", PUMP_RULES)
+    let main = "from rules.dosing import Settings\nfrom pump import new_pump, dose_for\n\nfn main():\n    let s = Settings(target=110, sensitivity=50, max_bolus=10_000, daily_limit=60_000)\n    print(dose_for(new_pump(s), 260))\n"
+    write(d + "/src/main.br", main)
+    let pump = d + "/src/pump.br"
+    # the bug the rules exist for: nothing stops a dose at the daily limit
+    write(pump, pump_src(false, ""))
+    let bug = brine(["check", d, "--json"])
+    assert bug.code == 1, bug.all()
+    assert diag_codes(bug) == ["W0003@RULES.br:1", "E0605@RULES.br:10"], bug.out
+    let e = brine(["build", d]).err
+    assert "rule \"a day's insulin never goes over the daily limit\" isn't proven, so nothing is built" in e, e
+    let r = brine(["rules", d, "--json"])
+    assert (
+        r.code == 1 and "\"status\":\"not proven\"" in r.out and "\"done\":false" in r.out
+    ), r.all()
+    let rt = brine(["rules", d])
+    assert "4 rules, 3 proven" in rt.out and "✗ not proven  a day's insulin" in rt.out, rt.all()
+    # fixed: every rule is proven, and the program runs
+    write(pump, pump_src(true, ""))
+    let ok = brine(["run", d])
+    assert ok.code == 0 and ok.out == "3000\n", ok.all()
+    assert "Proven 4 rules from RULES.br; the 2 functions they cover can't stop the program" in ok.err, ok.err
+    assert "4 rules not approved yet" in ok.err, ok.err
+    # approval: then no warning, and every change to what was approved stops the build
+    let a = brine(["rules", "approve", d])
+    assert a.code == 0 and file_exists(d + "/RULES.lock"), a.all()
+    let lock = text(d + "/RULES.lock")
+    assert "rule " in lock and "file " in lock and "rules/dosing.br" in lock, lock
+    assert diag_codes(brine(["check", d, "--json"])) == [], "approved rules warn"
+    let done = brine(["rules", d])
+    assert (
+        done.code == 0 and "4 rules, 4 proven" in done.out and "done: yes" in done.out
+    ), done.all()
+    # comments and layout don't count as changes
+    write(
+        d + "/RULES.br",
+        "# what the pump promises\n" + PUMP_RULES.replace(
+            "p.settings.max_bolus\n",
+            "p.settings.max_bolus   # one bolus\n"
+        )
+    )
+    assert brine(["check", d]).code == 0
+    # weakening a rule, or the definitions it uses
+    write(d + "/RULES.br", PUMP_RULES.replace("0 <= d <= p.settings.max_bolus", "0 <= d"))
+    let weak = brine(["check", d, "--json"])
+    assert diag_codes(weak) == ["E0613@RULES.br:4"], weak.out
+    write(d + "/RULES.br", PUMP_RULES)
+    write(d + "/rules/dosing.br", PUMP_SETTINGS.replace("<= 25_000", "<= 250_000"))
+    let vocab = brine(["check", d, "--json"])
+    assert diag_codes(vocab) == ["E0613@dosing.br:1"], vocab.out
+    write(d + "/rules/dosing.br", PUMP_SETTINGS)
+    # a removed rule; a new one only warns
+    write(
+        d + "/RULES.br",
+        PUMP_RULES.replace("\nrule \"dosing has no effects\":\n    effects pump: none\n", "")
+    )
+    let gone = brine(["check", d])
+    assert (
+        gone.code == 1 and "approved rule \"dosing has no effects\" is gone" in gone.err
+    ), gone.all()
+    # nor can the rules go away with their file, or be replaced by a closer one
+    match os.remove_file(d + "/RULES.br"):
+        case _:
+            pass
+    let none = brine(["check", d])
+    assert none.code == 1 and "E0613" in none.err and "approves 4 rules" in none.err, none.all()
+    write(d + "/RULES.br", PUMP_RULES)
+    write(d + "/src/RULES.br", "rule \"nothing\":\n    prove 1 == 1\n")
+    let near = brine(["check", d])
+    assert near.code == 1 and "a second RULES.br" in near.err, near.all()
+    match os.remove_file(d + "/src/RULES.br"):
+        case _:
+            pass
+    write(
+        d + "/RULES.br",
+        PUMP_RULES
+        + "\nrule \"readings out of range give nothing\" for p: Pump:\n    let d = dose_for(p, 1000)\n    prove d == 0\n"
+    )
+    let fresh = brine(["check", d, "--json"])
+    assert fresh.code == 1 and diag_codes(fresh) == [
+        "W0003@RULES.br:1",
+        "E0605@RULES.br:21"
+    ], fresh.out
+    write(d + "/RULES.br", PUMP_RULES)
+    # code a rule covers can't stop the program, or do what its effects line forbids
+    for case_ in [
+        ("    assert reading != 300\n", "E0607@pump.br:26"),
+        ("    if reading == 300:\n        panic(\"too much\")\n", "E0611@pump.br:27"),
+        ("    if {1: 2}.get(reading).unwrap() == 3:\n        q = 0\n", "E0611@pump.br:26"),
+        ("    print(q)\n", "E0612@RULES.br:17"),
+        # (unless the prover shows it can't happen)
+        ("    assert q >= 0\n", ""),
+        ("    if q < 0:\n        panic(\"can't happen\")\n", "")
+    ]:
+        let (extra, want) = case_
+        write(pump, pump_src(true, extra))
+        let o = brine(["check", d, "--json"])
+        let got = diag_codes(o)
+        if want == "":
+            assert o.code == 0 and got == [], f"{extra}: {o.all()}"
+        else:
+            assert o.code == 1 and got == [want], f"{extra}: {got}\n{o.out}"
+    write(pump, pump_src(true, "    print(q)\n"))
+    let eff = brine(["check", d]).err
+    assert "dose_for" in eff and "print" in eff, eff
+    write(pump, pump_src(true, ""))
+    # the owner's views: plain English and a pull-request receipt
+    let ex = brine(["rules", d, "--explain"])
+    assert ex.code == 0 and "a day's insulin never goes over the daily limit" in ex.out, ex.all()
+    let rc = brine(["rules", d, "--receipt"])
+    assert rc.code == 0 and "RULES.br" in rc.out and "proven" in rc.out, rc.all()
+    let js = brine(["rules", d, "--json"])
+    assert (
+        js.code == 0 and js.out.count("\"status\":\"proven\"") == 4 and "\"done\":true" in js.out
+    ), js.all()
+    # `brine test` doesn't run rules
+    assert brine(["test", d]).code == 0
+
+test "malformed rules":
+    let d = scratch("bad-rules")
+    write(d + "/lib.br", "fn twice(x: int) -> int:\n    return x + x\n")
+    write(
+        d + "/main.br",
+        "import lib\n\nfn main():\n    print(lib.twice(2))\n\nrule \"not here\":\n    prove 1 == 1\n"
+    )
+    write(
+        d + "/RULES.br",
+        "import lib\n\nrule \"\":\n    prove 1 == 1\n\nrule \"a\":\n    prove 1 == 1\n\nrule \"a\":\n    prove 2 == 2\n\nrule \"empty\":\n    pass\n\nrule \"unknown\":\n    proven lib.thrice\n\nrule \"effects\":\n    effects lib: none, console\n    effects lib: disks\n"
+    )
+    let o = brine(["check", d + "/main.br", "--json"])
+    assert o.code == 1, o.all()
+    let got = [c for c in diag_codes(o) if c.starts_with("E")]
+    assert got == [
+        "E0610@main.br:6",
+        "E0610@RULES.br:3",
+        "E0610@RULES.br:9",
+        "E0610@RULES.br:12",
+        "E0610@RULES.br:16",
+        "E0610@RULES.br:19",
+        "E0610@RULES.br:20"
+    ], "\n".join(got) + "\n" + o.out
+
 # false claims the prover once accepted
 test "proofs stay sound":
     assert (
@@ -1521,10 +1699,15 @@ test "every error code is explained":
         "E0607",
         "E0608",
         "E0609",
+        "E0610",
+        "E0611",
+        "E0612",
+        "E0613",
         "E0702",
         "E0706",
         "E0707",
-        "W0002"
+        "W0002",
+        "W0003"
     ]:
         let o = brine(["explain", code])
         assert o.code == 0, f"no explanation for {code}"
@@ -1594,6 +1777,7 @@ test "every command describes itself":
         "debug",
         "fmt",
         "spec-diff",
+        "rules",
         "explain",
         "guide",
         "doctor",
@@ -1737,7 +1921,7 @@ test "a new project works out of the box":
         case Err(e):
             panic(e)
     assert brine(["new", "app"]).code == 0
-    for f in ["brine.toml", "src/main.br", "AGENTS.md", ".gitignore"]:
+    for f in ["brine.toml", "src/main.br", "RULES.br", "RULES.lock", "AGENTS.md", ".gitignore"]:
         assert file_exists("app/" + f), f"missing {f}"
     match os.set_cwd("app"):
         case Ok(_):
@@ -1749,6 +1933,10 @@ test "a new project works out of the box":
     assert brine(["test"]).code == 0
     assert brine(["check"]).code == 0
     assert brine(["fmt", "--check"]).code == 0
+    # its starter rule is proven and approved, with no warnings
+    let r = brine(["rules"])
+    assert r.code == 0 and "1 rule, 1 proven" in r.out and "done: yes" in r.out, r.all()
+    assert "warning" not in brine(["check"]).err
 
 # Each tests/syntax/NAME.br has NAME.lex and NAME.parse: the expected `brine lex`
 # and `brine parse` output (regenerate with `brine run tests/update_syntax.br`).

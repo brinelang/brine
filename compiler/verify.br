@@ -15,7 +15,7 @@ import diag
 from types import Ty, IntTy, Res, CallRes, Builtin, NumM, StrM, Reducer, WorldOp, LocalInfo, LocalKind, int_ty
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import children, stmt_exprs, stmt_blocks, lvalue_root, local_of
-from info import ProgramInfo, ConstVal
+from info import ProgramInfo, ConstVal, PRELUDE
 from solver import Lin, F, AtomSet, prove_, prove_full, counterexample, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
 
 struct Report:
@@ -90,7 +90,17 @@ fn key(span: Span, tag: int) -> (int, int, int, int):
 
 # `must_prove`: a runtime check the prover can't remove is an error (E0607),
 # outside `test` blocks (`[check] proven = true`).
-fn verify_program(ref prog: Program, info: ProgramInfo, sm: SourceMap, must_prove: bool) -> Report:
+# `rules`: for each function, the rule that covers it ("" if none): nothing in
+# it may stop the program. `stops`: the functions a covered call can't reach
+# (`unwrap`, which stops the program on `None`).
+fn verify_program(
+    ref prog: Program,
+    info: ProgramInfo,
+    sm: SourceMap,
+    must_prove: bool,
+    rules: [str],
+    stops: [bool]
+) -> Report:
     var specs: [Option[FnSpec]] = [None] * len(info.fns)
     for m in prog.modules:
         for f in m.fns:
@@ -108,14 +118,35 @@ fn verify_program(ref prog: Program, info: ProgramInfo, sm: SourceMap, must_prov
     # applied in order, which keeps the output deterministic
     var fns: [FnDecl] = []
     var tests: [bool] = []
+    var covers: [str] = []
     for m in prog.modules:
         fns.extend(m.fns)
         fns.extend(m.tests)
         tests.extend([false] * len(m.fns))
-        tests.extend([true] * len(m.tests))
+        for f in m.fns:
+            covers.push(rules[f.id] if 0 <= f.id < len(rules) and m.name != PRELUDE else "")
+        # a rule is proven like code: its `assert`s are runtime checks
+        for t in m.tests:
+            match t.rule:
+                case Some(r):
+                    tests.push(false)
+                    covers.push(r.name)
+                case None:
+                    tests.push(true)
+                    covers.push("")
     let fps = footprints(prog, info)
     let done = par [
-        verify_fn(info, specs, fps, sm, fns[i], tests[i], must_prove and not tests[i])
+        verify_fn(
+            info,
+            specs,
+            fps,
+            sm,
+            fns[i],
+            tests[i],
+            (must_prove and not tests[i]) or covers[i] != "",
+            covers[i],
+            stops
+        )
         for i in 0..len(fns)
     ]
     # let go of the bodies, so rewriting them below doesn't copy them
@@ -184,7 +215,9 @@ fn verify_fn(
     sm: SourceMap,
     f: FnDecl,
     test: bool,
-    must_prove: bool
+    must_prove: bool,
+    rule: str,
+    stops: [bool]
 ) -> FnResult:
     let t0 = clock()
     if f.is_extern:
@@ -192,6 +225,9 @@ fn verify_fn(
     var v = new_vf(info, specs, fps, sm, f)
     v.test = test
     v.must_prove = must_prove
+    v.rule = rule
+    v.in_rule = f.rule.is_some()
+    v.stops = stops
     v.run(f)
     var proven: {(int, int, int, int): bool} = {}
     for p in v.proven.keys():
@@ -884,7 +920,10 @@ fn new_vf(
         own_self=-1,
         own_sid=-1,
         own_ref=false,
-        skip_inv=false
+        skip_inv=false,
+        rule="",
+        in_rule=false,
+        stops=[]
     )
 
 struct Vf:
@@ -929,6 +968,12 @@ struct Vf:
     own_ref: bool
     # `fresh_val` makes a value that may break its invariant (`self`, havocked)
     skip_inv: bool
+    # the rule this code is, or that covers it ("" if none)
+    rule: str
+    # the body of a `rule` block
+    in_rule: bool
+    # functions that can stop the program, which covered code can't call
+    stops: [bool]
 
     # The state, leaving none behind.
     fn take(ref self) -> Option[St]:
@@ -980,7 +1025,13 @@ struct Vf:
         if len(f.requires) > 0 and self.holds(F.False):
             let first = f.requires[0].span
             let last = f.requires[len(f.requires) - 1].span
-            var d = diag.error("E0608", f"the preconditions of `{f.name}` can never all hold")
+            var what = f"`{f.name}`"
+            match f.rule:
+                case Some(r):
+                    what = f"rule \"{r.name}\""
+                case None:
+                    pass
+            var d = diag.error("E0608", f"the preconditions of {what} can never all hold")
             d = d.label(first.to(last), "no values meet all of these")
             d = d.note("everything the body claims is proven vacuously, and no call can prove them")
             self.diags.push(
@@ -1217,17 +1268,14 @@ struct Vf:
             return
         let is_assert = what == "assert"
         var d = (
-            diag.error("E0607", "a runtime check is left in code that must be proven")
-            .label(
+            diag.error("E0607", "a runtime check is left in code that must be proven").label(
                 span,
                 "this `assert` is checked at runtime"
                 if is_assert
                 else f"the prover could not remove this {what}"
             )
-            .note(
-                "`proven = true` under [check] in brine.toml (or `--proven`) makes every check the prover can't remove an error, outside `test` blocks"
-            )
         )
+        d = d.note(self.why_proven())
         if what == "map key check":
             d = d.with_help(
                 "use `m.get(k)`, which gives an `Option` to match on (the prover doesn't follow the keys of maps)"
@@ -1249,6 +1297,28 @@ struct Vf:
                 self.fail(d, g)
             case None:
                 self.diags.push(d)
+
+    # Why everything here must be proven.
+    fn why_proven(self) -> str:
+        if self.in_rule:
+            return f"this is rule \"{self.rule}\": a failed check would stop the program instead of keeping the rule"
+        if self.rule != "":
+            return f"rule \"{self.rule}\" covers this function, so nothing it does may stop the program"
+        return "`proven = true` under [check] in brine.toml (or `--proven`) makes every check the prover can't remove an error, outside `test` blocks"
+
+    # A call that stops the program (`panic`, `exit`, `unwrap()`), in code that
+    # must not stop: an error unless the prover shows it can't be reached.
+    fn stop_call(ref self, span: Span, what: str, help: str):
+        if not self.must_prove or self.test or not self.live or self.rule == "":
+            return
+        if self.holds(F.False):
+            return
+        self.diags.push(
+            diag.error("E0611", f"{what} in code a rule covers")
+            .label(span, "this can stop the program")
+            .note(self.why_proven())
+            .with_help(help)
+        )
 
     # `x op= y`: the new value of `x`; the statement's check is proven or listed.
     fn compound(ref self, span: Span, op: BinOp, a: Lin, b: Lin, k: IntTy) -> V:
@@ -1728,7 +1798,19 @@ struct Vf:
                 match e.kind:
                     case ExprKind.Call(_, _):
                         match e.cres:
-                            case CallRes.Builtin(Builtin.Exit) | CallRes.Builtin(Builtin.Panic):
+                            case CallRes.Builtin(Builtin.Exit):
+                                self.stop_call(
+                                    e.span,
+                                    "`exit`",
+                                    "return a value or a `Result` instead, so the caller decides what happens"
+                                )
+                                self.live = false
+                            case CallRes.Builtin(Builtin.Panic):
+                                self.stop_call(
+                                    e.span,
+                                    "`panic`",
+                                    "if this can't happen, give the prover the facts that show it (`requires`, `invariant`); otherwise handle the case or return a `Result`"
+                                )
                                 self.live = false
                             case _:
                                 pass
@@ -1780,13 +1862,18 @@ struct Vf:
             case StmtKind.Prove(e):
                 let f = self.spec_cond(e)
                 if not self.holds(f):
-                    let d = (
-                        diag.error("E0605", "cannot prove this claim")
-                        .label(e.span, "the prover could not show this is always true")
-                        .with_help(
+                    var d = diag.error(
+                        "E0605",
+                        "cannot prove this claim"
+                    ).label(e.span, "the prover could not show this is always true")
+                    if self.in_rule:
+                        d = d.note(f"rule \"{self.rule}\" isn't proven, so nothing is built").with_help(
+                            "change the code the rule covers (or add `ensures`, `invariant` and `requires` lines there) until this follows; don't change the rule unless its owner agrees"
+                        )
+                    else:
+                        d = d.with_help(
                             "add facts it can use (`requires`, `invariant`, or an `assert` before this line), or use `assert` to check it at runtime instead"
                         )
-                    )
                     self.fail(d, f)
                 self.assume(f)
             case _:
@@ -3778,6 +3865,12 @@ struct Vf:
                         self.fail(d, f)
             case None:
                 pass
+        if 0 <= id < len(self.stops) and self.stops[id]:
+            self.stop_call(
+                e.span,
+                f"`{sig.name}()`",
+                f"`{sig.name}()` stops the program when there's no value: `match` on it and handle every case"
+            )
         # mutable arguments may change what the callee's footprint says,
         # arbitrarily (subject to its `ensures`)
         for i, p in enumerate(sig.params):

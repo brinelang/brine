@@ -16,6 +16,7 @@ import project
 import fmt
 import explain
 import specdiff
+import rules
 
 const GUIDE = embed("../docs/QUICKREF.md")
 
@@ -43,6 +44,11 @@ fn help_text() -> str:
             "      --target <t>          host (default), wasm (a .wasm module) or web (a page)",
             "  check [file]          Type-check and verify without building (fastest)",
             "      --report              list every runtime check the prover could not remove",
+            "  rules [file]          Show which rules in RULES.br are proven (every build proves them)",
+            "      approve               record that the rules' owner approves them (RULES.lock)",
+            "      --explain             the rules in plain English",
+            "      --receipt             a summary for a pull request (Markdown)",
+            "      --base <rev>          also list the approvals made since a git revision",
             "  test [file] [filter]  Run `test \"...\":` blocks in parallel (also --target wasm)",
             "      --timeout <s>       stop a test after <s> seconds (default 300; 0: no limit)",
             "  debug [file] [-- args]  Debug build, then launch gdb or lldb",
@@ -74,7 +80,9 @@ fn usage(cmd: str) -> Option[str]:
         ls = [
             "Usage: brine new <name>",
             "",
-            "Create a project in ./<name>: brine.toml, src/main.br, AGENTS.md, README.md and .gitignore."
+            "Create a project in ./<name>: brine.toml, src/main.br, RULES.br (what the",
+            "program promises, proven on every build) and RULES.lock, AGENTS.md,",
+            "README.md and .gitignore."
         ]
     elif cmd == "init":
         ls = ["Usage: brine init", "", "Create a project in the current directory, named after it."]
@@ -115,6 +123,28 @@ fn usage(cmd: str) -> Option[str]:
             "",
             "Options:",
             "  --report            list every runtime check the prover could not remove",
+            "  --typed             require a written type on every variable",
+            "  --proven            make every runtime check the prover can't remove an error"
+        ]
+    elif cmd == "rules":
+        ls = [
+            "Usage: brine rules [approve] [file | folder] [options]",
+            "",
+            "Report on RULES.br: each rule is proven or not, and approved by its owner",
+            "or not. Every build, run, test and check already proves the rules and fails",
+            "if one isn't; this command shows them all at once. Exits 1 unless every rule",
+            "is proven and approved.",
+            "",
+            "`brine rules approve` records that the rules' owner agrees with RULES.br and",
+            "the vocabulary in rules/, in RULES.lock. A rule or vocabulary file that",
+            "changes, or goes away, after approval stops the build until it is approved",
+            "again; a new rule only warns. Put RULES.br, rules/ and RULES.lock under",
+            "CODEOWNERS, so only the owner can approve.",
+            "",
+            "Options:",
+            "  --explain           the rules in plain English, rendered from their code",
+            "  --receipt           a one-page summary for a pull request (Markdown)",
+            "  --base <rev>        also list what was approved since a git revision",
             "  --typed             require a written type on every variable",
             "  --proven            make every runtime check the prover can't remove an error"
         ]
@@ -399,6 +429,8 @@ fn main() -> int:
         r = cmd_fmt(g, rest)
     elif cmd == "spec-diff":
         r = cmd_spec_diff(g, rest)
+    elif cmd == "rules":
+        r = cmd_rules(g, rest)
     elif cmd == "explain":
         r = explain.explain_cmd(first_pos(rest), g.json)
     elif cmd == "guide":
@@ -425,6 +457,7 @@ fn main() -> int:
             "run",
             "build",
             "check",
+            "rules",
             "test",
             "debug",
             "fmt",
@@ -608,6 +641,7 @@ fn build(
     g.diags(fe)
     if fe.has_errors():
         return Ok(None)
+    rules_line(g, fe)
     let code = driver.gen_code(fe, profile, tests, plat)
     let stem = t.name + "-tests" if tests else t.name
     var exe = ""
@@ -663,7 +697,7 @@ fn cmd_new(g: G, a: Args) -> Result[int, str]:
         )
     if file_exists(name):
         return Err(f"`{name}` already exists")
-    project.create(name, name)?
+    approve_new(name, project.create(name, name)?)?
     if g.json:
         print("{\"created\":" + json_str(name) + "}")
     else:
@@ -671,6 +705,15 @@ fn cmd_new(g: G, a: Args) -> Result[int, str]:
         if not g.quiet:
             eprint(f"\n    cd {name}\n    brine run\n")
     return Ok(0)
+
+# A new project's starter rules are approved by whoever made the project.
+fn approve_new(dir: str, made: [str]) -> Result[bool, str]:
+    if rules.FILE not in made or file_exists(project.join(dir, rules.LOCK)):
+        return Ok(false)
+    let src = read_file(project.join(dir, rules.FILE))?
+    let (m, _) = parser.parse_module(src, 0, rules.MODULE)
+    write_file(project.join(dir, rules.LOCK), rules.lock_text(rules.entries(src, m, dir)))?
+    return Ok(true)
 
 fn cmd_init(g: G, a: Args) -> Result[int, str]:
     a.check_flags([])?
@@ -683,7 +726,9 @@ fn cmd_init(g: G, a: Args) -> Result[int, str]:
         else:
             mapped += "_"
     let name = mapped if project.valid_name(mapped) else "app_" + mapped
-    let made = project.create(cwd, name)?
+    var made = project.create(cwd, name)?
+    if approve_new(cwd, made)?:
+        made.push(rules.LOCK)
     let list = ", ".join(made)
     g.status("Created", f"project `{name}` ({list})")
     return Ok(0)
@@ -1055,6 +1100,7 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
     g.diags(fe)
     if fe.has_errors():
         return Ok(1)
+    rules_line(g, fe)
     var proven = 0
     var remaining: [(diag.Span, str)] = []
     match fe.report:
@@ -1092,6 +1138,365 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
         g.status(
             "Checked",
             f"{t.name} in {clock() - t0:.2f}s — {proven} runtime check{plural(proven)} proven unnecessary, {len(remaining)} remain{see}"
+        )
+    return Ok(0)
+
+# ================================================================ rules
+
+# `Proven 3 rules` after a build or check that proved them.
+fn rules_line(g: G, fe: Frontend):
+    match fe.rules:
+        case Some(rl):
+            let n = len(rl.rules)
+            if rl.present and n > 0:
+                var fns = 0
+                for id in 0..len(rl.covered):
+                    if rl.covered[id] != "":
+                        fns += 1
+                var more = ""
+                if fns == 1:
+                    more = "; the function they cover can't stop the program"
+                elif fns > 1:
+                    more = f"; the {fns} functions they cover can't stop the program"
+                g.status("Proven", f"{n} rule{plural(n)} from {rules.FILE}{more}")
+        case None:
+            pass
+
+fn cmd_rules(g: G, a: Args) -> Result[int, str]:
+    a.check_flags(["--explain", "--receipt", "--base", "--typed", "--proven"])?
+    var pos = a.pos
+    let approve = len(pos) > 0 and pos[0] == "approve"
+    if approve:
+        pos = pos[1:]
+    let t = resolve(Some(pos[0]) if len(pos) > 0 else None)?.typed_if(a)
+    let dir = driver.rules_dir(driver.dir_of(t.entry))
+    if dir == "":
+        return Err(
+            "no RULES.br next to the main file or at the project root: write one (see `brine guide`, \"Rules\")"
+        )
+    let path = project.join(dir, rules.FILE)
+    if approve:
+        return rules_approve(g, dir, path)
+    if a.has("--explain"):
+        let src = read_file(path)?
+        let (m, ds) = parser.parse_module(src, 0, rules.MODULE)
+        if any(d.is_error() for d in ds):
+            var sm = SourceMap.new()
+            sm.add(display_path(path), src)
+            g.diag_list(ds, sm)
+            return Ok(1)
+        let lines = rules.explain(src, m)
+        if g.json:
+            print("{\"explain\":" + json_str("\n".join(lines)) + "}")
+        else:
+            out_text("\n".join(lines))
+        return Ok(0)
+    let fe = driver.frontend(
+        t.entry,
+        FrontOpts(verify=true, need_main=false, typed=t.typed, proven=t.proven)
+    )
+    if not g.json:
+        g.diags(fe)
+    match fe.rules:
+        case Some(rl):
+            let base = rules_base(dir, a.val("--base"))?
+            if a.has("--receipt"):
+                out_text(receipt(fe, rl, base))
+                return Ok(0 if rules_done(fe) else 1)
+            return Ok(rules_report(g, fe, rl, base))
+        case None:
+            if g.json:
+                for d in fe.diags:
+                    print(diag.to_json(d, fe.sm))
+                print("{\"rules\":null,\"done\":false}")
+            else:
+                g.error("the program has errors, so its rules couldn't be checked")
+            return Ok(1)
+
+# The approved rules and files in RULES.lock at git revision `rev`, if asked for.
+fn rules_base(dir: str, rev: Option[str]) -> Result[Option[(str, [rules.Entry])], str]:
+    match rev:
+        case Some(r):
+            match driver.read_at(project.join(dir, rules.LOCK), Some(r)):
+                case Ok(t):
+                    return Ok(Some((r, rules.parse_lock(t))))
+                case Err(_):
+                    return Ok(Some((r, [])))
+        case None:
+            return Ok(None)
+
+# Every rule proven, nothing else wrong, and the lock up to date.
+fn rules_done(fe: Frontend) -> bool:
+    return fe.report.is_some() and not fe.has_errors()
+
+fn rule_status(fe: Frontend, probs: [int]) -> str:
+    if fe.report.is_none():
+        return "unchecked"
+    return "proven" if len(probs) == 0 else "not proven"
+
+# What `--base` says about the approvals this change makes.
+fn base_changes(rl: rules.Rules, dir: str, base: Option[(str, [rules.Entry])]) -> [str]:
+    var out: [str] = []
+    match base:
+        case Some(b):
+            let (rev, old) = b
+            var now: [rules.Entry] = []
+            match read_file(project.join(dir, rules.LOCK)):
+                case Ok(t):
+                    now = rules.parse_lock(t)
+                case Err(_):
+                    pass
+            for e in now:
+                let what = "rule" if e.kind == "rule" else "vocabulary"
+                match rules.find_entry(old, e.kind, e.name):
+                    case Some(o):
+                        if o.hash != e.hash:
+                            out.push(f"changed  {what} \"{e.name}\" (approved again since {rev})")
+                    case None:
+                        out.push(f"new      {what} \"{e.name}\" (approved since {rev})")
+            for o in old:
+                if rules.find_entry(now, o.kind, o.name).is_none():
+                    let what = "rule" if o.kind == "rule" else "vocabulary"
+                    out.push(f"removed  {what} \"{o.name}\" (approved at {rev}, no longer)")
+            if len(out) == 0:
+                out.push(f"no approvals changed since {rev}")
+        case None:
+            pass
+    return out
+
+fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.Entry])]) -> int:
+    let probs = rules.problems(rl, fe.diags)
+    var proven = 0
+    for ri in 0..len(rl.rules):
+        if rule_status(fe, probs[ri]) == "proven":
+            proven += 1
+    var attributed: {int: bool} = {}
+    for ps in probs:
+        for i in ps:
+            attributed[i] = true
+    var other = 0
+    for di, d in enumerate(fe.diags):
+        if d.is_error() and d.code != "E0613" and di not in attributed:
+            other += 1
+    let done = rules_done(fe)
+    let changes = base_changes(rl, rl.dir, base)
+    if g.json:
+        var rs: [str] = []
+        for ri, r in enumerate(rl.rules):
+            let ds = [diag.to_json(fe.diags[i], fe.sm) for i in probs[ri]]
+            rs.push(
+                "{\"name\":"
+                + json_str(r.name)
+                + ",\"status\":"
+                + json_str(rule_status(fe, probs[ri]))
+                + ",\"approval\":"
+                + json_str(r.approval)
+                + ",\"location\":"
+                + json_str(fe.sm.loc(r.head))
+                + f",\"covers\":{len(r.covers)}"
+                + ",\"problems\":["
+                + ",".join(ds)
+                + "]}"
+            )
+        let removed = ",".join([json_str(x) for x in rl.removed])
+        let vocab = ",".join(
+            ["{\"file\":" + json_str(p) + ",\"approval\":" + json_str(s) + "}" for p, s in rl.vocab]
+        )
+        let others = ",".join(
+            [
+                diag.to_json(d, fe.sm) for di,
+                d in enumerate(fe.diags) if d.is_error() and di not in attributed
+            ]
+        )
+        let ch = ",".join([json_str(x) for x in changes])
+        print(
+            "{\"rules\":["
+            + ",".join(rs)
+            + "],\"removed\":["
+            + removed
+            + "],\"vocabulary\":["
+            + vocab
+            + "],\"locked\":"
+            + ("true" if rl.locked else "false")
+            + ",\"other_errors\":["
+            + others
+            + "],\"since_base\":["
+            + ch
+            + "],\"done\":"
+            + ("true" if done else "false")
+            + "}"
+        )
+        return 0 if done else 1
+    let c = g.c()
+    let n = len(rl.rules)
+    print(f"{rules.FILE}: {n} rule{plural(n)}, {proven} proven")
+    for ri, r in enumerate(rl.rules):
+        let st = rule_status(fe, probs[ri])
+        var mark = f"{c.green()}✓ proven     {c.reset()}"
+        if st == "not proven":
+            mark = f"{c.red()}✗ not proven {c.reset()}"
+        elif st == "unchecked":
+            mark = f"{c.yellow()}? unchecked  {c.reset()}"
+        var tag = ""
+        if r.approval == "new":
+            tag = f"  {c.yellow()}(not approved yet){c.reset()}"
+        elif r.approval == "changed":
+            tag = f"  {c.red()}(changed since approval){c.reset()}"
+        print(f"  {mark} {r.name}{tag}")
+        for i in probs[ri]:
+            let d = fe.diags[i]
+            print(f"                 {fe.sm.loc(d.labels[0].span)}  {d.code} {d.msg}")
+    for x in rl.removed:
+        print(
+            f"  {c.red()}✗ removed    {c.reset()} {x}  {c.red()}(approved, no longer in {rules.FILE}){c.reset()}"
+        )
+    for p, s in rl.vocab:
+        if s == "changed" or s == "removed":
+            print(f"  {c.red()}! vocabulary {c.reset()} {p} {s} since approval")
+    if not rl.locked and n > 0:
+        print(
+            f"  no {rules.LOCK} yet: the rules' owner runs `brine rules approve` once they agree with them"
+        )
+    if len(changes) > 0:
+        print("since the base:")
+        for x in changes:
+            print("  " + x)
+    print(
+        "also guaranteed by brine: memory safety, no data races, no silent overflow, deterministic `par`, no deadlocks in `world`"
+    )
+    if other > 0:
+        print(f"{other} other error{plural(other)} (above), outside the rules")
+    if done:
+        print("done: yes, every rule is proven")
+    elif fe.report.is_none():
+        print("done: no, the program has errors, so the rules weren't proven")
+    elif any(d.code == "E0613" for d in fe.diags):
+        print("done: no, the rules changed since their owner approved them, so `brine build` fails")
+    else:
+        print("done: no, so `brine build` fails")
+    return 0 if done else 1
+
+# One page of Markdown for a pull request.
+fn receipt(fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.Entry])]) -> str:
+    let probs = rules.problems(rl, fe.diags)
+    var proven = 0
+    for ri in 0..len(rl.rules):
+        if rule_status(fe, probs[ri]) == "proven":
+            proven += 1
+    let n = len(rl.rules)
+    var o: [str] = []
+    o.push(f"## Rules: {proven} of {n} proven")
+    o.push("")
+    o.push("| rule | status | approval |")
+    o.push("|---|---|---|")
+    for ri, r in enumerate(rl.rules):
+        let name = r.name.replace("|", "\\|")
+        o.push(f"| {name} | {rule_status(fe, probs[ri])} | {r.approval} |")
+    for x in rl.removed:
+        o.push(f"| {x} | removed | was approved |")
+    o.push("")
+    let changes = base_changes(rl, rl.dir, base)
+    if len(changes) > 0:
+        o.push("**Approvals since the base:**")
+        for x in changes:
+            o.push("- " + x)
+        o.push("")
+    var vocab: [str] = []
+    for p, s in rl.vocab:
+        vocab.push(f"`{p}` ({s})")
+    if len(vocab) > 0:
+        o.push("**Vocabulary** (locked with the rules): " + ", ".join(vocab))
+    var fns = 0
+    var ext: [str] = []
+    for id in 0..len(rl.covered):
+        if rl.covered[id] != "":
+            fns += 1
+    for r in rl.rules:
+        for x in r.externs:
+            if x not in ext:
+                ext.push(x)
+    o.push(
+        f"**Covered code:** {fns} function{plural(fns)}, none of which can stop the program on the rules' inputs."
+    )
+    let trusted = "none reached" if len(ext) == 0 else ", ".join([f"`{x}`" for x in ext])
+    o.push(
+        f"**Trusted:** brine {VERSION}, its runtime and the C compiler; extern C code: {trusted}."
+    )
+    o.push(
+        "**Limits:** a rule holds whenever the code it runs returns; brine doesn't prove yet that loops and recursion end, or that memory and stack suffice."
+    )
+    o.push(
+        "**Also guaranteed by brine:** memory safety, no data races, no silent overflow, deterministic `par`, no deadlocks in `world`."
+    )
+    var tests = 0
+    var hashes: [str] = []
+    match fe.prog:
+        case Some(p):
+            for m in p.modules:
+                for tt in m.tests:
+                    if tt.rule.is_none():
+                        tests += 1
+                if m.name != "prelude":
+                    hashes.push(fe.sm.file(m.file).text)
+        case None:
+            pass
+    o.push(f"**Tested, not guaranteed:** {tests} `test` block{plural(tests)} (`brine test`).")
+    let src_hash = rules.fnv_hex("".join(hashes))
+    o.push(f"**Sources:** {src_hash}")
+    return "\n".join(o) + "\n"
+
+fn rules_approve(g: G, dir: str, path: str) -> Result[int, str]:
+    let src = read_file(path)?
+    let (m, ds) = parser.parse_module(src, 0, rules.MODULE)
+    if any(d.is_error() for d in ds):
+        var sm = SourceMap.new()
+        sm.add(display_path(path), src)
+        g.diag_list(ds, sm)
+        return Ok(1)
+    let now = rules.entries(src, m, dir)
+    let lp = project.join(dir, rules.LOCK)
+    var old: [rules.Entry] = []
+    match read_file(lp):
+        case Ok(t):
+            old = rules.parse_lock(t)
+        case Err(_):
+            pass
+    write_file(lp, rules.lock_text(now))?
+    var fresh = 0
+    var changed = 0
+    var same = 0
+    var nrules = 0
+    for e in now:
+        if e.kind == "rule":
+            nrules += 1
+        match rules.find_entry(old, e.kind, e.name):
+            case Some(o):
+                if o.hash == e.hash:
+                    same += 1
+                else:
+                    changed += 1
+            case None:
+                fresh += 1
+    var removed = 0
+    for o in old:
+        if rules.find_entry(now, o.kind, o.name).is_none():
+            removed += 1
+    if g.json:
+        print(
+            "{\"approved\":"
+            + f"{nrules},\"new\":{fresh},\"changed\":{changed},\"removed\":{removed},\"lock\":"
+            + json_str(display_path(lp))
+            + "}"
+        )
+    else:
+        let files = len(now) - nrules
+        g.status(
+            "Approved",
+            f"{nrules} rule{plural(nrules)} and {files} vocabulary file{plural(files)} ({fresh} new, {changed} changed, {removed} removed, {same} unchanged)"
+        )
+        g.status(
+            "Wrote",
+            display_path(lp) + ": commit it; CI and CODEOWNERS make sure only an owner changes it"
         )
     return Ok(0)
 

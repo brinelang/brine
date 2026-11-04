@@ -1,0 +1,1203 @@
+# Rules: what RULES.br promises, proven on every build.
+#
+# A `rule` block is checked and proven like a function whose parameters are its
+# inputs (`verify.br`). This pass adds what a function can't say:
+# - the code a rule covers (everything its body and its `proven` lines reach)
+#   must not be able to stop the program; `verify.br` proves that (E0607, E0611);
+# - `effects m: ...` lines, decided over the whole call graph (E0612);
+# - RULES.lock: a rule or vocabulary file that changed or went away since an
+#   owner approved it blocks the build until they approve again (E0613).
+from diag import Span, Diag, SourceMap, best_match, json_str
+import diag
+from types import CallRes, Builtin, OsOp
+from ast import Expr, ExprKind, Stmt, StmtKind, Block, FnDecl, Program, Module, TypeExpr
+from ast import BinOp, CmpOp, UnOp, Arg, LetPat, RuleInfo, children, stmt_exprs, stmt_blocks
+from info import ProgramInfo, PRELUDE
+import lexer
+from lexer import Tok
+import project
+import pareffects
+
+const MODULE = "RULES"
+const FILE = "RULES.br"
+const LOCK = "RULES.lock"
+const VOCAB = "rules"
+
+# What an `effects` line can allow.
+fn effect_kinds() -> [str]:
+    return ["files", "console", "processes", "clock", "environment", "network", "world", "extern"]
+
+fn effect_words(k: str) -> str:
+    if k == "console":
+        return "the console"
+    if k == "processes":
+        return "other processes"
+    if k == "clock":
+        return "the clock"
+    if k == "environment":
+        return "the environment (arguments, environment variables, the machine)"
+    if k == "network":
+        return "the network"
+    if k == "world":
+        return "`world` messages"
+    if k == "extern":
+        return "extern C code"
+    return k
+
+# ---------------------------------------------------------------- the call graph
+
+fn builtin_effect(b: Builtin) -> str:
+    match b:
+        case Builtin.Print | Builtin.Eprint | Builtin.Flush | Builtin.Input | Builtin.ReadStdin:
+            return "console"
+        case Builtin.ReadFile | Builtin.WriteFile | Builtin.AppendFile | Builtin.FileExists:
+            return "files"
+        case Builtin.Run | Builtin.Exit:
+            return "processes"
+        case Builtin.Clock:
+            return "clock"
+        case Builtin.Args | Builtin.Getenv:
+            return "environment"
+        case _:
+            return ""
+
+fn os_effect(op: OsOp) -> str:
+    match op:
+        case OsOp.Name | OsOp.Arch | OsOp.Pid | OsOp.CpuCount | OsOp.ThreadCount:
+            return "environment"
+        case OsOp.Sleep:
+            return "clock"
+        case OsOp.IsTerminal | OsOp.EnableAnsi:
+            return "console"
+        case OsOp.FreePorts:
+            return "network"
+        case OsOp.Spawn | OsOp.Wait | OsOp.Poll | OsOp.Kill | OsOp.Output:
+            return "processes"
+        case _:
+            return "files"
+
+# What one function does itself.
+struct Scan:
+    calls: [int]
+    # (kind, the call that does it), the first of each kind
+    effects: [(str, str)]
+    # calls `panic` or `exit`
+    stops: bool
+
+fn add_effect(ref sc: Scan, kind: str, what: str):
+    if kind == "":
+        return
+    for k, _ in sc.effects:
+        if k == kind:
+            return
+    sc.effects.push((kind, what))
+
+fn scan_expr(e: Expr, info: ProgramInfo, ref sc: Scan):
+    match e.cres:
+        case CallRes.Builtin(b):
+            match b:
+                case Builtin.Panic | Builtin.Exit:
+                    sc.stops = true
+                case _:
+                    pass
+            add_effect(ref sc, builtin_effect(b), pareffects.call_name(e))
+        case CallRes.Os(op):
+            add_effect(ref sc, os_effect(op), pareffects.call_name(e))
+        case CallRes.World(_):
+            add_effect(ref sc, "world", pareffects.call_name(e))
+        case _:
+            pass
+    match pareffects.callee(e):
+        case Some(id):
+            sc.calls.push(id)
+            if 0 <= id < len(info.fns) and info.fns[id].is_extern:
+                add_effect(ref sc, "extern", info.fns[id].name)
+        case None:
+            pass
+    for c in children(e):
+        scan_expr(c, info, ref sc)
+
+fn scan_block(b: Block, info: ProgramInfo, ref sc: Scan):
+    for s in b.stmts:
+        for e in stmt_exprs(s):
+            scan_expr(e, info, ref sc)
+        for sb in stmt_blocks(s):
+            scan_block(sb, info, ref sc)
+
+# By function id.
+struct Graph:
+    names: [str]
+    calls: [[int]]
+    direct: [[(str, str)]]
+    stops: [bool]
+    # the signature and the body
+    spans: [Span]
+    has_body: [bool]
+
+fn fn_name(m: Module, f: FnDecl) -> str:
+    var n = f.name
+    match f.method_of:
+        case Some(t):
+            n = t + "." + n
+        case None:
+            pass
+    return m.name + "." + n
+
+fn graph(prog: Program, info: ProgramInfo) -> Graph:
+    let n = len(info.fns)
+    var names: [str] = [""] * n
+    var calls: [[int]] = [[]] * n
+    var direct: [[(str, str)]] = [[]] * n
+    var stops: [bool] = [false] * n
+    var spans: [Span] = [Span(file=0, lo=0, hi=0)] * n
+    var has_body: [bool] = [false] * n
+    for id in 0..n:
+        names[id] = info.fns[id].name
+    for m in prog.modules:
+        for f in m.fns:
+            if f.id < 0 or f.id >= n:
+                continue
+            names[f.id] = fn_name(m, f)
+            spans[f.id] = f.span.to(f.body.span)
+            if f.is_extern:
+                continue
+            has_body[f.id] = true
+            var sc = Scan(calls=[], effects=[], stops=false)
+            scan_block(f.body, info, ref sc)
+            calls[f.id] = sc.calls
+            direct[f.id] = sc.effects
+            stops[f.id] = sc.stops
+    return Graph(
+        names=names,
+        calls=calls,
+        direct=direct,
+        stops=stops,
+        spans=spans,
+        has_body=has_body
+    )
+
+# Every function reached from `roots` (the roots too), in the order found.
+fn reach(g: Graph, roots: [int]) -> [int]:
+    var seen: [bool] = [false] * len(g.calls)
+    var out: [int] = []
+    var todo: [int] = []
+    for r in roots:
+        if 0 <= r < len(seen) and not seen[r]:
+            seen[r] = true
+            todo.push(r)
+    var i = 0
+    while i < len(todo):
+        let id = todo[i]
+        i += 1
+        out.push(id)
+        for c in g.calls[id]:
+            if 0 <= c < len(seen) and not seen[c]:
+                seen[c] = true
+                todo.push(c)
+    return out
+
+# The shortest chain of calls from `from` to a function that does `kind` itself,
+# and the call that does it: (["pump.dose_for", "pump.log"], "write_file").
+fn chain_to(g: Graph, start: int, kind: str) -> ([str], str):
+    let n = len(g.calls)
+    var prev: [int] = [-2] * n
+    prev[start] = -1
+    var todo = [start]
+    var i = 0
+    while i < len(todo):
+        let id = todo[i]
+        i += 1
+        for k, w in g.direct[id]:
+            if k == kind:
+                var path: [str] = []
+                var at = id
+                while at >= 0:
+                    path.insert(0, g.names[at])
+                    at = prev[at]
+                return (path, w)
+        for c in g.calls[id]:
+            if 0 <= c < n and prev[c] == -2:
+                prev[c] = id
+                todo.push(c)
+    return ([g.names[start]], "?")
+
+# ---------------------------------------------------------------- the result
+
+struct RuleSummary:
+    name: str
+    # the `rule "..." for ...:` line, and the whole block
+    head: Span
+    whole: Span
+    # the functions it covers
+    covers: [int]
+    # extern functions it reaches: trusted C code
+    externs: [str]
+    # "approved", "new" or "changed"
+    approval: str
+    has_body: bool
+
+struct Rules:
+    # there is a RULES.br
+    present: bool
+    dir: str
+    file: int
+    rules: [RuleSummary]
+    # approved rules that are gone
+    removed: [str]
+    # (path, "approved" | "new" | "changed" | "removed"): RULES.br's own
+    # definitions and the files in rules/
+    vocab: [(str, str)]
+    # a RULES.lock exists
+    locked: bool
+    # by function id: the first rule that covers it ("" if none)
+    covered: [str]
+    # by function id: prelude functions that stop the program (`unwrap`)
+    stops: [bool]
+    # by function id
+    spans: [Span]
+    names: [str]
+    diags: [Diag]
+
+fn none_rules(n: int) -> Rules:
+    return Rules(
+        present=false,
+        dir="",
+        file=-1,
+        rules=[],
+        removed=[],
+        vocab=[],
+        locked=false,
+        covered=[""] * n,
+        stops=[false] * n,
+        spans=[],
+        names=[],
+        diags=[]
+    )
+
+fn module_index(prog: Program, name: str) -> int:
+    for mi, m in enumerate(prog.modules):
+        if m.name == name:
+            return mi
+    return -1
+
+# The functions `path` names, from RULES.br: a module (all its functions), a
+# function `m.f`, a method `m.T.f`, or a name RULES.br defines or imports.
+fn resolve(prog: Program, rmi: int, path0: [str]) -> [int]:
+    var path = path0
+    for imp in prog.modules[rmi].imports:
+        if imp.alias != "" and imp.alias == path[0]:
+            var p = imp.path
+            p.extend(path[1:])
+            path = p
+            break
+        if len(path) == 1 and any(nm.0 == path[0] for nm in imp.names):
+            var p = imp.path
+            p.push(path[0])
+            path = p
+            break
+    let whole = module_index(prog, ".".join(path))
+    if whole >= 0:
+        return [f.id for f in prog.modules[whole].fns]
+    let n = len(path)
+    var out: [int] = []
+    if n == 1:
+        for f in prog.modules[rmi].fns:
+            if f.name == path[0] and f.method_of.is_none():
+                out.push(f.id)
+        return out
+    let mi = module_index(prog, ".".join(path[:n - 1]))
+    if mi >= 0:
+        for f in prog.modules[mi].fns:
+            if f.name == path[n - 1] and f.method_of.is_none():
+                out.push(f.id)
+    if len(out) == 0 and n >= 3:
+        let mj = module_index(prog, ".".join(path[:n - 2]))
+        if mj >= 0:
+            for f in prog.modules[mj].fns:
+                if f.name == path[n - 1] and f.method_of == Some(path[n - 2]):
+                    out.push(f.id)
+    return out
+
+fn unknown_target(prog: Program, path: [str], span: Span, what: str) -> Diag:
+    let shown = ".".join(path)
+    var d = diag.error(
+        "E0610",
+        f"`{what}` names `{shown}`, which isn't a module or function"
+    ).label(span, "not found")
+    var names: [str] = []
+    for m in prog.modules:
+        if m.name != PRELUDE and m.name != MODULE:
+            names.push(m.name)
+            for f in m.fns:
+                names.push(fn_name(m, f))
+    match best_match(shown, names):
+        case Some(b):
+            d = d.with_help(f"did you mean `{b}`?")
+        case None:
+            d = d.with_help(
+                "name a module (`pump`), a function (`pump.dose_for`), or a method (`pump.Pump.step`)"
+            )
+    return d
+
+# Everything a build needs to know about the rules. `dir`: where RULES.br is;
+# `main_dir`: the main file's; `lock`: compare with RULES.lock (not for a git
+# revision).
+fn analyze(
+    prog: Program,
+    info: ProgramInfo,
+    sm: SourceMap,
+    dir: str,
+    main_dir: str,
+    lock: bool
+) -> Rules:
+    let n = len(info.fns)
+    var out = none_rules(n)
+    let rmi = module_index(prog, MODULE)
+    # rules anywhere else
+    for m in prog.modules:
+        if m.name == MODULE:
+            continue
+        for t in m.tests:
+            if t.rule.is_some():
+                out.diags.push(
+                    diag.error("E0610", "a `rule` outside RULES.br")
+                    .label(t.span, "this rule is never proven")
+                    .note(
+                        "rules live in RULES.br, next to the main file or at the project root, where their owner reviews them"
+                    )
+                    .with_help("move it to RULES.br")
+                )
+        for imp in m.imports:
+            if len(imp.path) == 1 and imp.path[0] == MODULE:
+                out.diags.push(
+                    diag.error("E0610", "RULES.br can't be imported")
+                    .label(imp.span, "imports the rules")
+                    .with_help(
+                        "rules are proven, never called; put shared definitions in a module under rules/ and import that"
+                    )
+                )
+    if rmi < 0:
+        if dir != "" and lock:
+            lock_without_rules(ref out, dir)
+        return out
+    let here = main_dir if main_dir != "" else "."
+    if here != dir and file_exists(project.join(here, FILE)):
+        out.diags.push(
+            diag.error("E0610", "a second RULES.br, next to the main file")
+            .note(f"the project's rules are in {project.join(dir, FILE)}, and only they are proven")
+            .with_help("move its rules into the project's RULES.br, then delete it")
+        )
+    out.present = true
+    out.dir = dir
+    out.file = prog.modules[rmi].file
+    let g = graph(prog, info)
+    out.spans = g.spans
+    out.names = g.names
+    # prelude functions that stop the program: covered code can't call them
+    let pmi = module_index(prog, PRELUDE)
+    if pmi >= 0:
+        for f in prog.modules[pmi].fns:
+            if 0 <= f.id < n:
+                out.stops[f.id] = g.stops[f.id]
+    let kinds = effect_kinds()
+    var seen: {str: Span} = {}
+    # effect lines are checked once the effects of every function are known
+    var lines: [(int, int)] = []
+    for ti, t in enumerate(prog.modules[rmi].tests):
+        match t.rule:
+            case Some(r):
+                if r.name.strip() == "" or "\n" in r.name or r.name != r.name.strip():
+                    out.diags.push(
+                        diag.error(
+                            "E0610",
+                            "a rule needs a one-line name that says what it promises"
+                        )
+                        .label(t.span, "this name")
+                        .with_help("e.g. `rule \"a withdrawal never overdraws\" for a: Account:`")
+                    )
+                match seen.get(r.name):
+                    case Some(first):
+                        out.diags.push(
+                            diag.error("E0610", f"two rules are named \"{r.name}\"")
+                            .label(t.span, "the second")
+                            .label(first, "the first")
+                            .with_help("RULES.lock tells rules apart by name: give each its own")
+                        )
+                    case None:
+                        seen[r.name] = t.span
+                let empty = all(is_pass(s) for s in t.body.stmts)
+                if empty and len(r.effects) == 0 and len(r.proven) == 0:
+                    out.diags.push(
+                        diag.error("E0610", f"rule \"{r.name}\" promises nothing")
+                        .label(t.span, "an empty rule")
+                        .with_help(
+                            "say what must hold with `prove`, what a module may do with `effects`, or what can't crash with `proven`"
+                        )
+                    )
+                # what it covers: what its body calls, and its `proven` lines
+                var sc = Scan(calls=[], effects=[], stops=false)
+                scan_block(t.body, info, ref sc)
+                var roots = sc.calls
+                for path, span in r.proven:
+                    let ids = resolve(prog, rmi, path)
+                    if len(ids) == 0:
+                        out.diags.push(unknown_target(prog, path, span, "proven"))
+                    roots.extend(ids)
+                for li, e in enumerate(r.effects):
+                    let ids = resolve(prog, rmi, e.module)
+                    if len(ids) == 0:
+                        out.diags.push(unknown_target(prog, e.module, e.span, "effects"))
+                    for a in e.allowed:
+                        if a == "none":
+                            if len(e.allowed) > 1:
+                                out.diags.push(
+                                    diag.error(
+                                        "E0610",
+                                        "`none` can't be combined with other effects"
+                                    )
+                                    .label(e.span, "here")
+                                    .with_help("write `none`, or list what the module may do")
+                                )
+                        elif a not in kinds:
+                            var d = diag.error(
+                                "E0610",
+                                f"`{a}` isn't an effect"
+                            ).label(e.span, "here")
+                            match best_match(a, kinds):
+                                case Some(b):
+                                    d = d.with_help(f"did you mean `{b}`?")
+                                case None:
+                                    d = d.with_help(
+                                        "the effects are " + ", ".join(kinds) + ", or `none`"
+                                    )
+                            out.diags.push(d)
+                    lines.push((ti, li))
+                let covers = reach(g, roots)
+                var externs: [str] = []
+                for id in covers:
+                    if 0 <= id < n:
+                        if info.fns[id].is_extern:
+                            externs.push(g.names[id])
+                        elif out.covered[id] == "":
+                            out.covered[id] = r.name
+                out.rules.push(
+                    RuleSummary(
+                        name=r.name,
+                        head=t.span,
+                        whole=r.whole,
+                        covers=covers,
+                        externs=externs,
+                        approval="new",
+                        has_body=not empty
+                    )
+                )
+            case None:
+                pass
+    if len(lines) > 0:
+        out.diags.extend(check_effects(prog, info, g, rmi, lines))
+    if lock:
+        lock_check(ref out, prog, sm)
+    return out
+
+fn check_effects(
+    prog: Program,
+    info: ProgramInfo,
+    g: Graph,
+    rmi: int,
+    lines: [(int, int)]
+) -> [Diag]:
+    let n = len(g.calls)
+    # the kinds of effect each function has, itself or through what it calls
+    var eff: [[str]] = [[]] * n
+    for id in 0..n:
+        eff[id] = [k for k, _ in g.direct[id]]
+    var changed = true
+    while changed:
+        changed = false
+        for id in 0..n:
+            for c in g.calls[id]:
+                if c < 0 or c >= n or c == id:
+                    continue
+                let ks = eff[c]
+                for k in ks:
+                    if k not in eff[id]:
+                        eff[id].push(k)
+                        changed = true
+    var diags: [Diag] = []
+    for ti, li in lines:
+        let t = prog.modules[rmi].tests[ti]
+        let r = t.rule.unwrap_or(empty_info())
+        let e = r.effects[li]
+        let ids = resolve(prog, rmi, e.module)
+        var reported: [str] = []
+        for id in ids:
+            if id < 0 or id >= n:
+                continue
+            for k in eff[id]:
+                if k in e.allowed or k in reported:
+                    continue
+                reported.push(k)
+                let (path, what) = chain_to(g, id, k)
+                let shown = ".".join(e.module)
+                var d = diag.error(
+                    "E0612",
+                    f"`{shown}` uses {effect_words(k)}, which rule \"{r.name}\" doesn't allow"
+                ).label(e.span, "this rule")
+                let at = path[len(path) - 1]
+                if len(path) > 1:
+                    d = d.note(f"`{path[0]}` calls `{what}` through " + " -> ".join(path[1:]))
+                else:
+                    d = d.note(f"`{at}` calls `{what}`")
+                d = d.with_help(
+                    f"move the call to `{what}` out of `{shown}` (pass its result in as a parameter), or ask the rule's owner to allow `{k}`"
+                )
+                # point at the call itself
+                for fid in 0..n:
+                    if g.names[fid] == at and g.has_body[fid]:
+                        d = d.label(g.spans[fid], f"`{what}` is called in here")
+                        break
+                diags.push(d)
+    return diags
+
+fn empty_info() -> RuleInfo:
+    return RuleInfo(name="", effects=[], proven=[], whole=Span(file=0, lo=0, hi=0))
+
+# ---------------------------------------------------------------- RULES.lock
+
+# 64-bit FNV-1a, as hex.
+fn fnv_hex(data: str) -> str:
+    let mask: u128 = 18446744073709551615
+    let prime: u128 = 1099511628211
+    var h: u128 = 14695981039346656037
+    for b in data.bytes():
+        h = h ^ u128(b)
+        h = (h * prime) & mask
+    let v = u64(h)
+    return f"{v:016x}"
+
+# A hash of what `text` says, ignoring comments, blank lines and spacing.
+fn norm_hash(text: str) -> str:
+    let (toks, _) = lexer.lex(text, 0, 0, false, true)
+    var parts: [str] = []
+    for t in toks:
+        match t.tok:
+            case Tok.Newline:
+                parts.push("\n")
+            case Tok.Indent:
+                parts.push("{")
+            case Tok.Dedent:
+                parts.push("}")
+            case Tok.Eof:
+                pass
+            case _:
+                parts.push(text[t.lo:t.hi])
+    return fnv_hex(" ".join(parts))
+
+struct Entry:
+    # "rule" or "file"
+    kind: str
+    hash: str
+    # the rule's name, or the file's path from the rules directory
+    name: str
+
+# What RULES.br says (`src`, parsed as `m`) and its vocabulary in `dir/rules/`.
+fn entries(src: str, m: Module, dir: str) -> [Entry]:
+    var out: [Entry] = []
+    var cuts: [(int, int)] = []
+    for t in m.tests:
+        match t.rule:
+            case Some(r):
+                out.push(
+                    Entry(kind="rule", hash=norm_hash(src[r.whole.lo:r.whole.hi]), name=r.name)
+                )
+                cuts.push((r.whole.lo, r.whole.hi))
+            case None:
+                pass
+    # RULES.br without its rules: its imports and definitions
+    var rest = ""
+    var at = 0
+    for lo, hi in cuts:
+        if lo >= at:
+            rest += src[at:lo]
+            at = hi
+    rest += src[at:]
+    out.push(Entry(kind="file", hash=norm_hash(rest), name=FILE))
+    for rel in vocab_files(dir):
+        match read_file(project.join(dir, rel)):
+            case Ok(text):
+                out.push(Entry(kind="file", hash=norm_hash(text), name=rel))
+            case Err(_):
+                pass
+    return out
+
+# The `.br` files under `dir/rules/`, as `rules/a.br`, sorted.
+fn vocab_files(dir: str) -> [str]:
+    var out: [str] = []
+    var todo = [VOCAB]
+    var i = 0
+    while i < len(todo):
+        let rel = todo[i]
+        i += 1
+        match os.list_dir(project.join(dir, rel)):
+            case Ok(names):
+                for nm in names:
+                    let r = rel + "/" + nm
+                    let p = project.join(dir, r)
+                    if os.is_dir(p):
+                        todo.push(r)
+                    elif nm.ends_with(".br"):
+                        out.push(r)
+            case Err(_):
+                pass
+    out.sort()
+    return out
+
+fn parse_lock(text: str) -> [Entry]:
+    var out: [Entry] = []
+    for line in text.lines():
+        let l = line.strip()
+        if l == "" or l.starts_with("#"):
+            continue
+        match l.find(" "):
+            case Some(a):
+                let kind = l[:a]
+                let more = l[a + 1:]
+                match more.find(" "):
+                    case Some(b):
+                        if kind == "rule" or kind == "file":
+                            out.push(Entry(kind=kind, hash=more[:b], name=more[b + 1:]))
+                    case None:
+                        pass
+            case None:
+                pass
+    return out
+
+fn lock_text(es: [Entry]) -> str:
+    var out = "# RULES.lock: the rules and vocabulary an owner approved, written by\n"
+    out += "# `brine rules approve`. Every build compares RULES.br and rules/ with it.\n"
+    out += "# Keep RULES.br, rules/ and this file under CODEOWNERS.\n"
+    for e in es:
+        out += f"{e.kind} {e.hash} {e.name}\n"
+    return out
+
+fn find_entry(es: [Entry], kind: str, name: str) -> Option[Entry]:
+    for e in es:
+        if e.kind == kind and e.name == name:
+            return Some(e)
+    return None
+
+# Compare with RULES.lock: what's approved, new, changed and removed.
+# RULES.lock without RULES.br: every approved rule is gone.
+fn lock_without_rules(ref out: Rules, dir: str):
+    var approved: [Entry] = []
+    match read_file(project.join(dir, LOCK)):
+        case Ok(t):
+            approved = parse_lock(t)
+        case Err(_):
+            return
+    for a in approved:
+        if a.kind == "rule":
+            out.removed.push(a.name)
+    if len(out.removed) == 0:
+        return
+    let n = len(out.removed)
+    let what = "1 rule" if n == 1 else f"{n} rules"
+    out.diags.push(
+        diag.error("E0613", f"RULES.br is gone, and RULES.lock approves {what} it had")
+        .note(
+            f"{project.join(dir, LOCK)} records what an owner approved; without RULES.br none of it is proven"
+        )
+        .with_help(
+            "restore RULES.br; if its owner wants the rules gone, they delete RULES.lock too"
+        )
+    )
+
+fn lock_check(ref out: Rules, prog: Program, sm: SourceMap):
+    let rmi = module_index(prog, MODULE)
+    let src = sm.file(out.file).text
+    let now = entries(src, prog.modules[rmi], out.dir)
+    var approved: [Entry] = []
+    match read_file(project.join(out.dir, LOCK)):
+        case Ok(t):
+            approved = parse_lock(t)
+            out.locked = true
+        case Err(_):
+            pass
+    let top = Span(file=out.file, lo=0, hi=0)
+    let fix = "if the rules' owner agrees with the change, they run `brine rules approve` and commit RULES.lock; otherwise undo it"
+    let why = "RULES.lock records what an owner approved; CODEOWNERS on RULES.br, rules/ and RULES.lock keeps anyone else from changing them"
+    var fresh: [str] = []
+    for ri in 0..len(out.rules):
+        let name = out.rules[ri].name
+        let h = find_entry(now, "rule", name)
+        match find_entry(approved, "rule", name):
+            case Some(a):
+                if h.is_some() and h.unwrap().hash == a.hash:
+                    out.rules[ri].approval = "approved"
+                else:
+                    out.rules[ri].approval = "changed"
+                    out.diags.push(
+                        diag.error("E0613", f"rule \"{name}\" changed since it was approved")
+                        .label(out.rules[ri].head, "not the approved version")
+                        .note(why)
+                        .with_help(fix)
+                    )
+            case None:
+                fresh.push(name)
+    for a in approved:
+        if a.kind == "rule" and find_entry(now, "rule", a.name).is_none():
+            out.removed.push(a.name)
+            out.diags.push(
+                diag.error("E0613", f"approved rule \"{a.name}\" is gone from RULES.br")
+                .label(top, "RULES.br")
+                .note(why)
+                .with_help(fix)
+            )
+    for e in now:
+        if e.kind != "file":
+            continue
+        match find_entry(approved, "file", e.name):
+            case Some(a):
+                if a.hash == e.hash:
+                    out.vocab.push((e.name, "approved"))
+                else:
+                    out.vocab.push((e.name, "changed"))
+                    var at = top
+                    let mi = module_index(prog, e.name.replace("/", ".").replace(".br", ""))
+                    if mi >= 0:
+                        at = Span(file=prog.modules[mi].file, lo=0, hi=0)
+                    let what = (
+                        "RULES.br's imports and definitions changed"
+                        if e.name == FILE
+                        else f"`{e.name}` changed"
+                    )
+                    out.diags.push(
+                        diag.error("E0613", f"{what} since the rules were approved")
+                        .label(at, "the rules' vocabulary")
+                        .note(
+                            "what rules say depends on these definitions, so they're locked with the rules"
+                        )
+                        .note(why)
+                        .with_help(fix)
+                    )
+            case None:
+                out.vocab.push((e.name, "new"))
+    for a in approved:
+        if a.kind == "file" and find_entry(now, "file", a.name).is_none():
+            out.vocab.push((a.name, "removed"))
+            out.diags.push(
+                diag.error("E0613", f"`{a.name}` is gone since the rules were approved")
+                .label(top, "RULES.br")
+                .note(why)
+                .with_help(fix)
+            )
+    if len(fresh) > 0:
+        let ws = len(fresh)
+        let s = "" if ws == 1 else "s"
+        let list = ", ".join([f"\"{x}\"" for x in fresh])
+        out.diags.push(
+            diag.warning("W0003", f"{ws} rule{s} not approved yet: {list}")
+            .label(top, "RULES.br")
+            .note(
+                "new rules are proven like the others; approving them records that their owner agrees with them"
+            )
+            .with_help(
+                "once the owner has read them (`brine rules --explain`), they run `brine rules approve`"
+            )
+        )
+
+# ---------------------------------------------------------------- verdicts
+
+fn inside(s: Span, outer: Span) -> bool:
+    return s.file == outer.file and outer.lo <= s.lo and s.hi <= outer.hi
+
+# For each rule, the errors that keep it from being proven (indices into `ds`).
+fn problems(rl: Rules, ds: [Diag]) -> [[int]]:
+    var out: [[int]] = [[]] * len(rl.rules)
+    for di, d in enumerate(ds):
+        if not d.is_error() or d.code == "E0613" or len(d.labels) == 0:
+            continue
+        let s = d.labels[0].span
+        for ri, r in enumerate(rl.rules):
+            var hit = inside(s, r.whole)
+            if not hit:
+                for id in r.covers:
+                    if 0 <= id < len(rl.spans) and inside(s, rl.spans[id]):
+                        hit = true
+                        break
+            if hit:
+                out[ri].push(di)
+    return out
+
+# ---------------------------------------------------------------- in plain English
+
+struct English:
+    src: str
+    # names that are the owner's: defined in RULES.br or imported from rules/
+    vocab: [str]
+    out: [str]
+
+    fn line(ref self, depth: int, s: str):
+        self.out.push("   " + "  ".repeat(depth) + s)
+
+    fn text(self, sp: Span) -> str:
+        if 0 <= sp.lo <= sp.hi <= len(self.src):
+            return self.src[sp.lo:sp.hi]
+        return "?"
+
+    fn ty(self, t: TypeExpr) -> str:
+        match t:
+            case TypeExpr.Array(el, _):
+                return "list of " + self.ty(el)
+            case TypeExpr.Map(k, v, _):
+                return "map from " + self.ty(k) + " to " + self.ty(v)
+            case _:
+                return self.text(t.span())
+
+    # an operand of a comparison: arithmetic reads fine without parentheses
+    fn wrap(self, e: Expr) -> str:
+        match e.kind:
+            case ExprKind.Binary(op, _, _):
+                if op == BinOp.And or op == BinOp.Or:
+                    return "(" + self.expr(e) + ")"
+                return self.expr(e)
+            case ExprKind.Compare(_, _) | ExprKind.IfElse(_, _, _):
+                return "(" + self.expr(e) + ")"
+            case _:
+                return self.expr(e)
+
+    # an operand of `op`: in parentheses when it binds less tightly
+    fn operand(self, e: Expr, op: BinOp, right: bool) -> str:
+        match e.kind:
+            case ExprKind.Binary(o, _, _):
+                let p = prec(o)
+                let q = prec(op)
+                let assoc = o == op and (
+                    op == BinOp.Add or op == BinOp.Mul or op == BinOp.And or op == BinOp.Or
+                )
+                if p < q or (right and p == q and not assoc):
+                    return "(" + self.expr(e) + ")"
+                return self.expr(e)
+            case ExprKind.Compare(_, _):
+                if op == BinOp.And or op == BinOp.Or:
+                    return self.expr(e)
+                return "(" + self.expr(e) + ")"
+            case ExprKind.IfElse(_, _, _):
+                return "(" + self.expr(e) + ")"
+            case _:
+                return self.expr(e)
+
+    fn cmp_words(self, op: CmpOp) -> str:
+        match op:
+            case CmpOp.Eq:
+                return "is"
+            case CmpOp.Ne:
+                return "is not"
+            case CmpOp.Lt:
+                return "is less than"
+            case CmpOp.Le:
+                return "is at most"
+            case CmpOp.Gt:
+                return "is more than"
+            case CmpOp.Ge:
+                return "is at least"
+
+    fn flip(self, op: CmpOp) -> CmpOp:
+        match op:
+            case CmpOp.Eq:
+                return CmpOp.Ne
+            case CmpOp.Ne:
+                return CmpOp.Eq
+            case CmpOp.Lt:
+                return CmpOp.Ge
+            case CmpOp.Le:
+                return CmpOp.Gt
+            case CmpOp.Gt:
+                return CmpOp.Le
+            case CmpOp.Ge:
+                return CmpOp.Lt
+
+    fn compare(self, first: Expr, rest: [(CmpOp, Expr)], neg: bool) -> str:
+        # `lo <= x <= hi`: x is between them
+        if len(rest) == 2 and not neg:
+            let (o1, mid) = rest[0]
+            let (o2, hi) = rest[1]
+            if (o1 == CmpOp.Le or o1 == CmpOp.Lt) and (o2 == CmpOp.Le or o2 == CmpOp.Lt):
+                let a = "at least" if o1 == CmpOp.Le else "more than"
+                let b = "at most" if o2 == CmpOp.Le else "less than"
+                return f"{self.wrap(mid)} is {a} {self.wrap(first)} and {b} {self.wrap(hi)}"
+        var parts: [str] = []
+        var left = first
+        for op, r in rest:
+            let o = self.flip(op) if neg and len(rest) == 1 else op
+            parts.push(f"{self.wrap(left)} {self.cmp_words(o)} {self.wrap(r)}")
+            left = r
+        let s = " and ".join(parts)
+        if neg and len(rest) > 1:
+            return f"not ({s})"
+        return s
+
+    fn args(self, xs: [Arg]) -> str:
+        return ", ".join([self.expr(a.expr) for a in xs])
+
+    fn expr(self, e: Expr) -> str:
+        match e.kind:
+            case ExprKind.Ident(n):
+                return n
+            case ExprKind.Bool(b):
+                return "true" if b else "false"
+            case ExprKind.Field(x, name, _):
+                return self.expr(x) + "." + name
+            case ExprKind.Index(x, i):
+                return self.expr(x) + "[" + self.expr(i) + "]"
+            case ExprKind.Compare(first, rest):
+                return self.compare(first, rest, false)
+            case ExprKind.Unary(op, x):
+                match op:
+                    case UnOp.Not:
+                        match x.kind:
+                            case ExprKind.Compare(first, rest):
+                                return self.compare(first, rest, true)
+                            case ExprKind.Contains(item, coll, neg):
+                                let w = "is in" if neg else "is not in"
+                                return f"{self.wrap(item)} {w} {self.wrap(coll)}"
+                            case ExprKind.Binary(_, _, _):
+                                return f"not ({self.expr(x)})"
+                            case _:
+                                return f"{self.expr(x)} is false"
+                    case UnOp.Neg:
+                        return "-" + self.wrap(x)
+                    case UnOp.BitNot:
+                        return "~" + self.wrap(x)
+            case ExprKind.Binary(op, l, r):
+                var w = op.sym()
+                match op:
+                    case BinOp.Add:
+                        w = "plus"
+                    case BinOp.Sub:
+                        w = "minus"
+                    case BinOp.Mul:
+                        w = "times"
+                    case BinOp.Div:
+                        w = "divided by"
+                    case BinOp.Mod:
+                        w = "modulo"
+                    case _:
+                        pass
+                return f"{self.operand(l, op, false)} {w} {self.operand(r, op, true)}"
+            case ExprKind.Contains(item, coll, neg):
+                let w = "is not in" if neg else "is in"
+                return f"{self.wrap(item)} {w} {self.wrap(coll)}"
+            case ExprKind.IfElse(c, a, b):
+                return f"{self.wrap(a)} if {self.expr(c)}, otherwise {self.wrap(b)}"
+            case ExprKind.Call(callee, xs):
+                match callee.kind:
+                    case ExprKind.Ident(n):
+                        if n == "len" and len(xs) == 1:
+                            return "the length of " + self.wrap(xs[0].expr)
+                        if n == "abs" and len(xs) == 1:
+                            return "the absolute value of " + self.wrap(xs[0].expr)
+                        if (n == "min" or n == "max") and len(xs) >= 2:
+                            let which = (
+                                ("smaller" if n == "min" else "larger")
+                                if len(xs) == 2
+                                else ("smallest" if n == "min" else "largest")
+                            )
+                            let names = [self.wrap(a.expr) for a in xs]
+                            let most = ", ".join(names[:len(names) - 1])
+                            return f"the {which} of {most} and {names[len(names) - 1]}"
+                        return f"{n}({self.args(xs)})"
+                    case _:
+                        return self.text(e.span)
+            case ExprKind.MethodCall(recv, name, _, xs):
+                return f"{self.expr(recv)}.{name}({self.args(xs)})"
+            case _:
+                return self.text(e.span)
+
+    fn block(ref self, depth: int, b: Block):
+        for s in b.stmts:
+            self.stmt(depth, s)
+
+    fn stmt(ref self, depth: int, s: Stmt):
+        match s.kind:
+            case StmtKind.Let(_, pat, _, init, _):
+                var name = ""
+                match pat:
+                    case LetPat.Name(n, _):
+                        name = n
+                    case LetPat.Tuple(ns):
+                        name = "(" + ", ".join([x.0 for x in ns]) + ")"
+                self.line(depth, f"let {name} be {self.expr(init)};")
+            case StmtKind.Prove(e):
+                self.line(depth, f"then {self.expr(e)}.")
+            case StmtKind.If(branches, els):
+                for bi, br in enumerate(branches):
+                    let (c, body) = br
+                    let w = "if" if bi == 0 else "otherwise, if"
+                    self.line(depth, f"{w} {self.expr(c)}:")
+                    self.block(depth + 1, body)
+                match els:
+                    case Some(b):
+                        self.line(depth, "otherwise:")
+                        self.block(depth + 1, b)
+                    case None:
+                        pass
+            case StmtKind.Match(scrut, cases):
+                for c in cases:
+                    self.line(depth, f"when {self.expr(scrut)} is {self.text(c.pat.span)}:")
+                    self.block(depth + 1, c.body)
+            case StmtKind.Pass:
+                pass
+            case StmtKind.For(name, _, _, iter, _, body, _):
+                self.line(depth, f"for each {name} in {self.expr(iter)}:")
+                self.block(depth + 1, body)
+            case _:
+                let t = self.text(s.span).split("\n")[0]
+                self.line(depth, f"it runs `{t}`;")
+
+fn prec(op: BinOp) -> int:
+    match op:
+        case BinOp.Or:
+            return 1
+        case BinOp.And:
+            return 2
+        case BinOp.BitOr:
+            return 3
+        case BinOp.BitXor:
+            return 4
+        case BinOp.BitAnd:
+            return 5
+        case BinOp.Shl | BinOp.Shr:
+            return 6
+        case BinOp.Add | BinOp.Sub:
+            return 7
+        case _:
+            return 8
+
+fn is_pass(s: Stmt) -> bool:
+    match s.kind:
+        case StmtKind.Pass:
+            return true
+        case _:
+            return false
+
+fn article(s: str) -> str:
+    if len(s) > 0 and "aeiouAEIOU".contains(s[0]):
+        return "an " + s
+    return "a " + s
+
+# Names RULES.br's rules may use to judge: its own definitions and what it
+# imports from rules/.
+fn vocab_names(m: Module) -> [str]:
+    var out: [str] = []
+    for f in m.fns:
+        out.push(f.name)
+    for s in m.structs:
+        out.push(s.name)
+    for c in m.consts:
+        out.push(c.name)
+    for imp in m.imports:
+        if len(imp.path) > 0 and imp.path[0] == VOCAB:
+            for nm in imp.names:
+                out.push(nm.0)
+            if imp.alias != "":
+                out.push(imp.alias)
+    return out
+
+# Every rule of `m` (RULES.br, parsed from `src`), rendered mechanically.
+fn explain(src: str, m: Module) -> [str]:
+    var en = English(src=src, vocab=vocab_names(m), out=[])
+    var k = 0
+    for t in m.tests:
+        match t.rule:
+            case Some(r):
+                k += 1
+                en.out.push(f"{k}. {r.name}")
+                var head = ""
+                if len(t.params) > 0:
+                    var ps: [str] = []
+                    for p in t.params:
+                        match p.ty:
+                            case Some(ty):
+                                ps.push(f"every {p.name} ({article(en.ty(ty))})")
+                            case None:
+                                ps.push(f"every {p.name}")
+                    head = "For " + " and ".join(ps)
+                    if len(t.requires) > 0:
+                        head += " where " + " and ".join([en.expr(x) for x in t.requires])
+                    head += ":"
+                elif len(t.requires) > 0:
+                    head = "Whenever " + " and ".join([en.expr(x) for x in t.requires]) + ":"
+                let has_body = not all(is_pass(s) for s in t.body.stmts)
+                if has_body:
+                    en.line(0, head if head != "" else "Always:")
+                    en.block(1, t.body)
+                    en.line(1, "Nothing this runs can stop the program.")
+                for e in r.effects:
+                    let shown = ".".join(e.module)
+                    if e.allowed == ["none"]:
+                        en.line(
+                            0,
+                            f"{shown}, and everything it calls, never uses files, the console, other processes, the clock, the environment, the network, `world` messages or extern C code."
+                        )
+                    else:
+                        let ws = [effect_words(a) for a in e.allowed]
+                        en.line(
+                            0,
+                            f"{shown}, and everything it calls, uses nothing but "
+                            + ", ".join(ws)
+                            + "."
+                        )
+                for path, _ in r.proven:
+                    let shown = ".".join(path)
+                    en.line(
+                        0,
+                        f"Nothing {shown} does, or anything it calls, can stop the program, for any input."
+                    )
+                # what the rule judges with, and what it judges
+                var code: [str] = []
+                var sc_names: [str] = []
+                collect_calls(t.body, ref sc_names)
+                for nm in sc_names:
+                    let base = nm.split(".")[len(nm.split(".")) - 1]
+                    if (
+                        base not in en.vocab
+                        and nm not in code
+                        and nm not in ["len", "abs", "min", "max"]
+                    ):
+                        code.push(nm)
+                if len(code) > 0:
+                    en.line(0, "Code it checks (the agent's): " + ", ".join(code) + ".")
+                en.out.push("")
+            case None:
+                pass
+    return en.out
+
+fn collect_calls(b: Block, ref out: [str]):
+    for s in b.stmts:
+        for e in stmt_exprs(s):
+            collect_expr(e, ref out)
+        for sb in stmt_blocks(s):
+            collect_calls(sb, ref out)
+
+fn collect_expr(e: Expr, ref out: [str]):
+    match e.kind:
+        case ExprKind.Call(callee, _):
+            match callee.kind:
+                case ExprKind.Ident(n):
+                    if n not in out:
+                        out.push(n)
+                case ExprKind.Field(x, name, _):
+                    match x.kind:
+                        case ExprKind.Ident(r):
+                            let q = r + "." + name
+                            if q not in out:
+                                out.push(q)
+                        case _:
+                            pass
+                case _:
+                    pass
+        case _:
+            pass
+    for c in children(e):
+        collect_expr(c, ref out)
