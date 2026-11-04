@@ -151,7 +151,7 @@ generated C, the bootstrap seed (see [bootstrap/README.md](bootstrap/README.md))
 git clone https://github.com/brinelang/brine && cd brine
 # Windows: brine.exe and -lws2_32 -lshell32 instead of -lm -lpthread -ldl
 cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread -ldl
-./brine build compiler/main.br -o brine2   # brine rebuilding itself
+./brine build compiler/main.br -o brine    # brine rebuilding itself
 ```
 
 ## A quick tour
@@ -551,7 +551,7 @@ laid out, how to build and test the compiler, and the commit conventions;
 full test suite runs with:
 
 ```sh
-./brine2 test tests/integration.br
+./brine test tests/integration.br
 ```
 
 ## License

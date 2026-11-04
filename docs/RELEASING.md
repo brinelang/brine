@@ -37,8 +37,8 @@ built or uploaded by hand.
      bottom;
    - rebuild the compiler with itself and refresh the seed:
      ```sh
-     ./brine build compiler/main.br -o brine2
-     ./brine2 emit-c --release compiler/main.br -o bootstrap/brinec.c
+     ./brine build compiler/main.br -o brine
+     ./brine emit-c --release compiler/main.br -o bootstrap/brinec.c
      ```
    - check that `sh scripts/release-notes.sh X.Y.Z` prints the notes.
 3. **Open a pull request** for it and merge it (merge commit) when CI is green.

@@ -17,9 +17,9 @@ Run these from the repository root. The result is the full `brine` tool
 After changing the compiler, rebuild it with itself and refresh the seed:
 
 ```sh
-./brine build --release compiler/main.br -o brine2
-./brine2 emit-c --release compiler/main.br -o bootstrap/brinec.c
+./brine build --release compiler/main.br -o brine
+./brine emit-c --release compiler/main.br -o bootstrap/brinec.c
 ```
 
-A correct compiler reaches a fixed point: building again with `brine2`
+A correct compiler reaches a fixed point: rebuilding `brine` with itself again
 gives the same `brinec.c`.
