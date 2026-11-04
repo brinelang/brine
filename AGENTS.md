@@ -22,11 +22,12 @@ the docs and the tests. Read `docs/DESIGN.md` for the why and `docs/QUICKREF.md`
 ```sh
 # once, from the seed (Windows: brine.exe and -lws2_32 -lshell32 instead of -lm -lpthread -ldl)
 cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread -ldl
-# after changing the compiler
-./brine build compiler/main.br -o brine2
+# after changing the compiler: brine rebuilds itself in place
+./brine build compiler/main.br -o brine
 ```
-Keep a known-good `brine` around while you work: if your change breaks the compiler,
-you need the old one to build the fix.
+If a change breaks the compiler, build `brine` again from the seed, or from the
+last commit that worked. (On Windows the replaced one stays as `brine.exe.old`
+until the next build, since a running program can't be deleted there.)
 
 A new builtin that the compiler itself uses needs two steps: build the compiler with
 the builtin added but not yet used (with the old `brine`), then use it and rebuild
@@ -34,13 +35,13 @@ with that new compiler.
 
 ## Before every commit
 ```sh
-./brine2 fmt --check compiler tests/integration.br tests/update_syntax.br
-./brine2 test tests/integration.br        # from the repository root; ~30 s
+./brine fmt --check compiler tests/integration.br tests/update_syntax.br
+./brine test tests/integration.br        # from the repository root; ~30 s
 ```
 `tests/integration.br` also runs the prover and diagnostics unit tests and checks
 that the compiler rebuilds itself to a fixed point. If you changed the lexer or
 parser on purpose, regenerate `tests/syntax/` with
-`./brine2 run tests/update_syntax.br -- ./brine2` and review the diff.
+`./brine run tests/update_syntax.br -- ./brine` and review the diff.
 
 ## Commits: Conventional Commits
 `type(scope): summary` in the imperative, lower case, no final period, under ~72
@@ -81,7 +82,7 @@ caches, generated C, `target/`). The exception is `bootstrap/brinec.c`: it can o
 be produced by a working brine, so it's the seed. Refresh it in release commits, or
 when the compiler starts using a feature the current seed can't compile:
 ```sh
-./brine2 emit-c --release compiler/main.br -o bootstrap/brinec.c
+./brine emit-c --release compiler/main.br -o bootstrap/brinec.c
 ```
 then check that the seed builds a compiler that passes the tests.
 
