@@ -5,6 +5,36 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) 
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-04
+### Added
+- `RULES.br`: rules that say what the whole program must do, written and
+  approved by its owner, and proven on every `build`, `run`, `test` and `check`.
+  An unproven rule means nothing is built. A rule is a block like a `test`:
+  `rule "name" for x: T, ...:` with `requires`, `let` and `prove` lines, over
+  every input of those types. Agents write the code that keeps the rules;
+  people decide what they say.
+- Code a rule covers (everything its body and its `proven m.f` lines call) can't
+  stop the program. Every runtime check there must be proven away (E0607), and
+  it can't reach `panic`, `exit` or `unwrap()` (E0611), so a proof can't pass by
+  stopping the program instead.
+- `effects m: none` (or `console`, `files`, `clock`, `network`, ...) in a rule
+  decides which effects module `m` can have, over everything it calls (E0612).
+- `brine rules approve` records the owner's approval in `RULES.lock`: a hash of
+  each rule, of RULES.br's own definitions and of each file in `rules/`, where
+  definitions the rules judge by live. An approved rule or file that changes or
+  goes away stops the build (E0613); a new rule only warns (W0003). Comments
+  and layout don't count as changes.
+- `brine rules` lists every rule as proven or not and approved or not (`--json`
+  for tools). `--explain` renders the rules in plain English, mechanically,
+  so the owner can check they say what was meant. `--receipt` writes a summary
+  for a pull request, and `--base <rev>` adds what was approved since then.
+- `brine new` and `brine init` write a starter `RULES.br`, approved, and the
+  project's AGENTS.md tells agents to fix the code when a rule fails, never the
+  rule.
+- E0610 reports a malformed rule: outside RULES.br, unnamed or named twice,
+  promising nothing, naming an unknown function or effect, a second RULES.br
+  next to the main file, or an import of RULES.br.
+
 ## [0.7.0] - 2026-10-29
 ### Added
 - `brine spec-diff [--base <rev>]` compares every `requires`, `ensures` and
@@ -329,7 +359,8 @@ The first version.
 - The compiler is written in brine and builds itself; `bootstrap/brinec.c` builds it
   from scratch with only a C compiler.
 
-[Unreleased]: https://github.com/brinelang/brine/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/brinelang/brine/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/brinelang/brine/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/brinelang/brine/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/brinelang/brine/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/brinelang/brine/compare/v0.5.0...v0.5.1
