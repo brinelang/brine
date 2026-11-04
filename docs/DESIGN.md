@@ -125,6 +125,40 @@ reaches has exact values.
 back to runtime checks in some "development" mode? Current answer: **no** — that would
 be a rule that can be broken. Use `assert` explicitly instead.
 
+### 2.2a Rules: RULES.br ("the agent can't write wrong software")
+
+Contracts on functions say what each function does; nothing says what the
+*program* must do, and the agent that writes the code also writes its contracts.
+`RULES.br` is that missing layer: a file the program's owner writes (or asks for
+in English and checks with `brine rules --explain`), and that every build proves.
+Right and wrong are what it says; the agent's job is code that keeps it.
+
+* `rule "name" [for x: T, ...]:` is a block whose inputs are any values of their
+  types that meet its `requires`; its body is checked and proven like a function
+  (`prove` lines, `let`s, calls into the program). Rules are never run.
+* `effects m: k, ...` decides, over the whole call graph below module `m`, which
+  effects it can have (`files`, `console`, `processes`, `clock`, `environment`,
+  `network`, `world`, `extern`, or `none`).
+* `proven m.f` makes `f` (and everything it calls) part of what the rules cover.
+* **Covered code can't stop the program.** A rule proves what holds when its code
+  returns; an `assert` or `unwrap()` there would let a proof pass by stopping the
+  program instead. So everything a rule reaches must have every runtime check
+  proven away (E0607) and can't reach `panic`, `exit` or a stopping prelude call
+  (E0611), unless the prover shows that line can't be reached.
+* **Approval.** `brine rules approve` writes RULES.lock: a hash (of the tokens, so
+  comments and layout don't count) of each rule, of RULES.br's other definitions,
+  and of each file in `rules/`, where definitions that decide what's right live.
+  An approved rule or file that changed stops the build (E0613); a new one warns
+  (W0003). The lock is what a CODEOWNERS entry protects; agents never run approve.
+  Any change counts, even one that makes a rule stronger: deciding that a change
+  only strengthens a rule needs spec-diff over whole rule bodies (planned).
+* What it can't promise: termination (a rule holds whenever its code returns),
+  memory and stack exhaustion, and `extern fn` C code, which is trusted.
+
+**[DECISION]** New rules only warn (W0003), even with no lock yet, so a project
+builds while its owner is still writing rules. Approval protects what was agreed,
+not what is being drafted.
+
 ### 2.3 Parallelism
 
 | Construct | Meaning |
@@ -362,12 +396,13 @@ from what brine knows that C doesn't (no aliasing, proven-away checks, race-free
 
 | Command | Purpose |
 |---|---|
-| `brine new <name>` / `brine init` | Create a project (`brine.toml`, `src/main.br`, `AGENTS.md`, `README.md`, `.gitignore`). |
+| `brine new <name>` / `brine init` | Create a project (`brine.toml`, `src/main.br`, `AGENTS.md`, `README.md`, `.gitignore`, a starter `RULES.br` and its `RULES.lock`). |
 | `brine run [file] [--ranks N] [--threads N] [-- args]` | Build and run. |
 | `brine build [--release\|--debug] [--emit-c]` | Build a native binary into `target/`. |
 | `brine check [--report] [--typed] [--proven]` | Type-check + verify, no codegen. Fastest feedback loop. `--typed` (or `typed = true` under `[check]` in brine.toml) requires a written type on every variable; `--proven` (or `proven = true`) requires every runtime check to be proven away. |
 | `brine test [filter]` | Run `test "name":` blocks, each in its own process, in parallel. |
 | `brine fmt [--check]` | Canonical formatting. |
+| `brine rules [approve] [--explain] [--receipt] [--base <rev>]` | Which rules in RULES.br are proven and approved. `approve` records the owner's approval in RULES.lock; `--explain` renders the rules in plain English, mechanically; `--receipt` writes a pull-request summary. |
 | `brine spec-diff [--base <rev>]` | How every `requires`, `ensures` and struct `invariant` changed since a git revision, decided by the prover (weaker, stronger, or the same written another way), and the runtime checks left before and after. Exit 1 when a spec promises less. A proof only means what its spec says, so this is for review and CI: it shows when a change made the proofs pass by proving less. |
 | `brine debug` | Debug build + launch gdb/lldb. |
 | `brine explain E0601` | Long-form explanation of any diagnostic. |
@@ -395,6 +430,10 @@ Global flags: `--json` (machine-readable diagnostics, one JSON object per line),
 | `E0607` | a runtime check is left in code that must be proven (`proven = true`) |
 | `E0608` | a function's preconditions contradict each other, so its proofs mean nothing |
 | `E0609` | a struct `invariant` can't be proven where a value is built or a method returns |
+| `E0610` | a malformed rule (outside RULES.br, no name, unknown target or effect) |
+| `E0611` | code a rule covers can stop the program (`panic`, `exit`, `unwrap()`) |
+| `E0612` | code a rule covers has an effect the rule doesn't allow |
+| `E0613` | an approved rule or rules file changed since it was approved |
 | `E07xx` | driver: missing module, no C compiler, no `main`, C compile/link failures |
 
 Proof failures list the facts the prover knew at that point and the exact goal,
@@ -445,6 +484,11 @@ instance), invariants on generic structs, ranged integer types (`int in 0..=200`
 distinct types, quantifiers in specs (`forall i in 0..n: a[i] >= 0`), array-content
 reasoning, nonlinear facts (`i * j`), running a failed proof's values through the code
 to tell a bug from a missing fact.
+
+**Rules:** pure function calls in `prove` lines and specs (with the function's
+`ensures` as its meaning), `old(x)`, `forall` over arrays, termination proofs (so a
+rule also says the code returns), classifying rule changes as stronger or weaker
+so only weaker ones need approval, rules about `world` protocols and traces.
 
 **Tools:** LSP server, `brine fix` (apply machine fixes), package manager
 (`brine add`), `brine launch --hosts`.
