@@ -21,7 +21,7 @@ from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pat
 from ast import FmtSpec, parse_fmt_spec, children, stmt_exprs, stmt_blocks, local_of, lvalue_root
 from info import ProgramInfo, ConstVal, TryKind, try_kind, mangle_module, PRELUDE
 from num import u128_bits
-from ir import K, Op, Func, Data, Reloc, Module, FB, new_func, le_bytes, str_bytes, f64_bits, f32_bits
+from ir import K, Op, Func, Data, Reloc, Module, FB, KFunc, new_func, le_bytes, str_bytes, f64_bits, f32_bits
 from ir import DType, DField, DVar, DT_BASE, DT_STRUCT, DT_UNION, DT_ENUM, DT_PTR, DT_TYPEDEF, DT_ARRAY
 import ptx
 import msl
@@ -32,6 +32,7 @@ import idiom
 import narrow
 import kernel
 import slp
+import xkern
 
 struct Options:
     # generate a test-runner `main` instead of the program's `main`
@@ -42,8 +43,11 @@ struct Options:
     gpu: bool
     # optimizations that make more code (release builds): interleaved loops
     fast: bool
-    # release builds through C: small fixed-size kernels as vector code (kernel.br)
+    # release builds: small fixed-size kernels as vector code (kernel.br)
     vec: bool
+    # ... made for the x86-64 backend (xkern.br), for Windows or System V
+    nvec: bool
+    win: bool
 
 struct Temp:
     v: int
@@ -337,7 +341,8 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         br_seen={},
         br_body=false,
         khints={},
-        kernels=[]
+        kernels=[],
+        nkernels=[]
     )
     return g.run()
 
@@ -395,6 +400,7 @@ struct Lower:
     # the array lengths callers pass (kernel.br), and the kernels made
     khints: {int: [int]}
     kernels: [str]
+    nkernels: [KFunc]
 
     # ============================================================ driver
     fn run(ref self) -> Lowered:
@@ -405,7 +411,7 @@ struct Lower:
                 for f in m.fns:
                     if not f.is_extern:
                         self.fdecls[f.id] = f
-        if self.opts.vec:
+        if self.opts.vec or self.opts.nvec:
             self.khints = kernel.hints(prog, self.info)
         for m in prog.modules:
             for f in m.fns:
@@ -451,7 +457,7 @@ struct Lower:
                 externs.push(new_func(sig.c_name, ks, has, self.kind(sig.ret) if has else K.I64))
         self.gpu_emit()
         return Lowered(
-            m=Module(funcs=self.funcs, data=self.data, dtypes=self.dtypes),
+            m=Module(funcs=self.funcs, data=self.data, dtypes=self.dtypes, kernels=self.nkernels),
             externs=externs,
             kernels=self.kernels
         )
@@ -591,13 +597,35 @@ struct Lower:
                     lays.push((self.lay(et).size, offs))
                 case _:
                     lays.push((0, []))
-        var k = kernel.Kernel(name="", c="", arrays=[], floats=[], has_ret=false)
+        var k = kernel.Kernel(
+            name="",
+            c="",
+            arrays=[],
+            floats=[],
+            has_ret=false,
+            dag=slp.new_dag([])
+        )
         match kernel.plan(f, self.info, self.fdecls, self.khints[f.id], lays, name):
             case Some(x):
                 k = x
             case None:
                 return
-        self.kernels.push(k.c)
+        if self.opts.nvec:
+            if len(k.arrays) > 4:
+                return
+            let w = xkern.width(k.dag)
+            let g = xkern.gen(k.dag, w)
+            self.nkernels.push(
+                xkern.compile(
+                    g,
+                    k.name,
+                    len(k.arrays),
+                    xkern.float_args(len(k.arrays), len(k.floats), self.opts.win),
+                    k.has_ret
+                )
+            )
+        else:
+            self.kernels.push(k.c)
         let slow = self.cx.fb.label()
         for pi, n, _ in k.arrays:
             let arr = self.param_arr(pi, sig.params[pi].by_ref)
@@ -4394,6 +4422,13 @@ struct Lower:
                     let w = self.cx.fb.load(K.U64, p, 0)
                     let one = self.cx.fb.konst(K.U64, 1)
                     let m = self.cx.fb.bin(Op.Shl, K.U64, one, sh)
+                    match value.kind:
+                        case ExprKind.Bool(true):
+                            # w | m: one bts (or an or to memory) in native code
+                            self.cx.fb.store(p, 0, self.cx.fb.bin(Op.Or, K.U64, w, m))
+                            return
+                        case _:
+                            pass
                     let nm = self.cx.fb.un(Op.Not, K.U64, m)
                     let keep = self.cx.fb.bin(Op.And, K.U64, w, nm)
                     let vb = self.cx.fb.conv(K.U64, v)

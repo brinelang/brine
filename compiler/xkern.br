@@ -1,0 +1,514 @@
+# Vector kernels for the x86-64 backend: what slp.br writes as C for a
+# kernel (kernel.br finds them), as SSE2 operations on xmm registers, for
+# x64.br to encode.
+#
+# The kernel is straight-line code, so registers go by the furthest next
+# use: when all 16 are taken, the value read last goes to a stack slot (or,
+# for a constant, is loaded again). Every lane does what the scalar code
+# does, the same operation on the same operands, so the results are the same
+# bits as the C kernel's.
+from ir import KOp, KFunc
+from ir import KO_MOV, KO_LD, KO_LDP, KO_LDH, KO_ST, KO_STH, KO_OP, KO_SQRT, KO_SHUF
+from ir import KO_CONST, KO_CONST2, KO_SPILL, KO_FILL, KO_ARG
+from ir import SSE_ADD, SSE_MUL, SSE_SUB, SSE_DIV, SSE_SQRT, SSE_XOR, SSE_UNPH, PFX_PD, PFX_SD
+import slp
+from slp import Dag, Layout, LOAD, PARAM, CONST, ADD, MUL, DIV, NEG, SQRT
+
+const NREG = 16
+const SIGN = -9223372036854775808
+const MINUS_ONE = -4616189618054758400
+const ONE = 4607182418800017408
+
+# value-level operations, before registers
+const V_LD = 0
+const V_LD2 = 1
+const V_LDP = 2
+const V_CONST = 3
+const V_CONST2 = 4
+const V_OP = 5
+const V_SQRT = 6
+const V_SHUF = 7
+const V_ST = 8
+const V_RET = 9
+
+struct VOp:
+    op: int
+    # the value defined (-1: none)
+    d: int
+    # operands (values; V_OP and V_SHUF write d from a, like the instructions)
+    a: int
+    b: int
+    # memory: the array and byte offsets; V_OP: the opcode and prefix;
+    # V_SHUF: the immediate; constants: the bits; V_ST: whether the high lane
+    arr: int
+    n: int
+    m: int
+
+struct Gen:
+    d: Dag
+    l: Layout
+    w: int
+    ops: [VOp]
+    nval: int
+    # the value of each pack
+    pv: [int]
+    gathers: {str: int}
+    consts: {str: int}
+    # pack -> its high lane in a value's low lane
+    highs: {int: int}
+    # parameter j -> its value
+    params: {int: int}
+
+    fn val(ref self) -> int:
+        self.nval += 1
+        return self.nval - 1
+
+    fn emit(ref self, op: int, a: int, b: int, arr: int, n: int, m: int) -> int:
+        let d = self.val()
+        self.ops.push(VOp(op=op, d=d, a=a, b=b, arr=arr, n=n, m=m))
+        return d
+
+    fn konst(ref self, lo: int, hi: int, two: bool) -> int:
+        let key = f"{lo},{hi},{two}"
+        match self.consts.get(key):
+            case Some(v):
+                return v
+            case None:
+                pass
+        let v = self.emit(V_CONST2 if two else V_CONST, -1, -1, -1, lo, hi)
+        self.consts[key] = v
+        return v
+
+    fn param(ref self, j: int) -> int:
+        match self.params.get(j):
+            case Some(v):
+                return v
+            case None:
+                pass
+        let v = self.val()
+        self.params[j] = v
+        return v
+
+    fn is_vec(self, p: int) -> bool:
+        return len(self.l.packs[p].lanes) > 1
+
+    fn high(ref self, p: int) -> int:
+        match self.highs.get(p):
+            case Some(v):
+                return v
+            case None:
+                pass
+        let v = self.emit(V_OP, self.pv[p], self.pv[p], -1, SSE_UNPH, PFX_PD)
+        self.highs[p] = v
+        return v
+
+    # a value with node n in its low lane
+    fn scal(ref self, n: int) -> int:
+        let x = self.d.nodes[n]
+        if x.op == CONST:
+            return self.konst(x.off, 0, false)
+        let p = self.l.pack_of[n]
+        if self.is_vec(p) and self.l.lane_of[n] == 1:
+            return self.high(p)
+        return self.pv[p]
+
+    # where node x is: a value and its lane
+    fn src(ref self, x: int) -> (int, int):
+        let p = self.l.pack_of[x]
+        if p >= 0 and self.is_vec(p):
+            return (self.pv[p], self.l.lane_of[x])
+        return (self.scal(x), 0)
+
+    # the nodes ns as one value, lane i holding ns[i]
+    fn gather(ref self, ns: [int]) -> int:
+        let p0 = self.l.pack_of[ns[0]]
+        var same = p0 >= 0 and self.is_vec(p0)
+        for i, x in enumerate(ns):
+            if self.l.pack_of[x] != p0 or self.l.lane_of[x] != i:
+                same = false
+        if same:
+            return self.pv[p0]
+        let key = slp.list_key(ns)
+        match self.gathers.get(key):
+            case Some(v):
+                return v
+            case None:
+                pass
+        let (v0, l0) = self.src(ns[0])
+        let (v1, l1) = self.src(ns[1] if len(ns) > 1 else ns[0])
+        let v = self.emit(V_SHUF, v0, v1, -1, l0 | (l1 << 1), 0)
+        self.gathers[key] = v
+        return v
+
+    fn operand(ref self, ns: [int], vec: bool) -> int:
+        if vec:
+            return self.gather(ns)
+        return self.scal(ns[0])
+
+    fn addr(self, n: int) -> int:
+        let x = self.d.nodes[n]
+        return x.k * self.d.sizes[x.arr] + x.off
+
+    fn pack(ref self, p: int):
+        let ls = self.l.packs[p].lanes
+        let vec = len(ls) > 1
+        let x0 = self.d.nodes[ls[0]]
+        let pfx = PFX_PD if vec else PFX_SD
+        if x0.op == LOAD:
+            let o0 = self.addr(ls[0])
+            if not vec:
+                self.pv[p] = self.emit(V_LD, -1, -1, x0.arr, o0, 0)
+                return
+            let o1 = self.addr(ls[1])
+            if o1 == o0 + 8:
+                self.pv[p] = self.emit(V_LDP, -1, -1, x0.arr, o0, 0)
+            else:
+                self.pv[p] = self.emit(V_LD2, -1, -1, x0.arr, o0, o1)
+            return
+        if x0.op == PARAM:
+            self.pv[p] = self.param(x0.arr)
+            return
+        let a = self.operand([self.d.nodes[x].a for x in ls], vec)
+        if x0.op == NEG:
+            let s = self.konst(SIGN, SIGN, true)
+            self.pv[p] = self.emit(V_OP, a, s, -1, SSE_XOR, PFX_PD)
+            return
+        if x0.op == SQRT:
+            self.pv[p] = self.emit(V_SQRT, a, -1, -1, SSE_SQRT, pfx)
+            return
+        let b = self.operand([self.d.nodes[x].b for x in ls], vec)
+        if x0.op == MUL:
+            self.pv[p] = self.emit(V_OP, a, b, -1, SSE_MUL, pfx)
+            return
+        if x0.op == DIV:
+            self.pv[p] = self.emit(V_OP, a, b, -1, SSE_DIV, pfx)
+            return
+        var subs = 0
+        for x in ls:
+            if self.d.nodes[x].sub:
+                subs += 1
+        if subs == 0:
+            self.pv[p] = self.emit(V_OP, a, b, -1, SSE_ADD, pfx)
+        elif subs == len(ls):
+            self.pv[p] = self.emit(V_OP, a, b, -1, SSE_SUB, pfx)
+        else:
+            # some lanes subtract: b * -1 is exactly -b, and a + -b is a - b
+            let lo = MINUS_ONE if self.d.nodes[ls[0]].sub else ONE
+            let hi = MINUS_ONE if self.d.nodes[ls[1]].sub else ONE
+            let t = self.emit(V_OP, b, self.konst(lo, hi, true), -1, SSE_MUL, PFX_PD)
+            self.pv[p] = self.emit(V_OP, a, t, -1, SSE_ADD, PFX_PD)
+
+# The value-level code of a kernel for vectors of w (1 or 2) doubles.
+fn gen(d: Dag, w: int) -> Gen:
+    let l = slp.layout(d, w)
+    var g = Gen(
+        d=d,
+        l=l,
+        w=w,
+        ops=[],
+        nval=0,
+        pv=[-1] * len(l.packs),
+        gathers={},
+        consts={},
+        highs={},
+        params={}
+    )
+    for c in l.order:
+        for p in l.cpacks[c]:
+            g.pack(p)
+    for s in d.stores:
+        let (n, arr, k, off) = s
+        let at = k * d.sizes[arr] + off
+        let x = d.nodes[n]
+        var v = -1
+        var hi = 0
+        if x.op == CONST:
+            v = g.konst(x.off, 0, false)
+        else:
+            let p = l.pack_of[n]
+            v = g.pv[p]
+            if g.is_vec(p) and l.lane_of[n] == 1:
+                hi = 1
+        g.ops.push(VOp(op=V_ST, d=-1, a=v, b=-1, arr=arr, n=at, m=hi))
+    if d.ret >= 0:
+        let v = g.scal(d.ret)
+        g.ops.push(VOp(op=V_RET, d=-1, a=v, b=-1, arr=-1, n=0, m=0))
+    return g
+
+# ================================================================ registers
+
+struct Alloc:
+    ops: [KOp]
+    # by value: its register (-1: none), its stack slot (-1: none), the ops
+    # reading it, and how many of those are done
+    reg: [int]
+    slot: [int]
+    uses: [[int]]
+    used: [int]
+    # by value: made where it is read, and again rather than spilled (a
+    # constant, or a load before any store): the operation (-1: not such a
+    # value), its array and its bits or offsets
+    remat: [int]
+    arr: [int]
+    lo: [int]
+    hi: [int]
+    # by value: a parameter passed on the stack, at this rbp offset
+    arg: [int]
+    # by register: its value (-1: free), and whether it is taken by the
+    # operation being done
+    held: [int]
+    pinned: [bool]
+    nslots: int
+    # the registers ever written
+    touched: [bool]
+
+    fn next_use(self, v: int) -> int:
+        let u = self.used[v]
+        if u >= len(self.uses[v]):
+            return 1000000000
+        return self.uses[v][u]
+
+    fn op(ref self, op: int, a: int, b: int, n: int, m: int):
+        self.ops.push(KOp(op=op, a=a, b=b, n=n, m=m))
+        if op != KO_ST and op != KO_STH and op != KO_SPILL and a >= 0:
+            self.touched[a] = true
+
+    # a free register, making one free if need be (never a pinned one)
+    fn free_reg(ref self) -> int:
+        for r in 0..NREG:
+            if self.held[r] < 0 and not self.pinned[r]:
+                return r
+        var best = -1
+        var far = -1
+        for r in 0..NREG:
+            if self.pinned[r]:
+                continue
+            let nu = self.next_use(self.held[r])
+            if nu > far:
+                far = nu
+                best = r
+        assert best >= 0, "xkern: every register is pinned"
+        self.evict(best)
+        return best
+
+    fn evict(ref self, r: int):
+        let v = self.held[r]
+        if self.remat[v] < 0 and self.slot[v] < 0 and self.arg[v] < 0:
+            self.slot[v] = self.nslots
+            self.nslots += 1
+            self.op(KO_SPILL, r, -1, self.slot[v], 0)
+        self.reg[v] = -1
+        self.held[r] = -1
+
+    # put value v in register r (not where it is: a copy, or loaded)
+    fn load_into(ref self, r: int, v: int):
+        if self.reg[v] >= 0:
+            if self.reg[v] != r:
+                self.op(KO_MOV, r, self.reg[v], 0, 0)
+        elif self.remat[v] >= 0:
+            self.make(r, self.remat[v], self.arr[v], self.lo[v], self.hi[v])
+        elif self.arg[v] >= 0:
+            self.op(KO_ARG, r, -1, self.arg[v], 0)
+        else:
+            assert self.slot[v] >= 0, "xkern: a value read before it is made"
+            self.op(KO_FILL, r, -1, self.slot[v], 0)
+
+    # a constant or a load, in register r
+    fn make(ref self, r: int, op: int, arr: int, n: int, m: int):
+        match op:
+            case V_CONST:
+                self.op(KO_CONST, r, -1, n, m)
+            case V_CONST2:
+                self.op(KO_CONST2, r, -1, n, m)
+            case V_LDP:
+                self.op(KO_LDP, r, arr, n, 0)
+            case _:
+                self.op(KO_LD, r, arr, n, 0)
+                if op == V_LD2:
+                    self.op(KO_LDH, r, arr, m, 0)
+
+    # v in a register of its own, pinned for the operation
+    fn need(ref self, v: int) -> int:
+        if self.reg[v] < 0:
+            let r = self.free_reg()
+            self.load_into(r, v)
+            self.reg[v] = r
+            self.held[r] = v
+        self.pinned[self.reg[v]] = true
+        return self.reg[v]
+
+    fn define(ref self, v: int, r: int):
+        self.reg[v] = r
+        self.held[r] = v
+        if len(self.uses[v]) == 0:
+            self.held[r] = -1
+            self.reg[v] = -1
+
+    # done reading v at this op: free it after its last read
+    fn read(ref self, v: int):
+        self.used[v] += 1
+        if self.used[v] >= len(self.uses[v]) and self.reg[v] >= 0:
+            self.held[self.reg[v]] = -1
+            self.reg[v] = -1
+
+    fn unpin(ref self):
+        for r in 0..NREG:
+            self.pinned[r] = false
+
+    # d = a op b, written over a copy of a (or a itself, read for the last time)
+    fn tied(ref self, i: int, d: int, a0: int, b0: int, kop: int, n: int, m: int):
+        var a = a0
+        var b = b0
+        let comm = kop == KO_OP and (n == SSE_ADD or n == SSE_MUL or n == SSE_XOR)
+        if comm and not self.last_read(a, i) and self.last_read(b, i) and self.reg[b] >= 0:
+            # write over b instead, which dies here
+            a = b0
+            b = a0
+        self.need(b)
+        var r = -1
+        let reuse = self.last_read(a, i) and self.reg[a] >= 0
+        if reuse:
+            r = self.reg[a]
+        else:
+            if self.reg[a] >= 0:
+                self.pinned[self.reg[a]] = true
+            r = self.free_reg()
+            self.pinned[r] = true
+            self.load_into(r, a)
+        self.op(kop, r, self.reg[b], n, m)
+        if reuse:
+            # a's register is d's now (and b's too, if b is a)
+            self.used[a] += 1
+            self.reg[a] = -1
+            self.held[r] = -1
+        else:
+            self.read(a)
+        if a != b:
+            self.read(b)
+        self.unpin()
+        self.define(d, r)
+
+    # is op i a's last read?
+    fn last_read(self, a: int, i: int) -> bool:
+        let u = self.used[a]
+        return u == len(self.uses[a]) - 1 and self.uses[a][u] == i
+
+# The kernel's machine operations. `pargs`: where each float parameter
+# comes in, an xmm register (0..15) or a stack offset from rbp (100 + it).
+fn compile(g: Gen, name: str, narr: int, pargs: [int], has_ret: bool) -> KFunc:
+    let nv = g.nval
+    var al = Alloc(
+        ops=[],
+        reg=[-1] * nv,
+        slot=[-1] * nv,
+        uses=[[] for _ in 0..nv],
+        used=[0] * nv,
+        remat=[-1] * nv,
+        arr=[-1] * nv,
+        lo=[0] * nv,
+        hi=[0] * nv,
+        arg=[-1] * nv,
+        held=[-1] * NREG,
+        pinned=[false] * NREG,
+        nslots=0,
+        touched=[false] * NREG
+    )
+    var first_st = len(g.ops)
+    for i, x in enumerate(g.ops):
+        if x.a >= 0:
+            al.uses[x.a].push(i)
+        if x.b >= 0 and x.b != x.a:
+            al.uses[x.b].push(i)
+        if x.op == V_ST and first_st == len(g.ops):
+            first_st = i
+    for x in g.ops:
+        let u = al.uses[x.d] if x.d >= 0 else []
+        let ld = x.op == V_LD or x.op == V_LD2 or x.op == V_LDP
+        if (
+            x.op == V_CONST
+            or x.op == V_CONST2
+            or (ld and (len(u) == 0 or u[len(u) - 1] < first_st))
+        ):
+            al.remat[x.d] = x.op
+            al.arr[x.d] = x.arr
+            al.lo[x.d] = x.n
+            al.hi[x.d] = x.m
+    # the parameters where they come in
+    for j in g.params:
+        let v = g.params[j]
+        let at = pargs[j]
+        if at >= 100:
+            al.arg[v] = at - 100
+        elif len(al.uses[v]) > 0:
+            al.reg[v] = at
+            al.held[at] = v
+    for i, x in enumerate(g.ops):
+        match x.op:
+            case V_LD | V_LD2 | V_LDP | V_CONST | V_CONST2:
+                if al.remat[x.d] < 0:
+                    # a load some store's value needs: made now, before the stores
+                    let r = al.free_reg()
+                    al.make(r, x.op, x.arr, x.n, x.m)
+                    al.define(x.d, r)
+            case V_OP:
+                al.tied(i, x.d, x.a, x.b, KO_OP, x.n, x.m)
+            case V_SHUF:
+                al.tied(i, x.d, x.a, x.b, KO_SHUF, x.n, 0)
+            case V_SQRT:
+                let ra = al.need(x.a)
+                var r = ra
+                if not al.last_read(x.a, i):
+                    r = al.free_reg()
+                al.op(KO_SQRT, r, ra, x.n, x.m)
+                if r == ra:
+                    al.used[x.a] += 1
+                    al.reg[x.a] = -1
+                    al.held[r] = -1
+                else:
+                    al.read(x.a)
+                al.unpin()
+                al.define(x.d, r)
+            case V_ST:
+                let r = al.need(x.a)
+                al.op(KO_STH if x.m == 1 else KO_ST, r, x.arr, x.n, 0)
+                al.read(x.a)
+                al.unpin()
+            case _:
+                # V_RET: the result in xmm0
+                let r = al.need(x.a)
+                if r != 0:
+                    al.op(KO_MOV, 0, r, 0, 0)
+                al.read(x.a)
+                al.unpin()
+    var touched: [int] = []
+    for r in 0..NREG:
+        if al.touched[r]:
+            touched.push(r)
+    return KFunc(
+        name=name,
+        narr=narr,
+        nflt=len(pargs),
+        has_ret=has_ret,
+        nslots=al.nslots,
+        regs=touched,
+        ops=al.ops
+    )
+
+# Where each float parameter of a kernel with narr array parameters (at
+# most 4) comes in: an xmm register, or 100 + its offset from rbp.
+fn float_args(narr: int, nflt: int, win: bool) -> [int]:
+    var out: [int] = []
+    for j in 0..nflt:
+        if win:
+            let i = narr + j
+            out.push(i if i < 4 else 100 + 48 + 8 * (i - 4))
+        else:
+            out.push(j if j < 8 else 100 + 16 + 8 * (j - 8))
+    return out
+
+# The width to use: 2 if the shuffles leave a tenth of the work saved (as
+# slp.kernel_c decides), else 1.
+fn width(d: Dag) -> int:
+    let base = slp.scalar_cost(d)
+    let (_, c2) = slp.emit_body(d, 2)
+    return 2 if c2 * 10 <= base * 9 else 1
