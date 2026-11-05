@@ -25,6 +25,8 @@
 # * Lanes: innermost loops that run interleaved iterations in lockstep
 #   (jam.br), four at a time doing the same work, get an AVX2 kernel from
 #   vlane.br that runs them as vectors.
+# * Reversals: a reversal of a prefix (lower.br's idiom) followed by a read
+#   of the first element hands that element over in a register.
 #
 # Back in flat code every phi becomes copies at the end of its predecessors
 # (critical edges are split first, and the copies on one edge are made in an
@@ -2867,6 +2869,86 @@ fn inv_index(four: [int], ref at: {str: int}, ref invs: [[int]]) -> int:
     invs.push(four)
     return len(invs) - 1
 
+# ================================================================ reversals
+
+# A reversal of a prefix, d[0..=j] (lower.br's idiom), whose next block reads
+# d[0] before anything writes memory: that read takes the new d[0] from the
+# reversal instead (`brine_bytes_rev0`, which x64.br keeps in a register), so
+# it doesn't wait for the reversal's stores to reach memory.
+fn rev_first(ref sf: SF):
+    var zero = [false] * len(sf.f.vk)
+    for b in sf.bs:
+        for x in b.code:
+            if x.op == Op.Const and x.d >= 0 and x.n == 0:
+                zero[x.d] = true
+    for b in 0..len(sf.bs):
+        let m = len(sf.bs[b].code)
+        if m < 2:
+            continue
+        let t = sf.bs[b].code[m - 1]
+        let c = sf.bs[b].code[m - 2]
+        if (
+            t.op != Op.BrNot
+            or c.op != Op.Call
+            or c.b != 1
+            or c.s != "brine_bytes_rev"
+            or c.d < 0
+            or t.a != c.d
+            or not zero[c.args[2]]
+        ):
+            continue
+        # through blocks that only jump on, each reached from the last alone
+        var s = sf.lab[t.c]
+        var hops = 0
+        while (
+            len(sf.bs[s].pred) == 1
+            and len(sf.bs[s].code) == 1
+            and sf.bs[s].code[0].op == Op.Jmp
+            and hops < 8
+        ):
+            s = sf.lab[sf.bs[s].code[0].n]
+            hops += 1
+        if s == b or len(sf.bs[s].pred) != 1:
+            continue
+        var at = -1
+        for i, x in enumerate(sf.bs[s].code):
+            if x.op == Op.Load and x.a == c.args[0] and x.n == 0 and sf.f.vk[x.d] == K.U8:
+                at = i
+                break
+            if (
+                x.op == Op.Store
+                or x.op == Op.Copy
+                or x.op == Op.Zero
+                or x.op == Op.Call
+                or x.op == Op.CallInd
+            ):
+                break
+        if at < 0:
+            continue
+        # the new d[0], or -1 (it then did nothing) where the reversal isn't
+        # all in bounds and short
+        let r = new_v(ref sf, K.I64)
+        let z = new_v(ref sf, K.I64)
+        var call = c
+        call.d = r
+        call.s = "brine_bytes_rev0"
+        call.args = [c.args[0], c.args[1], c.args[3]]
+        var code: [Inst] = []
+        for i in 0..m - 2:
+            code.push(sf.bs[b].code[i])
+        code.push(mk(Op.Const, z, -1, -1, -1, 0))
+        code.push(call)
+        code.push(mk(Op.Ge, c.d, r, z, -1, 0))
+        code.push(t)
+        sf.bs[b].code = code
+        let v = sf.bs[s].code[at].d
+        sf.bs[s].code[at] = mk(Op.Conv, v, r, -1, -1, 0)
+        # widening it back is r itself
+        for i in at + 1..len(sf.bs[s].code):
+            let x = sf.bs[s].code[i]
+            if x.op == Op.Conv and x.a == v and sf.f.vk[x.d] == K.I64:
+                sf.bs[s].code[i] = mk(Op.Mov, x.d, r, -1, -1, 0)
+
 # v at byte off of the block: booleans as -1 or 0.
 fn lane_store(ref sf: SF, ref code: [Inst], blk: int, v: int, off: int):
     var w = v
@@ -2898,5 +2980,6 @@ fn optimize(f: Func, vw: int) -> (Func, [KFunc]):
     var ks = vector_loops(ref sf, f"brv_{f.name}", vw)
     if vw >= 4:
         ks.extend(lane_loops(ref sf, f"brl_{f.name}"))
+    rev_first(ref sf)
     dce(ref sf)
     return (from_ssa(sf), ks)
