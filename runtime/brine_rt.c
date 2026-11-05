@@ -2063,6 +2063,7 @@ brine_arr *brine_arr_slice(brine_arr *a, int64_t lo, int64_t hi, const char *loc
 void brine_rt_map(void *p) { brine_map_retain(*(brine_map **)p); }
 void brine_rl_map(void *p) { brine_map_release(*(brine_map **)p); }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 brine_map *brine_map_new(const brine_map_ty *ty) {
     brine_map *m = (brine_map *)brine_alloc(sizeof(brine_map));
     BR_LIVE(1);
@@ -2071,6 +2072,7 @@ brine_map *brine_map_new(const brine_map_ty *ty) {
     m->ty = ty;
     return m;
 }
+#endif
 static void br_map_drop(void *p) {
     brine_map *m = (brine_map *)p;
     const brine_map_ty *t = m->ty;
@@ -2086,6 +2088,13 @@ static void br_map_drop(void *p) {
     free(m->index);
     free(m);
 }
+#ifdef BRINE_RT_BR
+/* runtime/rt.br's brine_map_free, for keys or values that need releasing */
+void brine_x_map_drop(brine_map *m) {
+    BR_LIVE(-1);
+    brine_drop(m, br_map_drop);
+}
+#else
 void brine_map_free(brine_map *m) {
     BR_LIVE(-1);
     if (m->ty->krelease || m->ty->vrelease) {
@@ -2273,6 +2282,8 @@ bool brine_map_eq(brine_map *a, brine_map *b) {
     }
     return true;
 }
+
+#endif
 
 /* ============================================================ string builder */
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
