@@ -1,0 +1,247 @@
+# Vector loops for the x86-64 backend. ssa.br finds innermost loops like
+#
+#     for j in lo..hi:
+#         c[j] = c[j] + a * b[j]
+#
+# that only load and store doubles at j of a few arrays and do + - * / on
+# them and on doubles that don't change in the loop. Such a loop gets a
+# kernel that runs it several elements at a time, called before the loop;
+# it says how many elements it did and the loop does the rest. The kernel
+# does four at a time with AVX when the CPU has AVX2 and the OS saves its
+# registers, else two with SSE2.
+#
+# Each lane does what one iteration does, the same operations in the same
+# order, so the results are the same bits. Lanes read before earlier lanes'
+# later writes, though, which differs from the loop when an access of a
+# later element meets a later access of an earlier one: the kernel tests
+# for that first and does nothing if so.
+from ir import KOp, KFunc
+from ir import KO_MOV, KO_LDP, KO_STP, KO_OP, KO_ARG, KO_CHK, KO_VLD, KO_VST, KO_VOP, KO_VBC
+from ir import SSE_ADD, SSE_MUL, SSE_SUB, SSE_DIV, SSE_UNPL, PFX_PD
+import xkern
+
+const L_LD = 0
+const L_ST = 1
+const L_ADD = 2
+const L_SUB = 3
+const L_MUL = 4
+const L_DIV = 5
+
+const NREG = 16
+
+# One operation of the body. Values 0..nflt-1 are the loop's float
+# parameters; each L_LD and arithmetic operation defines the next one.
+struct LOp:
+    op: int
+    # L_ST: the value stored; arithmetic: d = a op b
+    a: int
+    b: int
+    # memory: the array (parameter) and the byte offset
+    arr: int
+    off: int
+
+struct Loop:
+    narr: int
+    nflt: int
+    ops: [LOp]
+
+fn sse_op(op: int) -> int:
+    match op:
+        case L_ADD:
+            return SSE_ADD
+        case L_SUB:
+            return SSE_SUB
+        case L_MUL:
+            return SSE_MUL
+        case _:
+            return SSE_DIV
+
+fn kop(op: int, a: int, b: int, n: int, m: int) -> KOp:
+    return KOp(op=op, a=a, b=b, n=n, m=m)
+
+fn no_kernel(name: str) -> KFunc:
+    return KFunc(
+        name=name,
+        narr=0,
+        nflt=0,
+        has_ret=false,
+        nslots=0,
+        regs=[],
+        ops=[],
+        loop=true,
+        body=[],
+        apre=[],
+        abody=[]
+    )
+
+# The tests that lanes 0..w-1 run as the loop would (KO_CHK), or ok false
+# when two accesses of one array always meet.
+fn checks(l: Loop, w: int) -> (bool, [KOp]):
+    var out: [KOp] = []
+    var acc: [int] = []
+    for i, x in enumerate(l.ops):
+        if x.op == L_LD or x.op == L_ST:
+            acc.push(i)
+    for p in 0..len(acc):
+        for q in p + 1..len(acc):
+            let a = l.ops[acc[p]]
+            let b = l.ops[acc[q]]
+            if a.op == L_LD and b.op == L_LD:
+                continue
+            # a of a later element meets b of an earlier one when b's place
+            # is 1 to 8w - 1 bytes after a's
+            let n = b.off - a.off
+            if a.arr == b.arr:
+                if n > 0 and n < 8 * w:
+                    return (false, [])
+            else:
+                out.push(kop(KO_CHK, a.arr, b.arr, n, w))
+    return (true, out)
+
+fn free_reg(held: [bool]) -> int:
+    var r = 0
+    while r < NREG and held[r]:
+        r += 1
+    return r
+
+# The operations before the loop (the parameters in every lane) and the
+# loop body, w lanes wide (2: SSE2, 4: AVX), or ok false when the body
+# needs more than 16 registers.
+fn lanes(l: Loop, w: int, win: bool) -> (bool, [KOp], [KOp], [bool]):
+    var pre: [KOp] = []
+    var bc: [KOp] = []
+    var body: [KOp] = []
+    var nv = l.nflt
+    for x in l.ops:
+        if x.op != L_ST:
+            nv += 1
+    var reg = [-1] * nv
+    var last = [-1] * nv
+    for i, x in enumerate(l.ops):
+        if x.op != L_LD:
+            last[x.a] = i
+            if x.op != L_ST:
+                last[x.b] = i
+    var held = [false] * NREG
+    var touched = [false] * NREG
+    let at = xkern.float_args(l.narr + 1, l.nflt, win)
+    for j in 0..l.nflt:
+        if at[j] < 100:
+            reg[j] = at[j]
+            held[at[j]] = true
+    for j in 0..l.nflt:
+        if last[j] < 0:
+            continue
+        if reg[j] < 0:
+            let r = free_reg(held)
+            if r == NREG:
+                return (false, [], [], [])
+            pre.push(kop(KO_ARG, r, -1, at[j] - 100, 0))
+            reg[j] = r
+            held[r] = true
+        # after all the loads (movsd), so no SSE instruction follows AVX ones
+        if w == 4:
+            bc.push(kop(KO_VBC, reg[j], reg[j], 0, 0))
+        else:
+            bc.push(kop(KO_OP, reg[j], reg[j], SSE_UNPL, PFX_PD))
+        touched[reg[j]] = true
+    pre.extend(bc)
+    var v = l.nflt
+    for i, x in enumerate(l.ops):
+        match x.op:
+            case L_ST:
+                body.push(kop(KO_VST if w == 4 else KO_STP, reg[x.a], x.arr, x.off, 0))
+                if x.a >= l.nflt and last[x.a] == i:
+                    held[reg[x.a]] = false
+            case L_LD:
+                let r = free_reg(held)
+                if r == NREG:
+                    return (false, [], [], [])
+                touched[r] = true
+                reg[v] = r
+                held[r] = last[v] >= 0
+                body.push(kop(KO_VLD if w == 4 else KO_LDP, r, x.arr, x.off, 0))
+                v += 1
+            case _:
+                let a = x.a
+                let b = x.b
+                let dies_a = a >= l.nflt and last[a] == i
+                let dies_b = b >= l.nflt and last[b] == i and b != a
+                var r = -1
+                if w == 4:
+                    # three operands: d may be any register
+                    if dies_a:
+                        r = reg[a]
+                    elif dies_b:
+                        r = reg[b]
+                    else:
+                        r = free_reg(held)
+                        if r == NREG:
+                            return (false, [], [], [])
+                    body.push(kop(KO_VOP, r, reg[a], sse_op(x.op) & 255, reg[b]))
+                    if dies_a and dies_b:
+                        held[reg[b]] = false
+                else:
+                    if a >= l.nflt and last[a] == i:
+                        r = reg[a]
+                    else:
+                        r = free_reg(held)
+                        if r == NREG:
+                            return (false, [], [], [])
+                        body.push(kop(KO_MOV, r, reg[a], 0, 0))
+                    body.push(kop(KO_OP, r, reg[b], sse_op(x.op), PFX_PD))
+                    if b >= l.nflt and last[b] == i and b != a:
+                        held[reg[b]] = false
+                touched[r] = true
+                held[r] = last[v] >= 0
+                reg[v] = r
+                v += 1
+    return (true, pre, body, touched)
+
+# The kernel, or none (ok false). `avx0`: with the four-lane version too.
+fn compile(l: Loop, name: str, win: bool, avx0: bool) -> (bool, KFunc):
+    var avx = avx0
+    var (ok, chk) = checks(l, 4 if avx else 2)
+    if not ok and avx:
+        # two lanes may still be fine
+        avx = false
+        let (ok2, chk2) = checks(l, 2)
+        ok = ok2
+        chk = chk2
+    if not ok:
+        return (false, no_kernel(name))
+    let (okl, pre, body, t2) = lanes(l, 2, win)
+    if not okl:
+        return (false, no_kernel(name))
+    var touched = t2
+    var apre: [KOp] = []
+    var abody: [KOp] = []
+    if avx:
+        let (ok4, p4, b4, t4) = lanes(l, 4, win)
+        if ok4:
+            apre = p4
+            abody = b4
+            for r in 0..NREG:
+                touched[r] = touched[r] or t4[r]
+    var regs: [int] = []
+    for r in 0..NREG:
+        if touched[r]:
+            regs.push(r)
+    var ops = chk
+    ops.extend(pre)
+    return (
+        true,
+        KFunc(
+            name=name,
+            narr=l.narr,
+            nflt=l.nflt,
+            has_ret=false,
+            nslots=0,
+            regs=regs,
+            ops=ops,
+            loop=true,
+            body=body,
+            apre=apre,
+            abody=abody
+        )
+    )
