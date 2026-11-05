@@ -2939,9 +2939,24 @@ struct Lower:
                         if not (a in self.cx.narrow):
                             return -1
                         let (d, n) = self.bytes_of(a)
-                        let pi = self.local_ptr(i)
-                        let pj = self.local_ptr(j)
-                        ok = self.cx.fb.rt(K.Bool, "brine_bytes_rev", [d, n, pi, pj])
+                        let iv = self.read_local(i)
+                        let jv = self.read_local(j)
+                        ok = self.cx.fb.rt(K.Bool, "brine_bytes_rev", [d, n, iv, jv])
+                        # i and j by value (so they can stay in registers),
+                        # moved here to where the loop leaves them
+                        if self.cx.twin == 1:
+                            let l = self.cx.fb.label()
+                            self.cx.fb.brnot(ok, l)
+                            self.cx.twin_out[key] = l
+                            self.rev_ends(i, j, iv, jv)
+                            return -2
+                        let slow = self.cx.fb.label()
+                        let end = self.cx.fb.label()
+                        self.cx.fb.brnot(ok, slow)
+                        self.rev_ends(i, j, iv, jv)
+                        self.cx.fb.jmp(end)
+                        self.cx.fb.place(slow)
+                        return end
                     case idiom.Idiom.Shl(a):
                         if a in self.cx.packed or not self.plain_elems(a):
                             return -1
@@ -2969,6 +2984,22 @@ struct Lower:
                 return self.idiom_fail(key, ok)
             case None:
                 return -1
+
+    # After a reversal of bytes i..j: i and j meet in the middle (or, when
+    # i >= j, stay put)
+    fn rev_ends(ref self, i: int, j: int, iv: int, jv: int):
+        let skip = self.cx.fb.label()
+        self.cx.fb.brnot(self.cx.fb.cmp(Op.Lt, iv, jv), skip)
+        let one = self.cx.fb.konst(K.I64, 1)
+        let k = self.cx.fb.bin(Op.Sub, K.I64, jv, iv)
+        let h = self.cx.fb.bin(Op.Shr, K.I64, self.cx.fb.bin(Op.Add, K.I64, k, one), one)
+        let ni = self.cx.fb.bin(Op.Add, K.I64, iv, h)
+        let nj = self.cx.fb.bin(Op.Sub, K.I64, jv, h)
+        let pi = self.local_ptr(i)
+        self.cx.fb.store(pi, 0, ni)
+        let pj = self.local_ptr(j)
+        self.cx.fb.store(pj, 0, nj)
+        self.cx.fb.place(skip)
 
     # After an idiom's call: where to go when it returns false (see idiom_head)
     fn idiom_fail(ref self, key: str, ok: int) -> int:
