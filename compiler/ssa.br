@@ -1,0 +1,1642 @@
+# SSA optimizations on the IR (ir.br) for native code, the same for every
+# target. `optimize` takes a function as the lowering made it (flat code with
+# labels, vregs assigned any number of times) to SSA form over basic blocks,
+# simplifies it there, and turns it back into flat code:
+#
+# * SSA: every vreg is assigned once; where control flow merges, a `Phi`
+#   picks the value of the edge it came in on (semi-pruned: only for vregs
+#   read in a block other than the one that set them).
+# * Constants: sparse conditional constant propagation (Wegman and Zadeck)
+#   folds integer arithmetic, comparisons, conversions and checks whose
+#   operands are known, and the branches they decide; code no executable
+#   edge reaches goes away.
+# * Redundancy: value numbering over the dominator tree. A pure instruction,
+#   or a check that a dominating identical check already passed, reuses that
+#   one's result; so does a load of a place an earlier load read or a store
+#   wrote, with no write that may reach it in between (within an extended
+#   basic block).
+# * Loops: instructions whose operands don't change in a loop move to its
+#   preheader. Ones that may panic or depend on memory only from the loop's
+#   header, where they run on every trip, and only before anything with an
+#   effect.
+# * Dead code: instructions whose results nothing reads.
+#
+# Back in flat code every phi becomes copies at the end of its predecessors
+# (critical edges are split first, and the copies on one edge are made in an
+# order that doesn't overwrite a value another copy still reads).
+
+from ir import K, Op, Inst, Func
+
+struct Block:
+    label: int
+    # phis first; the last instruction is the terminator. `Br` and `BrNot`
+    # jump to label n, else to label c.
+    code: [Inst]
+    succ: [int]
+    pred: [int]
+
+struct SF:
+    f: Func
+    bs: [Block]
+    # the block of each label, -1 for none
+    lab: [int]
+
+fn mk(op: Op, d: int, a: int, b: int, c: int, n: int) -> Inst:
+    return Inst(op=op, d=d, a=a, b=b, c=c, n=n, s="", args=[])
+
+fn is_term(op: Op) -> bool:
+    match op:
+        case Op.Jmp | Op.Br | Op.BrNot | Op.Switch | Op.Ret | Op.Unreachable:
+            return true
+        case _:
+            return false
+
+fn is_check(op: Op) -> bool:
+    return op == Op.AddO or op == Op.SubO or op == Op.MulO or op == Op.IdxChk
+
+# Every vreg x reads (a phi: its values, at odd positions of `args`).
+fn uses(x: Inst) -> [int]:
+    match x.op:
+        case Op.Const | Op.FConst | Op.SlotAddr | Op.Global | Op.Label | Op.Jmp | Op.Line:
+            return []
+        case Op.Unreachable:
+            return []
+        case Op.Phi:
+            var r: [int] = []
+            var i = 1
+            while i < len(x.args):
+                r.push(x.args[i])
+                i += 2
+            return r
+        case Op.Call:
+            return x.args
+        case Op.CallInd:
+            var r = [x.a]
+            r.extend(x.args)
+            return r
+        case Op.Ret:
+            return [x.a] if x.a >= 0 else []
+        case Op.Switch | Op.Br | Op.BrNot:
+            return [x.a]
+        case _:
+            var r: [int] = []
+            if x.a >= 0:
+                r.push(x.a)
+            if x.b >= 0:
+                r.push(x.b)
+            if is_check(x.op) and x.c >= 0:
+                r.push(x.c)
+            return r
+
+# x with every vreg v it reads replaced by m[v].
+fn map_uses(x: Inst, m: [int]) -> Inst:
+    var y = x
+    match x.op:
+        case Op.Const | Op.FConst | Op.SlotAddr | Op.Global | Op.Label | Op.Jmp | Op.Line:
+            return y
+        case Op.Unreachable:
+            return y
+        case Op.Phi:
+            var i = 1
+            while i < len(y.args):
+                y.args[i] = m[y.args[i]]
+                i += 2
+        case Op.Call:
+            y.args = [m[v] for v in x.args]
+        case Op.CallInd:
+            y.a = m[x.a]
+            y.args = [m[v] for v in x.args]
+        case Op.Ret:
+            if x.a >= 0:
+                y.a = m[x.a]
+        case Op.Switch | Op.Br | Op.BrNot:
+            y.a = m[x.a]
+        case _:
+            if x.a >= 0:
+                y.a = m[x.a]
+            if x.b >= 0:
+                y.b = m[x.b]
+            if is_check(x.op) and x.c >= 0:
+                y.c = m[x.c]
+    return y
+
+# Does x do something besides setting x.d (write memory, call, maybe panic,
+# change control flow)?
+fn effect(x: Inst) -> bool:
+    match x.op:
+        case Op.Store | Op.Copy | Op.Zero | Op.Call | Op.CallInd | Op.Line:
+            return true
+        case Op.AddO | Op.SubO | Op.MulO | Op.IdxChk:
+            return true
+        case _:
+            return is_term(x.op)
+
+# The labels a terminator can go to.
+fn targets(x: Inst) -> [int]:
+    match x.op:
+        case Op.Jmp:
+            return [x.n]
+        case Op.Br | Op.BrNot:
+            return [x.n, x.c]
+        case Op.Switch:
+            var r: [int] = []
+            for l in x.args:
+                if l not in r:
+                    r.push(l)
+            return r
+        case _:
+            return []
+
+# A terminator that goes to label `to` where it went to `from`.
+fn retarget(x: Inst, from: int, to: int) -> Inst:
+    var y = x
+    match x.op:
+        case Op.Jmp:
+            y.n = to
+        case Op.Br | Op.BrNot:
+            if y.n == from:
+                y.n = to
+            if y.c == from:
+                y.c = to
+        case Op.Switch:
+            y.args = [to if l == from else l for l in x.args]
+        case _:
+            pass
+    return y
+
+# ================================================================ the CFG
+
+fn new_label(ref sf: SF) -> int:
+    sf.f.nlabels += 1
+    sf.lab.push(-1)
+    return sf.f.nlabels - 1
+
+fn add_block(ref bs: [Block], label: int, code: [Inst]):
+    bs.push(Block(label=label, code=code, succ=[], pred=[]))
+
+fn build(f: Func) -> SF:
+    var g = f
+    g.code = []
+    var nl = f.nlabels
+    var bs: [Block] = []
+    # an entry block nothing jumps back to, where the parameters (and any
+    # vreg read before it's set) are defined
+    var cur: [Inst] = []
+    var label = nl
+    nl += 1
+    var open = true
+    let n = len(f.code)
+    var i = 0
+    while i < n:
+        let x = f.code[i]
+        i += 1
+        if x.op == Op.Line:
+            continue
+        if x.op == Op.Label:
+            if open:
+                cur.push(mk(Op.Jmp, -1, -1, -1, -1, x.n))
+                add_block(ref bs, label, cur)
+            cur = []
+            label = x.n
+            open = true
+            continue
+        if not open:
+            # after a jump with no label: nothing reaches this
+            cur = []
+            label = nl
+            nl += 1
+            open = true
+        if x.op == Op.Br or x.op == Op.BrNot:
+            var y = x
+            if i < n and f.code[i].op == Op.Label:
+                y.c = f.code[i].n
+                cur.push(y)
+                add_block(ref bs, label, cur)
+                open = false
+            else:
+                y.c = nl
+                nl += 1
+                cur.push(y)
+                add_block(ref bs, label, cur)
+                cur = []
+                label = y.c
+            continue
+        cur.push(x)
+        if is_term(x.op):
+            add_block(ref bs, label, cur)
+            open = false
+    if open:
+        cur.push(mk(Op.Ret, -1, -1, -1, -1, 0))
+        add_block(ref bs, label, cur)
+    g.nlabels = nl
+    var sf = SF(f=g, bs=bs, lab=[-1] * nl)
+    relink(ref sf)
+    return sf
+
+# Recomputes successors and predecessors from the terminators, drops the
+# blocks the entry doesn't reach, and the phi entries of edges that are gone.
+fn relink(ref sf: SF):
+    let n = len(sf.bs)
+    sf.lab = [-1] * sf.f.nlabels
+    for i in 0..n:
+        sf.lab[sf.bs[i].label] = i
+    # a branch with both targets the same is a jump
+    for i in 0..n:
+        let m = len(sf.bs[i].code)
+        let t = sf.bs[i].code[m - 1]
+        if (t.op == Op.Br or t.op == Op.BrNot) and t.n == t.c:
+            sf.bs[i].code[m - 1] = mk(Op.Jmp, -1, -1, -1, -1, t.n)
+    var seen = [false] * n
+    seen[0] = true
+    var work = [0]
+    while len(work) > 0:
+        let b = work.pop()
+        let m = len(sf.bs[b].code)
+        for l in targets(sf.bs[b].code[m - 1]):
+            let s = sf.lab[l]
+            if not seen[s]:
+                seen[s] = true
+                work.push(s)
+    var keep: [Block] = []
+    for i in 0..n:
+        if seen[i]:
+            var b = sf.bs[i]
+            b.succ = []
+            b.pred = []
+            keep.push(b)
+    sf.bs = keep
+    let k = len(keep)
+    sf.lab = [-1] * sf.f.nlabels
+    for i in 0..k:
+        sf.lab[sf.bs[i].label] = i
+    for i in 0..k:
+        let m = len(sf.bs[i].code)
+        for l in targets(sf.bs[i].code[m - 1]):
+            let s = sf.lab[l]
+            sf.bs[i].succ.push(s)
+            sf.bs[s].pred.push(i)
+    # phi entries for edges that no longer exist
+    for i in 0..k:
+        if len(sf.bs[i].code) == 0 or sf.bs[i].code[0].op != Op.Phi:
+            continue
+        var ok = [false] * sf.f.nlabels
+        for p in sf.bs[i].pred:
+            ok[sf.bs[p].label] = true
+        for j in 0..len(sf.bs[i].code):
+            let x = sf.bs[i].code[j]
+            if x.op != Op.Phi:
+                break
+            var args: [int] = []
+            var q = 0
+            while q < len(x.args):
+                if ok[x.args[q]]:
+                    args.push(x.args[q])
+                    args.push(x.args[q + 1])
+                q += 2
+            sf.bs[i].code[j].args = args
+
+# Blocks in postorder from the entry.
+fn postorder(bs: [Block]) -> [int]:
+    let n = len(bs)
+    var seen = [false] * n
+    var out: [int] = []
+    var st = [0]
+    var it = [0]
+    seen[0] = true
+    while len(st) > 0:
+        let top = len(st) - 1
+        let b = st[top]
+        let k = it[top]
+        if k < len(bs[b].succ):
+            it[top] = k + 1
+            let s = bs[b].succ[k]
+            if not seen[s]:
+                seen[s] = true
+                st.push(s)
+                it.push(0)
+        else:
+            out.push(b)
+            st.pop()
+            it.pop()
+    return out
+
+# Immediate dominators (Cooper, Harvey and Kennedy); the entry's is itself.
+fn idoms(bs: [Block], po: [int]) -> [int]:
+    let n = len(bs)
+    var pon = [-1] * n
+    for i, b in enumerate(po):
+        pon[b] = i
+    var idom = [-1] * n
+    idom[0] = 0
+    var changed = true
+    while changed:
+        changed = false
+        var j = len(po) - 1
+        while j >= 0:
+            let b = po[j]
+            j -= 1
+            if b == 0:
+                continue
+            var nd = -1
+            for p in bs[b].pred:
+                if idom[p] < 0:
+                    continue
+                if nd < 0:
+                    nd = p
+                else:
+                    var x = p
+                    var y = nd
+                    while x != y:
+                        while pon[x] < pon[y]:
+                            x = idom[x]
+                        while pon[y] < pon[x]:
+                            y = idom[y]
+                    nd = x
+            if nd >= 0 and idom[b] != nd:
+                idom[b] = nd
+                changed = true
+    return idom
+
+fn dom_children(idom: [int]) -> [[int]]:
+    var ch: [[int]] = [[]] * len(idom)
+    for b in 1..len(idom):
+        if idom[b] >= 0:
+            ch[idom[b]].push(b)
+    return ch
+
+# Preorder numbers and subtree ends of the dominator tree: a dominates b when
+# tin[a] <= tin[b] < tout[a].
+fn dom_numbers(ch: [[int]]) -> ([int], [int]):
+    let n = len(ch)
+    var tin = [0] * n
+    var tout = [0] * n
+    var t = 0
+    var st = [0]
+    while len(st) > 0:
+        let e = st.pop()
+        if e < 0:
+            tout[-e - 1] = t
+            continue
+        tin[e] = t
+        t += 1
+        st.push(-e - 1)
+        var i = len(ch[e]) - 1
+        while i >= 0:
+            st.push(ch[e][i])
+            i -= 1
+    return (tin, tout)
+
+# ================================================================ into SSA
+
+fn undef_inst(d: int, k: K) -> Inst:
+    if k.is_float():
+        return mk(Op.FConst, d, -1, -1, -1, 0)
+    return mk(Op.Const, d, -1, -1, 0, 0)
+
+fn to_ssa(ref sf: SF):
+    let n = len(sf.bs)
+    let nv = len(sf.f.vk)
+    let np = sf.f.nparams
+    let po = postorder(sf.bs)
+    let idom = idoms(sf.bs, po)
+    let ch = dom_children(idom)
+    # dominance frontiers
+    var df: [[int]] = [[]] * n
+    for b in 0..n:
+        if len(sf.bs[b].pred) < 2:
+            continue
+        for p in sf.bs[b].pred:
+            var r = p
+            while r != idom[b]:
+                if b not in df[r]:
+                    df[r].push(b)
+                r = idom[r]
+    # vregs read in a block before it sets them, and the blocks setting each
+    var glob = [false] * nv
+    var defb: [[int]] = [[]] * nv
+    var stamp = [-1] * nv
+    for v in 0..np:
+        defb[v].push(0)
+        stamp[v] = 0
+    for b in 0..n:
+        for x in sf.bs[b].code:
+            for u in uses(x):
+                if stamp[u] != b:
+                    glob[u] = true
+            if x.d >= 0:
+                if stamp[x.d] != b:
+                    stamp[x.d] = b
+                    defb[x.d].push(b)
+        # the next block starts over
+        for x in sf.bs[b].code:
+            if x.d >= 0:
+                stamp[x.d] = -1
+        if b == 0:
+            for v in 0..np:
+                stamp[v] = -1
+    # phis at the iterated dominance frontier of the blocks setting a vreg
+    var phis: [[int]] = [[]] * n
+    var placed = [-1] * n
+    var inwork = [-1] * n
+    for v in 0..nv:
+        if not glob[v] or len(defb[v]) == 0:
+            continue
+        var work = defb[v]
+        for b in work:
+            inwork[b] = v
+        while len(work) > 0:
+            let b = work.pop()
+            for d in df[b]:
+                if placed[d] != v:
+                    placed[d] = v
+                    phis[d].push(v)
+                    if inwork[d] != v:
+                        inwork[d] = v
+                        work.push(d)
+    for b in 0..n:
+        if len(phis[b]) == 0:
+            continue
+        var code: [Inst] = []
+        for v in phis[b]:
+            code.push(mk(Op.Phi, v, -1, -1, -1, v))
+        code.extend(sf.bs[b].code)
+        sf.bs[b].code = code
+    # renaming, over the dominator tree
+    let oldk = sf.f.vk
+    var vk: [K] = []
+    for v in 0..np:
+        vk.push(oldk[v])
+    var cur = [-1] * nv
+    for v in 0..np:
+        cur[v] = v
+    var undef: {str: int} = {}
+    var undef_code: [Inst] = []
+    var log_v: [int] = []
+    var log_old: [int] = []
+    var marks = [0] * n
+    var st = [0]
+    while len(st) > 0:
+        let e = st.pop()
+        if e < 0:
+            let b = -e - 1
+            while len(log_v) > marks[b]:
+                cur[log_v.pop()] = log_old.pop()
+            continue
+        let b = e
+        marks[b] = len(log_v)
+        st.push(-b - 1)
+        var ci = len(ch[b]) - 1
+        while ci >= 0:
+            st.push(ch[b][ci])
+            ci -= 1
+        var code = sf.bs[b].code
+        for i in 0..len(code):
+            var x = code[i]
+            if x.op != Op.Phi:
+                for u in uses(x):
+                    if cur[u] < 0:
+                        let key = oldk[u].name()
+                        match undef.get(key):
+                            case Some(w):
+                                cur[u] = w
+                            case None:
+                                let w = len(vk)
+                                vk.push(oldk[u])
+                                undef[key] = w
+                                undef_code.push(undef_inst(w, oldk[u]))
+                                cur[u] = w
+                x = map_uses(x, cur)
+            if x.d >= 0:
+                let ov = x.d
+                let nd = len(vk)
+                vk.push(oldk[ov])
+                log_v.push(ov)
+                log_old.push(cur[ov])
+                cur[ov] = nd
+                x.d = nd
+            code[i] = x
+        sf.bs[b].code = code
+        let lb = sf.bs[b].label
+        for s in sf.bs[b].succ:
+            for i in 0..len(sf.bs[s].code):
+                let y = sf.bs[s].code[i]
+                if y.op != Op.Phi:
+                    break
+                let ov = y.n
+                var v = cur[ov]
+                if v < 0:
+                    let key = oldk[ov].name()
+                    match undef.get(key):
+                        case Some(w):
+                            v = w
+                        case None:
+                            v = len(vk)
+                            vk.push(oldk[ov])
+                            undef[key] = v
+                            undef_code.push(undef_inst(v, oldk[ov]))
+                sf.bs[s].code[i].args.push(lb)
+                sf.bs[s].code[i].args.push(v)
+    if len(undef_code) > 0:
+        undef_code.extend(sf.bs[0].code)
+        sf.bs[0].code = undef_code
+    sf.f.vk = vk
+
+# ================================================================ constants
+
+# Kinds whose values SCCP tracks: integers up to 64 bits, Bool and Ptr.
+fn tracked(k: K) -> bool:
+    return not k.is_float() and not k.is_wide()
+
+fn bits_of(k: K) -> int:
+    if k == K.Bool:
+        return 1
+    return k.size() * 8
+
+fn two(e: int) -> i128:
+    return i128(1) << e
+
+# v (any value of the right magnitude) wrapped to kind k, canonical: the
+# int holding it (64-bit unsigned values as their bit pattern).
+fn wrapk(v: i128, k: K) -> int:
+    if k == K.Bool:
+        return 0 if v == 0 else 1
+    let bits = bits_of(k)
+    var m = v & (two(bits) - 1)
+    if (k.is_signed() or bits == 64) and m >= two(bits - 1):
+        m -= two(bits)
+    return int(m)
+
+# The number a canonical value of kind k stands for.
+fn num(v: int, k: K) -> i128:
+    if not k.is_signed() and v < 0:
+        return i128(v) + two(64)
+    return i128(v)
+
+fn kmin(k: K) -> i128:
+    if k.is_signed():
+        return -two(bits_of(k) - 1)
+    return 0
+
+fn kmax(k: K) -> i128:
+    if k == K.Bool:
+        return 1
+    if k.is_signed():
+        return two(bits_of(k) - 1) - 1
+    return two(bits_of(k)) - 1
+
+# truncating division of numbers (b != 0)
+fn tdiv(a: i128, b: i128) -> i128:
+    let ma = a if a >= 0 else -a
+    let mb = b if b >= 0 else -b
+    let q = ma / mb
+    return q if (a < 0) == (b < 0) else -q
+
+const TOP = 0
+const CONST = 1
+const BOT = 2
+
+# The value of x (setting a tracked kind) from its operands' values:
+# (TOP | CONST | BOT, the constant).
+fn fold(x: Inst, vk: [K], st: [int], val: [int]) -> (int, int):
+    let k = vk[x.d]
+    if x.op == Op.Mov:
+        if not tracked(k):
+            return (BOT, 0)
+        return (st[x.a], val[x.a])
+    if not tracked(k):
+        return (BOT, 0)
+    match x.op:
+        case Op.Const:
+            return (CONST, wrapk(i128(x.n), k))
+        case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
+            pass
+        case Op.Div | Op.Rem:
+            pass
+        case Op.AddO | Op.SubO | Op.MulO | Op.IdxChk:
+            pass
+        case Op.Neg | Op.Not | Op.Conv:
+            if not tracked(vk[x.a]):
+                return (BOT, 0)
+            if st[x.a] != CONST:
+                return (st[x.a], 0)
+            let a = num(val[x.a], vk[x.a])
+            match x.op:
+                case Op.Neg:
+                    return (CONST, wrapk(-a, k))
+                case Op.Not:
+                    if k == K.Bool:
+                        return (CONST, 1 - int(a))
+                    return (CONST, wrapk(a ^ (two(64) - 1), k))
+                case _:
+                    return (CONST, wrapk(a, k))
+        case Op.Eq | Op.Ne | Op.Lt | Op.Le | Op.Gt | Op.Ge:
+            let ka = vk[x.a]
+            if not tracked(ka):
+                return (BOT, 0)
+            if st[x.a] == BOT or st[x.b] == BOT:
+                return (BOT, 0)
+            if st[x.a] == TOP or st[x.b] == TOP:
+                return (TOP, 0)
+            let a = num(val[x.a], ka)
+            let b = num(val[x.b], ka)
+            var r = false
+            match x.op:
+                case Op.Eq:
+                    r = a == b
+                case Op.Ne:
+                    r = a != b
+                case Op.Lt:
+                    r = a < b
+                case Op.Le:
+                    r = a <= b
+                case Op.Gt:
+                    r = a > b
+                case _:
+                    r = a >= b
+            return (CONST, 1 if r else 0)
+        case _:
+            return (BOT, 0)
+    # binary arithmetic of kind k (checks: a and b of kind k too)
+    let sa = st[x.a]
+    let sb = st[x.b]
+    # x * 0 and x & 0 are 0 whatever x is
+    if (
+        (x.op == Op.Mul or x.op == Op.And)
+        and ((sa == CONST and val[x.a] == 0) or (sb == CONST and val[x.b] == 0))
+    ):
+        return (CONST, 0)
+    if sa == BOT or sb == BOT:
+        return (BOT, 0)
+    if sa == TOP or sb == TOP:
+        return (TOP, 0)
+    let ka = vk[x.a]
+    let a = num(val[x.a], ka)
+    let b = num(val[x.b], vk[x.b])
+    match x.op:
+        case Op.Add:
+            return (CONST, wrapk(a + b, k))
+        case Op.Sub:
+            return (CONST, wrapk(a - b, k))
+        case Op.Mul:
+            # the low 64 bits of the product, from the 64-bit patterns
+            return (CONST, wrapk(i128(val[x.a]) * i128(val[x.b]), k))
+        case Op.And:
+            return (CONST, wrapk(i128(val[x.a] & val[x.b]), k))
+        case Op.Or:
+            return (CONST, wrapk(i128(val[x.a] | val[x.b]), k))
+        case Op.Xor:
+            return (CONST, wrapk(i128(val[x.a] ^ val[x.b]), k))
+        case Op.Shl:
+            if b < 0 or b >= i128(bits_of(k)):
+                return (BOT, 0)
+            return (CONST, wrapk(a << int(b), k))
+        case Op.Shr:
+            if b < 0 or b >= i128(bits_of(k)):
+                return (BOT, 0)
+            return (CONST, wrapk(a >> int(b), k))
+        case Op.Div | Op.Rem:
+            if b == 0 or (k.is_signed() and a == kmin(k) and b == -1):
+                return (BOT, 0)
+            let q = tdiv(a, b)
+            if x.op == Op.Div:
+                return (CONST, wrapk(q, k))
+            return (CONST, wrapk(a - q * b, k))
+        case Op.IdxChk:
+            if a >= 0 and a < b:
+                return (CONST, int(a))
+            return (BOT, 0)
+        case _:
+            var r = a + b
+            if x.op == Op.SubO:
+                r = a - b
+            elif x.op == Op.MulO:
+                r = a * b
+            if r < kmin(k) or r > kmax(k):
+                return (BOT, 0)
+            return (CONST, wrapk(r, k))
+
+fn sccp(ref sf: SF):
+    let n = len(sf.bs)
+    let nv = len(sf.f.vk)
+    var st = [TOP] * nv
+    var val = [0] * nv
+    for v in 0..sf.f.nparams:
+        st[v] = BOT
+    # where each vreg is read: block * 2^24 + index
+    var users: [[int]] = [[]] * nv
+    for b in 0..n:
+        for i, x in enumerate(sf.bs[b].code):
+            for u in uses(x):
+                users[u].push(b * 16777216 + i)
+    var exec_b = [false] * n
+    var exec_e: {int: bool} = {}
+    var flow: [int] = [n * n]
+    var ssa_work: [int] = []
+    while len(flow) > 0 or len(ssa_work) > 0:
+        while len(flow) > 0:
+            let e = flow.pop()
+            var b = 0
+            if e != n * n:
+                if e in exec_e:
+                    continue
+                exec_e[e] = true
+                b = e % n
+            if exec_b[b]:
+                # a new edge into a block already seen: only its phis change
+                for i in 0..len(sf.bs[b].code):
+                    if sf.bs[b].code[i].op != Op.Phi:
+                        break
+                    sccp_inst(sf, b, i, ref st, ref val, exec_e, exec_b, ref flow, ref ssa_work)
+                continue
+            exec_b[b] = true
+            for i in 0..len(sf.bs[b].code):
+                sccp_inst(sf, b, i, ref st, ref val, exec_e, exec_b, ref flow, ref ssa_work)
+        while len(ssa_work) > 0:
+            let v = ssa_work.pop()
+            for u in users[v]:
+                let b = u / 16777216
+                if exec_b[b]:
+                    sccp_inst(
+                        sf,
+                        b,
+                        u % 16777216,
+                        ref st,
+                        ref val,
+                        exec_e,
+                        exec_b,
+                        ref flow,
+                        ref ssa_work
+                    )
+    # rewrite: constants, decided branches, blocks nothing reaches
+    for b in 0..n:
+        if not exec_b[b]:
+            continue
+        let m = len(sf.bs[b].code)
+        for i in 0..m:
+            let x = sf.bs[b].code[i]
+            if x.d >= 0 and st[x.d] == CONST and x.op != Op.Const:
+                sf.bs[b].code[i] = mk(Op.Const, x.d, -1, -1, 0 if val[x.d] >= 0 else -1, val[x.d])
+            elif (x.op == Op.Br or x.op == Op.BrNot) and st[x.a] == CONST:
+                let taken = (val[x.a] != 0) == (x.op == Op.Br)
+                sf.bs[b].code[i] = mk(Op.Jmp, -1, -1, -1, -1, x.n if taken else x.c)
+            elif x.op == Op.Switch and st[x.a] == CONST:
+                sf.bs[b].code[i] = mk(Op.Jmp, -1, -1, -1, -1, switch_target(x, val[x.a]))
+    relink(ref sf)
+
+fn switch_target(x: Inst, v: int) -> int:
+    let i = v - x.n
+    if i >= 0 and i < len(x.args) - 1:
+        return x.args[1 + i]
+    return x.args[0]
+
+fn sccp_edge(sf: SF, b: int, l: int, ref flow: [int]):
+    let n = len(sf.bs)
+    flow.push(b * n + sf.lab[l])
+
+fn sccp_inst(
+    sf: SF,
+    b: int,
+    i: int,
+    ref st: [int],
+    ref val: [int],
+    exec_e: {int: bool},
+    exec_b: [bool],
+    ref flow: [int],
+    ref ssa_work: [int]
+):
+    let x = sf.bs[b].code[i]
+    let n = len(sf.bs)
+    match x.op:
+        case Op.Jmp:
+            sccp_edge(sf, b, x.n, ref flow)
+            return
+        case Op.Br | Op.BrNot:
+            if st[x.a] == CONST:
+                let taken = (val[x.a] != 0) == (x.op == Op.Br)
+                sccp_edge(sf, b, x.n if taken else x.c, ref flow)
+            elif st[x.a] == BOT:
+                sccp_edge(sf, b, x.n, ref flow)
+                sccp_edge(sf, b, x.c, ref flow)
+            return
+        case Op.Switch:
+            if st[x.a] == CONST:
+                sccp_edge(sf, b, switch_target(x, val[x.a]), ref flow)
+            elif st[x.a] == BOT:
+                for l in targets(x):
+                    sccp_edge(sf, b, l, ref flow)
+            return
+        case _:
+            pass
+    if x.d < 0:
+        return
+    var ns = BOT
+    var nval = 0
+    if x.op == Op.Phi:
+        if not tracked(sf.f.vk[x.d]):
+            ns = BOT
+        else:
+            ns = TOP
+            var q = 0
+            while q < len(x.args):
+                let p = sf.lab[x.args[q]]
+                let v = x.args[q + 1]
+                q += 2
+                if p < 0 or (p * n + b) not in exec_e:
+                    continue
+                if st[v] == BOT:
+                    ns = BOT
+                    break
+                if st[v] == CONST:
+                    if ns == TOP:
+                        ns = CONST
+                        nval = val[v]
+                    elif nval != val[v]:
+                        ns = BOT
+                        break
+    else:
+        let (s1, v1) = fold(x, sf.f.vk, st, val)
+        ns = s1
+        nval = v1
+    let d = x.d
+    if ns == st[d] and (ns != CONST or nval == val[d]):
+        return
+    if ns < st[d]:
+        return
+    if ns == CONST and st[d] == CONST:
+        # (can't happen in a monotone lattice; be safe)
+        ns = BOT
+    st[d] = ns
+    val[d] = nval
+    ssa_work.push(d)
+
+# ================================================================ identities
+
+# Instructions that do nothing (`x + 0`, `x * 1`, `x | 0`, ...) become copies;
+# ones whose result doesn't depend on a variable operand (`0 << x`, `x - x`)
+# become constants; multiplications by a power of two become shifts.
+fn simplify(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var is_c = [false] * nv
+    var cv = [0] * nv
+    for b in sf.bs:
+        for x in b.code:
+            if x.op == Op.Const and tracked(sf.f.vk[x.d]):
+                is_c[x.d] = true
+                cv[x.d] = x.n
+    var entry: [Inst] = []
+    for bi in 0..len(sf.bs):
+        for i in 0..len(sf.bs[bi].code):
+            let x = sf.bs[bi].code[i]
+            if x.d < 0 or not tracked(sf.f.vk[x.d]):
+                continue
+            let k = sf.f.vk[x.d]
+            let ca = x.a >= 0 and x.a < nv and is_c[x.a]
+            let cb = x.b >= 0 and x.b < nv and is_c[x.b]
+            let a0 = ca and cv[x.a] == 0
+            let b0 = cb and cv[x.b] == 0
+            let a1 = ca and cv[x.a] == 1
+            let b1 = cb and cv[x.b] == 1
+            let ones = wrapk(i128(-1), k)
+            var y = x
+            var change = true
+            match x.op:
+                case Op.Add | Op.Or | Op.Xor:
+                    if b0:
+                        y = mk(Op.Mov, x.d, x.a, -1, -1, 0)
+                    elif a0:
+                        y = mk(Op.Mov, x.d, x.b, -1, -1, 0)
+                    elif x.a == x.b and x.op == Op.Xor:
+                        y = mk(Op.Const, x.d, -1, -1, 0, 0)
+                    elif x.a == x.b and x.op == Op.Or:
+                        y = mk(Op.Mov, x.d, x.a, -1, -1, 0)
+                    else:
+                        change = false
+                case Op.Sub:
+                    if b0:
+                        y = mk(Op.Mov, x.d, x.a, -1, -1, 0)
+                    elif x.a == x.b:
+                        y = mk(Op.Const, x.d, -1, -1, 0, 0)
+                    else:
+                        change = false
+                case Op.AddO | Op.SubO:
+                    if b0:
+                        y = mk(Op.Mov, x.d, x.a, -1, -1, 0)
+                    elif a0 and x.op == Op.AddO:
+                        y = mk(Op.Mov, x.d, x.b, -1, -1, 0)
+                    else:
+                        change = false
+                case Op.Mul | Op.MulO:
+                    if b1:
+                        y = mk(Op.Mov, x.d, x.a, -1, -1, 0)
+                    elif a1:
+                        y = mk(Op.Mov, x.d, x.b, -1, -1, 0)
+                    elif x.op == Op.Mul and cb and cv[x.b] > 1 and cv[x.b] & (cv[x.b] - 1) == 0:
+                        # (the shift count goes in the entry block, which dominates all)
+                        let sh = len(sf.f.vk)
+                        sf.f.vk.push(sf.f.vk[x.b])
+                        entry.push(mk(Op.Const, sh, -1, -1, 0, log2i(cv[x.b])))
+                        y = mk(Op.Shl, x.d, x.a, sh, -1, 0)
+                    else:
+                        change = false
+                case Op.And:
+                    if cb and cv[x.b] == ones:
+                        y = mk(Op.Mov, x.d, x.a, -1, -1, 0)
+                    elif ca and cv[x.a] == ones:
+                        y = mk(Op.Mov, x.d, x.b, -1, -1, 0)
+                    elif x.a == x.b:
+                        y = mk(Op.Mov, x.d, x.a, -1, -1, 0)
+                    else:
+                        change = false
+                case Op.Shl | Op.Shr:
+                    if b0:
+                        y = mk(Op.Mov, x.d, x.a, -1, -1, 0)
+                    elif a0:
+                        y = mk(Op.Const, x.d, -1, -1, 0, 0)
+                    else:
+                        change = false
+                case Op.Div:
+                    if b1:
+                        y = mk(Op.Mov, x.d, x.a, -1, -1, 0)
+                    else:
+                        change = false
+                case Op.Eq | Op.Le | Op.Ge:
+                    if x.a == x.b and tracked(sf.f.vk[x.a]):
+                        y = mk(Op.Const, x.d, -1, -1, 0, 1)
+                    else:
+                        change = false
+                case Op.Ne | Op.Lt | Op.Gt:
+                    if x.a == x.b and tracked(sf.f.vk[x.a]):
+                        y = mk(Op.Const, x.d, -1, -1, 0, 0)
+                    else:
+                        change = false
+                case _:
+                    change = false
+            if change:
+                sf.bs[bi].code[i] = y
+                if y.op == Op.Const:
+                    is_c[y.d] = true
+                    cv[y.d] = y.n
+    if len(entry) > 0:
+        entry.extend(sf.bs[0].code)
+        sf.bs[0].code = entry
+
+fn log2i(v: int) -> int:
+    var n = 0
+    while (1 << n) < v:
+        n += 1
+    return n
+
+# ================================================================ copies
+
+# Replaces every read of a copy (`d = mov v`) by v, and of a phi whose values
+# are all one vreg (or itself) by that vreg.
+fn copies(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var repl = [0] * nv
+    for v in 0..nv:
+        repl[v] = v
+    var changed = true
+    while changed:
+        changed = false
+        for b in 0..len(sf.bs):
+            for x in sf.bs[b].code:
+                if x.d < 0 or repl[x.d] != x.d:
+                    continue
+                if x.op == Op.Mov and sf.f.vk[x.a] == sf.f.vk[x.d]:
+                    let r = find(ref repl, x.a)
+                    if r != x.d:
+                        repl[x.d] = r
+                        changed = true
+                elif x.op == Op.Phi:
+                    var one = -1
+                    var many = false
+                    var q = 1
+                    while q < len(x.args):
+                        let v = find(ref repl, x.args[q])
+                        q += 2
+                        if v == x.d:
+                            continue
+                        if one < 0:
+                            one = v
+                        elif one != v:
+                            many = true
+                            break
+                    if not many and one >= 0:
+                        repl[x.d] = one
+                        changed = true
+    for v in 0..nv:
+        repl[v] = find(ref repl, v)
+    for b in 0..len(sf.bs):
+        var code: [Inst] = []
+        for x in sf.bs[b].code:
+            if x.d >= 0 and repl[x.d] != x.d:
+                continue
+            code.push(map_uses(x, repl))
+        sf.bs[b].code = code
+
+fn find(ref repl: [int], v: int) -> int:
+    var r = v
+    while repl[r] != r:
+        r = repl[r]
+    var w = v
+    while repl[w] != r:
+        let nx = repl[w]
+        repl[w] = r
+        w = nx
+    return r
+
+# ================================================================ memory
+
+# The slots whose address only ever serves as the address of a load, a store,
+# a copy or a zeroing: nothing else can point at them. (false for the others)
+fn private_slots(sf: SF) -> [bool]:
+    let nv = len(sf.f.vk)
+    var slot = [-1] * nv
+    for b in sf.bs:
+        for x in b.code:
+            if x.op == Op.SlotAddr:
+                slot[x.d] = x.a
+    var ok = [true] * len(sf.f.slots)
+    for b in sf.bs:
+        for x in b.code:
+            for u in uses(x):
+                if slot[u] < 0:
+                    continue
+                let addr = (
+                    ((x.op == Op.Load or x.op == Op.Zero) and x.a == u)
+                    or (x.op == Op.Store and x.a == u and x.b != u)
+                    or (x.op == Op.Copy and (x.a == u or x.b == u))
+                )
+                if not addr:
+                    ok[slot[u]] = false
+    return ok
+
+# What a memory access touches: a base vreg plus [lo, hi) bytes; the slot
+# the base is the address of (-1: unknown), and whether that slot is private.
+struct Place:
+    base: int
+    lo: int
+    hi: int
+    slot: int
+    private: bool
+
+# Can a write to w change what a read of r sees?
+fn may_alias(w: Place, r: Place) -> bool:
+    if w.base == r.base:
+        return w.lo < r.hi and r.lo < w.hi
+    if w.slot >= 0 and r.slot >= 0:
+        return w.slot == r.slot and w.lo < r.hi and r.lo < w.hi
+    # a private slot is only reached through its own address
+    if (w.slot >= 0 and w.private) or (r.slot >= 0 and r.private):
+        return false
+    return true
+
+# ================================================================ value numbering
+
+fn gvn_key(x: Inst, vk: [K]) -> str:
+    match x.op:
+        case Op.Add | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Eq | Op.Ne:
+            let a = min(x.a, x.b)
+            let b = max(x.a, x.b)
+            return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{a}|{b}"
+        case Op.Sub | Op.Div | Op.Rem | Op.Shl | Op.Shr | Op.Lt | Op.Le | Op.Gt | Op.Ge:
+            return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{x.a}|{x.b}"
+        case Op.Neg | Op.Not | Op.Conv:
+            return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{x.a}"
+        case Op.Elem:
+            return f"elem|{x.a}|{x.b}|{x.n}"
+        case Op.AddO | Op.SubO | Op.MulO | Op.IdxChk:
+            return f"{x.op.name()}|{vk[x.d].name()}|{x.a}|{x.b}"
+        case Op.Global:
+            return f"global|{x.s}"
+        case Op.SlotAddr:
+            return f"slot|{x.a}"
+        case _:
+            return ""
+
+struct Avail:
+    place: Place
+    k: K
+    v: int
+
+fn gvn(ref sf: SF):
+    let n = len(sf.bs)
+    let nv = len(sf.f.vk)
+    let po = postorder(sf.bs)
+    let idom = idoms(sf.bs, po)
+    let ch = dom_children(idom)
+    let priv = private_slots(sf)
+    var slot = [-1] * nv
+    for b in sf.bs:
+        for x in b.code:
+            if x.op == Op.SlotAddr:
+                slot[x.d] = x.a
+    var repl = [0] * nv
+    for v in 0..nv:
+        repl[v] = v
+    var table: {str: int} = {}
+    var log_k: [str] = []
+    var marks = [0] * n
+    # the loads and stores known at the end of each block, for a successor
+    # that only it leads to
+    var at_end: [[Avail]] = [[]] * n
+    var st = [0]
+    while len(st) > 0:
+        let e = st.pop()
+        if e < 0:
+            let b = -e - 1
+            while len(log_k) > marks[b]:
+                table.remove(log_k.pop())
+            continue
+        let b = e
+        marks[b] = len(log_k)
+        st.push(-b - 1)
+        var ci = len(ch[b]) - 1
+        while ci >= 0:
+            st.push(ch[b][ci])
+            ci -= 1
+        var avail: [Avail] = []
+        if b != 0 and len(sf.bs[b].pred) == 1 and sf.bs[b].pred[0] == idom[b]:
+            avail = at_end[idom[b]]
+        var code = sf.bs[b].code
+        for i in 0..len(code):
+            var x = map_uses(code[i], repl)
+            code[i] = x
+            if x.op == Op.Phi:
+                continue
+            match x.op:
+                case Op.Load:
+                    let p = place(x.a, x.n, sf.f.vk[x.d].size(), slot, priv)
+                    var hit = -1
+                    for av in avail:
+                        if (
+                            av.place.base == p.base
+                            and av.place.lo == p.lo
+                            and av.place.hi == p.hi
+                            and av.k == sf.f.vk[x.d]
+                        ):
+                            hit = av.v
+                    if hit >= 0:
+                        repl[x.d] = hit
+                        code[i] = mk(Op.Mov, x.d, hit, -1, -1, 0)
+                    else:
+                        avail.push(Avail(place=p, k=sf.f.vk[x.d], v=x.d))
+                    continue
+                case Op.Store:
+                    let p = place(x.a, x.n, sf.f.vk[x.b].size(), slot, priv)
+                    avail = [av for av in avail if not may_alias(p, av.place)]
+                    avail.push(Avail(place=p, k=sf.f.vk[x.b], v=x.b))
+                    continue
+                case Op.Copy | Op.Zero:
+                    let p = place(x.a, 0, x.n, slot, priv)
+                    avail = [av for av in avail if not may_alias(p, av.place)]
+                    continue
+                case Op.Call | Op.CallInd:
+                    avail = [av for av in avail if av.place.slot >= 0 and av.place.private]
+                case _:
+                    pass
+            if len(avail) > 64:
+                avail = avail[len(avail) - 64:]
+            if x.d < 0:
+                continue
+            let key = gvn_key(x, sf.f.vk)
+            if key == "":
+                continue
+            match table.get(key):
+                case Some(v):
+                    repl[x.d] = v
+                    code[i] = mk(Op.Mov, x.d, v, -1, -1, 0)
+                case None:
+                    table[key] = x.d
+                    log_k.push(key)
+        sf.bs[b].code = code
+        for c in ch[b]:
+            if len(sf.bs[c].pred) == 1:
+                at_end[b] = avail
+                break
+    # phis read values of other blocks: map them now that all are known
+    for b in 0..n:
+        for i in 0..len(sf.bs[b].code):
+            if sf.bs[b].code[i].op != Op.Phi:
+                break
+            sf.bs[b].code[i] = map_uses(sf.bs[b].code[i], repl)
+
+fn place(base: int, off: int, size: int, slot: [int], priv: [bool]) -> Place:
+    let s = slot[base]
+    return Place(base=base, lo=off, hi=off + size, slot=s, private=s >= 0 and priv[s])
+
+# ================================================================ dead code
+
+fn dce(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var def_b = [-1] * nv
+    var def_i = [-1] * nv
+    for b in 0..len(sf.bs):
+        for i, x in enumerate(sf.bs[b].code):
+            if x.d >= 0:
+                def_b[x.d] = b
+                def_i[x.d] = i
+    var live = [false] * nv
+    var work: [int] = []
+    for b in sf.bs:
+        for x in b.code:
+            if effect(x):
+                for u in uses(x):
+                    if not live[u]:
+                        live[u] = true
+                        work.push(u)
+    while len(work) > 0:
+        let v = work.pop()
+        if def_b[v] < 0:
+            continue
+        for u in uses(sf.bs[def_b[v]].code[def_i[v]]):
+            if not live[u]:
+                live[u] = true
+                work.push(u)
+    for b in 0..len(sf.bs):
+        var code: [Inst] = []
+        for x in sf.bs[b].code:
+            if x.d >= 0 and not live[x.d] and not effect(x):
+                continue
+            code.push(x)
+        sf.bs[b].code = code
+
+# ================================================================ loops
+
+struct Loop:
+    header: int
+    # the blocks in the loop (by block index)
+    body: [int]
+
+fn find_loops(sf: SF) -> [Loop]:
+    let n = len(sf.bs)
+    let po = postorder(sf.bs)
+    let idom = idoms(sf.bs, po)
+    let (tin, tout) = dom_numbers(dom_children(idom))
+    var latches: [[int]] = [[]] * n
+    for b in 0..n:
+        for s in sf.bs[b].succ:
+            if tin[s] <= tin[b] and tin[b] < tout[s]:
+                latches[s].push(b)
+    var loops: [Loop] = []
+    var mark = [-1] * n
+    for h in 0..n:
+        if len(latches[h]) == 0:
+            continue
+        var body = [h]
+        mark[h] = h
+        var work: [int] = []
+        for t in latches[h]:
+            if mark[t] != h:
+                mark[t] = h
+                body.push(t)
+                work.push(t)
+        while len(work) > 0:
+            let b = work.pop()
+            for p in sf.bs[b].pred:
+                if mark[p] != h:
+                    mark[p] = h
+                    body.push(p)
+                    work.push(p)
+        loops.push(Loop(header=h, body=body))
+    return loops
+
+# Gives every loop header a preheader: a block outside the loop that only
+# jumps to the header, the only way into the loop.
+fn preheaders(ref sf: SF):
+    while preheader_one(ref sf):
+        pass
+
+# Adds one missing preheader; false when there is none to add.
+fn preheader_one(ref sf: SF) -> bool:
+    let loops = find_loops(sf)
+    var made = false
+    for lp in loops:
+        let h = lp.header
+        var inb = [false] * len(sf.bs)
+        for b in lp.body:
+            inb[b] = true
+        var outside: [int] = []
+        for p in sf.bs[h].pred:
+            if not inb[p]:
+                outside.push(p)
+        if len(outside) == 1 and len(sf.bs[outside[0]].succ) == 1:
+            continue
+        let hl = sf.bs[h].label
+        let pl = new_label(ref sf)
+        var olab = [false] * sf.f.nlabels
+        for p in outside:
+            olab[sf.bs[p].label] = true
+            let m = len(sf.bs[p].code)
+            sf.bs[p].code[m - 1] = retarget(sf.bs[p].code[m - 1], hl, pl)
+        # the header's phis: the entries from outside move to the preheader
+        var pcode: [Inst] = []
+        for j in 0..len(sf.bs[h].code):
+            let x = sf.bs[h].code[j]
+            if x.op != Op.Phi:
+                break
+            var inside: [int] = []
+            var outs: [int] = []
+            var q = 0
+            while q < len(x.args):
+                if olab[x.args[q]]:
+                    outs.push(x.args[q])
+                    outs.push(x.args[q + 1])
+                else:
+                    inside.push(x.args[q])
+                    inside.push(x.args[q + 1])
+                q += 2
+            if len(outs) == 0:
+                continue
+            var v = outs[1]
+            if len(outs) > 2:
+                v = len(sf.f.vk)
+                sf.f.vk.push(sf.f.vk[x.d])
+                var y = mk(Op.Phi, v, -1, -1, -1, -1)
+                y.args = outs
+                pcode.push(y)
+            inside.push(pl)
+            inside.push(v)
+            sf.bs[h].code[j].args = inside
+        pcode.push(mk(Op.Jmp, -1, -1, -1, -1, hl))
+        # placed right before the header (indices shift; relink fixes them)
+        sf.bs.insert(h, Block(label=pl, code=pcode, succ=[], pred=[]))
+        made = true
+        # later loops' indices are stale now: do the rest next round
+        break
+    if made:
+        relink(ref sf)
+    return made
+
+fn speculatable(x: Inst, sf: SF, def_b: [int], def_i: [int]) -> bool:
+    match x.op:
+        case Op.Const | Op.FConst | Op.Mov | Op.Global | Op.SlotAddr | Op.Elem:
+            return true
+        case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
+            return true
+        case Op.Neg | Op.Not | Op.Conv:
+            return true
+        case Op.Eq | Op.Ne | Op.Lt | Op.Le | Op.Gt | Op.Ge:
+            return true
+        case Op.Div | Op.Rem:
+            if sf.f.vk[x.d].is_float():
+                return true
+            # a constant divisor other than 0 and -1 can't trap
+            let db = def_b[x.b]
+            if db < 0:
+                return false
+            let y = sf.bs[db].code[def_i[x.b]]
+            return y.op == Op.Const and y.n != 0 and y.n != -1
+        case _:
+            return false
+
+fn licm(ref sf: SF):
+    preheaders(ref sf)
+    var loops = find_loops(sf)
+    if len(loops) == 0:
+        return
+    # innermost first: their hoisted code can move again with the outer loop
+    var order: [(int, int)] = []
+    for i, lp in enumerate(loops):
+        order.push((len(lp.body), i))
+    order.sort()
+    let n = len(sf.bs)
+    let nv = len(sf.f.vk)
+    let priv = private_slots(sf)
+    var slot = [-1] * nv
+    for b in sf.bs:
+        for x in b.code:
+            if x.op == Op.SlotAddr:
+                slot[x.d] = x.a
+    var def_b = [-1] * nv
+    var def_i = [-1] * nv
+    for (_, li) in order:
+        let lp = loops[li]
+        let h = lp.header
+        var inb = [false] * n
+        for b in lp.body:
+            inb[b] = true
+        var pre = -1
+        for p in sf.bs[h].pred:
+            if not inb[p]:
+                pre = p
+        if pre < 0:
+            continue
+        # where vregs are set now (hoisting moves them)
+        for b in 0..n:
+            for i, x in enumerate(sf.bs[b].code):
+                if x.d >= 0:
+                    def_b[x.d] = b
+                    def_i[x.d] = i
+        # the writes in the loop, for loads
+        var writes: [Place] = []
+        var calls = false
+        for b in lp.body:
+            for x in sf.bs[b].code:
+                match x.op:
+                    case Op.Store:
+                        writes.push(place(x.a, x.n, sf.f.vk[x.b].size(), slot, priv))
+                    case Op.Copy | Op.Zero:
+                        writes.push(place(x.a, 0, x.n, slot, priv))
+                    case Op.Call | Op.CallInd:
+                        calls = true
+                    case _:
+                        pass
+        var hoisted: [Inst] = []
+        var moved = [false] * nv
+        # in the loop's own order: an operand set earlier in it may move first
+        let po = postorder(sf.bs)
+        var j = len(po) - 1
+        while j >= 0:
+            let b = po[j]
+            j -= 1
+            if not inb[b]:
+                continue
+            var keep: [Inst] = []
+            var blocked = false
+            for x in sf.bs[b].code:
+                var go = x.d >= 0 and x.op != Op.Phi
+                if go:
+                    for u in uses(x):
+                        if def_b[u] >= 0 and inb[def_b[u]] and not moved[u]:
+                            go = false
+                            break
+                if go:
+                    if speculatable(x, sf, def_b, def_i):
+                        pass
+                    elif (
+                        b == h
+                        and not blocked
+                        and (is_check(x.op) or x.op == Op.Div or x.op == Op.Rem)
+                    ):
+                        pass
+                    elif b == h and x.op == Op.Load:
+                        # (a load can't panic: only the writes matter)
+                        let p = place(x.a, x.n, sf.f.vk[x.d].size(), slot, priv)
+                        if calls and not (p.slot >= 0 and p.private):
+                            go = false
+                        for w in writes:
+                            if may_alias(w, p):
+                                go = false
+                                break
+                    else:
+                        go = false
+                if go:
+                    hoisted.push(x)
+                    moved[x.d] = true
+                else:
+                    if effect(x) and x.op != Op.Phi:
+                        blocked = true
+                    keep.push(x)
+            sf.bs[b].code = keep
+        if len(hoisted) > 0:
+            var pc = sf.bs[pre].code
+            let t = pc.pop()
+            pc.extend(hoisted)
+            pc.push(t)
+            sf.bs[pre].code = pc
+
+# ================================================================ out of SSA
+
+fn split_edges(ref sf: SF):
+    var made = false
+    let n = len(sf.bs)
+    var new_blocks: [Block] = []
+    for s in 0..n:
+        if len(sf.bs[s].code) == 0 or sf.bs[s].code[0].op != Op.Phi:
+            continue
+        let sl = sf.bs[s].label
+        for p in sf.bs[s].pred:
+            if len(sf.bs[p].succ) < 2:
+                continue
+            let pl = sf.bs[p].label
+            let nl = new_label(ref sf)
+            let m = len(sf.bs[p].code)
+            sf.bs[p].code[m - 1] = retarget(sf.bs[p].code[m - 1], sl, nl)
+            for j in 0..len(sf.bs[s].code):
+                if sf.bs[s].code[j].op != Op.Phi:
+                    break
+                var q = 0
+                while q < len(sf.bs[s].code[j].args):
+                    if sf.bs[s].code[j].args[q] == pl:
+                        sf.bs[s].code[j].args[q] = nl
+                    q += 2
+            new_blocks.push(
+                Block(label=nl, code=[mk(Op.Jmp, -1, -1, -1, -1, sl)], succ=[], pred=[])
+            )
+            made = true
+    if made:
+        sf.bs.extend(new_blocks)
+        relink(ref sf)
+
+# Sequential copies doing the parallel copies (d, v) at once.
+fn parallel_copies(ref f: Func, ds: [int], vs: [int]) -> [Inst]:
+    var pd: [int] = []
+    var pv: [int] = []
+    for i in 0..len(ds):
+        if ds[i] != vs[i]:
+            pd.push(ds[i])
+            pv.push(vs[i])
+    var out: [Inst] = []
+    while len(pd) > 0:
+        var pick = -1
+        for i in 0..len(pd):
+            var read = false
+            for j in 0..len(pv):
+                if j != i and pv[j] == pd[i]:
+                    read = true
+                    break
+            if not read:
+                pick = i
+                break
+        if pick >= 0:
+            out.push(mk(Op.Mov, pd[pick], pv[pick], -1, -1, 0))
+            pd.pop(pick)
+            pv.pop(pick)
+            continue
+        # a cycle: save one destination's value first
+        let d = pd[0]
+        let t = len(f.vk)
+        f.vk.push(f.vk[d])
+        out.push(mk(Op.Mov, t, d, -1, -1, 0))
+        for j in 0..len(pv):
+            if pv[j] == d:
+                pv[j] = t
+    return out
+
+fn from_ssa(sf0: SF) -> Func:
+    var sf = sf0
+    split_edges(ref sf)
+    let n = len(sf.bs)
+    # each predecessor's copies, for the phis of its successor
+    for s in 0..n:
+        if len(sf.bs[s].code) == 0 or sf.bs[s].code[0].op != Op.Phi:
+            continue
+        var np = 0
+        while np < len(sf.bs[s].code) and sf.bs[s].code[np].op == Op.Phi:
+            np += 1
+        for p in sf.bs[s].pred:
+            let pl = sf.bs[p].label
+            var ds: [int] = []
+            var vs: [int] = []
+            for j in 0..np:
+                let x = sf.bs[s].code[j]
+                var q = 0
+                while q < len(x.args):
+                    if x.args[q] == pl:
+                        ds.push(x.d)
+                        vs.push(x.args[q + 1])
+                        break
+                    q += 2
+            let cs = parallel_copies(ref sf.f, ds, vs)
+            var pc = sf.bs[p].code
+            let t = pc.pop()
+            pc.extend(cs)
+            pc.push(t)
+            sf.bs[p].code = pc
+        sf.bs[s].code = sf.bs[s].code[np:]
+    # flat code, in block order
+    var code: [Inst] = []
+    for i in 0..n:
+        let b = sf.bs[i]
+        code.push(mk(Op.Label, -1, -1, -1, -1, b.label))
+        let m = len(b.code)
+        for j in 0..m - 1:
+            code.push(b.code[j])
+        let t = b.code[m - 1]
+        let next = sf.bs[i + 1].label if i + 1 < n else -1
+        match t.op:
+            case Op.Jmp:
+                if t.n != next:
+                    code.push(t)
+            case Op.Br | Op.BrNot:
+                if t.c == next:
+                    code.push(mk(t.op, -1, t.a, -1, -1, t.n))
+                elif t.n == next:
+                    let inv = Op.BrNot if t.op == Op.Br else Op.Br
+                    code.push(mk(inv, -1, t.a, -1, -1, t.c))
+                else:
+                    code.push(mk(t.op, -1, t.a, -1, -1, t.n))
+                    code.push(mk(Op.Jmp, -1, -1, -1, -1, t.c))
+            case _:
+                code.push(t)
+    var f = sf.f
+    f.code = code
+    return f
+
+# ================================================================ the pipeline
+
+fn optimize(f: Func) -> Func:
+    var sf = build(f)
+    to_ssa(ref sf)
+    copies(ref sf)
+    sccp(ref sf)
+    simplify(ref sf)
+    copies(ref sf)
+    gvn(ref sf)
+    copies(ref sf)
+    licm(ref sf)
+    gvn(ref sf)
+    copies(ref sf)
+    dce(ref sf)
+    return from_ssa(sf)
