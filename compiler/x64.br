@@ -2658,13 +2658,25 @@ struct X:
         self.fsaved = r.fsaved
         self.keep = r.keep
 
+    # An integer parameter can be in any register, an argument register too
+    # (ra.br), so the ones in registers are set last, in an order that reads
+    # each argument register before it is changed (a cycle goes through rax),
+    # and the ones passed on the stack after that.
     fn store_params(ref self, f: Func):
         let h = 1 if f.has_ret and f.ret.is_wide() else 0
         if h == 1:
             self.mov_mr(mrb(self.retp), self.int_reg(self.ploc[0]))
+        var todo: [int] = []
+        var src = [-1] * f.nparams
         for i in 0..f.nparams:
             let k = f.vk[i]
             let l = self.ploc[i + h]
+            if not k.is_wide() and l < L_XMM and self.reg[i] >= 0:
+                src[i] = self.int_reg(l)
+                self.norm(src[i], k)
+                if src[i] != self.reg[i]:
+                    todo.push(i)
+                continue
             if k.is_wide():
                 var r = R11
                 if l >= L_STACK:
@@ -2673,19 +2685,40 @@ struct X:
                     r = self.int_reg(l)
                 self.copy16(self.vm(i), mreg(r, 0))
             elif l >= L_STACK:
-                if self.reg[i] >= 0:
-                    self.load_k(self.reg[i], self.vm(i), k)
-                elif self.freg[i] >= 0:
-                    self.fload(fl_of(k), self.freg[i], self.vm(i))
-                elif k.size() < 8 and not k.is_float():
-                    self.load_k(RAX, self.vm(i), k)
-                    self.st(RAX, i)
+                pass
             elif l >= L_XMM:
                 self.fst(fl_of(k), i, l - L_XMM)
             else:
                 let r = self.int_reg(l)
                 self.norm(r, k)
                 self.st(r, i)
+        while len(todo) > 0:
+            var at = -1
+            for t, i in enumerate(todo):
+                if not any(j != i and src[j] == self.reg[i] for j in todo):
+                    at = t
+                    break
+            if at < 0:
+                let r = self.reg[todo[0]]
+                self.mov_rr(RAX, r)
+                for j in todo:
+                    if src[j] == r:
+                        src[j] = RAX
+                continue
+            let i = todo[at]
+            self.mov_rr(self.reg[i], src[i])
+            todo.pop(at)
+        for i in 0..f.nparams:
+            let k = f.vk[i]
+            if k.is_wide() or self.ploc[i + h] < L_STACK:
+                continue
+            if self.reg[i] >= 0:
+                self.load_k(self.reg[i], self.vm(i), k)
+            elif self.freg[i] >= 0:
+                self.fload(fl_of(k), self.freg[i], self.vm(i))
+            elif k.size() < 8 and not k.is_float():
+                self.load_k(RAX, self.vm(i), k)
+                self.st(RAX, i)
 
     # ------------------------------------------------------------ instructions
     # Compiles the instruction at i; returns the index of the next one.
