@@ -3,7 +3,8 @@
 # `brine_f` (brine_rt.h has the same functions, with the same parameters
 # and results) and native code inlines it. A function named `brine_f`
 # replaces the C one outright: it is the program's `brine_f`, which the C
-# runtime calls too, so brine_rt.c leaves its own out (BRINE_RT_BR).
+# runtime calls too, so brine_rt.c leaves its own out (BRINE_RT_BR). One
+# whose name ends in `_cold` is a slow path, never inlined.
 #
 # This module alone has `ptr`, a raw address, with `p + n` and `p - n`, and
 # the memory operations `load_<t>(p, off)` and `store_<t>(p, off, v)` (t is
@@ -11,10 +12,10 @@
 # of the C function at f; `call_void` has no result), `str_retain(p)` and
 # `str_release(p)` (also arr_ and map_), `str_of(p)` and `ptr_of(s)` (a
 # string's block as a `str` and back, borrowed), `stack_mem(n)` (n bytes of
-# the frame), `bswap(x)`, `thread_ptr()`, `addr(p)` (p as a number) and
-# `symbol("name")` (a C symbol's address) and `null_ptr()`. Its arithmetic wraps, and the
-# prover doesn't look at it. Code here can't use what lowers to the function
-# it is in (`a + b` on strings in brine_str_concat).
+# the frame), `bswap(x)`, `thread_ptr()`, `addr(p)` (p as a number),
+# `symbol("name")` (a C symbol's address) and `null_ptr()`. Its arithmetic
+# wraps, and the prover doesn't look at it. Code here can't use what lowers
+# to the function it is in (`a + b` on strings in brine_str_concat).
 
 # brine_str: a reference count (negative: immortal), the length, then the
 # bytes and a NUL. Every string can be read to the end of the 8-byte word
@@ -59,10 +60,6 @@ const SMALL = 256
 const ONES: u64 = 0xffffffffffffffff
 
 extern fn brine_hash_long(p: ptr, n: u64) -> u64
-
-extern fn brine_map_at(m: ptr, k: ptr, loc: ptr) -> ptr
-
-extern fn brine_map_val_mut_slow(pm: ptr, e: int, k: ptr, loc: ptr) -> ptr
 
 extern fn brine_x_str_reset(ps: ptr, lit: ptr)
 
@@ -1160,3 +1157,312 @@ fn brine_arr_slice(a: ptr, lo: int, hi: int, loc: ptr) -> ptr:
         arr_retain(a)
         return a
     return copy_elems(a, elem_at(a, lo), hi - lo, loc)
+
+# ------------------------------------------------------------ maps
+# brine_map: entries in insertion order (keys, values, hashes, live flags;
+# slots [0, used)) and `index`, an open-addressing table of entry numbers:
+# -1 empty, -2 removed. brine_map_ty: the key and value sizes, then the
+# functions that hash, compare, write and retain or release them.
+
+const MAP_USED = 16
+const MAP_CAP = 24
+const MAP_TY = 40
+const MAP_LIVE = 72
+const MAP_SIZE = 88
+
+const MT_KSZ = 0
+const MT_VSZ = 8
+const MT_HASH = 16
+const MT_KEQ = 24
+const MT_VEQ = 32
+const MT_KFMT = 40
+const MT_KRT = 48
+const MT_KRL = 56
+const MT_VRT = 64
+const MT_VRL = 72
+
+# frees a map whose keys or values hold something, past a depth on a list
+# (brine_drop)
+extern fn brine_x_map_drop(m: ptr)
+
+fn brine_map_new(ty: ptr) -> ptr:
+    let m = new_counted(MAP_SIZE)
+    memset(m, 0, u64(MAP_SIZE))
+    store_i64(m, MAP_RC, 1)
+    store_ptr(m, MAP_TY, ty)
+    return m
+
+fn free_if(p: ptr):
+    if addr(p) != 0:
+        blk_free(p)
+
+fn brine_map_free(m: ptr):
+    let t = load_ptr(m, MAP_TY)
+    if addr(load_ptr(t, MT_KRL)) != 0 or addr(load_ptr(t, MT_VRL)) != 0:
+        brine_x_map_drop(m)
+        return
+    free_if(load_ptr(m, MAP_KEYS))
+    free_if(load_ptr(m, MAP_VALS))
+    free_if(load_ptr(m, MAP_HASHES))
+    free_if(load_ptr(m, MAP_LIVE))
+    free_if(load_ptr(m, MAP_INDEX))
+    free_counted(m)
+
+# The index made again for the entries (a sparse one: fewer probes, and few
+# maps are big enough for it to cost much).
+fn map_reindex(m: ptr):
+    var n = 8
+    while n < 4 * load_i64(m, MAP_CAP):
+        n *= 2
+    free_if(load_ptr(m, MAP_INDEX))
+    store_i64(m, MAP_NIDX, n)
+    let ix = blk_alloc(n * 8)
+    # all -1
+    memset(ix, 0xff, u64(n * 8))
+    store_ptr(m, MAP_INDEX, ix)
+    let mask = u64(n - 1)
+    let hs = load_ptr(m, MAP_HASHES)
+    let live = load_ptr(m, MAP_LIVE)
+    for e in 0..load_i64(m, MAP_USED):
+        if not load_bool(live, e):
+            continue
+        var i = load_u64(hs, e * 8) & mask
+        while load_i64(ix, int(i) * 8) != -1:
+            i = (i + 1) & mask
+        store_i64(ix, int(i) * 8, e)
+
+# The entry arrays with room for `cap` entries (at least `used`), without
+# the removed ones.
+fn map_resize_cold(m: ptr, cap: int):
+    let t = load_ptr(m, MAP_TY)
+    let ksz = load_i64(t, MT_KSZ)
+    let vsz = load_i64(t, MT_VSZ)
+    let ok = load_ptr(m, MAP_KEYS)
+    let ov = load_ptr(m, MAP_VALS)
+    let oh = load_ptr(m, MAP_HASHES)
+    let ol = load_ptr(m, MAP_LIVE)
+    let used = load_i64(m, MAP_USED)
+    if used == load_i64(m, MAP_LEN):
+        # nothing removed: the arrays just grow
+        store_ptr(m, MAP_KEYS, brine_x_realloc(ok, cap * ksz + 1))
+        store_ptr(m, MAP_VALS, brine_x_realloc(ov, cap * vsz + 1))
+        store_ptr(m, MAP_HASHES, brine_x_realloc(oh, cap * 8))
+        store_ptr(m, MAP_LIVE, brine_x_realloc(ol, cap))
+    else:
+        let k = blk_alloc(cap * ksz + 1)
+        let v = blk_alloc(cap * vsz + 1)
+        let h = blk_alloc(cap * 8)
+        let l = blk_alloc(cap)
+        var j = 0
+        for i in 0..used:
+            if not load_bool(ol, i):
+                continue
+            copy_bytes(k + j * ksz, ok + i * ksz, ksz)
+            copy_bytes(v + j * vsz, ov + i * vsz, vsz)
+            store_u64(h, j * 8, load_u64(oh, i * 8))
+            store_bool(l, j, true)
+            j += 1
+        free_if(ok)
+        free_if(ov)
+        free_if(oh)
+        free_if(ol)
+        store_ptr(m, MAP_KEYS, k)
+        store_ptr(m, MAP_VALS, v)
+        store_ptr(m, MAP_HASHES, h)
+        store_ptr(m, MAP_LIVE, l)
+        store_i64(m, MAP_USED, j)
+    store_i64(m, MAP_CAP, cap)
+    map_reindex(m)
+
+# A copy of block p's first n bytes in a new block of n + 1 bytes.
+fn dup_bytes(p: ptr, n: int) -> ptr:
+    let d = blk_alloc(n + 1)
+    if n > 0:
+        memcpy(d, p, u64(n))
+    return d
+
+fn brine_map_unique(pm: ptr):
+    map_own(pm)
+
+# Makes *pm a map nothing else holds, to change it.
+fn map_own(pm: ptr):
+    if load_i64(load_ptr(pm, 0), MAP_RC) != 1:
+        map_copy_cold(pm)
+
+fn map_copy_cold(pm: ptr):
+    let a = load_ptr(pm, 0)
+    let t = load_ptr(a, MAP_TY)
+    let ksz = load_i64(t, MT_KSZ)
+    let vsz = load_i64(t, MT_VSZ)
+    let n = brine_map_new(t)
+    # copies of the entry arrays; map_resize_cold then compacts them and makes
+    # the index
+    let used = load_i64(a, MAP_USED)
+    store_i64(n, MAP_USED, used)
+    store_ptr(n, MAP_KEYS, dup_bytes(load_ptr(a, MAP_KEYS), used * ksz))
+    store_ptr(n, MAP_VALS, dup_bytes(load_ptr(a, MAP_VALS), used * vsz))
+    store_ptr(n, MAP_HASHES, dup_bytes(load_ptr(a, MAP_HASHES), used * 8))
+    store_ptr(n, MAP_LIVE, dup_bytes(load_ptr(a, MAP_LIVE), used))
+    let len = load_i64(a, MAP_LEN)
+    store_i64(n, MAP_LEN, len)
+    map_resize_cold(n, len if len > 4 else 4)
+    let krt = load_ptr(t, MT_KRT)
+    let vrt = load_ptr(t, MT_VRT)
+    if addr(krt) != 0:
+        each_elem(krt, load_ptr(n, MAP_KEYS), load_i64(n, MAP_USED), ksz)
+    if addr(vrt) != 0:
+        each_elem(vrt, load_ptr(n, MAP_VALS), load_i64(n, MAP_USED), vsz)
+    map_release(a)
+    store_ptr(pm, 0, n)
+
+# The entry of key k (hash h) in m, or -1.
+fn map_lookup(m: ptr, k: ptr, h: u64) -> int:
+    let t = load_ptr(m, MAP_TY)
+    return map_probe(m, k, h, load_ptr(t, MT_KEQ), load_i64(t, MT_KSZ), false)
+
+fn brine_map_find(m: ptr, k: ptr) -> int:
+    if load_i64(m, MAP_LEN) == 0:
+        return -1
+    return map_lookup(m, k, call_u64(load_ptr(load_ptr(m, MAP_TY), MT_HASH), k))
+
+fn map_missing_cold(m: ptr, k: ptr, loc: ptr):
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    sb_lit(sb, "key ")
+    call_void(load_ptr(load_ptr(m, MAP_TY), MT_KFMT), sb, k)
+    sb_lit(sb, " is not in the map")
+    brine_panic_at(loc, str_of(brine_sb_finish(sb)))
+
+fn brine_map_at(m: ptr, k: ptr, loc: ptr) -> ptr:
+    let e = brine_map_find(m, k)
+    if e < 0:
+        map_missing_cold(m, k, loc)
+    return load_ptr(m, MAP_VALS) + e * load_i64(load_ptr(m, MAP_TY), MT_VSZ)
+
+# The value of entry e (of key k) after making the map unique; copying it
+# compacts the entries, so e can change.
+fn val_unique(pm: ptr, e0: int, k: ptr) -> ptr:
+    let before = load_ptr(pm, 0)
+    map_own(pm)
+    let m = load_ptr(pm, 0)
+    let e = e0 if m == before else brine_map_find(m, k)
+    return load_ptr(m, MAP_VALS) + e * load_i64(load_ptr(m, MAP_TY), MT_VSZ)
+
+fn brine_map_at_mut(pm: ptr, k: ptr, loc: ptr) -> ptr:
+    let e = brine_map_find(load_ptr(pm, 0), k)
+    if e < 0:
+        map_missing_cold(load_ptr(pm, 0), k, loc)
+    return val_unique(pm, e, k)
+
+fn brine_map_val_mut_slow(pm: ptr, e: int, k: ptr, loc: ptr) -> ptr:
+    if e < 0:
+        # panics
+        return brine_map_at_mut(pm, k, loc)
+    return val_unique(pm, e, k)
+
+fn brine_map_set(pm: ptr, k: ptr, v: ptr):
+    map_own(pm)
+    let m = load_ptr(pm, 0)
+    let t = load_ptr(m, MAP_TY)
+    let ksz = load_i64(t, MT_KSZ)
+    let vsz = load_i64(t, MT_VSZ)
+    let h = call_u64(load_ptr(t, MT_HASH), k)
+    let found = map_lookup(m, k, h)
+    if found >= 0:
+        let krl = load_ptr(t, MT_KRL)
+        if addr(krl) != 0:
+            call_void(krl, k)
+        let vp = load_ptr(m, MAP_VALS) + found * vsz
+        let vrl = load_ptr(t, MT_VRL)
+        if addr(vrl) != 0:
+            call_void(vrl, vp)
+        copy_bytes(vp, v, vsz)
+        return
+    if load_i64(m, MAP_USED) == load_i64(m, MAP_CAP):
+        let n = load_i64(m, MAP_LEN) * 2
+        map_resize_cold(m, n if n > 8 else 8)
+    let e = load_i64(m, MAP_USED)
+    store_i64(m, MAP_USED, e + 1)
+    copy_bytes(load_ptr(m, MAP_KEYS) + e * ksz, k, ksz)
+    copy_bytes(load_ptr(m, MAP_VALS) + e * vsz, v, vsz)
+    store_u64(load_ptr(m, MAP_HASHES), e * 8, h)
+    store_bool(load_ptr(m, MAP_LIVE), e, true)
+    store_i64(m, MAP_LEN, load_i64(m, MAP_LEN) + 1)
+    let mask = load_u64(m, MAP_NIDX) - 1
+    let ix = load_ptr(m, MAP_INDEX)
+    var i = h & mask
+    while load_i64(ix, int(i) * 8) >= 0:
+        i = (i + 1) & mask
+    store_i64(ix, int(i) * 8, e)
+
+fn brine_map_remove(pm: ptr, k: ptr) -> bool:
+    if brine_map_find(load_ptr(pm, 0), k) < 0:
+        return false
+    map_own(pm)
+    let m = load_ptr(pm, 0)
+    let t = load_ptr(m, MAP_TY)
+    let ksz = load_i64(t, MT_KSZ)
+    let h = call_u64(load_ptr(t, MT_HASH), k)
+    let e = map_lookup(m, k, h)
+    let mask = load_u64(m, MAP_NIDX) - 1
+    let ix = load_ptr(m, MAP_INDEX)
+    var i = h & mask
+    while load_i64(ix, int(i) * 8) != e:
+        i = (i + 1) & mask
+    store_i64(ix, int(i) * 8, -2)
+    store_bool(load_ptr(m, MAP_LIVE), e, false)
+    store_i64(m, MAP_LEN, load_i64(m, MAP_LEN) - 1)
+    let krl = load_ptr(t, MT_KRL)
+    if addr(krl) != 0:
+        call_void(krl, load_ptr(m, MAP_KEYS) + e * ksz)
+    let vrl = load_ptr(t, MT_VRL)
+    if addr(vrl) != 0:
+        call_void(vrl, load_ptr(m, MAP_VALS) + e * load_i64(t, MT_VSZ))
+    return true
+
+# The keys or the values, as an array.
+fn map_column(m: ptr, keys: bool) -> ptr:
+    let t = load_ptr(m, MAP_TY)
+    let sz = load_i64(t, MT_KSZ if keys else MT_VSZ)
+    let rt = load_ptr(t, MT_KRT if keys else MT_VRT)
+    let rl = load_ptr(t, MT_KRL if keys else MT_VRL)
+    let a = brine_arr_new(load_i64(m, MAP_LEN), sz, rt, rl, ptr_of("") + STR_DATA)
+    let src = load_ptr(m, MAP_KEYS if keys else MAP_VALS)
+    let live = load_ptr(m, MAP_LIVE)
+    let d = load_ptr(a, ARR_DATA)
+    var j = 0
+    for i in 0..load_i64(m, MAP_USED):
+        if not load_bool(live, i):
+            continue
+        copy_bytes(d + j * sz, src + i * sz, sz)
+        if addr(rt) != 0:
+            call_void(rt, d + j * sz)
+        j += 1
+    return a
+
+fn brine_map_keys(m: ptr) -> ptr:
+    return map_column(m, true)
+
+fn brine_map_values(m: ptr) -> ptr:
+    return map_column(m, false)
+
+fn brine_map_eq(a: ptr, b: ptr) -> bool:
+    if a == b:
+        return true
+    if load_i64(a, MAP_LEN) != load_i64(b, MAP_LEN):
+        return false
+    let t = load_ptr(a, MAP_TY)
+    let ksz = load_i64(t, MT_KSZ)
+    let vsz = load_i64(t, MT_VSZ)
+    let veq = load_ptr(t, MT_VEQ)
+    let live = load_ptr(a, MAP_LIVE)
+    for i in 0..load_i64(a, MAP_USED):
+        if not load_bool(live, i):
+            continue
+        let k = load_ptr(a, MAP_KEYS) + i * ksz
+        let e = map_lookup(b, k, load_u64(load_ptr(a, MAP_HASHES), i * 8))
+        if e < 0:
+            return false
+        if not call_bool(veq, load_ptr(a, MAP_VALS) + i * vsz, load_ptr(b, MAP_VALS) + e * vsz):
+            return false
+    return true
