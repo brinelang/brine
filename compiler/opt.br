@@ -698,23 +698,38 @@ fn switches(f: Func) -> Func:
     return g
 
 # ================================================================ inlining
-# Small functions that call nothing are copied into their callers (native
-# code, not debug builds): the calls of float code made of little helpers
-# (`fmin`, a dot product) cost more than the helpers do. Tiny ones that do
-# call are too (a release function that frees through `brine_drop`): one
-# call instead of two. `hot` ones (the runtime's fast paths, a map's hash and
-# key comparison) up to a larger size, calls and all; an indirect call of a
-# function the caller names becomes a direct one, inlined in the next round.
-# A small function that calls itself gets its body in place of those calls,
-# once: half the calls of a walk over a tree.
-const INLINE_MAX = 40
+# Small functions that call nothing (or only `cheap_call`s) are copied into
+# their callers (native code, not debug builds): the calls of float code
+# made of little helpers (`fmin`, a dot product) cost more than the helpers
+# do. Tiny ones that do call are too (a release function that frees through
+# `brine_drop`): one call instead of two. `hot` ones (the runtime's fast
+# paths, a map's hash and key comparison) up to a larger size, calls and
+# all; an indirect call of a function the caller names becomes a direct
+# one, inlined in the next round. A small function that calls itself gets
+# its body in place of those calls, once: half the calls of a walk over a
+# tree.
+const INLINE_MAX = 64
 const INLINE_CALLS = 12
 const INLINE_HOT = 160
 const INLINE_ROUNDS = 3
 # the most code a function calling itself may end up with
 const INLINE_SELF = 160
 
-fn inlinable(f: Func) -> bool:
+# Calls that cost about as little as an instruction: reference count
+# increments (written inline by the backends) and the runtime's fast paths
+# in brine (`hot`, themselves inlined).
+fn cheap_call(x: Inst, hot: {str: bool}) -> bool:
+    if x.b == 0:
+        return x.s in hot
+    let n = x.s
+    return (
+        n == "brine_str_retain"
+        or n == "brine_arr_retain"
+        or n == "brine_map_retain"
+        or n == "brine_box_retain"
+    )
+
+fn inlinable(f: Func, hot: {str: bool}) -> bool:
     if f.public:
         return false
     if len(f.code) > (INLINE_HOT if f.hot else INLINE_MAX):
@@ -730,7 +745,8 @@ fn inlinable(f: Func) -> bool:
         if x.op == Op.Call:
             if x.b == 0 and x.s == f.name:
                 return false
-            calls = true
+            if not cheap_call(x, hot):
+                calls = true
     return f.hot or not calls or len(f.code) <= INLINE_CALLS
 
 fn inline_small(fs: [Func]) -> [Func]:
@@ -767,9 +783,13 @@ fn self_inline(f: Func) -> Func:
 fn inline_round(fs: [Func]) -> ([Func], bool):
     var small: {str: Func} = {}
     var names: {str: bool} = {}
+    var hot: {str: bool} = {}
     for f in fs:
         names[f.name] = true
-        if inlinable(f):
+        if f.hot:
+            hot[f.name] = true
+    for f in fs:
+        if inlinable(f, hot):
             # its parameters in vregs rather than slots
             small[f.name] = promote(f)
     var changed = false
