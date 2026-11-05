@@ -22,6 +22,9 @@
 # * Dead code: instructions whose results nothing reads.
 # * Vectors: innermost loops over arrays of doubles that vloop.br can run
 #   several elements at a time get its kernel, called before the loop.
+# * Lanes: innermost loops that run interleaved iterations in lockstep
+#   (jam.br), four at a time doing the same work, get an AVX2 kernel from
+#   vlane.br that runs them as vectors.
 #
 # Back in flat code every phi becomes copies at the end of its predecessors
 # (critical edges are split first, and the copies on one edge are made in an
@@ -29,6 +32,7 @@
 
 from ir import K, Op, Inst, Func, KFunc, Slot
 import vloop
+import vlane
 from vloop import LOp, L_LD, L_ST, L_ADD, L_SUB, L_MUL, L_DIV, L_IADD, L_ISUB, L_IMUL, L_IAND
 from vloop import L_IOR, L_IXOR, L_SHL, L_SAR, L_SHR, L_CONV, L_RED
 
@@ -549,6 +553,34 @@ fn to_ssa(ref sf: SF):
 # ================================================================ constants
 
 # Kinds whose values SCCP tracks: integers up to 64 bits, Bool and Ptr.
+# Rewrites that give the same bits with less work: `2.0 * x` is `x + x`, and
+# `a & (a & b)` (lanes of interleaved loops make it) is `a & b`.
+fn rewrites(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var two = [false] * nv
+    var and_a = [-1] * nv
+    var and_b = [-1] * nv
+    for b in sf.bs:
+        for x in b.code:
+            if x.op == Op.FConst and sf.f.vk[x.d] == K.F64 and x.n == 4611686018427387904:
+                two[x.d] = true
+            elif x.op == Op.And and x.d >= 0 and sf.f.vk[x.d] == K.Bool:
+                and_a[x.d] = x.a
+                and_b[x.d] = x.b
+    for bi in 0..len(sf.bs):
+        for i in 0..len(sf.bs[bi].code):
+            let x = sf.bs[bi].code[i]
+            if x.op == Op.Mul and x.d >= 0 and sf.f.vk[x.d] == K.F64:
+                if two[x.a]:
+                    sf.bs[bi].code[i] = mk(Op.Add, x.d, x.b, x.b, -1, 0)
+                elif two[x.b]:
+                    sf.bs[bi].code[i] = mk(Op.Add, x.d, x.a, x.a, -1, 0)
+            elif x.op == Op.And and x.d >= 0 and sf.f.vk[x.d] == K.Bool:
+                if and_a[x.b] == x.a or and_b[x.b] == x.a:
+                    sf.bs[bi].code[i] = mk(Op.Mov, x.d, x.b, -1, -1, 0)
+                elif and_a[x.a] == x.b or and_b[x.a] == x.b:
+                    sf.bs[bi].code[i] = mk(Op.Mov, x.d, x.a, -1, -1, 0)
+
 fn tracked(k: K) -> bool:
     return not k.is_float() and not k.is_wide()
 
@@ -2251,6 +2283,549 @@ fn log2_exact(n: int) -> int:
         k += 1
     return k if (1 << k) == n else -1
 
+# ================================================================ lane loops
+
+# Innermost loops that run four interleaved iterations in lockstep get an
+# AVX2 kernel (vlane.br), called before the loop.
+fn lane_loops(ref sf: SF, name: str) -> [KFunc]:
+    var out: [KFunc] = []
+    preheaders(ref sf)
+    let loops = find_loops(sf)
+    var is_head = [false] * len(sf.bs)
+    for lp in loops:
+        is_head[lp.header] = true
+    for lp in loops:
+        let (ok, k) = lane_loop(ref sf, lp, is_head, f"{name}_{len(out)}")
+        if ok:
+            out.push(k)
+    return out
+
+# One scalar operation of a lane: a vlane.br operation (V_*) on vregs.
+struct LaneOp:
+    op: int
+    p: int
+    d: int
+    args: [int]
+
+fn lane_none() -> (bool, LaneOp):
+    return (false, LaneOp(op=-1, p=0, d=-1, args=[]))
+
+# x as a lane operation, if it is one vlane.br has.
+fn lane_inst(sf: SF, x: Inst) -> (bool, LaneOp):
+    if x.d < 0:
+        return lane_none()
+    let kd = sf.f.vk[x.d]
+    var op = -1
+    var p = 0
+    var args = [x.a, x.b]
+    if kd == K.F64:
+        if x.op == Op.Add:
+            op = vlane.V_FADD
+        elif x.op == Op.Sub:
+            op = vlane.V_FSUB
+        elif x.op == Op.Mul:
+            op = vlane.V_FMUL
+        elif x.op == Op.Div:
+            op = vlane.V_FDIV
+    elif kd == K.I64 or kd == K.Bool:
+        if x.op == Op.And:
+            op = vlane.V_AND
+        elif x.op == Op.Or:
+            op = vlane.V_OR
+        elif x.op == Op.Xor:
+            op = vlane.V_XOR
+        elif x.op == Op.Not:
+            op = vlane.V_NOT
+            args = [x.a]
+        elif kd == K.I64 and x.op == Op.Add:
+            op = vlane.V_IADD
+        elif kd == K.I64 and x.op == Op.Sub:
+            op = vlane.V_ISUB
+    if kd == K.Bool and op < 0:
+        let ka = sf.f.vk[x.a]
+        if ka == K.F64:
+            # the ordered predicates, but != (true for NaN)
+            op = vlane.V_FCMP
+            match x.op:
+                case Op.Eq:
+                    p = 0
+                case Op.Ne:
+                    p = 4
+                case Op.Lt:
+                    p = 17
+                case Op.Le:
+                    p = 18
+                case Op.Gt:
+                    p = 30
+                case Op.Ge:
+                    p = 29
+                case _:
+                    op = -1
+        elif ka == K.I64:
+            op = vlane.V_IGT
+            match x.op:
+                case Op.Gt:
+                    pass
+                case Op.Lt:
+                    args = [x.b, x.a]
+                case Op.Le:
+                    p = 1
+                case Op.Ge:
+                    args = [x.b, x.a]
+                    p = 1
+                case Op.Eq:
+                    op = vlane.V_IEQ
+                case Op.Ne:
+                    op = vlane.V_IEQ
+                    p = 1
+                case _:
+                    op = -1
+        elif ka == K.Bool and (x.op == Op.Eq or x.op == Op.Ne):
+            # masks of -1 and 0 compare as integers
+            op = vlane.V_IEQ
+            p = 1 if x.op == Op.Ne else 0
+    if op < 0:
+        return lane_none()
+    return (true, LaneOp(op=op, p=p, d=x.d, args=args))
+
+fn lane_kind(k: K) -> bool:
+    return k == K.F64 or k == K.I64 or k == K.Bool
+
+# Whether block e only jumps from b to j, which only b and e reach.
+fn side_block(sf: SF, e: int, j: int, b: int, h: int, inb: [bool]) -> bool:
+    if e == h or j == h or not inb[e] or not inb[j]:
+        return false
+    let bs = sf.bs
+    if len(bs[e].pred) != 1 or bs[e].pred[0] != b or len(bs[e].succ) != 1 or bs[e].succ[0] != j:
+        return false
+    let jp = bs[j].pred
+    return len(jp) == 2 and ((jp[0] == b and jp[1] == e) or (jp[0] == e and jp[1] == b))
+
+# The loop must be: a header with phis in groups of four of one type (lanes
+# 0 to 3 of a variable), pure operations, and a branch into the loop when
+# the `or` of four values (the lanes of one) is true; then blocks in a row
+# where a branch on a value skips a block that only computes, with phis
+# after it. Lane k's operations must read lane k's values and values from
+# outside the loop, and each lane must do the same operations as lane 0 in
+# the same order.
+fn lane_loop(ref sf: SF, lp: Loop, is_head: [bool], name: str) -> (bool, KFunc):
+    let nb = len(sf.bs)
+    let nv = len(sf.f.vk)
+    let h = lp.header
+    var inb = [false] * nb
+    for b in lp.body:
+        inb[b] = true
+        if b != h and is_head[b]:
+            return no_kernel()
+    if len(sf.bs[h].pred) != 2:
+        return no_kernel()
+    var phis: [Inst] = []
+    var phi_ats: [int] = []
+    var hops: [Inst] = []
+    for i, x in enumerate(sf.bs[h].code):
+        if x.op == Op.Phi:
+            phis.push(x)
+            phi_ats.push(i)
+        elif x.op != Op.Line:
+            hops.push(x)
+    let nphi = len(phis)
+    if nphi == 0 or nphi % 4 != 0 or nphi > 128 or len(hops) < 2:
+        return no_kernel()
+    let br = hops.pop()
+    if br.op != Op.Br and br.op != Op.BrNot:
+        return no_kernel()
+    let first = br.n if br.op == Op.Br else br.c
+    let exitl = br.c if br.op == Op.Br else br.n
+    if first < 0 or exitl < 0 or sf.lab[first] < 0 or sf.lab[exitl] < 0:
+        return no_kernel()
+    if not inb[sf.lab[first]] or inb[sf.lab[exitl]]:
+        return no_kernel()
+    let pre_q = outside_arg(sf, phis[0], inb)
+    if pre_q < 0:
+        return no_kernel()
+    let pre_l = phis[0].args[pre_q - 1]
+    let pre = sf.lab[pre_l]
+    if pre < 0:
+        return no_kernel()
+    for i, x in enumerate(phis):
+        if outside_arg(sf, x, inb) != pre_q or x.args[pre_q - 1] != pre_l:
+            return no_kernel()
+        if not lane_kind(sf.f.vk[x.d]) or sf.f.vk[x.d] != sf.f.vk[phis[i - i % 4].d]:
+            return no_kernel()
+    var def_b = [-1] * nv
+    for b in 0..nb:
+        for x in sf.bs[b].code:
+            if x.d >= 0:
+                def_b[x.d] = b
+    # reads in the loop, and where in the header each value is made
+    var reads = [0] * nv
+    var hdef = [-1] * nv
+    for b in lp.body:
+        for x in sf.bs[b].code:
+            for u in uses(x):
+                reads[u] += 1
+    for i, x in enumerate(hops):
+        if x.d >= 0:
+            hdef[x.d] = i
+    # the test: an `or` of values, read by nothing else
+    var tree = [false] * nv
+    var leaves = [br.a]
+    if reads[br.a] != 1:
+        return no_kernel()
+    while len(leaves) < nphi:
+        var at = -1
+        for i, v in enumerate(leaves):
+            if at < 0 and hdef[v] >= 0 and hops[hdef[v]].op == Op.Or and reads[v] == 1:
+                at = i
+        if at < 0:
+            break
+        let x = hops[hdef[leaves[at]]]
+        tree[x.d] = true
+        var nl: [int] = []
+        for i, v in enumerate(leaves):
+            if i == at:
+                nl.push(x.a)
+                nl.push(x.b)
+            else:
+                nl.push(v)
+        leaves = nl
+    if len(leaves) % 4 != 0:
+        return no_kernel()
+    # the operations in order: the header's, then the rest's, with each
+    # skipped block's phis as selects
+    var lin: [LaneOp] = []
+    for x in hops:
+        if x.d >= 0 and tree[x.d]:
+            continue
+        if x.op == Op.Mov:
+            lin.push(LaneOp(op=-1, p=0, d=x.d, args=[x.a]))
+            continue
+        let (ok, o) = lane_inst(sf, x)
+        if not ok:
+            return no_kernel()
+        lin.push(o)
+    let nhead = len(lin)
+    var b = sf.lab[first]
+    var seen = 1
+    var join = false
+    while true:
+        if not inb[b] or seen > len(lp.body):
+            return no_kernel()
+        seen += 1
+        let code = sf.bs[b].code
+        for i in 0..len(code) - 1:
+            let x = code[i]
+            if x.op == Op.Line or (join and x.op == Op.Phi):
+                continue
+            if x.op == Op.Mov:
+                lin.push(LaneOp(op=-1, p=0, d=x.d, args=[x.a]))
+                continue
+            let (ok, o) = lane_inst(sf, x)
+            if not ok:
+                return no_kernel()
+            lin.push(o)
+        let t = code[len(code) - 1]
+        if t.op == Op.Jmp:
+            let nx = sf.lab[t.n]
+            if nx == h:
+                break
+            if nx < 0 or len(sf.bs[nx].pred) != 1:
+                return no_kernel()
+            b = nx
+            join = false
+            continue
+        if (t.op != Op.Br and t.op != Op.BrNot) or sf.lab[t.n] < 0 or sf.lab[t.c] < 0:
+            return no_kernel()
+        var e = sf.lab[t.n]
+        var j = sf.lab[t.c]
+        if not side_block(sf, e, j, b, h, inb):
+            e = sf.lab[t.c]
+            j = sf.lab[t.n]
+            if not side_block(sf, e, j, b, h, inb):
+                return no_kernel()
+        seen += 1
+        let ecode = sf.bs[e].code
+        for i in 0..len(ecode) - 1:
+            let x = ecode[i]
+            if x.op == Op.Line:
+                continue
+            if x.op == Op.Mov:
+                lin.push(LaneOp(op=-1, p=0, d=x.d, args=[x.a]))
+                continue
+            let (ok, o) = lane_inst(sf, x)
+            if not ok:
+                return no_kernel()
+            lin.push(o)
+        # e runs when t.a is `when_e`
+        let el = sf.bs[e].label
+        let when_e = (t.op == Op.Br and t.n == el) or (t.op == Op.BrNot and t.c == el)
+        for x in sf.bs[j].code:
+            if x.op != Op.Phi:
+                continue
+            if len(x.args) != 4 or not lane_kind(sf.f.vk[x.d]):
+                return no_kernel()
+            var ve = -1
+            var vb = -1
+            for q in [0, 2]:
+                let lb = sf.lab[x.args[q]]
+                if lb == e:
+                    ve = x.args[q + 1]
+                elif lb == b:
+                    vb = x.args[q + 1]
+            if ve < 0 or vb < 0:
+                return no_kernel()
+            let args = [t.a, ve, vb] if when_e else [t.a, vb, ve]
+            lin.push(LaneOp(op=vlane.V_SEL, p=0, d=x.d, args=args))
+        b = j
+        join = true
+    if seen != len(lp.body):
+        return no_kernel()
+    # values made in the loop: their vector and lane. Vectors 0 to nphi / 4
+    # - 1 are the variables; each other one is made by the operation of its
+    # lane 0, with operands vectors (>= 0) or values from outside (-1, and
+    # those in `vinv`, 4 for each operand).
+    let nvar = nphi / 4
+    var vec = [-1] * nv
+    var lane = [-1] * nv
+    var alias = [-1] * nv
+    for i, x in enumerate(phis):
+        vec[x.d] = i / 4
+        lane[x.d] = i % 4
+    var vop: [int] = []
+    var vp: [int] = []
+    var vk: [K] = []
+    var vopnd: [[int]] = []
+    var vinv: [[int]] = []
+    var vfill: [[int]] = []
+    var vhead: [bool] = []
+    for g in 0..nvar:
+        vop.push(-1)
+        vp.push(0)
+        vk.push(sf.f.vk[phis[4 * g].d])
+        vopnd.push([])
+        vinv.push([])
+        vfill.push([phis[4 * g].d, phis[4 * g + 1].d, phis[4 * g + 2].d, phis[4 * g + 3].d])
+        vhead.push(true)
+    for i, o in enumerate(lin):
+        if o.op < 0:
+            # a copy
+            var a = o.args[0]
+            if alias[a] >= 0:
+                a = alias[a]
+            alias[o.d] = a
+            vec[o.d] = vec[a]
+            lane[o.d] = lane[a]
+            continue
+        var args: [int] = []
+        var ln = -1
+        for u0 in o.args:
+            let u = alias[u0] if alias[u0] >= 0 else u0
+            args.push(u)
+            if vec[u] >= 0:
+                if ln >= 0 and ln != lane[u]:
+                    return no_kernel()
+                ln = lane[u]
+            elif ins(def_b, inb, u) or not lane_kind(sf.f.vk[u]):
+                return no_kernel()
+        if ln < 0:
+            return no_kernel()
+        var v = -1
+        if ln == 0:
+            v = len(vop)
+            vop.push(o.op)
+            vp.push(o.p)
+            vk.push(sf.f.vk[o.d])
+            var opnd: [int] = []
+            var inv = [-1] * (4 * len(args))
+            for j, u in enumerate(args):
+                opnd.push(vec[u])
+                if vec[u] < 0:
+                    inv[4 * j] = u
+            vopnd.push(opnd)
+            vinv.push(inv)
+            vfill.push([o.d, -1, -1, -1])
+            vhead.push(i < nhead)
+        else:
+            for c in nvar..len(vop):
+                if (
+                    v < 0
+                    and vfill[c][ln] < 0
+                    and vop[c] == o.op
+                    and vp[c] == o.p
+                    and vk[c] == sf.f.vk[o.d]
+                ):
+                    var same = len(vopnd[c]) == len(args)
+                    if same:
+                        for j, u in enumerate(args):
+                            if vopnd[c][j] != vec[u]:
+                                same = false
+                    if same:
+                        v = c
+            if v < 0:
+                return no_kernel()
+            for j, u in enumerate(args):
+                if vec[u] < 0:
+                    vinv[v][4 * j + ln] = u
+            vfill[v][ln] = o.d
+        vec[o.d] = v
+        lane[o.d] = ln
+    for c in 0..len(vop):
+        for k in 0..4:
+            if vfill[c][k] < 0:
+                return no_kernel()
+    # the test's values are the lanes of vectors, each lane once
+    var tvs: [int] = []
+    var lanes_seen: [[bool]] = []
+    for u0 in leaves:
+        let u = alias[u0] if alias[u0] >= 0 else u0
+        if vec[u] < 0 or not vhead[vec[u]]:
+            return no_kernel()
+        var at = -1
+        for i, t in enumerate(tvs):
+            if t == vec[u]:
+                at = i
+        if at < 0:
+            at = len(tvs)
+            tvs.push(vec[u])
+            lanes_seen.push([false] * 4)
+        if lanes_seen[at][lane[u]]:
+            return no_kernel()
+        lanes_seen[at][lane[u]] = true
+    if len(tvs) * 4 != len(leaves):
+        return no_kernel()
+    # each variable's next value: lane k of one vector, or values from outside
+    var nexts: [int] = []
+    var next_inv: [[int]] = []
+    for g in 0..nvar:
+        var nx = -2
+        var outs = [-1] * 4
+        for k in 0..4:
+            let x = phis[4 * g + k]
+            var u = x.args[4 - pre_q]
+            if alias[u] >= 0:
+                u = alias[u]
+            if vec[u] >= 0:
+                if lane[u] != k or (nx != -2 and nx != vec[u]):
+                    return no_kernel()
+                nx = vec[u]
+            elif ins(def_b, inb, u) or nx >= 0:
+                return no_kernel()
+            else:
+                nx = -1
+                outs[k] = u
+        nexts.push(nx)
+        next_inv.push(outs)
+    # nothing made in the loop is read after it, but in the header
+    for bb in 0..nb:
+        if not inb[bb]:
+            for x in sf.bs[bb].code:
+                for u in uses(x):
+                    if ins(def_b, inb, u) and def_b[u] != h:
+                        return no_kernel()
+    # the values from outside: one for each set of four
+    var inv_keys: [str] = []
+    var invs: [[int]] = []
+    var inv_at: {str: int} = {}
+    var vinv_ix: [[int]] = []
+    for c in 0..len(vop):
+        var ix: [int] = []
+        for j in 0..len(vopnd[c]):
+            if vopnd[c][j] >= 0:
+                ix.push(-1)
+                continue
+            let four = [vinv[c][4 * j], vinv[c][4 * j + 1], vinv[c][4 * j + 2], vinv[c][4 * j + 3]]
+            ix.push(inv_index(four, ref inv_at, ref invs))
+        vinv_ix.push(ix)
+    var next_ix = [-1] * nvar
+    for g in 0..nvar:
+        if nexts[g] == -1:
+            next_ix[g] = inv_index(next_inv[g], ref inv_at, ref invs)
+    let ninv = len(invs)
+    # the vectors as vlane.br numbers values
+    var num = [-1] * len(vop)
+    for g in 0..nvar:
+        num[g] = g
+    var head: [vlane.VOp] = []
+    var body: [vlane.VOp] = []
+    var nvals = nvar + ninv
+    var test = -1
+    for in_head in [true, false]:
+        for c in nvar..len(vop):
+            if vhead[c] != in_head:
+                continue
+            num[c] = nvals
+            nvals += 1
+            var a = [-1, -1, -1]
+            for j in 0..len(vopnd[c]):
+                a[j] = num[vopnd[c][j]] if vopnd[c][j] >= 0 else nvar + vinv_ix[c][j]
+            let o = vlane.VOp(op=vop[c], p=vp[c], d=num[c], a=a[0], b=a[1], c=a[2])
+            if in_head:
+                head.push(o)
+            else:
+                body.push(o)
+        if in_head:
+            # the test: the `or` of its vectors
+            test = num[tvs[0]]
+            for i in 1..len(tvs):
+                head.push(vlane.VOp(op=vlane.V_OR, p=0, d=nvals, a=test, b=num[tvs[i]], c=-1))
+                test = nvals
+                nvals += 1
+    var next: [int] = []
+    for g in 0..nvar:
+        next.push(num[nexts[g]] if nexts[g] >= 0 else nvar + next_ix[g])
+    let l = vlane.Lanes(nvar=nvar, ninv=ninv, head=head, test=test, body=body, next=next)
+    let (ok, k) = vlane.compile(l, name)
+    if not ok:
+        return no_kernel()
+    # the block and the call, at the end of the preheader
+    var code = sf.bs[pre].code
+    let term = code.pop()
+    let blk = new_v(ref sf, K.Ptr)
+    sf.f.slots.push(Slot(size=8 * vlane.nwords(l), align=8, name="", typed=false, k=K.I64))
+    code.push(mk(Op.SlotAddr, blk, len(sf.f.slots) - 1, -1, -1, 0))
+    for i, x in enumerate(phis):
+        lane_store(ref sf, ref code, blk, x.args[pre_q], 8 * i)
+    for j, four in enumerate(invs):
+        for k2 in 0..4:
+            lane_store(ref sf, ref code, blk, four[k2], 8 * (4 * (nvar + j) + k2))
+    code.push(Inst(op=Op.Call, d=-1, a=-1, b=-1, c=-1, n=0, s=name, args=[blk]))
+    # where the loop goes on from
+    for i, x in enumerate(phis):
+        let kd = sf.f.vk[x.d]
+        var v = new_v(ref sf, K.I64 if kd == K.Bool else kd)
+        code.push(mk(Op.Load, v, blk, -1, -1, 8 * i))
+        if kd == K.Bool:
+            let zero = new_v(ref sf, K.I64)
+            code.push(mk(Op.Const, zero, -1, -1, -1, 0))
+            let t = new_v(ref sf, K.Bool)
+            code.push(mk(Op.Ne, t, v, zero, -1, 0))
+            v = t
+        sf.bs[h].code[phi_ats[i]].args[pre_q] = v
+    code.push(term)
+    sf.bs[pre].code = code
+    return (true, k)
+
+fn inv_index(four: [int], ref at: {str: int}, ref invs: [[int]]) -> int:
+    let key = f"{four[0]},{four[1]},{four[2]},{four[3]}"
+    match at.get(key):
+        case Some(i):
+            return i
+        case None:
+            pass
+    at[key] = len(invs)
+    invs.push(four)
+    return len(invs) - 1
+
+# v at byte off of the block: booleans as -1 or 0.
+fn lane_store(ref sf: SF, ref code: [Inst], blk: int, v: int, off: int):
+    var w = v
+    if sf.f.vk[v] == K.Bool:
+        let n = new_v(ref sf, K.I64)
+        code.push(mk(Op.Conv, n, v, -1, -1, 0))
+        w = new_v(ref sf, K.I64)
+        code.push(mk(Op.Neg, w, n, -1, -1, 0))
+    code.push(mk(Op.Store, -1, blk, w, -1, off))
+
 # f optimized, and the vector loop kernels it calls (x86-64; `vw`: their
 # most lanes).
 fn optimize(f: Func, vw: int) -> (Func, [KFunc]):
@@ -2259,6 +2834,7 @@ fn optimize(f: Func, vw: int) -> (Func, [KFunc]):
     copies(ref sf)
     sccp(ref sf)
     simplify(ref sf)
+    rewrites(ref sf)
     copies(ref sf)
     addressing(ref sf)
     gvn(ref sf)
@@ -2268,6 +2844,8 @@ fn optimize(f: Func, vw: int) -> (Func, [KFunc]):
     copies(ref sf)
     # dead phis (of inlined calls' results) would hide loops' shapes
     dce(ref sf)
-    let ks = vector_loops(ref sf, f"brv_{f.name}", vw)
+    var ks = vector_loops(ref sf, f"brv_{f.name}", vw)
+    if vw >= 4:
+        ks.extend(lane_loops(ref sf, f"brl_{f.name}"))
     dce(ref sf)
     return (from_ssa(sf), ks)
