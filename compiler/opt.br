@@ -9,7 +9,95 @@
 # appender of `s += t[i]`, to the runtime's slow paths) is in memory only
 # during those calls.
 
-from ir import K, Op, Inst, Func
+from ir import K, Op, Inst, Func, Module
+
+# m without the runtime module's functions (runtime/rt.br) that nothing
+# reaches. The roots are the program's own functions, everything data points
+# to, and the exports C or the backends may call by name, except the math ones
+# (`brine_x_f_<name>`), which only calls the backends didn't inline make.
+fn prune_rt(m: Module) -> Module:
+    var at: {str: int} = {}
+    for i, f in enumerate(m.funcs):
+        at[f.name] = i
+    let n = len(m.funcs)
+    var live = [false] * n
+    var work: [int] = []
+    for i, f in enumerate(m.funcs):
+        let rt = f.name.starts_with("__rt__") and not f.export
+        let math = (
+            f.export
+            and f.name.starts_with("brine_x_f_")
+            and not f.name.starts_with("brine_x_f_fmod")
+        )
+        if not rt and not math:
+            live[i] = true
+            work.push(i)
+    for d in m.data:
+        for r in d.relocs:
+            match at.get(r.sym):
+                case Some(j):
+                    if not live[j]:
+                        live[j] = true
+                        work.push(j)
+                case None:
+                    pass
+    while len(work) > 0:
+        let i = work.pop()
+        for x in m.funcs[i].code:
+            var names: [str] = []
+            if x.op == Op.Call or x.op == Op.Global:
+                names.push(x.s)
+                if x.op == Op.Call and x.b == 1 and x.s.starts_with("brine_"):
+                    names.push("brine_x_" + x.s[6:])
+            for s in names:
+                match at.get(s):
+                    case Some(j):
+                        if not live[j]:
+                            live[j] = true
+                            work.push(j)
+                    case None:
+                        pass
+    var out = m
+    out.funcs = []
+    for i, f in enumerate(m.funcs):
+        if live[i]:
+            out.funcs.push(f)
+    return out
+
+# The constant arrays (lower.br's `br_ca` objects): their data pointer, the 8
+# bytes at 48, is their own address + 56, and nothing ever writes it.
+fn const_arrs(m: Module) -> {str: bool}:
+    var r: {str: bool} = {}
+    for d in m.data:
+        for x in d.relocs:
+            if x.off == 48 and x.sym == d.name and x.add == 56 and d.name.starts_with("br_ca"):
+                r[d.name] = true
+    return r
+
+# Reads of a constant array's data pointer as that address + 56: no load, and
+# the address is the same everywhere (LICM moves it out of loops).
+fn arr_data(f: Func, arrs: {str: bool}) -> Func:
+    if len(arrs) == 0:
+        return f
+    let nv = len(f.vk)
+    var ndef = [0] * nv
+    var sym = [""] * nv
+    for x in f.code:
+        if x.d >= 0:
+            ndef[x.d] += 1
+            if x.op == Op.Global:
+                sym[x.d] = x.s
+    var g = f
+    g.code = []
+    for x in f.code:
+        if x.op == Op.Load and x.n == 48 and ndef[x.a] == 1 and sym[x.a] in arrs:
+            let c = len(g.vk)
+            g.vk.push(K.I64)
+            g.code.push(Inst(op=Op.Const, d=c, a=-1, b=-1, c=-1, n=56, s="", args=[]))
+            g.code.push(Inst(op=Op.Elem, d=x.d, a=x.a, b=c, c=-1, n=1, s="", args=[]))
+        else:
+            g.code.push(x)
+    return g
 
 # The vregs that only ever hold the address of one slot: slot by vreg, -1 for
 # the others.
@@ -100,7 +188,9 @@ fn promotable(f: Func, slot: [int]) -> Fields:
         if x.op == Op.Load and slot[x.a] >= 0:
             addr = x.a
             k = f.vk[x.d]
-        elif x.op == Op.Store and slot[x.a] >= 0 and slot[x.b] < 0:
+        elif x.op == Op.Store and slot[x.a] >= 0 and slot[x.b] != slot[x.a]:
+            # (storing another slot's address, `let p = stack_mem(n)`: that
+            # one escapes, below, and this one is a variable as any other)
             addr = x.a
             k = f.vk[x.b]
         elif x.op == Op.Call:
@@ -119,7 +209,7 @@ fn promotable(f: Func, slot: [int]) -> Fields:
             elif i < 0:
                 fs.off[s].push(x.n)
                 fs.kind[s].push(k)
-            elif fs.kind[s][i] != k:
+            elif fs.kind[s][i] != k and not punnable(fs.kind[s][i], k):
                 ok[s] = false
     for s in 0..ns:
         # fields that overlap: no
@@ -131,6 +221,17 @@ fn promotable(f: Func, slot: [int]) -> Fields:
             fs.off[s] = []
             fs.kind[s] = []
     return fs
+
+# A float written to a slot and read as an integer of its size, or the other
+# way around (`to_bits`, `from_bits`): an `Op.Bits` between their vregs.
+fn punnable(a: K, b: K) -> bool:
+    if a.is_wide() or b.is_wide() or a.size() != b.size() or a.is_float() == b.is_float():
+        return false
+    let i = b if a.is_float() else a
+    return i == K.I64 or i == K.U64 or i == K.I32 or i == K.U32
+
+fn bits(d: int, a: int) -> Inst:
+    return Inst(op=Op.Bits, d=d, a=a, b=-1, c=-1, n=0, s="", args=[])
 
 fn arith(op: Op) -> bool:
     match op:
@@ -417,9 +518,9 @@ fn promote(f0: Func) -> Func:
         if s >= 0 and len(fs.off[s]) > 0:
             let v = home[s] + field_of(fs, s, x.n)
             if x.op == Op.Load:
-                code.push(mov(x.d, v))
+                code.push(mov(x.d, v) if g.vk[x.d] == g.vk[v] else bits(x.d, v))
             else:
-                code.push(mov(v, x.b))
+                code.push(mov(v, x.b) if g.vk[x.b] == g.vk[v] else bits(v, x.b))
             continue
         if x.op != Op.Call:
             code.push(x)

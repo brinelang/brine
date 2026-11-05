@@ -562,42 +562,67 @@ struct Lower:
                 var i = vs[1]
                 if self.cx.fb.f.vk[i] != K.I64:
                     i = self.cx.fb.conv(K.I64, i)
-                # `k + j * s` (the usual `FIELD + i * 8`): k in the load or
-                # store, j scaled in the address
-                var size = 1
-                let a = self.def_at(i)
-                if a >= 0 and (
-                    self.cx.fb.f.code[a].op == Op.Add or self.cx.fb.f.code[a].op == Op.AddO
-                ):
-                    let x = self.cx.fb.f.code[a]
-                    match self.const_of(x.b):
-                        case Some(c):
-                            off = c
-                            i = x.a
-                        case None:
-                            match self.const_of(x.a):
-                                case Some(c):
-                                    off = c
-                                    i = x.b
-                                case None:
-                                    pass
-                let m = self.def_at(i)
-                if m >= 0 and (
-                    self.cx.fb.f.code[m].op == Op.Mul or self.cx.fb.f.code[m].op == Op.MulO
-                ):
-                    let x = self.cx.fb.f.code[m]
-                    match self.const_of(x.b):
-                        case Some(c):
-                            if c == 2 or c == 4 or c == 8:
-                                size = c
-                                i = x.a
-                        case None:
-                            pass
-                p = self.cx.fb.elem(vs[0], i, size)
+                # `k + (j + c) * s` (the usual `FIELD + i * 8`, or `8 * (i - 1)`):
+                # k + c * s in the load or store, j scaled in the address
+                let (i1, k1) = self.split_add(i)
+                let (i2, size) = self.split_mul(i1)
+                var j = i2
+                var c = 0
+                if size > 1:
+                    let (i3, k3) = self.split_add(i2)
+                    j = i3
+                    c = k3
+                off = k1 + c * size
+                p = self.cx.fb.elem(vs[0], j, size)
         if n.starts_with("load_"):
             return self.cx.fb.load(k, p, off)
         self.cx.fb.store(p, off, vs[2])
         return self.unit()
+
+    # v as `j + c` with c a constant (j = v, c = 0 when it isn't one).
+    fn split_add(self, v: int) -> (int, int):
+        let a = self.def_at(v)
+        if a < 0:
+            return (v, 0)
+        let x = self.cx.fb.f.code[a]
+        if x.op == Op.Add or x.op == Op.AddO:
+            match self.const_of(x.b):
+                case Some(c):
+                    return (x.a, c)
+                case None:
+                    match self.const_of(x.a):
+                        case Some(c):
+                            return (x.b, c)
+                        case None:
+                            pass
+        elif x.op == Op.Sub or x.op == Op.SubO:
+            match self.const_of(x.b):
+                case Some(c):
+                    if c > -(1 << 31) and c < (1 << 31):
+                        return (x.a, -c)
+                case None:
+                    pass
+        return (v, 0)
+
+    # v as `j * s` for an address scale s of 2, 4 or 8 (j = v, s = 1 otherwise).
+    fn split_mul(self, v: int) -> (int, int):
+        let m = self.def_at(v)
+        if m < 0:
+            return (v, 1)
+        let x = self.cx.fb.f.code[m]
+        if x.op == Op.Mul or x.op == Op.MulO:
+            match self.const_of(x.b):
+                case Some(c):
+                    if c == 2 or c == 4 or c == 8:
+                        return (x.a, c)
+                case None:
+                    match self.const_of(x.a):
+                        case Some(c):
+                            if c == 2 or c == 4 or c == 8:
+                                return (x.b, c)
+                        case None:
+                            pass
+        return (v, 1)
 
     # The value of vreg v if the instruction that makes it is a constant.
     fn const_of(self, v: int) -> Option[int]:
@@ -3782,7 +3807,8 @@ struct Lower:
     # Does index (or index addition) `e` need its check? Not in the fast copy
     # of a loop `bounds_version` checked up front.
     fn idx_chk(self, e: Expr) -> bool:
-        if not e.checked:
+        # (the runtime module is trusted code, which verify.br doesn't prove)
+        if not e.checked or self.rt_body:
             return false
         return len(self.cx.nochk) == 0 or ranges.key(e.span) not in self.cx.nochk
 

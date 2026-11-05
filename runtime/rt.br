@@ -5569,3 +5569,2745 @@ fn brine_map_eq(a: ptr, b: ptr) -> bool:
         if not call_bool(veq, load_ptr(a, MAP_VALS) + i * vsz, load_ptr(b, MAP_VALS) + e * vsz):
             return false
     return true
+
+# ---- math: musl 1.2.5's libm (src/math), translated line by line from
+# runtime/brine_math.c, so native code computes the same bits as before, and as
+# WebAssembly (which still uses the C). Only the code paths without fused
+# multiply-adds; the C compilers' FORCE_EVAL and barriers are gone, since brine
+# keeps the order of operations as written and never looks at FP flags.
+#
+# musl's copyright notice (its COPYRIGHT file; the individual files keep
+# theirs, the Sun/FreeBSD and Arm ones among them):
+#
+# musl as a whole is licensed under the following standard MIT license:
+#
+# ----------------------------------------------------------------------
+# Copyright © 2005-2020 Rich Felker, et al.
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+# ----------------------------------------------------------------------
+
+# exp, exp2 and pow: musl 1.2.5 (Arm's 2018 implementations), ported from runtime/brine_math.c
+
+const MEXP_INVLN2N: float = 184.6649652337873
+const MEXP_NEGLN2HIN: float = -0.005415212348111709
+const MEXP_NEGLN2LON: float = -1.2864023111638346e-14
+const MEXP_SHIFT: float = 6755399441055744.0
+const MEXP_C2: float = 0.49999999999996786
+const MEXP_C3: float = 0.16666666666665886
+const MEXP_C4: float = 0.0416666808410674
+const MEXP_C5: float = 0.008333335853059549
+const MEXP_EXP2_SHIFT: float = 52776558133248.0
+const MEXP_E2C1: float = 0.6931471805599453
+const MEXP_E2C2: float = 0.24022650695909065
+const MEXP_E2C3: float = 0.0555041086686087
+const MEXP_E2C4: float = 0.009618131975721055
+const MEXP_E2C5: float = 0.0013332074570119598
+const MEXP_P1009: float = 5.486124068793689e+303
+const MEXP_PM1022: float = 2.2250738585072014e-308
+const MEXP_P769: float = 3.105036184601418e+231
+const MEXP_PM767: float = 1.2882297539194267e-231
+const MEXP_P1023: float = 8.98846567431158e+307
+const MEXP_PM969: float = 2.004168360008973e-292
+const MEXP_P52: float = 4503599627370496.0
+const MEXP_LN2HI: float = 0.6931471805598903
+const MEXP_LN2LO: float = 5.497923018708371e-14
+const MEXP_A0: float = -0.5
+const MEXP_A1: float = -0.6666666666666679
+const MEXP_A2: float = 0.5000000000000007
+const MEXP_A3: float = 0.7999999995323976
+const MEXP_A4: float = -0.6666666663487739
+const MEXP_A5: float = -1.142909628459501
+const MEXP_A6: float = 1.0000415263675542
+
+# fmt: off
+const MEXP_T: [u64] = [
+    0x0000000000000000, 0x3ff0000000000000, 0x3c9b3b4f1a88bf6e, 0x3feff63da9fb3335,
+    0xbc7160139cd8dc5d, 0x3fefec9a3e778061, 0xbc905e7a108766d1, 0x3fefe315e86e7f85,
+    0x3c8cd2523567f613, 0x3fefd9b0d3158574, 0xbc8bce8023f98efa, 0x3fefd06b29ddf6de,
+    0x3c60f74e61e6c861, 0x3fefc74518759bc8, 0x3c90a3e45b33d399, 0x3fefbe3ecac6f383,
+    0x3c979aa65d837b6d, 0x3fefb5586cf9890f, 0x3c8eb51a92fdeffc, 0x3fefac922b7247f7,
+    0x3c3ebe3d702f9cd1, 0x3fefa3ec32d3d1a2, 0xbc6a033489906e0b, 0x3fef9b66affed31b,
+    0xbc9556522a2fbd0e, 0x3fef9301d0125b51, 0xbc5080ef8c4eea55, 0x3fef8abdc06c31cc,
+    0xbc91c923b9d5f416, 0x3fef829aaea92de0, 0x3c80d3e3e95c55af, 0x3fef7a98c8a58e51,
+    0xbc801b15eaa59348, 0x3fef72b83c7d517b, 0xbc8f1ff055de323d, 0x3fef6af9388c8dea,
+    0x3c8b898c3f1353bf, 0x3fef635beb6fcb75, 0xbc96d99c7611eb26, 0x3fef5be084045cd4,
+    0x3c9aecf73e3a2f60, 0x3fef54873168b9aa, 0xbc8fe782cb86389d, 0x3fef4d5022fcd91d,
+    0x3c8a6f4144a6c38d, 0x3fef463b88628cd6, 0x3c807a05b0e4047d, 0x3fef3f49917ddc96,
+    0x3c968efde3a8a894, 0x3fef387a6e756238, 0x3c875e18f274487d, 0x3fef31ce4fb2a63f,
+    0x3c80472b981fe7f2, 0x3fef2b4565e27cdd, 0xbc96b87b3f71085e, 0x3fef24dfe1f56381,
+    0x3c82f7e16d09ab31, 0x3fef1e9df51fdee1, 0xbc3d219b1a6fbffa, 0x3fef187fd0dad990,
+    0x3c8b3782720c0ab4, 0x3fef1285a6e4030b, 0x3c6e149289cecb8f, 0x3fef0cafa93e2f56,
+    0x3c834d754db0abb6, 0x3fef06fe0a31b715, 0x3c864201e2ac744c, 0x3fef0170fc4cd831,
+    0x3c8fdd395dd3f84a, 0x3feefc08b26416ff, 0xbc86a3803b8e5b04, 0x3feef6c55f929ff1,
+    0xbc924aedcc4b5068, 0x3feef1a7373aa9cb, 0xbc9907f81b512d8e, 0x3feeecae6d05d866,
+    0xbc71d1e83e9436d2, 0x3feee7db34e59ff7, 0xbc991919b3ce1b15, 0x3feee32dc313a8e5,
+    0x3c859f48a72a4c6d, 0x3feedea64c123422, 0xbc9312607a28698a, 0x3feeda4504ac801c,
+    0xbc58a78f4817895b, 0x3feed60a21f72e2a, 0xbc7c2c9b67499a1b, 0x3feed1f5d950a897,
+    0x3c4363ed60c2ac11, 0x3feece086061892d, 0x3c9666093b0664ef, 0x3feeca41ed1d0057,
+    0x3c6ecce1daa10379, 0x3feec6a2b5c13cd0, 0x3c93ff8e3f0f1230, 0x3feec32af0d7d3de,
+    0x3c7690cebb7aafb0, 0x3feebfdad5362a27, 0x3c931dbdeb54e077, 0x3feebcb299fddd0d,
+    0xbc8f94340071a38e, 0x3feeb9b2769d2ca7, 0xbc87deccdc93a349, 0x3feeb6daa2cf6642,
+    0xbc78dec6bd0f385f, 0x3feeb42b569d4f82, 0xbc861246ec7b5cf6, 0x3feeb1a4ca5d920f,
+    0x3c93350518fdd78e, 0x3feeaf4736b527da, 0x3c7b98b72f8a9b05, 0x3feead12d497c7fd,
+    0x3c9063e1e21c5409, 0x3feeab07dd485429, 0x3c34c7855019c6ea, 0x3feea9268a5946b7,
+    0x3c9432e62b64c035, 0x3feea76f15ad2148, 0xbc8ce44a6199769f, 0x3feea5e1b976dc09,
+    0xbc8c33c53bef4da8, 0x3feea47eb03a5585, 0xbc845378892be9ae, 0x3feea34634ccc320,
+    0xbc93cedd78565858, 0x3feea23882552225, 0x3c5710aa807e1964, 0x3feea155d44ca973,
+    0xbc93b3efbf5e2228, 0x3feea09e667f3bcd, 0xbc6a12ad8734b982, 0x3feea012750bdabf,
+    0xbc6367efb86da9ee, 0x3fee9fb23c651a2f, 0xbc80dc3d54e08851, 0x3fee9f7df9519484,
+    0xbc781f647e5a3ecf, 0x3fee9f75e8ec5f74, 0xbc86ee4ac08b7db0, 0x3fee9f9a48a58174,
+    0xbc8619321e55e68a, 0x3fee9feb564267c9, 0x3c909ccb5e09d4d3, 0x3feea0694fde5d3f,
+    0xbc7b32dcb94da51d, 0x3feea11473eb0187, 0x3c94ecfd5467c06b, 0x3feea1ed0130c132,
+    0x3c65ebe1abd66c55, 0x3feea2f336cf4e62, 0xbc88a1c52fb3cf42, 0x3feea427543e1a12,
+    0xbc9369b6f13b3734, 0x3feea589994cce13, 0xbc805e843a19ff1e, 0x3feea71a4623c7ad,
+    0xbc94d450d872576e, 0x3feea8d99b4492ed, 0x3c90ad675b0e8a00, 0x3feeaac7d98a6699,
+    0x3c8db72fc1f0eab4, 0x3feeace5422aa0db, 0xbc65b6609cc5e7ff, 0x3feeaf3216b5448c,
+    0x3c7bf68359f35f44, 0x3feeb1ae99157736, 0xbc93091fa71e3d83, 0x3feeb45b0b91ffc6,
+    0xbc5da9b88b6c1e29, 0x3feeb737b0cdc5e5, 0xbc6c23f97c90b959, 0x3feeba44cbc8520f,
+    0xbc92434322f4f9aa, 0x3feebd829fde4e50, 0xbc85ca6cd7668e4b, 0x3feec0f170ca07ba,
+    0x3c71affc2b91ce27, 0x3feec49182a3f090, 0x3c6dd235e10a73bb, 0x3feec86319e32323,
+    0xbc87c50422622263, 0x3feecc667b5de565, 0x3c8b1c86e3e231d5, 0x3feed09bec4a2d33,
+    0xbc91bbd1d3bcbb15, 0x3feed503b23e255d, 0x3c90cc319cee31d2, 0x3feed99e1330b358,
+    0x3c8469846e735ab3, 0x3feede6b5579fdbf, 0xbc82dfcd978e9db4, 0x3feee36bbfd3f37a,
+    0x3c8c1a7792cb3387, 0x3feee89f995ad3ad, 0xbc907b8f4ad1d9fa, 0x3feeee07298db666,
+    0xbc55c3d956dcaeba, 0x3feef3a2b84f15fb, 0xbc90a40e3da6f640, 0x3feef9728de5593a,
+    0xbc68d6f438ad9334, 0x3feeff76f2fb5e47, 0xbc91eee26b588a35, 0x3fef05b030a1064a,
+    0x3c74ffd70a5fddcd, 0x3fef0c1e904bc1d2, 0xbc91bdfbfa9298ac, 0x3fef12c25bd71e09,
+    0x3c736eae30af0cb3, 0x3fef199bdd85529c, 0x3c8ee3325c9ffd94, 0x3fef20ab5fffd07a,
+    0x3c84e08fd10959ac, 0x3fef27f12e57d14b, 0x3c63cdaf384e1a67, 0x3fef2f6d9406e7b5,
+    0x3c676b2c6c921968, 0x3fef3720dcef9069, 0xbc808a1883ccb5d2, 0x3fef3f0b555dc3fa,
+    0xbc8fad5d3ffffa6f, 0x3fef472d4a07897c, 0xbc900dae3875a949, 0x3fef4f87080d89f2,
+    0x3c74a385a63d07a7, 0x3fef5818dcfba487, 0xbc82919e2040220f, 0x3fef60e316c98398,
+    0x3c8e5a50d5c192ac, 0x3fef69e603db3285, 0x3c843a59ac016b4b, 0x3fef7321f301b460,
+    0xbc82d52107b43e1f, 0x3fef7c97337b9b5f, 0xbc892ab93b470dc9, 0x3fef864614f5a129,
+    0x3c74b604603a88d3, 0x3fef902ee78b3ff6, 0x3c83c5ec519d7271, 0x3fef9a51fbc74c83,
+    0xbc8ff7128fd391f0, 0x3fefa4afa2a490da, 0xbc8dae98e223747d, 0x3fefaf482d8e67f1,
+    0x3c8ec3bc41aa2008, 0x3fefba1bee615a27, 0x3c842b94c3a9eb32, 0x3fefc52b376bba97,
+    0x3c8a64a931d185ee, 0x3fefd0765b6e4540, 0xbc8e37bae43be3ed, 0x3fefdbfdad9cbe14,
+    0x3c77893b4d91cd9d, 0x3fefe7c1819e90d8, 0x3c5305c14160cc89, 0x3feff3c22b8f71f1,
+]
+# fmt: on
+# fmt: off
+const MEXP_PT_INVC: [u64] = [
+    0x3ff6a00000000000, 0x3ff6800000000000, 0x3ff6600000000000, 0x3ff6400000000000,
+    0x3ff6200000000000, 0x3ff6000000000000, 0x3ff5e00000000000, 0x3ff5c00000000000,
+    0x3ff5a00000000000, 0x3ff5800000000000, 0x3ff5600000000000, 0x3ff5600000000000,
+    0x3ff5400000000000, 0x3ff5200000000000, 0x3ff5000000000000, 0x3ff4e00000000000,
+    0x3ff4c00000000000, 0x3ff4a00000000000, 0x3ff4a00000000000, 0x3ff4800000000000,
+    0x3ff4600000000000, 0x3ff4400000000000, 0x3ff4200000000000, 0x3ff4000000000000,
+    0x3ff4000000000000, 0x3ff3e00000000000, 0x3ff3c00000000000, 0x3ff3a00000000000,
+    0x3ff3a00000000000, 0x3ff3800000000000, 0x3ff3600000000000, 0x3ff3400000000000,
+    0x3ff3400000000000, 0x3ff3200000000000, 0x3ff3000000000000, 0x3ff3000000000000,
+    0x3ff2e00000000000, 0x3ff2c00000000000, 0x3ff2c00000000000, 0x3ff2a00000000000,
+    0x3ff2800000000000, 0x3ff2600000000000, 0x3ff2600000000000, 0x3ff2400000000000,
+    0x3ff2400000000000, 0x3ff2200000000000, 0x3ff2000000000000, 0x3ff2000000000000,
+    0x3ff1e00000000000, 0x3ff1c00000000000, 0x3ff1c00000000000, 0x3ff1a00000000000,
+    0x3ff1a00000000000, 0x3ff1800000000000, 0x3ff1600000000000, 0x3ff1600000000000,
+    0x3ff1400000000000, 0x3ff1400000000000, 0x3ff1200000000000, 0x3ff1000000000000,
+    0x3ff1000000000000, 0x3ff0e00000000000, 0x3ff0e00000000000, 0x3ff0c00000000000,
+    0x3ff0c00000000000, 0x3ff0a00000000000, 0x3ff0a00000000000, 0x3ff0800000000000,
+    0x3ff0800000000000, 0x3ff0600000000000, 0x3ff0400000000000, 0x3ff0400000000000,
+    0x3ff0200000000000, 0x3ff0200000000000, 0x3ff0000000000000, 0x3ff0000000000000,
+    0x3fefc00000000000, 0x3fef800000000000, 0x3fef400000000000, 0x3fef000000000000,
+    0x3feec00000000000, 0x3fee800000000000, 0x3fee400000000000, 0x3fee200000000000,
+    0x3fede00000000000, 0x3feda00000000000, 0x3fed600000000000, 0x3fed400000000000,
+    0x3fed000000000000, 0x3fecc00000000000, 0x3feca00000000000, 0x3fec600000000000,
+    0x3fec400000000000, 0x3fec000000000000, 0x3febe00000000000, 0x3feba00000000000,
+    0x3feb800000000000, 0x3feb400000000000, 0x3feb200000000000, 0x3feae00000000000,
+    0x3feac00000000000, 0x3feaa00000000000, 0x3fea600000000000, 0x3fea400000000000,
+    0x3fea000000000000, 0x3fe9e00000000000, 0x3fe9c00000000000, 0x3fe9a00000000000,
+    0x3fe9600000000000, 0x3fe9400000000000, 0x3fe9200000000000, 0x3fe9000000000000,
+    0x3fe8c00000000000, 0x3fe8a00000000000, 0x3fe8800000000000, 0x3fe8600000000000,
+    0x3fe8400000000000, 0x3fe8200000000000, 0x3fe7e00000000000, 0x3fe7c00000000000,
+    0x3fe7a00000000000, 0x3fe7800000000000, 0x3fe7600000000000, 0x3fe7400000000000,
+    0x3fe7200000000000, 0x3fe7000000000000, 0x3fe6e00000000000, 0x3fe6c00000000000,
+]
+# fmt: on
+# fmt: off
+const MEXP_PT_LOGC: [u64] = [
+    0xbfd62c82f2b9c800, 0xbfd5d1bdbf580800, 0xbfd5767717455800, 0xbfd51aad872df800,
+    0xbfd4be5f95777800, 0xbfd4618bc21c6000, 0xbfd404308686a800, 0xbfd3a64c55694800,
+    0xbfd347dd9a988000, 0xbfd2e8e2bae12000, 0xbfd2895a13de8800, 0xbfd2895a13de8800,
+    0xbfd22941fbcf7800, 0xbfd1c898c1699800, 0xbfd1675cababa800, 0xbfd1058bf9ae4800,
+    0xbfd0a324e2739000, 0xbfd0402594b4d000, 0xbfd0402594b4d000, 0xbfcfb9186d5e4000,
+    0xbfcef0adcbdc6000, 0xbfce27076e2af000, 0xbfcd5c216b4fc000, 0xbfcc8ff7c79aa000,
+    0xbfcc8ff7c79aa000, 0xbfcbc286742d9000, 0xbfcaf3c94e80c000, 0xbfca23bc1fe2b000,
+    0xbfca23bc1fe2b000, 0xbfc9525a9cf45000, 0xbfc87fa06520d000, 0xbfc7ab890210e000,
+    0xbfc7ab890210e000, 0xbfc6d60fe719d000, 0xbfc5ff3070a79000, 0xbfc5ff3070a79000,
+    0xbfc526e5e3a1b000, 0xbfc44d2b6ccb8000, 0xbfc44d2b6ccb8000, 0xbfc371fc201e9000,
+    0xbfc29552f81ff000, 0xbfc1b72ad52f6000, 0xbfc1b72ad52f6000, 0xbfc0d77e7cd09000,
+    0xbfc0d77e7cd09000, 0xbfbfec9131dbe000, 0xbfbe27076e2b0000, 0xbfbe27076e2b0000,
+    0xbfbc5e548f5bc000, 0xbfba926d3a4ae000, 0xbfba926d3a4ae000, 0xbfb8c345d631a000,
+    0xbfb8c345d631a000, 0xbfb6f0d28ae56000, 0xbfb51b073f062000, 0xbfb51b073f062000,
+    0xbfb341d7961be000, 0xbfb341d7961be000, 0xbfb16536eea38000, 0xbfaf0a30c0118000,
+    0xbfaf0a30c0118000, 0xbfab42dd71198000, 0xbfab42dd71198000, 0xbfa77458f632c000,
+    0xbfa77458f632c000, 0xbfa39e87b9fec000, 0xbfa39e87b9fec000, 0xbf9f829b0e780000,
+    0xbf9f829b0e780000, 0xbf97b91b07d58000, 0xbf8fc0a8b0fc0000, 0xbf8fc0a8b0fc0000,
+    0xbf7fe02a6b100000, 0xbf7fe02a6b100000, 0x0000000000000000, 0x0000000000000000,
+    0x3f80101575890000, 0x3f90205658938000, 0x3f98492528c90000, 0x3fa0415d89e74000,
+    0x3fa466aed42e0000, 0x3fa894aa149fc000, 0x3faccb73cdddc000, 0x3faeea31c006c000,
+    0x3fb1973bd1466000, 0x3fb3bdf5a7d1e000, 0x3fb5e95a4d97a000, 0x3fb700d30aeac000,
+    0x3fb9335e5d594000, 0x3fbb6ac88dad6000, 0x3fbc885801bc4000, 0x3fbec739830a2000,
+    0x3fbfe89139dbe000, 0x3fc1178e8227e000, 0x3fc1aa2b7e23f000, 0x3fc2d1610c868000,
+    0x3fc365fcb0159000, 0x3fc4913d8333b000, 0x3fc527e5e4a1b000, 0x3fc6574ebe8c1000,
+    0x3fc6f0128b757000, 0x3fc7898d85445000, 0x3fc8beafeb390000, 0x3fc95a5adcf70000,
+    0x3fca93ed3c8ae000, 0x3fcb31d8575bd000, 0x3fcbd087383be000, 0x3fcc6ffbc6f01000,
+    0x3fcdb13db0d49000, 0x3fce530effe71000, 0x3fcef5ade4dd0000, 0x3fcf991c6cb3b000,
+    0x3fd07138604d5800, 0x3fd0c42d67616000, 0x3fd1178e8227e800, 0x3fd16b5ccbacf800,
+    0x3fd1bf99635a6800, 0x3fd214456d0eb800, 0x3fd2bef07cdc9000, 0x3fd314f1e1d36000,
+    0x3fd36b6776be1000, 0x3fd3c25277333000, 0x3fd419b423d5e800, 0x3fd4718dc271c800,
+    0x3fd4c9e09e173000, 0x3fd522ae0738a000, 0x3fd57bf753c8d000, 0x3fd5d5bddf596000,
+]
+# fmt: on
+# fmt: off
+const MEXP_PT_LOGCTAIL: [u64] = [
+    0x3cfab42428375680, 0xbd1ca508d8e0f720, 0xbd2362a4d5b6506d, 0xbce684e49eb067d5,
+    0xbd041b6993293ee0, 0x3d13d82f484c84cc, 0x3cdc42f3ed820b3a, 0x3d20b1c686519460,
+    0x3d25594dd4c58092, 0x3d267b1e99b72bd8, 0x3d15ca14b6cfb03f, 0x3d15ca14b6cfb03f,
+    0xbd165a242853da76, 0xbd1fafbc68e75404, 0x3d1f1fc63382a8f0, 0xbd26a8c4fd055a66,
+    0xbd0c6bee7ef4030e, 0xbcf036b89ef42d7f, 0xbcf036b89ef42d7f, 0x3d0d572aab993c87,
+    0x3d2b26b79c86af24, 0xbd172f4f543fff10, 0x3d21ba91bbca681b, 0x3d27794f689f8434,
+    0x3d27794f689f8434, 0x3d194eb0318bb78f, 0x3cba4e633fcd9066, 0xbd258c64dc46c1ea,
+    0xbd258c64dc46c1ea, 0xbd2ad1d904c1d4e3, 0x3d2bbdbf7fdbfa09, 0x3d2bdb9072534a58,
+    0x3d2bdb9072534a58, 0xbd10e46aa3b2e266, 0xbd1e9e439f105039, 0xbd1e9e439f105039,
+    0xbd20de8b90075b8f, 0x3d170cc16135783c, 0x3d170cc16135783c, 0x3cf178864d27543a,
+    0xbd248d301771c408, 0xbd2e80a41811a396, 0xbd2e80a41811a396, 0x3d0a699688e85bf4,
+    0x3d0a699688e85bf4, 0xbd2575545ca333f2, 0x3d2a342c2af0003c, 0x3d2a342c2af0003c,
+    0xbd1d0c57585fbe06, 0x3d253935e85baac8, 0x3d253935e85baac8, 0x3d137c294d2f5668,
+    0x3d137c294d2f5668, 0xbd269737c93373da, 0x3d1f025b61c65e57, 0x3d1f025b61c65e57,
+    0x3d2c5edaccf913df, 0x3d2c5edaccf913df, 0x3d147c5e768fa309, 0x3d2d599e83368e91,
+    0x3d2d599e83368e91, 0x3d1c827ae5d6704c, 0x3d1c827ae5d6704c, 0xbd2cfc4634f2a1ee,
+    0xbd2cfc4634f2a1ee, 0x3cf502b7f526feaa, 0x3cf502b7f526feaa, 0xbd2980267c7e09e4,
+    0xbd2980267c7e09e4, 0xbd288d5493faa639, 0xbcdf1e7cf6d3a69c, 0xbcdf1e7cf6d3a69c,
+    0xbd19e23f0dda40e4, 0xbd19e23f0dda40e4, 0x0000000000000000, 0x0000000000000000,
+    0xbd10c76b999d2be8, 0xbd23dc5b06e2f7d2, 0xbd2aa0ba325a0c34, 0x3d0111c05cf1d753,
+    0xbd2c167375bdfd28, 0xbd197995d05a267d, 0xbd1a68f247d82807, 0xbd0e113e4fc93b7b,
+    0xbd25325d560d9e9b, 0x3d2cc85ea5db4ed7, 0xbd2c69063c5d1d1e, 0x3cec1e8da99ded32,
+    0x3d23115c3abd47da, 0xbd1390802bf768e5, 0x3d2646d1c65aacd3, 0xbd2dc068afe645e0,
+    0xbd2534d64fa10afd, 0x3d21ef78ce2d07f2, 0x3d2ca78e44389934, 0x3d039d6ccb81b4a1,
+    0x3cc62fa8234b7289, 0x3d25837954fdb678, 0x3d2633e8e5697dc7, 0x3d19cf8b2c3c2e78,
+    0xbd25118de59c21e1, 0xbd1c661070914305, 0xbd073d54aae92cd1, 0x3d07f22858a0ff6f,
+    0xbd28724350562169, 0xbd0c358d4eace1aa, 0xbd2d4bc4595412b6, 0xbcf1ec72c5962bd2,
+    0xbd2aff2af715b035, 0x3cc212276041f430, 0xbcca211565bb8e11, 0x3d1bcbecca0cdf30,
+    0x3cf89cdb16ed4e91, 0x3d27188b163ceae9, 0xbd2c210e63a5f01c, 0x3d2b9acdf7a51681,
+    0x3d2ca6ed5147bdb7, 0x3d0a87deba46baea, 0x3d2a9cfa4a5004f4, 0xbd28e27ad3213cb8,
+    0x3d116ecdb0f177c8, 0x3d183b54b606bd5c, 0x3d08e436ec90e09d, 0xbd2f27ce0967d675,
+    0xbd2e20891b0ad8a4, 0x3d2ebe708164c759, 0x3d1fadedee5d40ef, 0xbd0a0b2a08a465dc,
+]
+# fmt: on
+
+# ---- __math_xflow, oflow, uflow, divzero, invalid
+
+fn mexp_xflow(sign: u64, y: float) -> float:
+    return (-y if sign != 0 else y) * y
+
+fn mexp_oflow(sign: u64) -> float:
+    return mexp_xflow(sign, MEXP_P769)
+
+fn mexp_uflow(sign: u64) -> float:
+    return mexp_xflow(sign, MEXP_PM767)
+
+fn mexp_divzero(sign: u64) -> float:
+    return (-1.0 if sign != 0 else 1.0) / 0.0
+
+fn mexp_invalid(x: float) -> float:
+    return (x - x) / (x - x)
+
+# ---- scalbn
+
+fn mexp_scalbn(x: float, mut n: int) -> float:
+    var y = x
+    if n > 1023:
+        y *= MEXP_P1023
+        n -= 1023
+        if n > 1023:
+            y *= MEXP_P1023
+            n -= 1023
+            if n > 1023:
+                n = 1023
+    elif n < -1022:
+        # make sure final n < -53 to avoid double rounding in the subnormal range
+        y *= MEXP_PM969
+        n += 1022 - 53
+        if n < -1022:
+            y *= MEXP_PM969
+            n += 1022 - 53
+            if n < -1022:
+                n = -1022
+    return y * float.from_bits(u64(0x3ff + n) << 52)
+
+# ---- exp
+# Bit patterns and the top 12 bits of the C code's literals:
+# top12(0x1p-54) = 0x3c9, top12(512.0) = 0x408, top12(1024.0) = 0x409,
+# top12(INFINITY) = 0x7ff, asuint64(-INFINITY) = 0xfff0000000000000.
+
+# scale*(1+tmp) when it may overflow or underflow; sbits is scale's bits with an
+# exponent that may have run into the sign bit, (i32)ki the k of the reduction
+fn mexp_exp_specialcase(tmp: float, mut sbits: u64, ki: u64) -> float:
+    if ki & 0x80000000 == 0:
+        # k > 0, the exponent of scale might have overflowed by <= 460
+        sbits = sbits.wrapping_sub(u64(1009) << 52)
+        let scale = float.from_bits(sbits)
+        return MEXP_P1009 * (scale + scale * tmp)
+    # k < 0, need special care in the subnormal range
+    sbits = sbits.wrapping_add(u64(1022) << 52)
+    let scale = float.from_bits(sbits)
+    var y = scale + scale * tmp
+    if y < 1.0:
+        # round y to the right precision before scaling it into the subnormal
+        # range, to avoid double rounding
+        var lo = scale - y + scale * tmp
+        let hi = 1.0 + y
+        lo = 1.0 - hi + y + lo
+        y = (hi + lo) - 1.0
+        # avoid -0.0 with downward rounding
+        if y == 0.0:
+            y = 0.0
+    return MEXP_PM1022 * y
+
+fn f_exp(x: float) -> float:
+    let ix = x.to_bits()
+    var abstop = (ix >> 52) & 0x7ff
+    if abstop.wrapping_sub(0x3c9) >= 0x408 - 0x3c9:
+        if abstop < 0x3c9:
+            # avoid spurious underflow for tiny x; 0 is a common input
+            return 1.0 + x
+        if abstop >= 0x409:
+            if ix == 0xfff0000000000000:
+                return 0.0
+            if abstop >= 0x7ff:
+                return 1.0 + x
+            if ix >> 63 != 0:
+                return mexp_uflow(0)
+            return mexp_oflow(0)
+        # large x is special cased below
+        abstop = 0
+    # exp(x) = 2^(k/N) * exp(r), with exp(r) in [2^(-1/2N),2^(1/2N)]
+    # x = ln2/N*k + r, with int k and r in [-ln2/2N, ln2/2N]
+    let z = MEXP_INVLN2N * x
+    # z - kd is in [-1, 1] in non-nearest rounding modes
+    var kd = z + MEXP_SHIFT
+    let ki = kd.to_bits()
+    kd -= MEXP_SHIFT
+    let r = x + kd * MEXP_NEGLN2HIN + kd * MEXP_NEGLN2LON
+    # 2^(k/N) ~= scale * (1 + tail)
+    let idx = (ki & 127) << 1
+    let top = ki << 45
+    let tail = float.from_bits(MEXP_T[idx])
+    # only a valid scale when -1023*N < k < 1024*N
+    let sbits = MEXP_T[idx + 1].wrapping_add(top)
+    # exp(x) = 2^(k/N) * exp(r) ~= scale + scale * (tail + exp(r) - 1)
+    let r2 = r * r
+    let tmp = tail + r + r2 * (MEXP_C2 + r * MEXP_C3) + r2 * r2 * (MEXP_C4 + r * MEXP_C5)
+    if abstop == 0:
+        return mexp_exp_specialcase(tmp, sbits, ki)
+    let scale = float.from_bits(sbits)
+    return scale + scale * tmp
+
+# ---- exp2
+
+fn mexp_exp2_specialcase(tmp: float, mut sbits: u64, ki: u64) -> float:
+    if ki & 0x80000000 == 0:
+        # k > 0, the exponent of scale might have overflowed by 1
+        sbits = sbits.wrapping_sub(u64(1) << 52)
+        let scale = float.from_bits(sbits)
+        return 2.0 * (scale + scale * tmp)
+    # k < 0, need special care in the subnormal range
+    sbits = sbits.wrapping_add(u64(1022) << 52)
+    let scale = float.from_bits(sbits)
+    var y = scale + scale * tmp
+    if y < 1.0:
+        var lo = scale - y + scale * tmp
+        let hi = 1.0 + y
+        lo = 1.0 - hi + y + lo
+        y = (hi + lo) - 1.0
+        if y == 0.0:
+            y = 0.0
+    return MEXP_PM1022 * y
+
+# asuint64(-1075.0) = 0xc090cc0000000000, asuint64(928.0) = 0x408d000000000000
+fn f_exp2(x: float) -> float:
+    let ix = x.to_bits()
+    var abstop = (ix >> 52) & 0x7ff
+    if abstop.wrapping_sub(0x3c9) >= 0x408 - 0x3c9:
+        if abstop < 0x3c9:
+            return 1.0 + x
+        if abstop >= 0x409:
+            if ix == 0xfff0000000000000:
+                return 0.0
+            if abstop >= 0x7ff:
+                return 1.0 + x
+            if ix >> 63 == 0:
+                return mexp_oflow(0)
+            elif ix >= 0xc090cc0000000000:
+                return mexp_uflow(0)
+        if ix << 1 > u64(0x408d000000000000) << 1:
+            # large x is special cased below
+            abstop = 0
+    # exp2(x) = 2^(k/N) * 2^r, with 2^r in [2^(-1/2N),2^(1/2N)]
+    # x = k/N + r, with int k and r in [-1/2N, 1/2N]
+    var kd = x + MEXP_EXP2_SHIFT
+    let ki = kd.to_bits()
+    kd -= MEXP_EXP2_SHIFT
+    let r = x - kd
+    let idx = (ki & 127) << 1
+    let top = ki << 45
+    let tail = float.from_bits(MEXP_T[idx])
+    let sbits = MEXP_T[idx + 1].wrapping_add(top)
+    let r2 = r * r
+    let tmp = (
+        tail
+        + r * MEXP_E2C1
+        + r2 * (MEXP_E2C2 + r * MEXP_E2C3)
+        + r2 * r2 * (MEXP_E2C4 + r * MEXP_E2C5)
+    )
+    if abstop == 0:
+        return mexp_exp2_specialcase(tmp, sbits, ki)
+    let scale = float.from_bits(sbits)
+    return scale + scale * tmp
+
+# ---- pow
+
+# exp.c's specialcase, but for a signed result: the sign is in sbits
+fn mexp_pow_specialcase(tmp: float, mut sbits: u64, ki: u64) -> float:
+    if ki & 0x80000000 == 0:
+        # k > 0, the exponent of scale might have overflowed by <= 460
+        sbits = sbits.wrapping_sub(u64(1009) << 52)
+        let scale = float.from_bits(sbits)
+        return MEXP_P1009 * (scale + scale * tmp)
+    # k < 0, need special care in the subnormal range
+    sbits = sbits.wrapping_add(u64(1022) << 52)
+    # sbits is signed scale
+    let scale = float.from_bits(sbits)
+    var y = scale + scale * tmp
+    if f_fabs(y) < 1.0:
+        var one = 1.0
+        if y < 0.0:
+            one = -1.0
+        var lo = scale - y + scale * tmp
+        let hi = one + y
+        lo = one - hi + y + lo
+        y = (hi + lo) - one
+        # fix the sign of 0
+        if y == 0.0:
+            y = float.from_bits(sbits & 0x8000000000000000)
+    return MEXP_PM1022 * y
+
+# 0 if iy is not an integer, 1 if an odd one, 2 if an even one; iy is the bits
+# of a non-zero finite float
+fn mexp_checkint(iy: u64) -> int:
+    let e = (iy >> 52) & 0x7ff
+    if e < 0x3ff:
+        return 0
+    if e > 0x3ff + 52:
+        return 2
+    let s = u64(0x3ff + 52) - e
+    if iy & ((u64(1) << s) - 1) != 0:
+        return 0
+    if iy & (u64(1) << s) != 0:
+        return 1
+    return 2
+
+# whether i is the bits of 0, an infinity or a NaN
+# (2 * asuint64(INFINITY) = 0xffe0000000000000)
+fn mexp_zeroinfnan(i: u64) -> bool:
+    return (i << 1).wrapping_sub(1) >= u64(0xffe0000000000000) - 1
+
+# asuint64(1.0) = 0x3ff0000000000000
+fn f_pow(x: float, y: float) -> float:
+    var sign_bias = u64(0)
+    var ix = x.to_bits()
+    let iy = y.to_bits()
+    var topx = ix >> 52
+    let topy = iy >> 52
+    if (
+        topx.wrapping_sub(0x001) >= 0x7ff - 0x001
+        or (topy & 0x7ff).wrapping_sub(0x3be) >= 0x43e - 0x3be
+    ):
+        # if |y| > 1075 * ln2 * 2^53 ~= 0x1.749p62 then pow(x,y) = inf/0 and
+        # if |y| < 2^-54 / 1075 ~= 0x1.e7b6p-65 then pow(x,y) = +-1.
+        # special cases: (x < 0x1p-126 or inf or nan) or
+        # (|y| < 0x1p-65 or |y| >= 0x1p63 or nan)
+        if mexp_zeroinfnan(iy):
+            if iy << 1 == 0:
+                return 1.0
+            if ix == 0x3ff0000000000000:
+                return 1.0
+            if ix << 1 > 0xffe0000000000000 or iy << 1 > 0xffe0000000000000:
+                return x + y
+            if ix << 1 == 0x7fe0000000000000:
+                return 1.0
+            if (ix << 1 < 0x7fe0000000000000) == (iy >> 63 == 0):
+                # |x|<1 && y==inf or |x|>1 && y==-inf
+                return 0.0
+            return y * y
+        if mexp_zeroinfnan(ix):
+            var x2 = x * x
+            if ix >> 63 != 0 and mexp_checkint(iy) == 1:
+                x2 = -x2
+            return 1.0 / x2 if iy >> 63 != 0 else x2
+        # here x and y are non-zero finite
+        if ix >> 63 != 0:
+            # finite x < 0
+            let yint = mexp_checkint(iy)
+            if yint == 0:
+                return mexp_invalid(x)
+            if yint == 1:
+                sign_bias = 0x40000
+            ix &= 0x7fffffffffffffff
+            topx &= 0x7ff
+        if (topy & 0x7ff).wrapping_sub(0x3be) >= 0x43e - 0x3be:
+            # sign_bias == 0 here because y is not odd
+            if ix == 0x3ff0000000000000:
+                return 1.0
+            if (topy & 0x7ff) < 0x3be:
+                # |y| < 2^-65, x^y ~= 1 + y*log(x)
+                return 1.0 + y if ix > 0x3ff0000000000000 else 1.0 - y
+            if (ix > 0x3ff0000000000000) == (topy < 0x800):
+                return mexp_oflow(0)
+            return mexp_uflow(0)
+        if topx == 0:
+            # normalize subnormal x so the exponent becomes negative
+            ix = (x * MEXP_P52).to_bits()
+            ix &= 0x7fffffffffffffff
+            ix = ix.wrapping_sub(u64(52) << 52)
+    # log_inline (static inline in C, inlined by hand: as a function returning
+    # a tuple it made pow 1.4x slower on the native backend).
+    # hi + lo = log(x), lo with about 15 more bits. ix is x's bits, normalized
+    # in the subnormal range using the sign bit for the exponent.
+    # x = 2^k z, z in [OFF, 2*OFF) and exact, OFF = 0x3fe6955500000000; the
+    # range is split into N subintervals, the ith contains z and c is near its center
+    let ltmp = ix.wrapping_sub(0x3fe6955500000000)
+    let i = (ltmp >> 45) & 127
+    let iz = ix.wrapping_sub(ltmp & (u64(0xfff) << 52))
+    let z = float.from_bits(iz)
+    # kd = (double)((int64_t)tmp >> 52): the top 12 bits, sign-extended; exact,
+    # and with no int conversion, which would cost a check
+    let kd = float(int(ltmp) >> 52)
+    # log(x) = k*Ln2 + log(c) + log1p(z/c-1)
+    let invc = float.from_bits(MEXP_PT_INVC[i])
+    let logc = float.from_bits(MEXP_PT_LOGC[i])
+    let logctail = float.from_bits(MEXP_PT_LOGCTAIL[i])
+    # split z such that rhi, rlo and rhi*rhi are exact and |rlo| <= |r|
+    let zhi = float.from_bits((iz + (u64(1) << 31)) & 0xffffffff00000000)
+    let zlo = z - zhi
+    let rhi = zhi * invc - 1.0
+    let rlo = zlo * invc
+    let r = rhi + rlo
+    # k*Ln2 + log(c) + r
+    let t1 = kd * MEXP_LN2HI + logc
+    let t2 = t1 + r
+    let lo1 = kd * MEXP_LN2LO + logctail
+    let lo2 = t1 - t2 + r
+    let ar = MEXP_A0 * r
+    let ar2 = r * ar
+    let ar3 = r * ar2
+    # k*Ln2 + log(c) + r + A[0]*r*r
+    let arhi = MEXP_A0 * rhi
+    let arhi2 = rhi * arhi
+    let lhi0 = t2 + arhi2
+    let lo3 = rlo * (ar + arhi)
+    let lo4 = t2 - lhi0 + arhi2
+    # p = log1p(r) - r - A[0]*r*r
+    let p = ar3 * (
+        MEXP_A1 + r * MEXP_A2 + ar2 * (MEXP_A3 + r * MEXP_A4 + ar2 * (MEXP_A5 + r * MEXP_A6))
+    )
+    let llo0 = lo1 + lo2 + lo3 + lo4 + p
+    let hi = lhi0 + llo0
+    let lo = lhi0 - hi + llo0
+    # back in pow
+    let yhi = float.from_bits(iy & 0xfffffffff8000000)
+    let ylo = y - yhi
+    let lhi = float.from_bits(hi.to_bits() & 0xfffffffff8000000)
+    let llo = hi - lhi + lo
+    let ehi = yhi * lhi
+    # |elo| < |ehi| * 2^-25
+    let elo = ylo * lhi + y * llo
+    # exp_inline(ehi, elo, sign_bias), inlined by hand too: sign * exp(ehi + elo)
+    # with |elo| < 2^-8/N and |elo| <= |ehi|; sign_bias is SIGN_BIAS
+    # (0x800 << 7 = 0x40000) or 0 and makes the sign -1 or 1
+    let eix = ehi.to_bits()
+    var abstop = (eix >> 52) & 0x7ff
+    if abstop.wrapping_sub(0x3c9) >= 0x408 - 0x3c9:
+        if abstop < 0x3c9:
+            # avoid spurious underflow for tiny x; 0 is a common input
+            let one = 1.0 + ehi
+            return -one if sign_bias != 0 else one
+        if abstop >= 0x409:
+            # inf and nan are already handled
+            if eix >> 63 != 0:
+                return mexp_uflow(sign_bias)
+            return mexp_oflow(sign_bias)
+        # large x is special cased below
+        abstop = 0
+    # exp(x) = 2^(k/N) * exp(r), with exp(r) in [2^(-1/2N),2^(1/2N)]
+    # x = ln2/N*k + r, with int k and r in [-ln2/2N, ln2/2N]
+    let ez = MEXP_INVLN2N * ehi
+    var ekd = ez + MEXP_SHIFT
+    let ki = ekd.to_bits()
+    ekd -= MEXP_SHIFT
+    var er = ehi + ekd * MEXP_NEGLN2HIN + ekd * MEXP_NEGLN2LON
+    # the code assumes 2^-200 < |xtail| < 2^-8/N
+    er += elo
+    # 2^(k/N) ~= scale * (1 + tail)
+    let idx = (ki & 127) << 1
+    let top = (ki + sign_bias) << 45
+    let tail = float.from_bits(MEXP_T[idx])
+    # only a valid scale when -1023*N < k < 1024*N
+    let sbits = MEXP_T[idx + 1].wrapping_add(top)
+    # exp(x) = 2^(k/N) * exp(r) ~= scale + scale * (tail + exp(r) - 1)
+    let er2 = er * er
+    let tmp = tail + er + er2 * (MEXP_C2 + er * MEXP_C3) + er2 * er2 * (MEXP_C4 + er * MEXP_C5)
+    if abstop == 0:
+        return mexp_pow_specialcase(tmp, sbits, ki)
+    let scale = float.from_bits(sbits)
+    return scale + scale * tmp
+
+const MLOG_OFF: u64 = 0x3fe6000000000000
+const MLOG_ONE: u64 = 0x3ff0000000000000
+const MLOG_INF: u64 = 0x7ff0000000000000
+const MLOG_TOPMASK: u64 = 0xfff0000000000000
+const MLOG_HIMASK: u64 = 0xffffffff00000000
+const MLOG_LN2HI: float = 0.6931471805598903
+const MLOG_LN2LO: float = 5.497923018708371e-14
+const MLOG_B0: float = -0.5
+const MLOG_B1: float = 0.3333333333333352
+const MLOG_B2: float = -0.24999999999998432
+const MLOG_B3: float = 0.19999999999320328
+const MLOG_B4: float = -0.16666666669929706
+const MLOG_B5: float = 0.14285715076560868
+const MLOG_B6: float = -0.12499997863982555
+const MLOG_B7: float = 0.11110712032936046
+const MLOG_B8: float = -0.10000486757818193
+const MLOG_B9: float = 0.09181994006195467
+const MLOG_B10: float = -0.08328363062289341
+const MLOG_A0: float = -0.5000000000000001
+const MLOG_A1: float = 0.33333333331825593
+const MLOG_A2: float = -0.2499999999622955
+const MLOG_A3: float = 0.20000304511814496
+const MLOG_A4: float = -0.16667054827627667
+const MLOG_T: [u64] = [
+    0x3ff734f0c3e0de9f, 0xbfd7cc7f79e69000,
+    0x3ff713786a2ce91f, 0xbfd76feec20d0000,
+    0x3ff6f26008fab5a0, 0xbfd713e31351e000,
+    0x3ff6d1a61f138c7d, 0xbfd6b85b38287800,
+    0x3ff6b1490bc5b4d1, 0xbfd65d5590807800,
+    0x3ff69147332f0cba, 0xbfd602d076180000,
+    0x3ff6719f18224223, 0xbfd5a8ca86909000,
+    0x3ff6524f99a51ed9, 0xbfd54f4356035000,
+    0x3ff63356aa8f24c4, 0xbfd4f637c36b4000,
+    0x3ff614b36b9ddc14, 0xbfd49da7fda85000,
+    0x3ff5f66452c65c4c, 0xbfd445923989a800,
+    0x3ff5d867b5912c4f, 0xbfd3edf439b0b800,
+    0x3ff5babccb5b90de, 0xbfd396ce448f7000,
+    0x3ff59d61f2d91a78, 0xbfd3401e17bda000,
+    0x3ff5805612465687, 0xbfd2e9e2ef468000,
+    0x3ff56397cee76bd3, 0xbfd2941b3830e000,
+    0x3ff54725e2a77f93, 0xbfd23ec58cda8800,
+    0x3ff52aff42064583, 0xbfd1e9e129279000,
+    0x3ff50f22dbb2bddf, 0xbfd1956d2b48f800,
+    0x3ff4f38f4734ded7, 0xbfd141679ab9f800,
+    0x3ff4d843cfde2840, 0xbfd0edd094ef9800,
+    0x3ff4bd3ec078a3c8, 0xbfd09aa518db1000,
+    0x3ff4a27fc3e0258a, 0xbfd047e65263b800,
+    0x3ff4880524d48434, 0xbfcfeb224586f000,
+    0x3ff46dce1b192d0b, 0xbfcf474a7517b000,
+    0x3ff453d9d3391854, 0xbfcea4443d103000,
+    0x3ff43a2744b4845a, 0xbfce020d44e9b000,
+    0x3ff420b54115f8fb, 0xbfcd60a22977f000,
+    0x3ff40782da3ef4b1, 0xbfccc00104959000,
+    0x3ff3ee8f5d57fe8f, 0xbfcc202956891000,
+    0x3ff3d5d9a00b4ce9, 0xbfcb81178d811000,
+    0x3ff3bd60c010c12b, 0xbfcae2c9ccd3d000,
+    0x3ff3a5242b75dab8, 0xbfca45402e129000,
+    0x3ff38d22cd9fd002, 0xbfc9a877681df000,
+    0x3ff3755bc5847a1c, 0xbfc90c6d69483000,
+    0x3ff35dce49ad36e2, 0xbfc87120a645c000,
+    0x3ff34679984dd440, 0xbfc7d68fb4143000,
+    0x3ff32f5cceffcb24, 0xbfc73cb83c627000,
+    0x3ff3187775a10d49, 0xbfc6a39a9b376000,
+    0x3ff301c8373e3990, 0xbfc60b3154b7a000,
+    0x3ff2eb4ebb95f841, 0xbfc5737d76243000,
+    0x3ff2d50a0219a9d1, 0xbfc4dc7b8fc23000,
+    0x3ff2bef9a8b7fd2a, 0xbfc4462c51d20000,
+    0x3ff2a91c7a0c1bab, 0xbfc3b08abc830000,
+    0x3ff293726014b530, 0xbfc31b996b490000,
+    0x3ff27dfa5757a1f5, 0xbfc2875490a44000,
+    0x3ff268b39b1d3bbf, 0xbfc1f3b9f879a000,
+    0x3ff2539d838ff5bd, 0xbfc160c8252ca000,
+    0x3ff23eb7aac9083b, 0xbfc0ce7f57f72000,
+    0x3ff22a012ba940b6, 0xbfc03cdc49fea000,
+    0x3ff2157996cc4132, 0xbfbf57bdbc4b8000,
+    0x3ff201201dd2fc9b, 0xbfbe370896404000,
+    0x3ff1ecf4494d480b, 0xbfbd17983ef94000,
+    0x3ff1d8f5528f6569, 0xbfbbf9674ed8a000,
+    0x3ff1c52311577e7c, 0xbfbadc79202f6000,
+    0x3ff1b17c74cb26e9, 0xbfb9c0c3e7288000,
+    0x3ff19e010c2c1ab6, 0xbfb8a646b372c000,
+    0x3ff18ab07bb670bd, 0xbfb78d01b3ac0000,
+    0x3ff1778a25efbcb6, 0xbfb674f145380000,
+    0x3ff1648d354c31da, 0xbfb55e0e6d878000,
+    0x3ff151b990275fdd, 0xbfb4485cdea1e000,
+    0x3ff13f0ea432d24c, 0xbfb333d94d6aa000,
+    0x3ff12c8b7210f9da, 0xbfb22079f8c56000,
+    0x3ff11a3028ecb531, 0xbfb10e4698622000,
+    0x3ff107fbda8434af, 0xbfaffa6c6ad20000,
+    0x3ff0f5ee0f4e6bb3, 0xbfadda8d4a774000,
+    0x3ff0e4065d2a9fce, 0xbfabbcece4850000,
+    0x3ff0d244632ca521, 0xbfa9a1894012c000,
+    0x3ff0c0a77ce2981a, 0xbfa788583302c000,
+    0x3ff0af2f83c636d1, 0xbfa5715e67d68000,
+    0x3ff09ddb98a01339, 0xbfa35c8a49658000,
+    0x3ff08cabaf52e7df, 0xbfa149e364154000,
+    0x3ff07b9f2f4e28fb, 0xbf9e72c082eb8000,
+    0x3ff06ab58c358f19, 0xbf9a55f152528000,
+    0x3ff059eea5ecf92c, 0xbf963d62cf818000,
+    0x3ff04949cdd12c90, 0xbf9228fb8caa0000,
+    0x3ff038c6c6f0ada9, 0xbf8c317b20f90000,
+    0x3ff02865137932a9, 0xbf8419355daa0000,
+    0x3ff0182427ea7348, 0xbf781203c2ec0000,
+    0x3ff008040614b195, 0xbf60040979240000,
+    0x3fefe01ff726fa1a, 0x3f6feff384900000,
+    0x3fefa11cc261ea74, 0x3f87dc41353d0000,
+    0x3fef6310b081992e, 0x3f93cea3c4c28000,
+    0x3fef25f63ceeadcd, 0x3f9b9fc114890000,
+    0x3feee9c8039113e7, 0x3fa1b0d8ce110000,
+    0x3feeae8078cbb1ab, 0x3fa58a5bd001c000,
+    0x3fee741aa29d0c9b, 0x3fa95c8340d88000,
+    0x3fee3a91830a99b5, 0x3fad276aef578000,
+    0x3fee01e009609a56, 0x3fb07598e598c000,
+    0x3fedca01e577bb98, 0x3fb253f5e30d2000,
+    0x3fed92f20b7c9103, 0x3fb42edd8b380000,
+    0x3fed5cac66fb5cce, 0x3fb606598757c000,
+    0x3fed272caa5ede9d, 0x3fb7da76356a0000,
+    0x3fecf26e3e6b2ccd, 0x3fb9ab434e1c6000,
+    0x3fecbe6da2a77902, 0x3fbb78c7bb0d6000,
+    0x3fec8b266d37086d, 0x3fbd431332e72000,
+    0x3fec5894bd5d5804, 0x3fbf0a3171de6000,
+    0x3fec26b533bb9f8c, 0x3fc067152b914000,
+    0x3febf583eeece73f, 0x3fc147858292b000,
+    0x3febc4fd75db96c1, 0x3fc2266ecdca3000,
+    0x3feb951e0c864a28, 0x3fc303d7a6c55000,
+    0x3feb65e2c5ef3e2c, 0x3fc3dfc33c331000,
+    0x3feb374867c9888b, 0x3fc4ba366b7a8000,
+    0x3feb094b211d304a, 0x3fc5933928d1f000,
+    0x3feadbe885f2ef7e, 0x3fc66acd2418f000,
+    0x3feaaf1d31603da2, 0x3fc740f8ec669000,
+    0x3fea82e63fd358a7, 0x3fc815c0f51af000,
+    0x3fea5740ef09738b, 0x3fc8e92954f68000,
+    0x3fea2c2a90ab4b27, 0x3fc9bb3602f84000,
+    0x3fea01a01393f2d1, 0x3fca8bed1c2c0000,
+    0x3fe9d79f24db3c1b, 0x3fcb5b515c01d000,
+    0x3fe9ae2505c7b190, 0x3fcc2967ccbcc000,
+    0x3fe9852ef297ce2f, 0x3fccf635d5486000,
+    0x3fe95cbaeea44b75, 0x3fcdc1bd3446c000,
+    0x3fe934c69de74838, 0x3fce8c01b8cfe000,
+    0x3fe90d4f2f6752e6, 0x3fcf5509c0179000,
+    0x3fe8e6528effd79d, 0x3fd00e6c121fb800,
+    0x3fe8bfce9fcc007c, 0x3fd071b80e93d000,
+    0x3fe899c0dabec30e, 0x3fd0d46b9e867000,
+    0x3fe87427aa2317fb, 0x3fd13687334bd000,
+    0x3fe84f00acb39a08, 0x3fd1980d67234800,
+    0x3fe82a49e8653e55, 0x3fd1f8ffe0cc8000,
+    0x3fe8060195f40260, 0x3fd2595fd7636800,
+    0x3fe7e22563e0a329, 0x3fd2b9300914a800,
+    0x3fe7beb377dcb5ad, 0x3fd3187210436000,
+    0x3fe79baa679725c2, 0x3fd377266dec1800,
+    0x3fe77907f2170657, 0x3fd3d54ffbaf3000,
+    0x3fe756cadbd6130c, 0x3fd432eee32fe000,
+]
+const MLOG_T2: [u64] = [
+    0x3fe61000014fb66b, 0x3c7e026c91425b3c,
+    0x3fe63000034db495, 0x3c8dbfea48005d41,
+    0x3fe650000d94d478, 0x3c8e7fa786d6a5b7,
+    0x3fe67000074e6fad, 0x3c61fcea6b54254c,
+    0x3fe68ffffedf0fae, 0xbc7c7e274c590efd,
+    0x3fe6b0000763c5bc, 0xbc8ac16848dcda01,
+    0x3fe6d0001e5cc1f6, 0x3c833f1c9d499311,
+    0x3fe6efffeb05f63e, 0xbc7e80041ae22d53,
+    0x3fe710000e869780, 0x3c7bff6671097952,
+    0x3fe72ffffc67e912, 0x3c8c00e226bd8724,
+    0x3fe74fffdf81116a, 0xbc6e02916ef101d2,
+    0x3fe770000f679c90, 0xbc67fc71cd549c74,
+    0x3fe78ffffa7ec835, 0x3c81bec19ef50483,
+    0x3fe7affffe20c2e6, 0xbc707e1729cc6465,
+    0x3fe7cfffed3fc900, 0xbc808072087b8b1c,
+    0x3fe7efffe9261a76, 0x3c8dc0286d9df9ae,
+    0x3fe81000049ca3e8, 0x3c897fd251e54c33,
+    0x3fe8300017932c8f, 0xbc8afee9b630f381,
+    0x3fe850000633739c, 0x3c89bfbf6b6535bc,
+    0x3fe87000204289c6, 0xbc8bbf65f3117b75,
+    0x3fe88fffebf57904, 0xbc89006ea23dcb57,
+    0x3fe8b00022bc04df, 0xbc7d00df38e04b0a,
+    0x3fe8cfffe50c1b8a, 0xbc88007146ff9f05,
+    0x3fe8effffc918e43, 0x3c83817bd07a7038,
+    0x3fe910001efa5fc7, 0x3c893e9176dfb403,
+    0x3fe9300013467bb9, 0x3c7f804e4b980276,
+    0x3fe94fffe6ee076f, 0xbc8f7ef0d9ff622e,
+    0x3fe96fffde3c12d1, 0xbc7082aa962638ba,
+    0x3fe98ffff4458a0d, 0xbc87801b9164a8ef,
+    0x3fe9afffdd982e3e, 0xbc8740e08a5a9337,
+    0x3fe9cfffed49fb66, 0x3c3fce08c19be000,
+    0x3fe9f00020f19c51, 0xbc8a3faa27885b0a,
+    0x3fea10001145b006, 0x3c74ff489958da56,
+    0x3fea300007bbf6fa, 0x3c8cbeab8a2b6d18,
+    0x3fea500010971d79, 0x3c88fecadd787930,
+    0x3fea70001df52e48, 0xbc8f41763dd8abdb,
+    0x3fea90001c593352, 0xbc8ebf0284c27612,
+    0x3feab0002a4f3e4b, 0xbc69fd043cff3f5f,
+    0x3feacfffd7ae1ed1, 0xbc823ee7129070b4,
+    0x3feaefffee510478, 0x3c6a063ee00edea3,
+    0x3feb0fffdb650d5b, 0x3c5a06c8381f0ab9,
+    0x3feb2ffffeaaca57, 0xbc79011e74233c1d,
+    0x3feb4fffd995badc, 0xbc79ff1068862a9f,
+    0x3feb7000249e659c, 0x3c8aff45d0864f3e,
+    0x3feb8ffff9871640, 0x3c7cfe7796c2c3f9,
+    0x3febafffd204cb4f, 0xbc63ff27eef22bc4,
+    0x3febcfffd2415c45, 0xbc6cffb7ee3bea21,
+    0x3febeffff86309df, 0xbc814103972e0b5c,
+    0x3fec0fffe1b57653, 0x3c8bc16494b76a19,
+    0x3fec2ffff1fa57e3, 0xbc64feef8d30c6ed,
+    0x3fec4fffdcbfe424, 0xbc843f68bcec4775,
+    0x3fec6fffed54b9f7, 0x3c847ea3f053e0ec,
+    0x3fec8fffeb998fd5, 0x3c7383068df992f1,
+    0x3fecb0002125219a, 0xbc68fd8e64180e04,
+    0x3feccfffdd94469c, 0x3c8e7ebe1cc7ea72,
+    0x3fecefffeafdc476, 0x3c8ebe39ad9f88fe,
+    0x3fed1000169af82b, 0x3c757d91a8b95a71,
+    0x3fed30000d0ff71d, 0x3c89c1906970c7da,
+    0x3fed4fffea790fc4, 0xbc580e37c558fe0c,
+    0x3fed70002edc87e5, 0xbc7f80d64dc10f44,
+    0x3fed900021dc82aa, 0xbc747c8f94fd5c5c,
+    0x3fedafffd86b0283, 0x3c8c7f1dc521617e,
+    0x3fedd000296c4739, 0x3c88019eb2ffb153,
+    0x3fedefffe54490f5, 0x3c6e00d2c652cc89,
+    0x3fee0fffcdabf694, 0xbc7f8340202d69d2,
+    0x3fee2fffdb52c8dd, 0x3c7b00c1ca1b0864,
+    0x3fee4ffff24216ef, 0x3c72ffa8b094ab51,
+    0x3fee6fffe88a5e11, 0xbc57f673b1efbe59,
+    0x3fee9000119eff0d, 0xbc84808d5e0bc801,
+    0x3feeafffdfa51744, 0x3c780006d54320b5,
+    0x3feed0001a127fa1, 0xbc5002f860565c92,
+    0x3feef00007babcc4, 0xbc8540445d35e611,
+    0x3fef0ffff57a8d02, 0xbc4ffb3139ef9105,
+    0x3fef30001ee58ac7, 0x3c8a81acf2731155,
+    0x3fef4ffff5823494, 0x3c8a3f41d4d7c743,
+    0x3fef6ffffca94c6b, 0xbc6202f41c987875,
+    0x3fef8fffe1f9c441, 0x3c777dd1f477e74b,
+    0x3fefafffd2e0e37e, 0xbc6f01199a7ca331,
+    0x3fefd0001c77e49e, 0x3c7181ee4bceacb1,
+    0x3fefeffff7e0c331, 0xbc6e05370170875a,
+    0x3ff00ffff465606e, 0xbc8a7ead491c0ada,
+    0x3ff02ffff3867a58, 0xbc977f69c3fcb2e0,
+    0x3ff04ffffdfc0d17, 0x3c97bffe34cb945b,
+    0x3ff0700003cd4d82, 0x3c820083c0e456cb,
+    0x3ff08ffff9f2cbe8, 0xbc6dffdfbe37751a,
+    0x3ff0b000010cda65, 0xbc913f7faee626eb,
+    0x3ff0d00001a4d338, 0x3c807dfa79489ff7,
+    0x3ff0effffadafdfd, 0xbc77040570d66bc0,
+    0x3ff110000bbafd96, 0x3c8e80d4846d0b62,
+    0x3ff12ffffae5f45d, 0x3c9dbffa64fd36ef,
+    0x3ff150000dd59ad9, 0x3c9a0077701250ae,
+    0x3ff170000f21559a, 0x3c8dfdf9e2e3deee,
+    0x3ff18ffffc275426, 0x3c910030dc3b7273,
+    0x3ff1b000123d3c59, 0x3c997f7980030188,
+    0x3ff1cffff8299eb7, 0xbc65f932ab9f8c67,
+    0x3ff1effff48ad400, 0x3c937fbf9da75beb,
+    0x3ff210000c8b86a4, 0x3c9f806b91fd5b22,
+    0x3ff2300003854303, 0x3c93ffc2eb9fbf33,
+    0x3ff24fffffbcf684, 0x3c7601e77e2e2e72,
+    0x3ff26ffff52921d9, 0x3c7ffcbb767f0c61,
+    0x3ff2900014933a3c, 0xbc7202ca3c02412b,
+    0x3ff2b00014556313, 0xbc92808233f21f02,
+    0x3ff2cfffebfe523b, 0xbc88ff7e384fdcf2,
+    0x3ff2f0000bb8ad96, 0xbc85ff51503041c5,
+    0x3ff30ffffb7ae2af, 0xbc810071885e289d,
+    0x3ff32ffffeac5f7f, 0xbc91ff5d3fb7b715,
+    0x3ff350000ca66756, 0x3c957f82228b82bd,
+    0x3ff3700011fbf721, 0x3c8000bac40dd5cc,
+    0x3ff38ffff9592fb9, 0xbc943f9d2db2a751,
+    0x3ff3b00004ddd242, 0x3c857f6b707638e1,
+    0x3ff3cffff5b2c957, 0x3c7a023a10bf1231,
+    0x3ff3efffeab0b418, 0x3c987f6d66b152b0,
+    0x3ff410001532aff4, 0x3c67f8375f198524,
+    0x3ff4300017478b29, 0x3c8301e672dc5143,
+    0x3ff44fffe795b463, 0x3c89ff69b8b2895a,
+    0x3ff46fffe80475e0, 0xbc95c0b19bc2f254,
+    0x3ff48fffef6fc1e7, 0x3c9b4009f23a2a72,
+    0x3ff4afffe5bea704, 0xbc94ffb7bf0d7d45,
+    0x3ff4d000171027de, 0xbc99c06471dc6a3d,
+    0x3ff4f0000ff03ee2, 0x3c977f890b85531c,
+    0x3ff5100012dc4bd1, 0x3c6004657166a436,
+    0x3ff530001605277a, 0xbc96bfcece233209,
+    0x3ff54fffecdb704c, 0xbc8902720505a1d7,
+    0x3ff56fffef5f54a9, 0x3c9bbfe60ec96412,
+    0x3ff5900017e61012, 0x3c887ec581afef90,
+    0x3ff5b00003c93e92, 0xbc9f41080abf0cc0,
+    0x3ff5d0001d4919bc, 0xbc98812afb254729,
+    0x3ff5efffe7b87a89, 0xbc947eb780ed6904,
+]
+const MLOG2_INVLN2HI: float = 1.4426950407214463
+const MLOG2_INVLN2LO: float = 1.6751713164886512e-10
+const MLOG2_B0: float = -0.7213475204444817
+const MLOG2_B1: float = 0.48089834696298744
+const MLOG2_B2: float = -0.360673760222145
+const MLOG2_B3: float = 0.2885390081805197
+const MLOG2_B4: float = -0.24044917405728863
+const MLOG2_B5: float = 0.2060992861022954
+const MLOG2_B6: float = -0.18033596705327856
+const MLOG2_B7: float = 0.1603032746063156
+const MLOG2_B8: float = -0.14483316576701266
+const MLOG2_B9: float = 0.13046826811283835
+const MLOG2_A0: float = -0.7213475204444882
+const MLOG2_A1: float = 0.4808983469629985
+const MLOG2_A2: float = -0.36067375954075914
+const MLOG2_A3: float = 0.2885390073180969
+const MLOG2_A4: float = -0.2404693555628422
+const MLOG2_A5: float = 0.2061202382173603
+const MLOG2_T: [u64] = [
+    0x3ff724286bb1acf8, 0xbfe1095feecdb000,
+    0x3ff6e1f766d2cca1, 0xbfe08494bd76d000,
+    0x3ff6a13d0e30d48a, 0xbfe00143aee8f800,
+    0x3ff661ec32d06c85, 0xbfdefec5360b4000,
+    0x3ff623fa951198f8, 0xbfddfdd91ab7e000,
+    0x3ff5e75ba4cf026c, 0xbfdcffae0cc79000,
+    0x3ff5ac055a214fb8, 0xbfdc043811fda000,
+    0x3ff571ed0f166e1e, 0xbfdb0b67323ae000,
+    0x3ff53909590bf835, 0xbfda152f5a2db000,
+    0x3ff5014fed61addd, 0xbfd9217f5af86000,
+    0x3ff4cab88e487bd0, 0xbfd8304db0719000,
+    0x3ff49539b4334fee, 0xbfd74189f9a9e000,
+    0x3ff460cbdfafd569, 0xbfd6552bb5199000,
+    0x3ff42d664ee4b953, 0xbfd56b23a29b1000,
+    0x3ff3fb01111dd8a6, 0xbfd483650f5fa000,
+    0x3ff3c995b70c5836, 0xbfd39de937f6a000,
+    0x3ff3991c4ab6fd4a, 0xbfd2baa1538d6000,
+    0x3ff3698e0ce099b5, 0xbfd1d98340ca4000,
+    0x3ff33ae48213e7b2, 0xbfd0fa853a40e000,
+    0x3ff30d191985bdb1, 0xbfd01d9c32e73000,
+    0x3ff2e025cab271d7, 0xbfce857da2fa6000,
+    0x3ff2b404cf13cd82, 0xbfccd3c8633d8000,
+    0x3ff288b02c7ccb50, 0xbfcb26034c14a000,
+    0x3ff25e2263944de5, 0xbfc97c1c2f4fe000,
+    0x3ff234563d8615b1, 0xbfc7d6023f800000,
+    0x3ff20b46e33eaf38, 0xbfc633a71a05e000,
+    0x3ff1e2eefdcda3dd, 0xbfc494f5e9570000,
+    0x3ff1bb4a580b3930, 0xbfc2f9e424e0a000,
+    0x3ff19453847f2200, 0xbfc162595afdc000,
+    0x3ff16e06c0d5d73c, 0xbfbf9c9a75bd8000,
+    0x3ff1485f47b7e4c2, 0xbfbc7b575bf9c000,
+    0x3ff12358ad0085d1, 0xbfb960c60ff48000,
+    0x3ff0fef00f532227, 0xbfb64ce247b60000,
+    0x3ff0db2077d03a8f, 0xbfb33f78b2014000,
+    0x3ff0b7e6d65980d9, 0xbfb0387d1a42c000,
+    0x3ff0953efe7b408d, 0xbfaa6f9208b50000,
+    0x3ff07325cac53b83, 0xbfa47a954f770000,
+    0x3ff05197e40d1b5c, 0xbf9d23a8c50c0000,
+    0x3ff03091c1208ea2, 0xbf916a2629780000,
+    0x3ff0101025b37e21, 0xbf7720f8d8e80000,
+    0x3fefc07ef9caa76b, 0x3f86fe53b1500000,
+    0x3fef4465d3f6f184, 0x3fa11ccce10f8000,
+    0x3feecc079f84107f, 0x3fac4dfc8c8b8000,
+    0x3fee573a99975ae8, 0x3fb3aa321e574000,
+    0x3fede5d6f0bd3de6, 0x3fb918a0d08b8000,
+    0x3fed77b681ff38b3, 0x3fbe72e9da044000,
+    0x3fed0cb5724de943, 0x3fc1dcd2507f6000,
+    0x3feca4b2dc0e7563, 0x3fc476ab03dea000,
+    0x3fec3f8ee8d6cb51, 0x3fc7074377e22000,
+    0x3febdd2b4f020c4c, 0x3fc98ede8ba94000,
+    0x3feb7d6c006015ca, 0x3fcc0db86ad2e000,
+    0x3feb20366e2e338f, 0x3fce840aafcee000,
+    0x3feac57026295039, 0x3fd0790ab4678000,
+    0x3fea6d01bc2731dd, 0x3fd1ac056801c000,
+    0x3fea16d3bc3ff18b, 0x3fd2db11d4fee000,
+    0x3fe9c2d14967fead, 0x3fd406464ec58000,
+    0x3fe970e4f47c9902, 0x3fd52dbe093af000,
+    0x3fe920fb3982bcf2, 0x3fd651902050d000,
+    0x3fe8d30187f759f1, 0x3fd771d2cdeaf000,
+    0x3fe886e5ebb9f66d, 0x3fd88e9c857d9000,
+    0x3fe83c97b658b994, 0x3fd9a80155e16000,
+    0x3fe7f405ffc61022, 0x3fdabe186ed3d000,
+    0x3fe7ad22181415ca, 0x3fdbd0f2aea0e000,
+    0x3fe767dcf99eff8c, 0x3fdce0a43dbf4000,
+]
+const MLOG2_T2: [u64] = [
+    0x3fe6200012b90a8e, 0x3c8904ab0644b605,
+    0x3fe66000045734a6, 0x3c61ff9bea62f7a9,
+    0x3fe69fffc325f2c5, 0x3c827ecfcb3c90ba,
+    0x3fe6e00038b95a04, 0x3c88ff8856739326,
+    0x3fe71fffe09994e3, 0x3c8afd40275f82b1,
+    0x3fe7600015590e10, 0xbc72fd75b4238341,
+    0x3fe7a00012655bd5, 0x3c7808e67c242b76,
+    0x3fe7e0003259e9a6, 0xbc6208e426f622b7,
+    0x3fe81fffedb4b2d2, 0xbc8402461ea5c92f,
+    0x3fe860002dfafcc3, 0x3c6df7f4a2f29a1f,
+    0x3fe89ffff78c6b50, 0xbc8e0453094995fd,
+    0x3fe8e00039671566, 0xbc8a04f3bec77b45,
+    0x3fe91fffe2bf1745, 0xbc77fa34400e203c,
+    0x3fe95fffcc5c9fd1, 0xbc76ff8005a0695d,
+    0x3fe9a0003bba4767, 0x3c70f8c4c4ec7e03,
+    0x3fe9dfffe7b92da5, 0x3c8e7fd9478c4602,
+    0x3fea1fffd72efdaf, 0xbc6a0c554dcdae7e,
+    0x3fea5fffde04ff95, 0x3c867da98ce9b26b,
+    0x3fea9fffca5e8d2b, 0xbc8284c9b54c13de,
+    0x3feadfffddad03ea, 0x3c5812c8ea602e3c,
+    0x3feb1ffff10d3d4d, 0xbc8efaddad27789c,
+    0x3feb5fffce21165a, 0x3c53cb1719c61237,
+    0x3feb9fffd950e674, 0x3c73f7d94194ce00,
+    0x3febe000139ca8af, 0x3c750ac4215d9bc0,
+    0x3fec20005b46df99, 0x3c6beea653e9c1c9,
+    0x3fec600040b9f7ae, 0xbc7c079f274a70d6,
+    0x3feca0006255fd8a, 0xbc7a0b4076e84c1f,
+    0x3fecdfffd94c095d, 0x3c88f933f99ab5d7,
+    0x3fed1ffff975d6cf, 0xbc582c08665fe1be,
+    0x3fed5fffa2561c93, 0xbc7b04289bd295f3,
+    0x3fed9fff9d228b0c, 0x3c870251340fa236,
+    0x3fede00065bc7e16, 0xbc75011e16a4d80c,
+    0x3fee200002f64791, 0x3c89802f09ef62e0,
+    0x3fee600057d7a6d8, 0xbc7e0b75580cf7fa,
+    0x3feea00027edc00c, 0xbc8c848309459811,
+    0x3feee0006cf5cb7c, 0xbc8f8027951576f4,
+    0x3fef2000782b7dcc, 0xbc8f81d97274538f,
+    0x3fef6000260c450a, 0xbc4071002727ffdc,
+    0x3fef9fffe88cd533, 0xbc581bdce1fda8b0,
+    0x3fefdfffd50f8689, 0x3c87f91acb918e6e,
+    0x3ff0200004292367, 0x3c9b7ff365324681,
+    0x3ff05fffe3e3d668, 0x3c86fa08ddae957b,
+    0x3ff0a0000a85a757, 0xbc57e2de80d3fb91,
+    0x3ff0e0001a5f3fcc, 0xbc91823305c5f014,
+    0x3ff11ffff8afbaf5, 0xbc8bfabb6680bac2,
+    0x3ff15fffe54d91ad, 0xbc9d7f121737e7ef,
+    0x3ff1a00011ac36e1, 0x3c9c000a0516f5ff,
+    0x3ff1e00019c84248, 0xbc9082fbe4da5da0,
+    0x3ff220000ffe5e6e, 0xbc88fdd04c9cfb43,
+    0x3ff26000269fd891, 0x3c8cfe2a7994d182,
+    0x3ff2a00029a6e6da, 0xbc700273715e8bc5,
+    0x3ff2dfffe0293e39, 0x3c9b7c39dab2a6f9,
+    0x3ff31ffff7dcf082, 0x3c7df1336edc5254,
+    0x3ff35ffff05a8b60, 0xbc9e03564ccd31eb,
+    0x3ff3a0002e0eaecc, 0x3c75f0e74bd3a477,
+    0x3ff3e000043bb236, 0x3c9c7dcb149d8833,
+    0x3ff4200002d187ff, 0x3c7e08afcf2d3d28,
+    0x3ff460000d387cb1, 0x3c820837856599a6,
+    0x3ff4a00004569f89, 0xbc89fa5c904fbcd2,
+    0x3ff4e000043543f3, 0xbc781125ed175329,
+    0x3ff51fffcc027f0f, 0x3c9883d8847754dc,
+    0x3ff55ffffd87b36f, 0xbc8709e731d02807,
+    0x3ff59ffff21df7ba, 0x3c87f79f68727b02,
+    0x3ff5dfffebfc3481, 0xbc9180902e30e93e,
+]
+const MLOG10_IVLN10HI: float = 0.4342944818781689
+const MLOG10_IVLN10LO: float = 2.5082946711645275e-11
+const MLOG10_LOG10_2HI: float = 0.30102999566361177
+const MLOG10_LOG10_2LO: float = 3.694239077158931e-13
+const MLOG10_LG1: float = 0.6666666666666735
+const MLOG10_LG2: float = 0.3999999999940942
+const MLOG10_LG3: float = 0.2857142874366239
+const MLOG10_LG4: float = 0.22222198432149784
+const MLOG10_LG5: float = 0.1818357216161805
+const MLOG10_LG6: float = 0.15313837699209373
+const MLOG10_LG7: float = 0.14798198605116586
+const MLOG1P_LN2_HI: float = 0.6931471803691238
+const MLOG1P_LN2_LO: float = 1.9082149292705877e-10
+const MLOG1P_LG1: float = 0.6666666666666735
+const MLOG1P_LG2: float = 0.3999999999940942
+const MLOG1P_LG3: float = 0.2857142874366239
+const MLOG1P_LG4: float = 0.22222198432149784
+const MLOG1P_LG5: float = 0.1818357216161805
+const MLOG1P_LG6: float = 0.15313837699209373
+const MLOG1P_LG7: float = 0.14798198605116586
+const MLOG_P27: float = 134217728.0
+const MLOG_P52: float = 4503599627370496.0
+const MLOG_P54: float = 1.8014398509481984e+16
+const MLOG_LO: u64 = 0x3fee000000000000
+const MLOG_HI: u64 = 0x3ff1090000000000
+const MLOG2_LO: u64 = 0x3feea4af00000000
+const MLOG2_HI: u64 = 0x3ff0b55900000000
+
+fn mlog_divzero(sign: bool) -> float:
+    return (-1.0 if sign else 1.0) / 0.0
+
+fn mlog_invalid(x: float) -> float:
+    return (x - x) / (x - x)
+
+fn f_log(x: float) -> float:
+    var ix = x.to_bits()
+    let top = ix >> 48
+    if ix.wrapping_sub(MLOG_LO) < MLOG_HI - MLOG_LO:
+        # close to 1.0
+        if ix == MLOG_ONE:
+            return 0.0
+        let r = x - 1.0
+        let r2 = r * r
+        let r3 = r * r2
+        var y = r3 * (
+            MLOG_B1
+            + r * MLOG_B2
+            + r2 * MLOG_B3
+            + r3 * (
+                MLOG_B4
+                + r * MLOG_B5
+                + r2 * MLOG_B6
+                + r3 * (MLOG_B7 + r * MLOG_B8 + r2 * MLOG_B9 + r3 * MLOG_B10)
+            )
+        )
+        var w = r * MLOG_P27
+        let rhi = r + w - w
+        let rlo = r - rhi
+        w = rhi * rhi * MLOG_B0
+        let hi = r + w
+        var lo = r - hi + w
+        lo += MLOG_B0 * rlo * (rhi + r)
+        y += lo
+        y += hi
+        return y
+    if top.wrapping_sub(0x0010) >= 0x7ff0 - 0x0010:
+        # x < 0x1p-1022 or inf or nan
+        if ix << 1 == 0:
+            return mlog_divzero(true)
+        if ix == MLOG_INF:
+            return x
+        if (top & 0x8000) != 0 or (top & 0x7ff0) == 0x7ff0:
+            return mlog_invalid(x)
+        # subnormal: normalize
+        ix = (x * MLOG_P52).to_bits()
+        ix = ix.wrapping_sub(u64(52) << 52)
+    let tmp = ix.wrapping_sub(MLOG_OFF)
+    let i = (tmp >> 44) & 0xfe  # 2 * ((tmp >> 45) % N): T holds pairs
+    let kd = float(int(tmp) >> 52)
+    let iz = ix.wrapping_sub(tmp & MLOG_TOPMASK)
+    let invc = float.from_bits(MLOG_T[i])
+    let logc = float.from_bits(MLOG_T[i + 1])
+    let z = float.from_bits(iz)
+    let r = (z - float.from_bits(MLOG_T2[i]) - float.from_bits(MLOG_T2[i + 1])) * invc
+    let w = kd * MLOG_LN2HI + logc
+    let hi = w + r
+    let lo = w - hi + r + kd * MLOG_LN2LO
+    let r2 = r * r
+    return lo + r2 * MLOG_A0 + r * r2 * (MLOG_A1 + r * MLOG_A2 + r2 * (MLOG_A3 + r * MLOG_A4)) + hi
+
+fn f_log2(x: float) -> float:
+    var ix = x.to_bits()
+    let top = ix >> 48
+    if ix.wrapping_sub(MLOG2_LO) < MLOG2_HI - MLOG2_LO:
+        # close to 1.0
+        if ix == MLOG_ONE:
+            return 0.0
+        let r = x - 1.0
+        let rhi = float.from_bits(r.to_bits() & MLOG_HIMASK)
+        let rlo = r - rhi
+        let hi = rhi * MLOG2_INVLN2HI
+        var lo = rlo * MLOG2_INVLN2HI + r * MLOG2_INVLN2LO
+        let r2 = r * r
+        let r4 = r2 * r2
+        let p = r2 * (MLOG2_B0 + r * MLOG2_B1)
+        var y = hi + p
+        lo += hi - y + p
+        lo += r4 * (
+            MLOG2_B2
+            + r * MLOG2_B3
+            + r2 * (MLOG2_B4 + r * MLOG2_B5)
+            + r4 * (MLOG2_B6 + r * MLOG2_B7 + r2 * (MLOG2_B8 + r * MLOG2_B9))
+        )
+        y += lo
+        return y
+    if top.wrapping_sub(0x0010) >= 0x7ff0 - 0x0010:
+        # x < 0x1p-1022 or inf or nan
+        if ix << 1 == 0:
+            return mlog_divzero(true)
+        if ix == MLOG_INF:
+            return x
+        if (top & 0x8000) != 0 or (top & 0x7ff0) == 0x7ff0:
+            return mlog_invalid(x)
+        # subnormal: normalize
+        ix = (x * MLOG_P52).to_bits()
+        ix = ix.wrapping_sub(u64(52) << 52)
+    let tmp = ix.wrapping_sub(MLOG_OFF)
+    let i = (tmp >> 45) & 0x7e  # 2 * ((tmp >> 46) % N): T holds pairs
+    let kd = float(int(tmp) >> 52)
+    let iz = ix.wrapping_sub(tmp & MLOG_TOPMASK)
+    let invc = float.from_bits(MLOG2_T[i])
+    let logc = float.from_bits(MLOG2_T[i + 1])
+    let z = float.from_bits(iz)
+    let r = (z - float.from_bits(MLOG2_T2[i]) - float.from_bits(MLOG2_T2[i + 1])) * invc
+    let rhi = float.from_bits(r.to_bits() & MLOG_HIMASK)
+    let rlo = r - rhi
+    let t1 = rhi * MLOG2_INVLN2HI
+    let t2 = rlo * MLOG2_INVLN2HI + r * MLOG2_INVLN2LO
+    let t3 = kd + logc
+    let hi = t3 + t1
+    let lo = t3 - hi + t1 + t2
+    let r2 = r * r
+    let r4 = r2 * r2
+    let p = (
+        MLOG2_A0 + r * MLOG2_A1 + r2 * (MLOG2_A2 + r * MLOG2_A3) + r4 * (MLOG2_A4 + r * MLOG2_A5)
+    )
+    return lo + r2 * p + hi
+
+fn f_log10(mut x: float) -> float:
+    var u = x.to_bits()
+    var hx = u >> 32  # uint32_t
+    # C's int k, kept as the double dk it becomes (small integers: exact)
+    var dk = 0.0
+    if hx < 0x00100000 or hx >= 0x80000000:
+        if u << 1 == 0:
+            return -1.0 / (x * x)  # log(+-0) = -inf
+        if hx >= 0x80000000:
+            return (x - x) / 0.0  # log(-#) = NaN
+        # subnormal: scale x up
+        dk -= 54.0
+        x *= MLOG_P54
+        u = x.to_bits()
+        hx = u >> 32
+    elif hx >= 0x7ff00000:
+        return x
+    elif hx == 0x3ff00000 and u << 32 == 0:
+        return 0.0
+    # reduce x into [sqrt(2)/2, sqrt(2)]
+    hx += 0x3ff00000 - 0x3fe6a09e
+    dk += float(hx >> 20) - 1023.0  # k += (int)(hx>>20) - 0x3ff
+    hx = (hx & 0x000fffff) + 0x3fe6a09e
+    u = (hx << 32) | (u & 0xffffffff)
+    x = float.from_bits(u)
+    let f = x - 1.0
+    let hfsq = 0.5 * f * f
+    let s = f / (2.0 + f)
+    let z = s * s
+    var w = z * z
+    let t1 = w * (MLOG10_LG2 + w * (MLOG10_LG4 + w * MLOG10_LG6))
+    let t2 = z * (MLOG10_LG1 + w * (MLOG10_LG3 + w * (MLOG10_LG5 + w * MLOG10_LG7)))
+    let rr = t2 + t1
+    # hi+lo = f - hfsq + s*(hfsq+R) ~ log(1+f)
+    var hi = f - hfsq
+    hi = float.from_bits(hi.to_bits() & MLOG_HIMASK)
+    let lo = f - hi - hfsq + s * (hfsq + rr)
+    # val_hi+val_lo ~ log10(1+f) + k*log10(2)
+    var val_hi = hi * MLOG10_IVLN10HI
+    let y = dk * MLOG10_LOG10_2HI
+    var val_lo = dk * MLOG10_LOG10_2LO + (lo + hi) * MLOG10_IVLN10LO + lo * MLOG10_IVLN10HI
+    w = y + val_hi
+    val_lo += (y - w) + val_hi
+    val_hi = w
+    return val_lo + val_hi
+
+fn f_log1p(x: float) -> float:
+    var u = x.to_bits()
+    let hx = u >> 32  # uint32_t
+    # C's int k: `reduce` is k != 0 before the reduction, dk is (double)k after it
+    var reduce = true
+    var dk = 0.0
+    var c = 0.0
+    var f = 0.0
+    if hx < 0x3fda827a or hx >= 0x80000000:
+        # 1+x < sqrt(2)+
+        if hx >= 0xbff00000:
+            # x <= -1.0
+            if x == -1.0:
+                return x / 0.0  # log1p(-1) = -inf
+            return (x - x) / 0.0  # log1p(x<-1) = NaN
+        if (hx & 0x7fffffff) < 0x3ca00000:
+            # |x| < 2**-53 (C: hx<<1 < 0x3ca00000<<1 on uint32_t)
+            return x
+        if hx <= 0xbfd2bec4:
+            # sqrt(2)/2- <= 1+x < sqrt(2)+
+            reduce = false  # k = 0
+            c = 0.0
+            f = x
+    elif hx >= 0x7ff00000:
+        return x
+    if reduce:
+        let uf = 1.0 + x
+        u = uf.to_bits()
+        var hu = u >> 32  # uint32_t
+        hu += 0x3ff00000 - 0x3fe6a09e
+        let kb = hu >> 20  # k + 0x3ff
+        # correction term ~ log(1+x)-log(u), avoid underflow in c/u
+        if kb < 54 + 0x3ff:
+            c = 1.0 - (uf - x) if kb >= 2 + 0x3ff else x - (uf - 1.0)
+            c /= uf
+        else:
+            c = 0.0
+        # reduce u into [sqrt(2)/2, sqrt(2)]
+        hu = (hu & 0x000fffff) + 0x3fe6a09e
+        u = (hu << 32) | (u & 0xffffffff)
+        f = float.from_bits(u) - 1.0
+        dk = float(int(kb)) - 1023.0
+    let hfsq = 0.5 * f * f
+    let s = f / (2.0 + f)
+    let z = s * s
+    let w = z * z
+    let t1 = w * (MLOG1P_LG2 + w * (MLOG1P_LG4 + w * MLOG1P_LG6))
+    let t2 = z * (MLOG1P_LG1 + w * (MLOG1P_LG3 + w * (MLOG1P_LG5 + w * MLOG1P_LG7)))
+    let rr = t2 + t1
+    return s * (hfsq + rr) + (dk * MLOG1P_LN2_LO + c) - hfsq + f + dk * MLOG1P_LN2_HI
+
+# expm1, sinh, cosh, tanh, hypot and cbrt: musl 1.2.5 (src/math), translated
+# line by line from runtime/brine_math.c so they give the same bits.
+
+const MHYP_ABS: u64 = 0x7fffffffffffffff
+const MHYP_SIGN: u64 = 0x8000000000000000
+
+# expm1.c
+const MHYP_O_THRESHOLD: float = 709.782712893384
+const MHYP_LN2_HI: float = 0.6931471803691238
+const MHYP_LN2_LO: float = 1.9082149292705877e-10
+const MHYP_INVLN2: float = 1.4426950408889634
+const MHYP_Q1: float = -0.03333333333333313
+const MHYP_Q2: float = 0.0015873015872548146
+const MHYP_Q3: float = -7.93650757867488e-05
+const MHYP_Q4: float = 4.008217827329362e-06
+const MHYP_Q5: float = -2.0109921818362437e-07
+const MHYP_P1023: float = 8.98846567431158e+307
+
+fn f_expm1(x0: float) -> float:
+    var x = x0
+    let ui = x.to_bits()
+    let hx = (ui >> 32) & 0x7fffffff
+    let sign = ui >> 63
+    var hi = 0.0
+    var lo = 0.0
+    var c = 0.0
+    var t = 0.0
+    var k = 0
+
+    # filter out huge and non-finite argument
+    if hx >= 0x4043687A:  # |x| >= 56*ln2
+        if x != x:
+            return x
+        if sign != 0:
+            return -1.0
+        if x > MHYP_O_THRESHOLD:
+            return x * MHYP_P1023
+
+    # argument reduction
+    if hx > 0x3fd62e42:  # |x| > 0.5 ln2
+        if hx < 0x3FF0A2B2:  # and |x| < 1.5 ln2
+            if sign == 0:
+                hi = x - MHYP_LN2_HI
+                lo = MHYP_LN2_LO
+                k = 1
+            else:
+                hi = x + MHYP_LN2_HI
+                lo = -MHYP_LN2_LO
+                k = -1
+        else:
+            # |x| < 709.8 here, so k fits easily
+            if sign != 0:
+                k = int(MHYP_INVLN2 * x + -0.5)
+            else:
+                k = int(MHYP_INVLN2 * x + 0.5)
+            t = float(k)
+            hi = x - t * MHYP_LN2_HI  # t*ln2_hi is exact here
+            lo = t * MHYP_LN2_LO
+        x = hi - lo
+        c = (hi - x) - lo
+    elif hx < 0x3c900000:  # |x| < 2**-54, return x
+        return x
+
+    # x is now in primary range
+    let hfx = 0.5 * x
+    let hxs = x * hfx
+    let r1 = 1.0 + hxs * (
+        MHYP_Q1 + hxs * (MHYP_Q2 + hxs * (MHYP_Q3 + hxs * (MHYP_Q4 + hxs * MHYP_Q5)))
+    )
+    t = 3.0 - r1 * hfx
+    var e = hxs * ((r1 - t) / (6.0 - x * t))
+    if k == 0:  # c is 0
+        return x - (x * e - hxs)
+    e = x * (e - c) - c
+    e -= hxs
+    # exp(x) ~ 2^k (x_reduced - e + 1)
+    if k == -1:
+        return 0.5 * (x - e) - 0.5
+    if k == 1:
+        if x < -0.25:
+            return -2.0 * (e - (x + 0.5))
+        return 1.0 + 2.0 * (x - e)
+    # k is in [-56, 1024] here: 0x3ff + k and 0x3ff - k are >= 0
+    let twopk = float.from_bits(u64(0x3ff + k) << 52)  # 2^k
+    var y = 0.0
+    if k < 0 or k > 56:  # suffice to return exp(x)-1
+        y = x - e + 1.0
+        if k == 1024:
+            y = y * 2.0 * MHYP_P1023
+        else:
+            y = y * twopk
+        return y - 1.0
+    let u = float.from_bits(u64(0x3ff - k) << 52)  # 2^-k
+    if k < 20:
+        y = (x - e + (1.0 - u)) * twopk
+    else:
+        y = (x - (e + u) + 1.0) * twopk
+    return y
+
+# __expo2.c: k = 2043 makes k*ln2 have minimal relative error
+const MHYP_KLN2: float = 1416.0996898839683
+# 2^(k/2) = 2^1021: high word (0x3ff + k/2) << 20, low word 0
+const MHYP_EXPO2_SCALE: u64 = 0x7fc0000000000000
+
+# exp(x)/2 for x >= log(DBL_MAX), slightly better than 0.5*exp(x/2)*exp(x/2)
+fn mhyp_expo2(x: float, sign: float) -> float:
+    # k is odd and scale*scale overflows
+    let scale = float.from_bits(MHYP_EXPO2_SCALE)
+    # exp(x - k ln2) * 2**(k-1)
+    return f_exp(x - MHYP_KLN2) * (sign * scale) * scale
+
+# sinh.c
+fn f_sinh(x: float) -> float:
+    var ui = x.to_bits()
+    var h = 0.5
+    if ui >> 63 != 0:
+        h = -h
+    # |x|
+    ui &= MHYP_ABS
+    let absx = float.from_bits(ui)
+    let w = ui >> 32
+    var t = 0.0
+
+    # |x| < log(DBL_MAX)
+    if w < 0x40862e42:
+        t = f_expm1(absx)
+        if w < 0x3ff00000:
+            if w < 0x3ff00000 - (26 << 20):
+                return x
+            return h * (2.0 * t - t * t / (t + 1.0))
+        return h * (t + t / (t + 1.0))
+
+    # |x| > log(DBL_MAX) or nan
+    t = mhyp_expo2(absx, 2.0 * h)
+    return t
+
+# cosh.c
+fn f_cosh(x0: float) -> float:
+    var ui = x0.to_bits()
+    # |x|
+    ui &= MHYP_ABS
+    let x = float.from_bits(ui)
+    let w = ui >> 32
+    var t = 0.0
+
+    # |x| < log(2)
+    if w < 0x3fe62e42:
+        if w < 0x3ff00000 - (26 << 20):
+            return 1.0
+        t = f_expm1(x)
+        return 1.0 + t * t / (2.0 * (1.0 + t))
+
+    # |x| < log(DBL_MAX)
+    if w < 0x40862e42:
+        t = f_exp(x)
+        return 0.5 * (t + 1.0 / t)
+
+    # |x| > log(DBL_MAX) or nan
+    t = mhyp_expo2(x, 1.0)
+    return t
+
+# tanh.c
+fn f_tanh(x0: float) -> float:
+    var ui = x0.to_bits()
+    let sign = ui >> 63
+    ui &= MHYP_ABS
+    let x = float.from_bits(ui)
+    let w = ui >> 32
+    var t = 0.0
+
+    if w > 0x3fe193ea:
+        # |x| > log(3)/2 ~= 0.5493 or nan
+        if w > 0x40340000:
+            # |x| > 20 or nan
+            t = 1.0 - 0.0 / x
+        else:
+            t = f_expm1(2.0 * x)
+            t = 1.0 - 2.0 / (t + 2.0)
+    elif w > 0x3fd058ae:
+        # |x| > log(5/3)/2 ~= 0.2554
+        t = f_expm1(2.0 * x)
+        t = t / (t + 2.0)
+    elif w >= 0x00100000:
+        # |x| >= 0x1p-1022, up to 2ulp error in [0.1,0.2554]
+        t = f_expm1(-2.0 * x)
+        t = -t / (t + 2.0)
+    else:
+        # |x| is subnormal
+        t = x
+    if sign != 0:
+        return -t
+    return t
+
+# hypot.c
+const MHYP_SPLIT: float = 134217729.0  # 0x1p27 + 1
+const MHYP_P700: float = 5.260135901548374e+210
+const MHYP_M700: float = 1.90109156629516e-211
+
+fn f_hypot(x0: float, y0: float) -> float:
+    var uxi = x0.to_bits() & MHYP_ABS
+    var uyi = y0.to_bits() & MHYP_ABS
+    # arrange |x| >= |y|
+    if uxi < uyi:
+        let ut = uxi
+        uxi = uyi
+        uyi = ut
+
+    # special cases
+    let ex = int(uxi >> 52)
+    let ey = int(uyi >> 52)
+    var x = float.from_bits(uxi)
+    var y = float.from_bits(uyi)
+    # hypot(inf,nan) == inf
+    if ey == 0x7ff:
+        return y
+    if ex == 0x7ff or uyi == 0:
+        return x
+    # hypot(x,y) ~= x + y*y/x/2 with inexact for small y/x
+    if ex - ey > 64:
+        return x + y
+
+    # precise sqrt argument in nearest rounding mode without overflow
+    # xh*xh must not overflow and xl*xl must not underflow in sq
+    var z = 1.0
+    if ex > 0x3ff + 510:
+        z = MHYP_P700
+        x *= MHYP_M700
+        y *= MHYP_M700
+    elif ey < 0x3ff - 450:
+        z = MHYP_M700
+        x *= MHYP_P700
+        y *= MHYP_P700
+    # sq(&hx, &lx, x) and sq(&hy, &ly, y), written out: x*x as hi + lo
+    # exactly (Dekker), in musl's operation order. A helper returning a tuple
+    # costs a third of the time on the native backend.
+    let xc = x * MHYP_SPLIT
+    let xh = x - xc + xc
+    let xl = x - xh
+    let hx = x * x
+    let lx = xh * xh - hx + 2.0 * xh * xl + xl * xl
+    let yc = y * MHYP_SPLIT
+    let yh = y - yc + yc
+    let yl = y - yh
+    let hy = y * y
+    let ly = yh * yh - hy + 2.0 * yh * yl + yl * yl
+    return z * sqrt(ly + lx + hy + hx)
+
+# cbrt.c
+const MHYP_B1: u64 = 715094163  # (1023-1023/3-0.03306235651)*2**20
+const MHYP_B2: u64 = 696219795  # (1023-1023/3-54/3-0.03306235651)*2**20
+const MHYP_P54: float = 1.8014398509481984e+16
+# |1/cbrt(x) - p(x)| < 2**-23.5 (~[-7.93e-8, 7.929e-8])
+const MHYP_P0: float = 1.87595182427177
+const MHYP_P1: float = -1.8849797954337717
+const MHYP_P2: float = 1.6214297201053545
+const MHYP_P3: float = -0.758397934778766
+const MHYP_P4: float = 0.14599619288661245
+
+fn f_cbrt(x: float) -> float:
+    var ui = x.to_bits()
+    var hx = (ui >> 32) & 0x7fffffff
+
+    if hx >= 0x7ff00000:  # cbrt(NaN,INF) is itself
+        return x + x
+
+    # rough cbrt to 5 bits: integer division of the bits (unsigned, so it
+    # rounds down like C's)
+    if hx < 0x00100000:  # zero or subnormal?
+        ui = (x * MHYP_P54).to_bits()
+        hx = (ui >> 32) & 0x7fffffff
+        if hx == 0:
+            return x  # cbrt(0) is itself
+        hx = hx / 3 + MHYP_B2
+    else:
+        hx = hx / 3 + MHYP_B1
+    ui &= MHYP_SIGN
+    ui |= hx << 32
+    var t = float.from_bits(ui)
+
+    # new cbrt to 23 bits: cbrt(x) = t*cbrt(x/t**3) ~= t*P(t**3/x)
+    var r = (t * t) * (t / x)
+    t = t * ((MHYP_P0 + r * (MHYP_P1 + r * MHYP_P2)) + ((r * r) * r) * (MHYP_P3 + r * MHYP_P4))
+
+    # round t away from zero to 23 bits (|t| is finite, so no carry out)
+    ui = (t.to_bits() + 0x80000000) & 0xffffffffc0000000
+    t = float.from_bits(ui)
+
+    # one step Newton iteration to 53 bits with error < 0.667 ulps
+    let s = t * t  # t*t is exact
+    r = x / s  # error <= 0.5 ulps; |r| < |t|
+    let w = t + t  # t+t is exact
+    r = (r - t) / (w + r)  # r-t is exact; w+r ~= 3*t
+    t = t + t * r  # error <= 0.5 + 0.5/3 + epsilon
+    return t
+
+# trig group: musl's sin, cos and tan (with __rem_pio2, __rem_pio2_large,
+# __sin, __cos, __tan, scalbn and floor), ported from runtime/brine_math.c.
+
+const MTRIG_P1023: float = 8.98846567431158e+307
+const MTRIG_PM969: float = 2.004168360008973e-292
+const MTRIG_P24: float = 16777216.0
+const MTRIG_PM24: float = 5.960464477539063e-08
+const MTRIG_P52: float = 4503599627370496.0
+const MTRIG_TOINT: float = 6755399441055744.0
+const MTRIG_PIO4: float = 0.7853981633974483
+const MTRIG_INVPIO2: float = 0.6366197723675814
+const MTRIG_PIO2_1: float = 1.5707963267341256
+const MTRIG_PIO2_1T: float = 6.077100506506192e-11
+const MTRIG_PIO2_2: float = 6.077100506303966e-11
+const MTRIG_PIO2_2T: float = 2.0222662487959506e-21
+const MTRIG_PIO2_3: float = 2.0222662487111665e-21
+const MTRIG_PIO2_3T: float = 8.4784276603689e-32
+const MTRIG_S1: float = -0.16666666666666632
+const MTRIG_S2: float = 0.00833333333332249
+const MTRIG_S3: float = -0.0001984126982985795
+const MTRIG_S4: float = 2.7557313707070068e-06
+const MTRIG_S5: float = -2.5050760253406863e-08
+const MTRIG_S6: float = 1.58969099521155e-10
+const MTRIG_C1: float = 0.0416666666666666
+const MTRIG_C2: float = -0.001388888888887411
+const MTRIG_C3: float = 2.480158728947673e-05
+const MTRIG_C4: float = -2.7557314351390663e-07
+const MTRIG_C5: float = 2.087572321298175e-09
+const MTRIG_C6: float = -1.1359647557788195e-11
+const MTRIG_TPIO4LO: float = 3.061616997868383e-17
+const MTRIG_T0: float = 0.3333333333333341
+const MTRIG_T1: float = 0.13333333333320124
+const MTRIG_T2: float = 0.05396825397622605
+const MTRIG_T3: float = 0.021869488294859542
+const MTRIG_T4: float = 0.0088632398235993
+const MTRIG_T5: float = 0.0035920791075913124
+const MTRIG_T6: float = 0.0014562094543252903
+const MTRIG_T7: float = 0.0005880412408202641
+const MTRIG_T8: float = 0.0002464631348184699
+const MTRIG_T9: float = 7.817944429395571e-05
+const MTRIG_T10: float = 7.140724913826082e-05
+const MTRIG_T11: float = -1.8558637485527546e-05
+const MTRIG_T12: float = 2.590730518636337e-05
+
+const MTRIG_PIO2: [u64] = [
+    0x3ff921fb40000000, 0x3e74442d00000000, 0x3cf8469880000000, 0x3b78cc5160000000,
+    0x39f01b8380000000, 0x387a252040000000, 0x36e3822280000000, 0x3569f31d00000000,
+]
+# ipio2: 2/pi in 24-bit pieces (musl's first 66: enough for double)
+const MTRIG_IPIO2: [int] = [
+    0xA2F983, 0x6E4E44, 0x1529FC, 0x2757D1, 0xF534DD, 0xC0DB62,
+    0x95993C, 0x439041, 0xFE5163, 0xABDEBB, 0xC561B7, 0x246E3A,
+    0x424DD2, 0xE00649, 0x2EEA09, 0xD1921C, 0xFE1DEB, 0x1CB129,
+    0xA73EE8, 0x8235F5, 0x2EBB44, 0x84E99C, 0x7026B4, 0x5F7E41,
+    0x3991D6, 0x398353, 0x39F49C, 0x845F8B, 0xBDF928, 0x3B1FF8,
+    0x97FFDE, 0x05980F, 0xEF2F11, 0x8B5A0A, 0x6D1F6D, 0x367ECF,
+    0x27CB09, 0xB74F46, 0x3F669E, 0x5FEA2D, 0x7527BA, 0xC7EBE5,
+    0xF17B3D, 0x0739F7, 0x8A5292, 0xEA6BFB, 0x5FB11F, 0x8D5D08,
+    0x560330, 0x46FC7B, 0x6BABF0, 0xCFBC20, 0x9AF436, 0x1DA9E3,
+    0x91615E, 0xE61B08, 0x659985, 0x5F14A0, 0x68408D, 0xFFD880,
+    0x4D7327, 0x310606, 0x1556CA, 0x73A8C9, 0x60E27B, 0xC08C6B,
+]
+
+const MTRIG_ONES: u64 = 0xffffffffffffffff
+
+# musl __rem_pio2_large.c for prec = 1 (jk = 4). x[] is (x0, x1, x2) with
+# nx of them used; returns (n & 7, y[0], y[1]).
+fn mtrig_rem_pio2_large(x0: float, x1: float, x2: float, e0: int, nx: int) -> (int, float, float):
+    let iq = stack_mem(160)
+    let f = stack_mem(160)
+    let fq = stack_mem(160)
+    let q = stack_mem(160)
+
+    let jk = 4
+    let jp = jk
+
+    # determine jx, jv, q0, note that 3 > q0. jv: C truncates (e0-3)/24 and
+    # brine rounds down; they differ only for negative e0-3, where both give
+    # a value <= 0 and the clamp makes it 0.
+    let jx = nx - 1
+    var jv = (e0 - 3) / 24
+    if jv < 0:
+        jv = 0
+    var q0 = e0 - 24 * (jv + 1)
+
+    # set up f[0] to f[jx+jk] where f[jx+jk] = ipio2[jv+jk]
+    var j = jv - jx
+    let m = jx + jk
+    var i = 0
+    while i <= m:
+        store_f64(f, 8 * i, 0.0 if j < 0 else float(MTRIG_IPIO2[j]))
+        i += 1
+        j += 1
+
+    # compute q[0],q[1],...q[jk]
+    var fw = 0.0
+    i = 0
+    while i <= jk:
+        fw = 0.0
+        fw += x0 * load_f64(f, 8 * (jx + i))
+        if jx >= 1:
+            fw += x1 * load_f64(f, 8 * (jx + i - 1))
+            if jx >= 2:
+                fw += x2 * load_f64(f, 8 * (jx + i - 2))
+        store_f64(q, 8 * i, fw)
+        i += 1
+
+    var jz = jk
+    var z = 0.0
+    var n = 0
+    var ih = 0
+    var carry = 0
+    var k = 0
+    while true:
+        # recompute: distill q[] into iq[] reversingly. Every value here is
+        # >= 0 and < 2^31, so int() truncates as C's (int32_t) does.
+        i = 0
+        j = jz
+        z = load_f64(q, 8 * jz)
+        while j > 0:
+            fw = float(int(MTRIG_PM24 * z))
+            store_i64(iq, 8 * i, int(z - MTRIG_P24 * fw))
+            z = load_f64(q, 8 * (j - 1)) + fw
+            i += 1
+            j -= 1
+
+        # compute n
+        z = mexp_scalbn(z, q0)
+        z -= 8.0 * f_floor(z * 0.125)
+        n = int(z)
+        z -= float(n)
+        ih = 0
+        if q0 > 0:
+            # need iq[jz-1] to determine n
+            i = load_i64(iq, 8 * (jz - 1)) >> (24 - q0)
+            n += i
+            store_i64(iq, 8 * (jz - 1), load_i64(iq, 8 * (jz - 1)) - (i << (24 - q0)))
+            ih = load_i64(iq, 8 * (jz - 1)) >> (23 - q0)
+        elif q0 == 0:
+            ih = load_i64(iq, 8 * (jz - 1)) >> 23
+        elif z >= 0.5:
+            ih = 2
+
+        if ih > 0:
+            # q > 0.5
+            n += 1
+            carry = 0
+            i = 0
+            while i < jz:
+                # compute 1-q
+                j = load_i64(iq, 8 * i)
+                if carry == 0:
+                    if j != 0:
+                        carry = 1
+                        store_i64(iq, 8 * i, 0x1000000 - j)
+                else:
+                    store_i64(iq, 8 * i, 0xffffff - j)
+                i += 1
+            if q0 > 0:
+                # rare case: chance is 1 in 12
+                if q0 == 1:
+                    store_i64(iq, 8 * (jz - 1), load_i64(iq, 8 * (jz - 1)) & 0x7fffff)
+                elif q0 == 2:
+                    store_i64(iq, 8 * (jz - 1), load_i64(iq, 8 * (jz - 1)) & 0x3fffff)
+            if ih == 2:
+                z = 1.0 - z
+                if carry != 0:
+                    z -= mexp_scalbn(1.0, q0)
+
+        # check if recomputation is needed
+        if z == 0.0:
+            j = 0
+            i = jz - 1
+            while i >= jk:
+                j |= load_i64(iq, 8 * i)
+                i -= 1
+            if j == 0:
+                # need recomputation; k = no. of terms needed
+                k = 1
+                while load_i64(iq, 8 * (jk - k)) == 0:
+                    k += 1
+                # add q[jz+1] to q[jz+k]
+                i = jz + 1
+                while i <= jz + k:
+                    store_f64(f, 8 * (jx + i), float(MTRIG_IPIO2[jv + i]))
+                    fw = 0.0
+                    fw += x0 * load_f64(f, 8 * (jx + i))
+                    if jx >= 1:
+                        fw += x1 * load_f64(f, 8 * (jx + i - 1))
+                        if jx >= 2:
+                            fw += x2 * load_f64(f, 8 * (jx + i - 2))
+                    store_f64(q, 8 * i, fw)
+                    i += 1
+                jz += k
+                continue
+        break
+
+    # chop off zero terms
+    if z == 0.0:
+        jz -= 1
+        q0 -= 24
+        while load_i64(iq, 8 * jz) == 0:
+            jz -= 1
+            q0 -= 24
+    else:
+        # break z into 24-bit if necessary
+        z = mexp_scalbn(z, -q0)
+        if z >= MTRIG_P24:
+            fw = float(int(MTRIG_PM24 * z))
+            store_i64(iq, 8 * jz, int(z - MTRIG_P24 * fw))
+            jz += 1
+            q0 += 24
+            store_i64(iq, 8 * jz, int(fw))
+        else:
+            store_i64(iq, 8 * jz, int(z))
+
+    # convert integer "bit" chunk to floating-point value
+    fw = mexp_scalbn(1.0, q0)
+    i = jz
+    while i >= 0:
+        store_f64(q, 8 * i, fw * float(load_i64(iq, 8 * i)))
+        fw *= MTRIG_PM24
+        i -= 1
+
+    # compute PIo2[0,...,jp]*q[jz,...,0]
+    i = jz
+    while i >= 0:
+        fw = 0.0
+        k = 0
+        while k <= jp and k <= jz - i:
+            fw += float.from_bits(MTRIG_PIO2[k]) * load_f64(q, 8 * (i + k))
+            k += 1
+        store_f64(fq, 8 * (jz - i), fw)
+        i -= 1
+
+    # compress fq[] into y[]
+    fw = 0.0
+    i = jz
+    while i >= 0:
+        fw += load_f64(fq, 8 * i)
+        i -= 1
+    let y0 = fw if ih == 0 else -fw
+    fw = load_f64(fq, 8 * 0) - fw
+    i = 1
+    while i <= jz:
+        fw += load_f64(fq, 8 * i)
+        i += 1
+    let y1 = fw if ih == 0 else -fw
+    return (n & 7, y0, y1)
+
+# the medium case of __rem_pio2: |x| ~< 2^20*(pi/2), and the cancellation
+# cases near multiples of pi/2 that jump to it
+fn mtrig_rem_pio2_medium(x: float, ix: u64) -> (int, float, float):
+    # rint(x/(pi/2))
+    var fnv = x * MTRIG_INVPIO2 + MTRIG_TOINT - MTRIG_TOINT
+    var n = int(fnv)
+    var r = x - fnv * MTRIG_PIO2_1
+    var w = fnv * MTRIG_PIO2_1T
+    # matters with directed rounding
+    if r - w < -MTRIG_PIO4:
+        n -= 1
+        fnv -= 1.0
+        r = x - fnv * MTRIG_PIO2_1
+        w = fnv * MTRIG_PIO2_1T
+    elif r - w > MTRIG_PIO4:
+        n += 1
+        fnv += 1.0
+        r = x - fnv * MTRIG_PIO2_1
+        w = fnv * MTRIG_PIO2_1T
+    var y0 = r - w
+    var ey = (y0.to_bits() >> 52) & 0x7ff
+    let ex = ix >> 20
+    # ex - ey > 16, in unsigned arithmetic that cannot wrap
+    if ex > ey + 16:
+        # 2nd round, good to 118 bits
+        var t = r
+        w = fnv * MTRIG_PIO2_2
+        r = t - w
+        w = fnv * MTRIG_PIO2_2T - ((t - r) - w)
+        y0 = r - w
+        ey = (y0.to_bits() >> 52) & 0x7ff
+        if ex > ey + 49:
+            # 3rd round, good to 151 bits, covers all cases
+            t = r
+            w = fnv * MTRIG_PIO2_3
+            r = t - w
+            w = fnv * MTRIG_PIO2_3T - ((t - r) - w)
+            y0 = r - w
+    let y1 = (r - y0) - w
+    return (n, y0, y1)
+
+# musl __rem_pio2.c: x rem pi/2 as (n, y[0], y[1]). The caller handles
+# |x| ~<= pi/4, where no reduction is needed.
+fn mtrig_rem_pio2(x: float) -> (int, float, float):
+    let u = x.to_bits()
+    let sign = (u >> 63) != 0
+    let ix = (u >> 32) & 0x7fffffff
+    if ix <= 0x400f6a7a:
+        # |x| ~<= 5pi/4
+        if (ix & 0xfffff) == 0x921fb:
+            # |x| ~= pi/2 or 2pi/2: cancellation, use the medium case
+            return mtrig_rem_pio2_medium(x, ix)
+        if ix <= 0x4002d97c:
+            # |x| ~<= 3pi/4
+            if not sign:
+                let z = x - MTRIG_PIO2_1
+                let a = z - MTRIG_PIO2_1T
+                return (1, a, (z - a) - MTRIG_PIO2_1T)
+            let z = x + MTRIG_PIO2_1
+            let a = z + MTRIG_PIO2_1T
+            return (-1, a, (z - a) + MTRIG_PIO2_1T)
+        if not sign:
+            let z = x - 2.0 * MTRIG_PIO2_1
+            let a = z - 2.0 * MTRIG_PIO2_1T
+            return (2, a, (z - a) - 2.0 * MTRIG_PIO2_1T)
+        let z = x + 2.0 * MTRIG_PIO2_1
+        let a = z + 2.0 * MTRIG_PIO2_1T
+        return (-2, a, (z - a) + 2.0 * MTRIG_PIO2_1T)
+    if ix <= 0x401c463b:
+        # |x| ~<= 9pi/4
+        if ix <= 0x4015fdbc:
+            # |x| ~<= 7pi/4
+            if ix == 0x4012d97c:
+                # |x| ~= 3pi/2
+                return mtrig_rem_pio2_medium(x, ix)
+            if not sign:
+                let z = x - 3.0 * MTRIG_PIO2_1
+                let a = z - 3.0 * MTRIG_PIO2_1T
+                return (3, a, (z - a) - 3.0 * MTRIG_PIO2_1T)
+            let z = x + 3.0 * MTRIG_PIO2_1
+            let a = z + 3.0 * MTRIG_PIO2_1T
+            return (-3, a, (z - a) + 3.0 * MTRIG_PIO2_1T)
+        if ix == 0x401921fb:
+            # |x| ~= 4pi/2
+            return mtrig_rem_pio2_medium(x, ix)
+        if not sign:
+            let z = x - 4.0 * MTRIG_PIO2_1
+            let a = z - 4.0 * MTRIG_PIO2_1T
+            return (4, a, (z - a) - 4.0 * MTRIG_PIO2_1T)
+        let z = x + 4.0 * MTRIG_PIO2_1
+        let a = z + 4.0 * MTRIG_PIO2_1T
+        return (-4, a, (z - a) + 4.0 * MTRIG_PIO2_1T)
+    if ix < 0x413921fb:
+        # |x| ~< 2^20*(pi/2), medium size
+        return mtrig_rem_pio2_medium(x, ix)
+    # all other (large) arguments
+    if ix >= 0x7ff00000:
+        # x is inf or NaN
+        let d = x - x
+        return (0, d, d)
+    # set z = scalbn(|x|,-ilogb(x)+23)
+    var z = float.from_bits((u & (MTRIG_ONES >> 12)) | (u64(0x3ff + 23) << 52))
+    let tx0 = float(int(z))
+    z = (z - tx0) * MTRIG_P24
+    let tx1 = float(int(z))
+    z = (z - tx1) * MTRIG_P24
+    let tx2 = z
+    # skip zero terms, first term is non-zero
+    var nx = 3
+    if tx2 == 0.0:
+        nx = 2
+        if tx1 == 0.0:
+            nx = 1
+    let (n, ty0, ty1) = mtrig_rem_pio2_large(tx0, tx1, tx2, int(ix >> 20) - (0x3ff + 23), nx)
+    if sign:
+        return (-n, -ty0, -ty1)
+    return (n, ty0, ty1)
+
+# musl __sin.c: sin on ~[-pi/4, pi/4]; y is the tail of x, iy = 0 when y is 0
+fn mtrig_ksin(x: float, y: float, iy: int) -> float:
+    let z = x * x
+    let w = z * z
+    let r = MTRIG_S2 + z * (MTRIG_S3 + z * MTRIG_S4) + z * w * (MTRIG_S5 + z * MTRIG_S6)
+    let v = z * x
+    if iy == 0:
+        return x + v * (MTRIG_S1 + z * r)
+    return x - ((z * (0.5 * y - v * r) - y) - v * MTRIG_S1)
+
+# musl __cos.c: cos on [-pi/4, pi/4]; y is the tail of x
+fn mtrig_kcos(x: float, y: float) -> float:
+    let z = x * x
+    var w = z * z
+    let r = (
+        z * (MTRIG_C1 + z * (MTRIG_C2 + z * MTRIG_C3))
+        + w * w * (MTRIG_C4 + z * (MTRIG_C5 + z * MTRIG_C6))
+    )
+    let hz = 0.5 * z
+    w = 1.0 - hz
+    return w + (((1.0 - w) - hz) + (z * r - x * y))
+
+# musl __tan.c: tan (odd = 0) or -1/tan (odd = 1) on ~[-pi/4, pi/4]
+fn mtrig_ktan(mut x: float, mut y: float, odd: int) -> float:
+    let hx = x.to_bits() >> 32
+    let big = (hx & 0x7fffffff) >= 0x3FE59428
+    let sign = (hx >> 31) != 0
+    if big:
+        # |x| >= 0.6744
+        if sign:
+            x = -x
+            y = -y
+        # musl's pio4 here has the same bits as __rem_pio2's
+        x = (MTRIG_PIO4 - x) + (MTRIG_TPIO4LO - y)
+        y = 0.0
+    let z = x * x
+    var w = z * z
+    # break x^5*(T[1]+x^2*T[2]+...) into
+    # x^5(T[1]+x^4*T[3]+...+x^20*T[11]) + x^5(x^2*(T[2]+x^4*T[4]+...+x^22*[T12]))
+    var r = MTRIG_T1 + w * (
+        MTRIG_T3 + w * (MTRIG_T5 + w * (MTRIG_T7 + w * (MTRIG_T9 + w * MTRIG_T11)))
+    )
+    var v = z * (
+        MTRIG_T2 + w * (
+            MTRIG_T4 + w * (MTRIG_T6 + w * (MTRIG_T8 + w * (MTRIG_T10 + w * MTRIG_T12)))
+        )
+    )
+    var s = z * x
+    r = y + z * (s * (r + v) + y) + s * MTRIG_T0
+    w = x + r
+    if big:
+        s = float(1 - 2 * odd)
+        v = s - 2.0 * (x + (r - w * w / (w + s)))
+        return -v if sign else v
+    if odd == 0:
+        return w
+    # -1.0/(x+r) has up to 2ulp error, so compute it accurately
+    let w0 = float.from_bits(w.to_bits() & 0xffffffff00000000)
+    v = r - (w0 - x)
+    # w0+v = r+x
+    let a = -1.0 / w
+    let a0 = float.from_bits(a.to_bits() & 0xffffffff00000000)
+    return a0 + a * (1.0 + a0 * w0 + a0 * v)
+
+# musl sin.c
+fn f_sin(x: float) -> float:
+    let ix = (x.to_bits() >> 32) & 0x7fffffff
+    # |x| ~< pi/4
+    if ix <= 0x3fe921fb:
+        if ix < 0x3e500000:
+            # |x| < 2**-26
+            return x
+        return mtrig_ksin(x, 0.0, 0)
+    # sin(Inf or NaN) is NaN
+    if ix >= 0x7ff00000:
+        return x - x
+    # argument reduction needed
+    let (n, y0, y1) = mtrig_rem_pio2(x)
+    let c = n & 3
+    if c == 0:
+        return mtrig_ksin(y0, y1, 1)
+    if c == 1:
+        return mtrig_kcos(y0, y1)
+    if c == 2:
+        return -mtrig_ksin(y0, y1, 1)
+    return -mtrig_kcos(y0, y1)
+
+# musl cos.c
+fn f_cos(x: float) -> float:
+    let ix = (x.to_bits() >> 32) & 0x7fffffff
+    # |x| ~< pi/4
+    if ix <= 0x3fe921fb:
+        if ix < 0x3e46a09e:
+            # |x| < 2**-27 * sqrt(2)
+            return 1.0
+        return mtrig_kcos(x, 0.0)
+    # cos(Inf or NaN) is NaN
+    if ix >= 0x7ff00000:
+        return x - x
+    # argument reduction
+    let (n, y0, y1) = mtrig_rem_pio2(x)
+    let c = n & 3
+    if c == 0:
+        return mtrig_kcos(y0, y1)
+    if c == 1:
+        return -mtrig_ksin(y0, y1, 1)
+    if c == 2:
+        return -mtrig_kcos(y0, y1)
+    return mtrig_ksin(y0, y1, 1)
+
+# musl tan.c
+fn f_tan(x: float) -> float:
+    let ix = (x.to_bits() >> 32) & 0x7fffffff
+    # |x| ~< pi/4
+    if ix <= 0x3fe921fb:
+        if ix < 0x3e400000:
+            # |x| < 2**-27
+            return x
+        return mtrig_ktan(x, 0.0, 0)
+    # tan(Inf or NaN) is NaN
+    if ix >= 0x7ff00000:
+        return x - x
+    # argument reduction
+    let (n, y0, y1) = mtrig_rem_pio2(x)
+    return mtrig_ktan(y0, y1, n & 1)
+
+# atan, atan2, asin and acos: musl 1.2.5's atan.c, atan2.c, asin.c and
+# acos.c (FreeBSD msun, Sun Microsystems), translated line by line so they
+# give the same bits as runtime/brine_math.c.
+
+# atan.c: atanhi[], atanlo[] and aT[]
+const MATR_ATANHI0: float = 0.4636476090008061
+const MATR_ATANHI1: float = 0.7853981633974483
+const MATR_ATANHI2: float = 0.982793723247329
+const MATR_ATANHI3: float = 1.5707963267948966
+const MATR_ATANLO0: float = 2.2698777452961687e-17
+const MATR_ATANLO1: float = 3.061616997868383e-17
+const MATR_ATANLO2: float = 1.3903311031230998e-17
+const MATR_ATANLO3: float = 6.123233995736766e-17
+const MATR_AT0: float = 0.3333333333333293
+const MATR_AT1: float = -0.19999999999876483
+const MATR_AT2: float = 0.14285714272503466
+const MATR_AT3: float = -0.11111110405462356
+const MATR_AT4: float = 0.09090887133436507
+const MATR_AT5: float = -0.0769187620504483
+const MATR_AT6: float = 0.06661073137387531
+const MATR_AT7: float = -0.058335701337905735
+const MATR_AT8: float = 0.049768779946159324
+const MATR_AT9: float = -0.036531572744216916
+const MATR_AT10: float = 0.016285820115365782
+# atan2.c
+const MATR_PI: float = 3.141592653589793
+const MATR_PI_LO: float = 1.2246467991473532e-16
+# asin.c and acos.c (the same values in both)
+const MATR_PIO2_HI: float = 1.5707963267948966
+const MATR_PIO2_LO: float = 6.123233995736766e-17
+const MATR_PS0: float = 0.16666666666666666
+const MATR_PS1: float = -0.3255658186224009
+const MATR_PS2: float = 0.20121253213486293
+const MATR_PS3: float = -0.04005553450067941
+const MATR_PS4: float = 0.0007915349942898145
+const MATR_PS5: float = 3.479331075960212e-05
+const MATR_QS1: float = -2.403394911734414
+const MATR_QS2: float = 2.0209457602335057
+const MATR_QS3: float = -0.6882839716054533
+const MATR_QS4: float = 0.07703815055590194
+# 0x1p-120f
+const MATR_TINY: float = 7.52316384526264e-37
+
+fn matr_fabs(x: float) -> float:
+    return float.from_bits(x.to_bits() & 0x7fffffffffffffff)
+
+fn f_atan(x0: float) -> float:
+    var x = x0
+    let hw = x.to_bits() >> 32
+    let sign = hw >> 31
+    let ix = hw & 0x7fffffff
+    # atanhi[id] and atanlo[id]; id < 0 is `full`
+    var hi = 0.0
+    var lo = 0.0
+    var full = false
+    if ix >= 0x44100000:
+        # |x| >= 2^66
+        if x != x:
+            return x
+        let z = MATR_ATANHI3 + MATR_TINY
+        if sign != 0:
+            return -z
+        return z
+    if ix < 0x3fdc0000:
+        # |x| < 0.4375
+        if ix < 0x3e400000:
+            # |x| < 2^-27
+            return x
+        full = true
+    else:
+        x = matr_fabs(x)
+        if ix < 0x3ff30000:
+            # |x| < 1.1875
+            if ix < 0x3fe60000:
+                # 7/16 <= |x| < 11/16
+                hi = MATR_ATANHI0
+                lo = MATR_ATANLO0
+                x = (2.0 * x - 1.0) / (2.0 + x)
+            else:
+                # 11/16 <= |x| < 19/16
+                hi = MATR_ATANHI1
+                lo = MATR_ATANLO1
+                x = (x - 1.0) / (x + 1.0)
+        else:
+            if ix < 0x40038000:
+                # |x| < 2.4375
+                hi = MATR_ATANHI2
+                lo = MATR_ATANLO2
+                x = (x - 1.5) / (1.0 + 1.5 * x)
+            else:
+                # 2.4375 <= |x| < 2^66
+                hi = MATR_ATANHI3
+                lo = MATR_ATANLO3
+                x = -1.0 / x
+    var z = x * x
+    let w = z * z
+    # the sum from i=0 to 10 of aT[i]z**(i+1), as an odd and an even polynomial
+    let s1 = z * (
+        MATR_AT0 + w * (MATR_AT2 + w * (MATR_AT4 + w * (MATR_AT6 + w * (MATR_AT8 + w * MATR_AT10))))
+    )
+    let s2 = w * (MATR_AT1 + w * (MATR_AT3 + w * (MATR_AT5 + w * (MATR_AT7 + w * MATR_AT9))))
+    if full:
+        return x - x * (s1 + s2)
+    z = hi - (x * (s1 + s2) - lo - x)
+    if sign != 0:
+        return -z
+    return z
+
+fn f_atan2(y: float, x: float) -> float:
+    if x != x or y != y:
+        # C's x+y: the C compiler commutes it to addsd y, x, and with two
+        # NaNs x86 returns the first operand's, so the order matters
+        return y + x
+    let bx = x.to_bits()
+    let by = y.to_bits()
+    var ix = bx >> 32
+    let lx = bx & 0xffffffff
+    var iy = by >> 32
+    let ly = by & 0xffffffff
+    # C: (ix-0x3ff00000 | lx) == 0 in uint32_t, which is x == 1.0
+    if ix == 0x3ff00000 and lx == 0:
+        return f_atan(y)
+    # 2*sign(x)+sign(y)
+    let m = ((iy >> 31) & 1) | ((ix >> 30) & 2)
+    ix = ix & 0x7fffffff
+    iy = iy & 0x7fffffff
+    # y = 0
+    if (iy | ly) == 0:
+        if m <= 1:
+            return y
+        if m == 2:
+            return MATR_PI
+        return -MATR_PI
+    # x = 0
+    if (ix | lx) == 0:
+        if (m & 1) != 0:
+            return -MATR_PI / 2.0
+        return MATR_PI / 2.0
+    # x is inf
+    if ix == 0x7ff00000:
+        if iy == 0x7ff00000:
+            if m == 0:
+                return MATR_PI / 4.0
+            if m == 1:
+                return -MATR_PI / 4.0
+            if m == 2:
+                return 3.0 * MATR_PI / 4.0
+            return -3.0 * MATR_PI / 4.0
+        else:
+            if m == 0:
+                return 0.0
+            if m == 1:
+                return -0.0
+            if m == 2:
+                return MATR_PI
+            return -MATR_PI
+    # |y/x| > 0x1p64 (no wraparound: ix and iy are below 2^31)
+    if ix + (64 << 20) < iy or iy == 0x7ff00000:
+        if (m & 1) != 0:
+            return -MATR_PI / 2.0
+        return MATR_PI / 2.0
+    # z = atan(|y/x|) without spurious underflow
+    var z = 0.0
+    if (m & 2) != 0 and iy + (64 << 20) < ix:
+        # |y/x| < 0x1p-64, x < 0
+        z = 0.0
+    else:
+        z = f_atan(matr_fabs(y / x))
+    if m == 0:
+        return z
+    if m == 1:
+        return -z
+    if m == 2:
+        return MATR_PI - (z - MATR_PI_LO)
+    return (z - MATR_PI_LO) - MATR_PI
+
+# R(z) of asin.c and acos.c (the same function in both)
+fn matr_r(z: float) -> float:
+    let p = z * (
+        MATR_PS0 + z * (MATR_PS1 + z * (MATR_PS2 + z * (MATR_PS3 + z * (MATR_PS4 + z * MATR_PS5))))
+    )
+    let q = 1.0 + z * (MATR_QS1 + z * (MATR_QS2 + z * (MATR_QS3 + z * MATR_QS4)))
+    return p / q
+
+fn f_asin(x0: float) -> float:
+    var x = x0
+    let b = x.to_bits()
+    let hx = b >> 32
+    let ix = hx & 0x7fffffff
+    # |x| >= 1 or nan
+    if ix >= 0x3ff00000:
+        let lx = b & 0xffffffff
+        # C: (ix-0x3ff00000 | lx) == 0, which is |x| == 1
+        if ix == 0x3ff00000 and lx == 0:
+            # asin(1) = +-pi/2 with inexact
+            return x * MATR_PIO2_HI + MATR_TINY
+        return 0.0 / (x - x)
+    # |x| < 0.5
+    if ix < 0x3fe00000:
+        # 0x1p-1022 <= |x| < 0x1p-26
+        if ix < 0x3e500000 and ix >= 0x00100000:
+            return x
+        return x + x * matr_r(x * x)
+    # 1 > |x| >= 0.5
+    let z = (1.0 - matr_fabs(x)) * 0.5
+    let s = sqrt(z)
+    let r = matr_r(z)
+    if ix >= 0x3fef3333:
+        # |x| > 0.975
+        x = MATR_PIO2_HI - (2.0 * (s + s * r) - MATR_PIO2_LO)
+    else:
+        # f+c = sqrt(z)
+        let f = float.from_bits(s.to_bits() & 0xffffffff00000000)
+        let c = (z - f * f) / (s + f)
+        x = 0.5 * MATR_PIO2_HI - (
+            2.0 * s * r - (MATR_PIO2_LO - 2.0 * c) - (0.5 * MATR_PIO2_HI - 2.0 * f)
+        )
+    if (hx >> 31) != 0:
+        return -x
+    return x
+
+fn f_acos(x: float) -> float:
+    let b = x.to_bits()
+    let hx = b >> 32
+    let ix = hx & 0x7fffffff
+    # |x| >= 1 or nan
+    if ix >= 0x3ff00000:
+        let lx = b & 0xffffffff
+        if ix == 0x3ff00000 and lx == 0:
+            # acos(1)=0, acos(-1)=pi
+            if (hx >> 31) != 0:
+                return 2.0 * MATR_PIO2_HI + MATR_TINY
+            return 0.0
+        return 0.0 / (x - x)
+    # |x| < 0.5
+    if ix < 0x3fe00000:
+        if ix <= 0x3c600000:
+            # |x| < 2**-57
+            return MATR_PIO2_HI + MATR_TINY
+        return MATR_PIO2_HI - (x - (MATR_PIO2_LO - x * matr_r(x * x)))
+    # x < -0.5
+    if (hx >> 31) != 0:
+        let z = (1.0 + x) * 0.5
+        let s = sqrt(z)
+        let w = matr_r(z) * s - MATR_PIO2_LO
+        return 2.0 * (MATR_PIO2_HI - (s + w))
+    # x > 0.5
+    let z = (1.0 - x) * 0.5
+    let s = sqrt(z)
+    let df = float.from_bits(s.to_bits() & 0xffffffff00000000)
+    let c = (z - df * df) / (s + df)
+    let w = matr_r(z) * s + c
+    return 2.0 * (df + w)
+
+# ---- the exact operations (musl's floor.c, ceil.c, round.c, fmod.c): any
+# correct version gives the C library's bits
+
+const MX_TOINT: float = 4503599627370496.0
+
+fn f_floor(x: float) -> float:
+    let u = x.to_bits()
+    let e = (u >> 52) & 0x7ff
+    if e >= 0x3ff + 52 or x == 0.0:
+        return x
+    # y = int(x) - x, where int(x) is an integer neighbor of x
+    var y = 0.0
+    if (u >> 63) != 0:
+        y = x - MX_TOINT + MX_TOINT - x
+    else:
+        y = x + MX_TOINT - MX_TOINT - x
+    if e <= 0x3ff - 1:
+        return -1.0 if (u >> 63) != 0 else 0.0
+    if y > 0.0:
+        return x + y - 1.0
+    return x + y
+
+fn f_ceil(x: float) -> float:
+    let u = x.to_bits()
+    let e = (u >> 52) & 0x7ff
+    if e >= 0x3ff + 52 or x == 0.0:
+        return x
+    var y = 0.0
+    if (u >> 63) != 0:
+        y = x - MX_TOINT + MX_TOINT - x
+    else:
+        y = x + MX_TOINT - MX_TOINT - x
+    if e <= 0x3ff - 1:
+        return -0.0 if (u >> 63) != 0 else 1.0
+    if y < 0.0:
+        return x + y + 1.0
+    return x + y
+
+# halfway cases away from zero
+fn f_round(x0: float) -> float:
+    let u = x0.to_bits()
+    let e = (u >> 52) & 0x7ff
+    if e >= 0x3ff + 52:
+        return x0
+    var x = x0
+    if (u >> 63) != 0:
+        x = -x
+    if e < 0x3ff - 1:
+        return 0.0 * x0
+    var y = x + MX_TOINT - MX_TOINT - x
+    if y > 0.5:
+        y = y + x - 1.0
+    elif y <= -0.5:
+        y = y + x + 1.0
+    else:
+        y = y + x
+    if (u >> 63) != 0:
+        y = -y
+    return y
+
+fn f_fabs(x: float) -> float:
+    return float.from_bits(x.to_bits() & 0x7fffffffffffffff)
+
+# C's fmod: x - n*y for n = x/y truncated, exactly
+fn mx_fmod(x: float, y: float) -> float:
+    let ux = x.to_bits()
+    var uy = y.to_bits()
+    var ex = int((ux >> 52) & 0x7ff)
+    var ey = int((uy >> 52) & 0x7ff)
+    let sx = ux >> 63
+    if uy << 1 == 0 or y != y or ex == 0x7ff:
+        return (x * y) / (x * y)
+    var uxi = ux
+    if uxi << 1 <= uy << 1:
+        if uxi << 1 == uy << 1:
+            return 0.0 * x
+        return x
+    # normalize x and y
+    var i: u64 = 0
+    if ex == 0:
+        i = uxi << 12
+        while i >> 63 == 0:
+            ex -= 1
+            i <<= 1
+        uxi <<= u64(-ex + 1)
+    else:
+        uxi &= ONES >> 12
+        uxi |= u64(1) << 52
+    if ey == 0:
+        i = uy << 12
+        while i >> 63 == 0:
+            ey -= 1
+            i <<= 1
+        uy <<= u64(-ey + 1)
+    else:
+        uy &= ONES >> 12
+        uy |= u64(1) << 52
+    # x mod y
+    while ex > ey:
+        i = uxi - uy
+        if i >> 63 == 0:
+            if i == 0:
+                return 0.0 * x
+            uxi = i
+        uxi <<= 1
+        ex -= 1
+    i = uxi - uy
+    if i >> 63 == 0:
+        if i == 0:
+            return 0.0 * x
+        uxi = i
+    while uxi >> 52 == 0:
+        uxi <<= 1
+        ex -= 1
+    # scale result
+    if ex > 0:
+        uxi -= u64(1) << 52
+        uxi |= u64(ex) << 52
+    else:
+        uxi >>= u64(-ex + 1)
+    uxi |= sx << 63
+    return float.from_bits(uxi)
+
+# float `%` also takes the sign of the divisor, like Python
+fn f_fmod(a: float, b: float) -> float:
+    let r = mx_fmod(a, b)
+    if r != 0.0 and (r < 0.0) != (b < 0.0):
+        return r + b
+    return r
+
+fn f_fmodf(a: f32, b: f32) -> f32:
+    # (exact, so the same as C's fmodf)
+    let r = f32(mx_fmod(float(a), float(b)))
+    if r != f32(0.0) and (r < f32(0.0)) != (b < f32(0.0)):
+        return r + b
+    return r
+
+# float min and max: a NaN loses to a number, and -0.0 is less than 0.0, the
+# same on every platform (brine_rt.h's BR_MINMAX)
+fn f_fmin(a: float, b: float) -> float:
+    if a < b or b != b:
+        return a
+    if b < a or a != a:
+        return b
+    return a if (a.to_bits() >> 63) != 0 else b
+
+fn f_fmax(a: float, b: float) -> float:
+    if a > b or b != b:
+        return a
+    if b > a or a != a:
+        return b
+    return b if (a.to_bits() >> 63) != 0 else a
+
+fn f_fminf(a: f32, b: f32) -> f32:
+    if a < b or b != b:
+        return a
+    if b < a or a != a:
+        return b
+    return a if (a.to_bits() >> 31) != 0 else b
+
+fn f_fmaxf(a: f32, b: f32) -> f32:
+    if a > b or b != b:
+        return a
+    if b > a or a != a:
+        return b
+    return b if (a.to_bits() >> 31) != 0 else a
+
+fn f_fabsf(x: f32) -> f32:
+    return f32.from_bits(x.to_bits() & 0x7fffffff)
+
+# f32: the f64 function, rounded (exact for floor, ceil and round)
+fn f_floorf(x: f32) -> f32:
+    return f32(f_floor(float(x)))
+
+fn f_ceilf(x: f32) -> f32:
+    return f32(f_ceil(float(x)))
+
+fn f_roundf(x: f32) -> f32:
+    return f32(f_round(float(x)))
+
+fn f_sinf(x: f32) -> f32:
+    return f32(f_sin(float(x)))
+
+fn f_cosf(x: f32) -> f32:
+    return f32(f_cos(float(x)))
+
+fn f_tanf(x: f32) -> f32:
+    return f32(f_tan(float(x)))
+
+fn f_asinf(x: f32) -> f32:
+    return f32(f_asin(float(x)))
+
+fn f_acosf(x: f32) -> f32:
+    return f32(f_acos(float(x)))
+
+fn f_atanf(x: f32) -> f32:
+    return f32(f_atan(float(x)))
+
+fn f_sinhf(x: f32) -> f32:
+    return f32(f_sinh(float(x)))
+
+fn f_coshf(x: f32) -> f32:
+    return f32(f_cosh(float(x)))
+
+fn f_tanhf(x: f32) -> f32:
+    return f32(f_tanh(float(x)))
+
+fn f_expf(x: f32) -> f32:
+    return f32(f_exp(float(x)))
+
+fn f_exp2f(x: f32) -> f32:
+    return f32(f_exp2(float(x)))
+
+fn f_expm1f(x: f32) -> f32:
+    return f32(f_expm1(float(x)))
+
+fn f_logf(x: f32) -> f32:
+    return f32(f_log(float(x)))
+
+fn f_log2f(x: f32) -> f32:
+    return f32(f_log2(float(x)))
+
+fn f_log10f(x: f32) -> f32:
+    return f32(f_log10(float(x)))
+
+fn f_log1pf(x: f32) -> f32:
+    return f32(f_log1p(float(x)))
+
+fn f_cbrtf(x: f32) -> f32:
+    return f32(f_cbrt(float(x)))
+
+fn f_powf(a: f32, b: f32) -> f32:
+    return f32(f_pow(float(a), float(b)))
+
+fn f_atan2f(a: f32, b: f32) -> f32:
+    return f32(f_atan2(float(a), float(b)))
+
+fn f_hypotf(a: f32, b: f32) -> f32:
+    return f32(f_hypot(float(a), float(b)))
+
+# ---- for the backends, which call these where they have no instruction
+
+fn brine_x_f_sqrt(x: float) -> float:
+    return sqrt(x)
+
+fn brine_x_f_sqrtf(x: f32) -> f32:
+    return sqrt(x)
+
+fn brine_x_f_sin(x: float) -> float:
+    return f_sin(x)
+
+fn brine_x_f_sinf(x: f32) -> f32:
+    return f_sinf(x)
+
+fn brine_x_f_cos(x: float) -> float:
+    return f_cos(x)
+
+fn brine_x_f_cosf(x: f32) -> f32:
+    return f_cosf(x)
+
+fn brine_x_f_tan(x: float) -> float:
+    return f_tan(x)
+
+fn brine_x_f_tanf(x: f32) -> f32:
+    return f_tanf(x)
+
+fn brine_x_f_asin(x: float) -> float:
+    return f_asin(x)
+
+fn brine_x_f_asinf(x: f32) -> f32:
+    return f_asinf(x)
+
+fn brine_x_f_acos(x: float) -> float:
+    return f_acos(x)
+
+fn brine_x_f_acosf(x: f32) -> f32:
+    return f_acosf(x)
+
+fn brine_x_f_atan(x: float) -> float:
+    return f_atan(x)
+
+fn brine_x_f_atanf(x: f32) -> f32:
+    return f_atanf(x)
+
+fn brine_x_f_sinh(x: float) -> float:
+    return f_sinh(x)
+
+fn brine_x_f_sinhf(x: f32) -> f32:
+    return f_sinhf(x)
+
+fn brine_x_f_cosh(x: float) -> float:
+    return f_cosh(x)
+
+fn brine_x_f_coshf(x: f32) -> f32:
+    return f_coshf(x)
+
+fn brine_x_f_tanh(x: float) -> float:
+    return f_tanh(x)
+
+fn brine_x_f_tanhf(x: f32) -> f32:
+    return f_tanhf(x)
+
+fn brine_x_f_exp(x: float) -> float:
+    return f_exp(x)
+
+fn brine_x_f_expf(x: f32) -> f32:
+    return f_expf(x)
+
+fn brine_x_f_exp2(x: float) -> float:
+    return f_exp2(x)
+
+fn brine_x_f_exp2f(x: f32) -> f32:
+    return f_exp2f(x)
+
+fn brine_x_f_expm1(x: float) -> float:
+    return f_expm1(x)
+
+fn brine_x_f_expm1f(x: f32) -> f32:
+    return f_expm1f(x)
+
+fn brine_x_f_log(x: float) -> float:
+    return f_log(x)
+
+fn brine_x_f_logf(x: f32) -> f32:
+    return f_logf(x)
+
+fn brine_x_f_log2(x: float) -> float:
+    return f_log2(x)
+
+fn brine_x_f_log2f(x: f32) -> f32:
+    return f_log2f(x)
+
+fn brine_x_f_log10(x: float) -> float:
+    return f_log10(x)
+
+fn brine_x_f_log10f(x: f32) -> f32:
+    return f_log10f(x)
+
+fn brine_x_f_log1p(x: float) -> float:
+    return f_log1p(x)
+
+fn brine_x_f_log1pf(x: f32) -> f32:
+    return f_log1pf(x)
+
+fn brine_x_f_cbrt(x: float) -> float:
+    return f_cbrt(x)
+
+fn brine_x_f_cbrtf(x: f32) -> f32:
+    return f_cbrtf(x)
+
+fn brine_x_f_floor(x: float) -> float:
+    return f_floor(x)
+
+fn brine_x_f_floorf(x: f32) -> f32:
+    return f_floorf(x)
+
+fn brine_x_f_ceil(x: float) -> float:
+    return f_ceil(x)
+
+fn brine_x_f_ceilf(x: f32) -> f32:
+    return f_ceilf(x)
+
+fn brine_x_f_round(x: float) -> float:
+    return f_round(x)
+
+fn brine_x_f_roundf(x: f32) -> f32:
+    return f_roundf(x)
+
+fn brine_x_f_fabs(x: float) -> float:
+    return f_fabs(x)
+
+fn brine_x_f_fabsf(x: f32) -> f32:
+    return f_fabsf(x)
+
+fn brine_x_f_pow(a: float, b: float) -> float:
+    return f_pow(a, b)
+
+fn brine_x_f_powf(a: f32, b: f32) -> f32:
+    return f_powf(a, b)
+
+fn brine_x_f_atan2(a: float, b: float) -> float:
+    return f_atan2(a, b)
+
+fn brine_x_f_atan2f(a: f32, b: f32) -> f32:
+    return f_atan2f(a, b)
+
+fn brine_x_f_hypot(a: float, b: float) -> float:
+    return f_hypot(a, b)
+
+fn brine_x_f_hypotf(a: f32, b: f32) -> f32:
+    return f_hypotf(a, b)
+
+fn brine_x_f_fmod(a: float, b: float) -> float:
+    return f_fmod(a, b)
+
+fn brine_x_f_fmodf(a: f32, b: f32) -> f32:
+    return f_fmodf(a, b)
+
+fn brine_x_f_fmin(a: float, b: float) -> float:
+    return f_fmin(a, b)
+
+fn brine_x_f_fminf(a: f32, b: f32) -> f32:
+    return f_fminf(a, b)
+
+fn brine_x_f_fmax(a: float, b: float) -> float:
+    return f_fmax(a, b)
+
+fn brine_x_f_fmaxf(a: f32, b: f32) -> f32:
+    return f_fmaxf(a, b)
