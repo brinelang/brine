@@ -8,7 +8,9 @@
 # saves around the calls in `keep`); one that isn't, and isn't a call's
 # argument or a parameter, can also take a caller-saved one that no
 # instruction template uses (r8 r9, and rsi rdi on System V; xmm2-5, xmm2-7
-# on System V). The templates in x64.br write a result's register only after
+# on System V). Calls of `cold` functions (slow paths) are the exception:
+# what is live across one may be in any register, and the call saves the
+# ones it changes (`keep`). The templates in x64.br write a result's register only after
 # reading the operands, except `d = a op b` for integer add, sub, and, or, xor
 # and float add, sub, mul, div, which write d before reading b: there d and b
 # interfere even when b dies.
@@ -23,8 +25,9 @@ struct RA:
     # callee-saved registers used: general ones, and xmm ones on Windows
     saved: [int]
     fsaved: [int]
-    # System V: per instruction, the float vregs in xmm registers live across
-    # the call it makes
+    # per instruction, the vregs live across the call it makes in registers
+    # that call changes: on System V floats in xmm registers, and for a call
+    # of a `cold` function anything in a caller-saved register
     keep: [[int]]
 
 fn is_term(op: Op) -> bool:
@@ -140,7 +143,7 @@ fn reads_x(x: Inst, nv: int, ea: [int], eb: [int]) -> [int]:
     return out
 
 # ok[v]: may v live in a register? (Not folded into its uses, not 128 bits.)
-fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
+fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool, cold: {str: bool}) -> RA:
     let nv = len(f.vk)
     let ncode = len(f.code)
     var out = RA(reg=[-1] * nv, freg=[-1] * nv, saved=[], fsaved=[], keep=[])
@@ -248,6 +251,8 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
     var noarg = [false] * nc
     var fcalls: [int] = []
     var flive: [[int]] = []
+    var ccalls: [int] = []
+    var clive: [[int]] = []
     var live = [0] * wn
     for b in 0..nb:
         for k in 0..wn:
@@ -284,6 +289,7 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
                     add_edge(ref mat, ref adj, wn, cd, ci[x.b])
             let rs = reads_x(x, nv, ea, eb)
             if callish(x, f.vk):
+                let slow = x.op == Op.Call and x.s in cold
                 var fl: [int] = []
                 for k in 0..wn:
                     var wd = live[k]
@@ -291,10 +297,16 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
                         let t = wd.trailing_zeros()
                         wd ^= 1 << t
                         let j = k * 64 + t
-                        cross[j] = true
-                        if isf[j]:
+                        if slow:
                             fl.push(j)
-                if not win and len(fl) > 0:
+                        else:
+                            cross[j] = true
+                            if isf[j]:
+                                fl.push(j)
+                if slow:
+                    ccalls.push(i)
+                    clive.push(fl)
+                elif not win and len(fl) > 0:
                     fcalls.push(i)
                     flive.push(fl)
                 for u in rs:
@@ -385,14 +397,19 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
     for c in callee:
         if used[c]:
             out.saved.push(c)
+    out.keep = [[] for _ in 0..ncode]
     if win:
         for c in fcallee:
             if used[c]:
                 out.fsaved.push(c - 16)
     else:
-        out.keep = [[] for _ in 0..ncode]
         for n, i in enumerate(fcalls):
             for j in flive[n]:
                 if color[j] >= 16:
                     out.keep[i].push(cv[j])
+    for n, i in enumerate(ccalls):
+        for j in clive[n]:
+            let c = color[j]
+            if c >= 0 and (c in caller or c in fcaller or (not win and c in fcallee)):
+                out.keep[i].push(cv[j])
     return out

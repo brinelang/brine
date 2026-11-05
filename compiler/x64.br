@@ -323,9 +323,11 @@ struct X:
     # prologue saves them
     fsaved: [int]
     fsave_at: [int]
-    # System V (no callee-saved xmm): per instruction, the float vregs in
-    # registers live across the call it makes, saved around it
+    # per instruction, the vregs live across the call it makes in registers
+    # that call changes, saved around it (ra.br)
     keep: [[int]]
+    # the functions whose calls are slow paths (Module.cold)
+    cold: {str: bool}
     fold: [int]
     fval: [int]
     nuse: [int]
@@ -1034,6 +1036,16 @@ struct X:
 
     # calls symbol `sym` (or, with sym < 0, the pointer in vreg fp)
     fn do_call(ref self, sym: int, fp: int, args: [CArg]):
+        # what the call changes and is live across it goes to its home and
+        # back (before the arguments: they may go to those registers)
+        var keep: [int] = []
+        if self.cur >= 0 and self.cur < len(self.keep):
+            keep = self.keep[self.cur]
+        for v in keep:
+            if self.freg[v] >= 0:
+                self.fstore(fl_of(self.vk[v]), self.vm(v), self.freg[v])
+            else:
+                self.mov_mr(self.vm(v), self.reg[v])
         var fls: [int] = []
         for a in args:
             fls.push(a.fl)
@@ -1052,13 +1064,6 @@ struct X:
                 self.arg_int(self.int_reg(l), a)
         if sym < 0:
             self.ld(R11, fp)
-        # System V: calls change every xmm register, so floats live across
-        # this one go to their homes and back
-        var keep: [int] = []
-        if self.cur >= 0 and self.cur < len(self.keep):
-            keep = self.keep[self.cur]
-            for v in keep:
-                self.fstore(fl_of(self.vk[v]), self.vm(v), self.freg[v])
         if sym >= 0:
             self.b(232)
             self.reloc(R_CALL, sym, -4)
@@ -1066,7 +1071,10 @@ struct X:
         else:
             self.rr(0, 0, 255, 2, R11)
         for v in keep:
-            self.fload(fl_of(self.vk[v]), self.freg[v], self.vm(v))
+            if self.freg[v] >= 0:
+                self.fload(fl_of(self.vk[v]), self.freg[v], self.vm(v))
+            else:
+                self.mov_rm(self.reg[v], self.vm(v))
 
     fn call_rt(ref self, name: str, args: [CArg]):
         let s = self.sym_ref(name)
@@ -1562,11 +1570,16 @@ struct X:
             elif self.win:
                 self.home[i] = 16 + 8 * (i + h)
                 has_home[i] = true
+        # (a register saved around a call goes to its vreg's home)
+        var kept = [false] * nv
+        for ks in self.keep:
+            for v in ks:
+                kept[v] = true
         for v in 0..nv:
             if (
                 has_home[v]
                 or self.fold[v] != F_NONE
-                or self.reg[v] >= 0
+                or (self.reg[v] >= 0 and not kept[v])
                 or (ndef[v] == 0 and self.nuse[v] == 0)
             ):
                 continue
@@ -2590,7 +2603,7 @@ struct X:
                 let e = f.code[self.fval[v]]
                 ea[v] = e.a
                 eb[v] = e.b
-        let r = ra.allocate(f, ok, ea, eb, self.win)
+        let r = ra.allocate(f, ok, ea, eb, self.win, self.cold)
         self.reg = r.reg
         self.freg = r.freg
         self.saved = r.saved
@@ -3946,6 +3959,7 @@ fn emit(
         fsaved=[],
         fsave_at=[],
         keep=[],
+        cold={},
         fold=[],
         fval=[],
         nuse=[],
@@ -3978,6 +3992,8 @@ fn emit(
         entry_main=false,
         entry=(-1, -1)
     )
+    for n in m.cold:
+        x.cold[n] = true
     x.text_sym = x.sym_def("__brx_text", SEC_TEXT, 0, false, false)
     if windows:
         x.xdata_sym = x.sym_def("__brx_xdata", SEC_UNWIND, 0, false, false)
