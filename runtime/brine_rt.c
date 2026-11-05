@@ -765,6 +765,21 @@ static brine_str *br_str_alloc(int64_t n) {
     s->data[n] = 0;
     return s;
 }
+#ifdef BRINE_RT_BR
+/* what runtime/rt.br's strings still take from here */
+brine_str *brine_x_str_alloc(int64_t n) { return br_str_alloc(n); }
+brine_str *brine_x_str_grow(brine_str *s, int64_t n) {
+    if (br_str_size(n) > br_str_size(s->len)) {
+        s = (brine_str *)realloc(s, br_str_size(n));
+        if (!s) {
+            fprintf(stderr, "out of memory\n");
+            abort();
+        }
+    }
+    return s;
+}
+#endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 brine_str *brine_str_new(const char *p, int64_t n) {
     brine_str *s = br_str_alloc(n);
     if (n) memcpy(s->data, p, (size_t)n);
@@ -821,6 +836,7 @@ void brine_str_add_byte_slow(brine_str **ps, uint8_t c) {
     brine_str_release(a);
     *ps = s;
 }
+#endif
 /* brine_app_byte past the appender's fast paths: the 9th byte, a shared
    string, or a full block */
 brine_app_st brine_app_more(brine_str *a, int64_t n, int64_t room, uint64_t w0, uint8_t c) {
@@ -849,6 +865,7 @@ brine_app_st brine_app_more(brine_str *a, int64_t n, int64_t room, uint64_t w0, 
     x.w0 = brine_ld8(a->data) & brine_lowmask((uint64_t)n);
     return x;
 }
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 bool brine_str_eq_long(brine_str *a, brine_str *b) { return memcmp(a->data, b->data, (size_t)a->len) == 0; }
 bool brine_str_contains(brine_str *s, brine_str *sub) {
     if (sub->len == 0) return true;
@@ -856,6 +873,7 @@ bool brine_str_contains(brine_str *s, brine_str *sub) {
         if (s->data[i] == sub->data[0] && memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) return true;
     return false;
 }
+#endif
 #define BR_B1(i) {-1, 1, {(char)(i), 0}}
 #define BR_B4(i) BR_B1(i), BR_B1((i) + 1), BR_B1((i) + 2), BR_B1((i) + 3)
 #define BR_B16(i) BR_B4(i), BR_B4((i) + 4), BR_B4((i) + 8), BR_B4((i) + 12)
@@ -882,6 +900,7 @@ static int64_t br_utf8_len(const unsigned char *p, int64_t avail) {
 static inline bool br_mid_char(const brine_str *s, int64_t i) {
     return i > 0 && i < s->len && ((unsigned char)s->data[i] & 0xc0) == 0x80;
 }
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 static BR_NORETURN BR_COLD void br_slice_splits(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
     int64_t b = br_mid_char(s, lo) ? lo : hi, a = b;
     while (a > 0 && b - a < 3 && br_mid_char(s, a)) a--;
@@ -930,11 +949,13 @@ brine_str *brine_chr(int64_t c, const char *loc) {
     }
     return brine_str_new(b, n);
 }
+#endif
 static int64_t br_find(brine_str *s, brine_str *sub, int64_t from) {
     for (int64_t i = from; i + sub->len <= s->len; i++)
         if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) return i;
     return -1;
 }
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 int64_t brine_s_find(brine_str *s, brine_str *sub, const char *loc) {
     (void)loc;
     return br_find(s, sub, 0);
@@ -949,6 +970,7 @@ int64_t brine_start_chk(int64_t start, int64_t len, const char *loc) {
         br_panicf(loc, "index() start %lld is out of range for an array of length %lld", (long long)start, (long long)len);
     return start;
 }
+#endif
 /* a `[str]`: its elements are pointer slots (BR_PSLOT, brine_rt.h) */
 static brine_arr *br_strs(void) { return brine_arr_new(0, BR_PSLOT, brine_rt_str, brine_rl_str, ""); }
 static void br_push_str(brine_arr **a, brine_str *s) {
@@ -956,6 +978,7 @@ static void br_push_str(brine_arr **a, brine_str *s) {
     brine_arr_push(a, &slot);
 }
 static brine_str *br_str_at(const brine_arr *a, int64_t i) { return *(brine_str **)(a->data + i * BR_PSLOT); }
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 brine_arr *brine_s_split(brine_str *s, brine_str *sep, const char *loc) {
     if (sep->len == 0) brine_panic_at(loc, "split() separator is empty");
     brine_arr *out = br_strs();
@@ -964,6 +987,7 @@ brine_arr *brine_s_split(brine_str *s, brine_str *sep, const char *loc) {
     br_push_str(&out, br_sub(s, at, s->len));
     return out;
 }
+#endif
 /* ============================================================ unicode */
 typedef struct {
     uint32_t lo, hi;

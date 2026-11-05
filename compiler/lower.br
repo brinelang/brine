@@ -498,7 +498,9 @@ struct Lower:
             if sig.is_extern:
                 cold.push(sig.c_name)
             else:
-                to["brine_" + sig.name] = sig.c_name
+                # (a `brine_` one already has the C function's name)
+                if not sig.name.starts_with("brine_"):
+                    to["brine_" + sig.name] = sig.c_name
                 own[sig.c_name] = true
         for fi in 0..len(self.funcs):
             if self.funcs[fi].name in own:
@@ -521,21 +523,29 @@ struct Lower:
         var vs: [int] = []
         for a in args:
             vs.push(self.expr(a.expr))
-        if n == "call_bool":
-            return self.cx.fb.call_ind(true, K.Bool, vs[0], vs[1:])
+        if n == "call_void":
+            self.cx.fb.call_ind(false, K.I64, vs[0], vs[1:])
+            return self.unit()
+        if n.starts_with("call_"):
+            return self.cx.fb.call_ind(true, prim_kind(n), vs[0], vs[1:])
+        if n.ends_with("_retain") or n.ends_with("_release"):
+            self.cx.fb.rt_void("brine_" + n, vs)
+            return self.unit()
         if n == "bswap":
             return self.cx.fb.rt(K.U64, "brine_bswap_u64", vs)
         if n == "thread_ptr":
             return self.cx.fb.rt(K.Ptr, "brine_thread_ptr", vs)
         if n == "addr":
             return self.cx.fb.conv(K.U64, vs[0])
-        var k = K.Ptr
-        if n.ends_with("_i64"):
-            k = K.I64
-        elif n.ends_with("_u64"):
-            k = K.U64
-        elif n.ends_with("_u8"):
-            k = K.U8
+        if n == "str_of" or n == "ptr_of":
+            return vs[0]
+        if n == "stack_mem":
+            match self.const_of(vs[0]):
+                case Some(c):
+                    return self.cx.fb.temp_mem(c, 16)
+                case None:
+                    panic("stack_mem takes a constant size")
+        let k = prim_kind(n)
         # a constant offset goes in the load or store
         var p = vs[0]
         var off = 0
@@ -597,6 +607,9 @@ struct Lower:
         self.rt_body = not is_test and self.info.module_names[self.info.fns[f.id].module] == RT
         self.cx = new_cx(new_func(name, ks, has, rk))
         self.cx.fb.f.hot = self.rt_body
+        if self.rt_body and f.name.starts_with("brine_"):
+            self.cx.fb.f.export = true
+            self.cx.fb.f.hot = false
         self.cx.nc = self.nc_body
         self.cx.bret = self.br_body
         if self.opts.debug:
@@ -8908,3 +8921,23 @@ fn borrow_place(e: Expr) -> bool:
                     return false
         case _:
             return false
+
+# The kind a runtime module operation's name ends in (`load_u32`: U32).
+fn prim_kind(n: str) -> K:
+    let ks = [
+        ("_i8", K.I8),
+        ("_i16", K.I16),
+        ("_i32", K.I32),
+        ("_i64", K.I64),
+        ("_u8", K.U8),
+        ("_u16", K.U16),
+        ("_u32", K.U32),
+        ("_u64", K.U64),
+        ("_f32", K.F32),
+        ("_f64", K.F64),
+        ("_bool", K.Bool)
+    ]
+    for suf, k in ks:
+        if n.ends_with(suf):
+            return k
+    return K.Ptr

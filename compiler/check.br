@@ -149,18 +149,48 @@ fn reducer_by_name(n: str) -> Option[Reducer]:
         case _:
             return None
 
+# The types `load_<t>`, `store_<t>` and `call_<t>` name.
+fn prim_tys() -> [(str, Ty)]:
+    return [
+        ("i8", Ty.Int(IntTy.I8)),
+        ("i16", Ty.Int(IntTy.I16)),
+        ("i32", Ty.Int(IntTy.I32)),
+        ("i64", int_ty()),
+        ("u8", Ty.Int(IntTy.U8)),
+        ("u16", Ty.Int(IntTy.U16)),
+        ("u32", Ty.Int(IntTy.U32)),
+        ("u64", Ty.Int(IntTy.U64)),
+        ("f32", Ty.Float(FloatTy.F32)),
+        ("f64", float_ty()),
+        ("bool", Ty.Bool),
+        ("ptr", Ty.Ptr)
+    ]
+
+# The result of `call_<t>(f, ...)`, which calls the C function at f
+# (`call_void` returns nothing).
+fn call_prim(n: str) -> Option[Ty]:
+    if n == "call_void":
+        return Some(Ty.Unit)
+    for k, t in prim_tys():
+        if n == "call_" + k:
+            return Some(t)
+    return None
+
 # The memory operations of the runtime module (runtime/rt.br), as
 # (parameters, result): `load_<t>(p, off)` reads the <t> at address p + off,
 # `store_<t>(p, off, v)` writes one, and `bswap(x)` reverses x's bytes.
-# (`call_bool(f, ...)`, which calls the function at f, is checked apart.)
+# (`call_<t>(f, ...)` is checked apart.)
 fn prim_sig(n: str) -> Option[([Ty], Ty)]:
     let u64 = Ty.Int(IntTy.U64)
-    let ts = [("i64", int_ty()), ("u64", u64), ("u8", Ty.Int(IntTy.U8)), ("ptr", Ty.Ptr)]
-    for k, t in ts:
+    for k, t in prim_tys():
         if n == "load_" + k:
             return Some(([Ty.Ptr, int_ty()], t))
         if n == "store_" + k:
             return Some(([Ty.Ptr, int_ty(), t], Ty.Unit))
+    # reference counts, as generated code changes them (brine_rt.h)
+    for k in ["str", "arr", "map"]:
+        if n == k + "_retain" or n == k + "_release":
+            return Some(([Ty.Ptr], Ty.Unit))
     if n == "bswap":
         return Some(([u64], u64))
     # the thread's own block (fs/gs on x86-64, tpidr_el0 on AArch64), an
@@ -170,6 +200,14 @@ fn prim_sig(n: str) -> Option[([Ty], Ty)]:
     if n == "addr":
         return Some(([Ty.Ptr], u64))
     if n == "symbol":
+        return Some(([Ty.Str], Ty.Ptr))
+    # a string's block as a `str` and back, borrowed: no reference changes hands
+    if n == "str_of":
+        return Some(([Ty.Ptr], Ty.Str))
+    # n bytes (a constant) of the function's stack frame, 16-byte aligned
+    if n == "stack_mem":
+        return Some(([int_ty()], Ty.Ptr))
+    if n == "ptr_of":
         return Some(([Ty.Str], Ty.Ptr))
     return None
 
@@ -371,7 +409,9 @@ struct Checker:
                 prog.modules[mi].fns[fi].id = id
                 let f = m.fns[fi]
                 var c_name = f"{mm}__{f.name}"
-                if f.is_extern:
+                # the runtime module's `brine_` functions stand in for the C
+                # runtime's, under the same names
+                if f.is_extern or (m.name == RT and f.name.starts_with("brine_")):
                     c_name = f.name
                 else:
                     match f.method_of:
@@ -5001,17 +5041,20 @@ struct Checker:
             case None:
                 pass
         if self.in_rt():
-            if name == "call_bool":
-                res = CallRes.Prim(name)
-                for i in 0..len(args):
-                    let t = self.check_expr(ref args[i].expr, Some(Ty.Ptr) if i == 0 else None)
-                    if i == 0:
-                        self.expect_ty(Ty.Ptr, args[i].expr)
-                    elif not t.is_int() and t != Ty.Ptr and t != Ty.Bool:
-                        self.expect_ty(Ty.Ptr, args[i].expr)
-                if len(args) == 0:
-                    self.nargs(name, ref args, 1, span)
-                return Ty.Bool
+            match call_prim(name):
+                case Some(rt):
+                    res = CallRes.Prim(name)
+                    for i in 0..len(args):
+                        let t = self.check_expr(ref args[i].expr, Some(Ty.Ptr) if i == 0 else None)
+                        if i == 0:
+                            self.expect_ty(Ty.Ptr, args[i].expr)
+                        elif not t.is_int() and not t.is_float() and t != Ty.Ptr and t != Ty.Bool:
+                            self.expect_ty(Ty.Ptr, args[i].expr)
+                    if len(args) == 0:
+                        self.nargs(name, ref args, 1, span)
+                    return rt
+                case None:
+                    pass
             match prim_sig(name):
                 case Some(sig):
                     res = CallRes.Prim(name)
