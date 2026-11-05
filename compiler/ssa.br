@@ -33,6 +33,7 @@
 # order that doesn't overwrite a value another copy still reads).
 
 from ir import K, Op, Inst, Func, KFunc, Slot
+from num import u64_to_int
 import vloop
 import vlane
 from vloop import LOp, L_LD, L_ST, L_ADD, L_SUB, L_MUL, L_DIV, L_IADD, L_ISUB, L_IMUL, L_IAND
@@ -634,19 +635,91 @@ const TOP = 0
 const CONST = 1
 const BOT = 2
 
+# What SCCP folds: every integer kind, 128-bit ones included. A 128-bit
+# value is held as its number, and folds only when the exact result fits
+# (U128 only below 2^127); anything else is BOT.
+fn stracked(k: K) -> bool:
+    return not k.is_float()
+
+const WMAX: i128 = 170141183460469231731687303715884105727
+const WMIN: i128 = -170141183460469231731687303715884105727 - 1
+
+# the number held for a value of kind k
+fn numv(v: i128, k: K) -> i128:
+    if k.is_wide():
+        return v
+    return num(int(v), k)
+
+# r as a constant of the 128-bit kind k, if it is one exactly
+fn fitw(r: i128, k: K) -> (int, i128):
+    if k == K.U128 and r < 0:
+        return (BOT, 0)
+    return (CONST, r)
+
+# a and b fold to a + b or a - b without overflow (numbers, not wrapped)
+fn wadd(a: i128, b: i128) -> (bool, i128):
+    if (b > 0 and a > WMAX - b) or (b < 0 and a < WMIN - b):
+        return (false, 0)
+    return (true, a + b)
+
+fn wmul(a: i128, b: i128) -> (bool, i128):
+    if a == 0 or b == 0:
+        return (true, 0)
+    if a == WMIN or b == WMIN:
+        return (false, 0)
+    let ma = a if a > 0 else -a
+    let mb = b if b > 0 else -b
+    if ma > WMAX / mb:
+        return (false, 0)
+    let m = ma * mb
+    return (true, m if (a < 0) == (b < 0) else -m)
+
+# binary arithmetic of a 128-bit kind on known numbers a and b
+fn fold_wide(op: Op, k: K, a: i128, b: i128) -> (int, i128):
+    match op:
+        case Op.Add | Op.AddO:
+            let (ok, r) = wadd(a, b)
+            return fitw(r, k) if ok else (BOT, 0)
+        case Op.Sub | Op.SubO:
+            if b == WMIN:
+                return (BOT, 0)
+            let (ok, r) = wadd(a, -b)
+            return fitw(r, k) if ok else (BOT, 0)
+        case Op.Mul | Op.MulO:
+            let (ok, r) = wmul(a, b)
+            return fitw(r, k) if ok else (BOT, 0)
+        case Op.And:
+            return fitw(a & b, k)
+        case Op.Or:
+            return fitw(a | b, k)
+        case Op.Xor:
+            return fitw(a ^ b, k)
+        case Op.Shl:
+            if b < 0 or b >= 127 or a < 0 or (a >> int(127 - b)) != 0:
+                return (BOT, 0)
+            return fitw(a << int(b), k)
+        case Op.Shr:
+            if b < 0 or b >= 128:
+                return (BOT, 0)
+            return fitw(a >> int(b), k)
+        case _:
+            return (BOT, 0)
+
 # The value of x (setting a tracked kind) from its operands' values:
 # (TOP | CONST | BOT, the constant).
-fn fold(x: Inst, vk: [K], st: [int], val: [int]) -> (int, int):
+fn fold(x: Inst, vk: [K], st: [int], val: [i128]) -> (int, i128):
     let k = vk[x.d]
-    if x.op == Op.Mov:
-        if not tracked(k):
-            return (BOT, 0)
-        return (st[x.a], val[x.a])
-    if not tracked(k):
+    if not stracked(k):
         return (BOT, 0)
+    if x.op == Op.Mov:
+        return (st[x.a], val[x.a])
     match x.op:
         case Op.Const:
-            return (CONST, wrapk(i128(x.n), k))
+            if k.is_wide():
+                if k == K.U128 and x.c < 0:
+                    return (BOT, 0)
+                return (CONST, i128(x.c) * two(64) + num(x.n, K.U64))
+            return (CONST, i128(wrapk(i128(x.n), k)))
         case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
             pass
         case Op.Div | Op.Rem:
@@ -654,30 +727,42 @@ fn fold(x: Inst, vk: [K], st: [int], val: [int]) -> (int, int):
         case Op.AddO | Op.SubO | Op.MulO | Op.IdxChk:
             pass
         case Op.Neg | Op.Not | Op.Conv:
-            if not tracked(vk[x.a]):
+            if not stracked(vk[x.a]):
                 return (BOT, 0)
             if st[x.a] != CONST:
                 return (st[x.a], 0)
-            let a = num(val[x.a], vk[x.a])
+            let a = numv(val[x.a], vk[x.a])
+            if k.is_wide():
+                match x.op:
+                    case Op.Neg:
+                        if a == WMIN:
+                            return (BOT, 0)
+                        return fitw(-a, k)
+                    case Op.Not:
+                        return fitw(-1 - a, k)
+                    case _:
+                        return fitw(a, k)
             match x.op:
                 case Op.Neg:
-                    return (CONST, wrapk(-a, k))
+                    if a == WMIN:
+                        return (BOT, 0)
+                    return (CONST, i128(wrapk(-a, k)))
                 case Op.Not:
                     if k == K.Bool:
-                        return (CONST, 1 - int(a))
-                    return (CONST, wrapk(a ^ (two(64) - 1), k))
+                        return (CONST, 1 - a)
+                    return (CONST, i128(wrapk(a ^ (two(64) - 1), k)))
                 case _:
-                    return (CONST, wrapk(a, k))
+                    return (CONST, i128(wrapk(a, k)))
         case Op.Eq | Op.Ne | Op.Lt | Op.Le | Op.Gt | Op.Ge:
             let ka = vk[x.a]
-            if not tracked(ka):
+            if not stracked(ka):
                 return (BOT, 0)
             if st[x.a] == BOT or st[x.b] == BOT:
                 return (BOT, 0)
             if st[x.a] == TOP or st[x.b] == TOP:
                 return (TOP, 0)
-            let a = num(val[x.a], ka)
-            let b = num(val[x.b], ka)
+            let a = numv(val[x.a], ka)
+            let b = numv(val[x.b], ka)
             var r = false
             match x.op:
                 case Op.Eq:
@@ -700,10 +785,14 @@ fn fold(x: Inst, vk: [K], st: [int], val: [int]) -> (int, int):
             let v = x.args[0]
             if vk[v] != k or st[v] != CONST:
                 return (st[v] if st[v] == TOP else BOT, 0)
-            let a = num(val[v], k)
+            let a = numv(val[v], k)
+            if k.is_wide():
+                if a == WMIN:
+                    return (BOT, 0)
+                return fitw(-a, k)
             if a == kmin(k):
                 return (BOT, 0)
-            return (CONST, wrapk(-a, k))
+            return (CONST, i128(wrapk(-a, k)))
         case _:
             return (BOT, 0)
     # binary arithmetic of kind k (checks: a and b of kind k too)
@@ -720,40 +809,44 @@ fn fold(x: Inst, vk: [K], st: [int], val: [int]) -> (int, int):
     if sa == TOP or sb == TOP:
         return (TOP, 0)
     let ka = vk[x.a]
-    let a = num(val[x.a], ka)
-    let b = num(val[x.b], vk[x.b])
+    let a = numv(val[x.a], ka)
+    let b = numv(val[x.b], vk[x.b])
+    if k.is_wide() or ka.is_wide():
+        if not k.is_wide() or not ka.is_wide():
+            return (BOT, 0)
+        return fold_wide(x.op, k, a, b)
     match x.op:
         case Op.Add:
-            return (CONST, wrapk(a + b, k))
+            return (CONST, i128(wrapk(a + b, k)))
         case Op.Sub:
-            return (CONST, wrapk(a - b, k))
+            return (CONST, i128(wrapk(a - b, k)))
         case Op.Mul:
             # the low 64 bits of the product, from the 64-bit patterns
-            return (CONST, wrapk(i128(val[x.a]) * i128(val[x.b]), k))
+            return (CONST, i128(wrapk(val[x.a] * val[x.b], k)))
         case Op.And:
-            return (CONST, wrapk(i128(val[x.a] & val[x.b]), k))
+            return (CONST, i128(wrapk(val[x.a] & val[x.b], k)))
         case Op.Or:
-            return (CONST, wrapk(i128(val[x.a] | val[x.b]), k))
+            return (CONST, i128(wrapk(val[x.a] | val[x.b], k)))
         case Op.Xor:
-            return (CONST, wrapk(i128(val[x.a] ^ val[x.b]), k))
+            return (CONST, i128(wrapk(val[x.a] ^ val[x.b], k)))
         case Op.Shl:
             if b < 0 or b >= i128(bits_of(k)):
                 return (BOT, 0)
-            return (CONST, wrapk(a << int(b), k))
+            return (CONST, i128(wrapk(a << int(b), k)))
         case Op.Shr:
             if b < 0 or b >= i128(bits_of(k)):
                 return (BOT, 0)
-            return (CONST, wrapk(a >> int(b), k))
+            return (CONST, i128(wrapk(a >> int(b), k)))
         case Op.Div | Op.Rem:
             if b == 0 or (k.is_signed() and a == kmin(k) and b == -1):
                 return (BOT, 0)
             let q = tdiv(a, b)
             if x.op == Op.Div:
-                return (CONST, wrapk(q, k))
-            return (CONST, wrapk(a - q * b, k))
+                return (CONST, i128(wrapk(q, k)))
+            return (CONST, i128(wrapk(a - q * b, k)))
         case Op.IdxChk:
             if a >= 0 and a < b:
-                return (CONST, int(a))
+                return (CONST, a)
             return (BOT, 0)
         case _:
             var r = a + b
@@ -763,13 +856,13 @@ fn fold(x: Inst, vk: [K], st: [int], val: [int]) -> (int, int):
                 r = a * b
             if r < kmin(k) or r > kmax(k):
                 return (BOT, 0)
-            return (CONST, wrapk(r, k))
+            return (CONST, i128(wrapk(r, k)))
 
 fn sccp(ref sf: SF):
     let n = len(sf.bs)
     let nv = len(sf.f.vk)
     var st = [TOP] * nv
-    var val = [0] * nv
+    var val: [i128] = [i128(0)] * nv
     for v in 0..sf.f.nparams:
         st[v] = BOT
     # where each vreg is read: block * 2^24 + index
@@ -825,7 +918,11 @@ fn sccp(ref sf: SF):
         for i in 0..m:
             let x = sf.bs[b].code[i]
             if x.d >= 0 and st[x.d] == CONST and x.op != Op.Const:
-                sf.bs[b].code[i] = mk(Op.Const, x.d, -1, -1, 0 if val[x.d] >= 0 else -1, val[x.d])
+                let v = val[x.d]
+                # a 128-bit constant: low 64 bits in n, high in c
+                let lo = u64_to_int(u64(v & 18446744073709551615))
+                let hi = int(v >> 64)
+                sf.bs[b].code[i] = mk(Op.Const, x.d, -1, -1, hi, lo)
             elif (x.op == Op.Br or x.op == Op.BrNot) and st[x.a] == CONST:
                 let taken = (val[x.a] != 0) == (x.op == Op.Br)
                 sf.bs[b].code[i] = mk(Op.Jmp, -1, -1, -1, -1, x.n if taken else x.c)
@@ -844,10 +941,10 @@ fn sccp(ref sf: SF):
         sf.bs[b].code = phis
     relink(ref sf)
 
-fn switch_target(x: Inst, v: int) -> int:
-    let i = v - x.n
-    if i >= 0 and i < len(x.args) - 1:
-        return x.args[1 + i]
+fn switch_target(x: Inst, v: i128) -> int:
+    let i = v - i128(x.n)
+    if i >= 0 and i < i128(len(x.args) - 1):
+        return x.args[1 + int(i)]
     return x.args[0]
 
 fn sccp_edge(sf: SF, b: int, l: int, ref flow: [int]):
@@ -859,7 +956,7 @@ fn sccp_inst(
     b: int,
     i: int,
     ref st: [int],
-    ref val: [int],
+    ref val: [i128],
     exec_e: {int: bool},
     exec_b: [bool],
     ref flow: [int],
@@ -891,9 +988,9 @@ fn sccp_inst(
     if x.d < 0:
         return
     var ns = BOT
-    var nval = 0
+    var nval: i128 = 0
     if x.op == Op.Phi:
-        if not tracked(sf.f.vk[x.d]):
+        if not stracked(sf.f.vk[x.d]):
             ns = BOT
         else:
             ns = TOP

@@ -112,12 +112,27 @@ fn callish(x: Inst, vk: [K]) -> bool:
         return true
     if x.op == Op.Copy or x.op == Op.Zero:
         return x.n > 256
-    if x.d >= 0 and (vk[x.d].is_wide() or (x.op == Op.Rem and vk[x.d].is_float())):
+    if x.d >= 0 and x.op == Op.Rem and vk[x.d].is_float():
         return true
+    return wide_call(x, vk)
+
+# Does x64.br call the runtime for this 128-bit operation? The others it
+# does inline with rax, rcx and rdx, which hold no vregs. (The checked ones
+# call it only to panic.)
+fn wide_call(x: Inst, vk: [K]) -> bool:
+    var wide = x.d >= 0 and vk[x.d].is_wide()
     for v in reads(x, len(vk)):
         if vk[v].is_wide():
+            wide = true
+    if not wide:
+        return false
+    match x.op:
+        case Op.Div | Op.Rem | Op.MulO:
             return true
-    return false
+        case Op.Conv:
+            return vk[x.d].is_float() or vk[x.a].is_float()
+        case _:
+            return false
 
 # Does x64.br's code for x leave r10 and r11 alone? Then they can hold vregs
 # live across it, and its operands and result.
@@ -150,16 +165,23 @@ fn two_address(x: Inst, vk: [K]) -> bool:
         return false
     if vk[x.d].is_float():
         return x.op == Op.Add or x.op == Op.Sub or x.op == Op.Mul or x.op == Op.Div
-    return x.op == Op.Add or x.op == Op.Sub or x.op == Op.And or x.op == Op.Or or x.op == Op.Xor
+    return (
+        x.op == Op.Add
+        or x.op == Op.Sub
+        or x.op == Op.Mul
+        or x.op == Op.And
+        or x.op == Op.Or
+        or x.op == Op.Xor
+    )
 
 # Is x `d = op a (, b)`, computed in d's register after loading a into it?
 fn same_reg_ok(x: Inst, vk: [K]) -> bool:
     if x.d < 0 or x.a < 0 or vk[x.d].is_wide():
         return false
     match x.op:
-        case Op.Add | Op.Sub | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
+        case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
             return true
-        case Op.Mul | Op.Div:
+        case Op.Div:
             return vk[x.d].is_float()
         case Op.Neg | Op.Not:
             return not vk[x.d].is_float()
