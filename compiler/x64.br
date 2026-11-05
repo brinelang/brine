@@ -298,6 +298,10 @@ struct X:
     vpool: {str: int}
     # the function being compiled
     code: [Inst]
+    # code[i] can't be reached: a block no jump goes to, after a jump
+    dead: [bool]
+    # how many jumps go to each label
+    lrefs: [int]
     vk: [K]
     nparams: int
     home: [int]
@@ -1123,6 +1127,196 @@ struct X:
         if x.d >= 0:
             self.store_ret(x.d)
 
+    # Jumps to a block that only jumps on (an edge's copies all went away in
+    # register allocation) go straight to its target; the blocks nothing
+    # jumps to any more are then left out.
+    fn thread_jumps(ref self, nlabels: int):
+        let n = len(self.code)
+        var fwd = [-1] * nlabels
+        for i, x in enumerate(self.code):
+            if x.op == Op.Label:
+                var j = i + 1
+                while j < n and self.no_code(self.code[j]):
+                    j += 1
+                if j < n and self.code[j].op == Op.Jmp:
+                    fwd[x.n] = self.code[j].n
+        var refs = [0] * nlabels
+        for i in 0..n:
+            var x = self.code[i]
+            if x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot:
+                var hops = 0
+                while fwd[x.n] >= 0 and fwd[x.n] != x.n and hops < 8:
+                    x.n = fwd[x.n]
+                    hops += 1
+                self.code[i] = x
+                refs[x.n] += 1
+            elif x.op == Op.Switch:
+                for l in x.args:
+                    refs[l] += 1
+        self.lrefs = refs
+        self.dead = [false] * n
+        var gone = false
+        for i, x in enumerate(self.code):
+            if x.op == Op.Label:
+                gone = gone and refs[x.n] == 0
+            self.dead[i] = gone
+            if not gone and (
+                x.op == Op.Jmp or x.op == Op.Ret or x.op == Op.Unreachable or x.op == Op.Switch
+            ):
+                gone = true
+
+    # Does control fall from code[j] on to label l, with no code between?
+    fn falls_to(self, j: int, l: int) -> bool:
+        var k = j
+        while k < len(self.code):
+            let x = self.code[k]
+            if x.op == Op.Label and x.n == l:
+                return true
+            if not self.dead[k] and not self.no_code(x):
+                return false
+            k += 1
+        return false
+
+    # [m] = [m] & ~(1 << b) (or | 1 << b) on 64 bits: the mask in rax, then
+    # one and (or) to memory. Returns how many instructions that took, or 0.
+    fn bit_rmw(ref self, i: int) -> int:
+        let x = self.code[i]
+        let k = self.vk[x.d]
+        if (
+            i + 3 >= len(self.code)
+            or k.size() != 8
+            or k.is_float()
+            or k.is_wide()
+            or self.nuse[x.d] != 1
+            or self.fold[x.d] != F_NONE
+        ):
+            return 0
+        let s = self.code[i + 1]
+        if (
+            s.op != Op.Shl
+            or self.vk[s.d].size() != 8
+            or self.fold[s.a] != F_CONST
+            or self.fval[s.a] != 1
+            or self.nuse[s.d] != 1
+            or s.b == x.d
+        ):
+            return 0
+        var m = s.d
+        var j = i + 2
+        var op = 9
+        if self.code[j].op == Op.Not and self.code[j].a == m:
+            if self.nuse[self.code[j].d] != 1 or self.fold[self.code[j].d] != F_NONE:
+                return 0
+            m = self.code[j].d
+            j += 1
+            op = 33
+        if j + 1 >= len(self.code):
+            return 0
+        let y = self.code[j]
+        if (
+            y.op != (Op.And if op == 33 else Op.Or)
+            or y.d < 0
+            or self.nuse[y.d] != 1
+            or self.fold[y.d] != F_NONE
+            or y.a == y.b
+            or not ((y.a == x.d and y.b == m) or (y.b == x.d and y.a == m))
+        ):
+            return 0
+        let st = self.code[j + 1]
+        if st.op != Op.Store or st.b != y.d or st.a != x.a or st.n != x.n:
+            return 0
+        self.ld(RCX, s.b)
+        self.mov_ri(RAX, 1)
+        self.shift_cl(SHL, RAX)
+        if op == 33:
+            # not rax
+            self.rr(0, 1, 247, 2, RAX)
+        self.rm(0, 1, op, RAX, self.addr(x.a, x.n, R10), 0)
+        return j + 2 - i
+
+    # branch on (w >> b) & 1 (compared with 0) on 64 bits: bt w, b, then jc
+    # or jnc. Returns the next instruction's index, or 0.
+    fn bit_test(ref self, i: int) -> int:
+        let x = self.code[i]
+        let k = self.vk[x.d]
+        if (
+            i + 3 >= len(self.code)
+            or k.size() != 8
+            or k.is_float()
+            or k.is_wide()
+            or self.nuse[x.d] != 1
+            or self.fold[x.d] != F_NONE
+            or self.fold[x.a] != F_NONE
+        ):
+            return 0
+        let t = self.code[i + 1]
+        if (
+            t.op != Op.And
+            or t.a != x.d
+            or self.fold[t.b] != F_CONST
+            or self.fval[t.b] != 1
+            or self.nuse[t.d] != 1
+            or self.fold[t.d] != F_NONE
+        ):
+            return 0
+        let c = self.code[i + 2]
+        if (
+            (c.op != Op.Ne and c.op != Op.Eq)
+            or c.a != t.d
+            or self.fold[c.b] != F_CONST
+            or self.fval[c.b] != 0
+            or self.nuse[c.d] != 1
+        ):
+            return 0
+        let br = self.code[i + 3]
+        if (br.op != Op.Br and br.op != Op.BrNot) or br.a != c.d:
+            return 0
+        let rw = self.use(RAX, x.a)
+        let rb = self.use(RCX, x.b)
+        self.rr(0, 1, 4003, rb, rw)
+        # `if bit: v += 1` (the branch skips just that add): adc v, 0
+        var at = i + 4
+        while (
+            at < len(self.code)
+            and self.no_code(self.code[at])
+            and not (self.code[at].op == Op.Label and self.lrefs[self.code[at].n] > 0)
+        ):
+            at += 1
+        let a = self.code[min(at, len(self.code) - 1)]
+        if (
+            at + 1 < len(self.code)
+            and a.op == Op.Add
+            and a.d >= 0
+            and self.reg[a.d] >= 0
+            and self.fold[a.a] == F_NONE
+            and self.reg[a.a] == self.reg[a.d]
+            and self.fold[a.b] == F_CONST
+            and self.fval[a.b] == 1
+            and not self.vk[a.d].is_wide()
+            and self.vk[a.d].size() == 8
+        ):
+            var j = at + 1
+            while (
+                j < len(self.code)
+                and self.no_code(self.code[j])
+                and not (
+                    self.code[j].op == Op.Label
+                    and (self.code[j].n == br.n or self.lrefs[self.code[j].n] > 0)
+                )
+            ):
+                j += 1
+            if j < len(self.code) and self.code[j].op == Op.Label and self.code[j].n == br.n:
+                if (c.op == Op.Ne) == (br.op == Op.BrNot):
+                    # adc r, 0
+                    self.rr(0, 1, 131, 2, self.reg[a.d])
+                    self.b(0)
+                else:
+                    # sbb r, -1
+                    self.rr(0, 1, 131, 3, self.reg[a.d])
+                    self.b(255)
+                return j
+        return self.cond_jump(i + 3, CC_B if c.op == Op.Ne else CC_AE, br.op == Op.Br, br.n)
+
     # brine_arr_unique(p) only when the array *p is shared (its count isn't
     # 1), as br_arr_mine in brine_rt.h does
     fn arr_unique(ref self, x: Inst):
@@ -1376,11 +1570,15 @@ struct X:
         if self.dbg and f.dline > 0 and not f.dfile.starts_with("<"):
             let fi = self.dw.file(f.dfile)
             self.rows.push(DRow(pc=self.u.start, file=fi, line=f.dline))
+        self.thread_jumps(f.nlabels)
         var i = 0
         while i < ncode:
             self.cur = i
             self.ipos[i] = self.pos()
-            i = self.inst(i)
+            if self.dead[i]:
+                i += 1
+            else:
+                i = self.inst(i)
         self.ipos[ncode] = self.pos()
         if ncode == 0 or not (
             f.code[ncode - 1].op == Op.Ret
@@ -1892,6 +2090,14 @@ struct X:
         let x = self.code[i]
         if x.d >= 0 and self.fold[x.d] != F_NONE:
             return i + 1
+        if x.op == Op.Load:
+            let n = self.bit_rmw(i)
+            if n > 0:
+                return i + n
+        if x.op == Op.Shr:
+            let n = self.bit_test(i)
+            if n > 0:
+                return n
         match x.op:
             case Op.Const:
                 self.op_const(x)
@@ -1981,12 +2187,8 @@ struct X:
                 self.cpos = -1
             case Op.Jmp:
                 # no jump to the next instruction
-                var j = i + 1
-                while j < len(self.code) and self.no_code(self.code[j]):
-                    if self.code[j].op == Op.Label and self.code[j].n == x.n:
-                        return i + 1
-                    j += 1
-                self.jmp_label(x.n)
+                if not self.falls_to(i + 1, x.n):
+                    self.jmp_label(x.n)
             case Op.Br | Op.BrNot:
                 let want = x.op == Op.Br
                 if self.fold[x.a] == F_CONST:
@@ -2002,7 +2204,7 @@ struct X:
                         # cmp byte [a], 0
                         self.rm(0, 0, 128, 7, self.vm(x.a), 1)
                         self.b(0)
-                    self.jcc_label(CC_NE if want else CC_E, x.n)
+                    return self.cond_jump(i, CC_NE, want, x.n)
             case Op.Switch:
                 self.switch(x)
             case Op.Ret:
@@ -2368,8 +2570,7 @@ struct X:
         if i + 1 < len(self.code) and self.nuse[x.d] == 1:
             let y = self.code[i + 1]
             if (y.op == Op.Br or y.op == Op.BrNot) and y.a == x.d:
-                self.branch_cc(cc, y.op == Op.Br, y.n)
-                return i + 2
+                return self.cond_jump(i + 1, cc, y.op == Op.Br, y.n)
         if cc == CC_FEQ:
             self.setcc(CC_E, RAX)
             self.setcc(CC_NP, RCX)
@@ -2382,6 +2583,16 @@ struct X:
             self.setcc(cc, RAX)
         self.rr8(4022, RAX, RAX)
         self.st(RAX, x.d)
+        return i + 1
+
+    # The branch code[i] on flags cc; when a jump follows it and its own
+    # target comes right after, the condition is flipped and goes to the
+    # jump's target instead. Returns the next instruction's index.
+    fn cond_jump(ref self, i: int, cc: int, want: bool, l: int) -> int:
+        if i + 1 < len(self.code) and self.code[i + 1].op == Op.Jmp and self.falls_to(i + 2, l):
+            self.branch_cc(cc, not want, self.code[i + 1].n)
+            return i + 2
+        self.branch_cc(cc, want, l)
         return i + 1
 
     # jumps to label l when the condition is `want`
@@ -3058,6 +3269,8 @@ fn emit(
         fpool={},
         vpool={},
         code=[],
+        dead=[],
+        lrefs=[],
         vk=[],
         nparams=0,
         home=[],
