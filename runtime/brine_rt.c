@@ -1708,6 +1708,7 @@ brine_u128 brine_parse_u128(brine_str *s, const char *loc) {
     if (!br_parse_128(s, &neg, &u) || (neg && u != 0)) br_panicf(loc, "invalid integer: \"%.*s\"", (int)s->len, s->data);
     return u;
 }
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 /* Exact powers of ten: a double holds 10^k exactly up to 10^22. */
 static const double br_pow10[23] = {1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
                                     1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
@@ -1822,6 +1823,7 @@ bool brine_try_parse_float(brine_str *s, bool f32, void *out) {
         memcpy(out, &v, 8);
     return true;
 }
+#endif
 
 /* ============================================================ arrays */
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
@@ -2373,6 +2375,7 @@ void brine_sb_fmt_i128(brine_sb *sb, brine_i128 v, int kind) {
     else
         brine_sb_i128(sb, v);
 }
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 /* |v| rounded to p significant digits: the digits go to d, the result is the
  * decimal exponent. Whether they read back as v is in *back. */
 static int br_digits(double v, int p, char *d, int is_f32, bool *back) {
@@ -2450,7 +2453,6 @@ static void br_fmt_float(brine_sb *sb, double v, int is_f32) {
 }
 void brine_sb_f64(brine_sb *sb, double v) { br_fmt_float(sb, v, 0); }
 void brine_sb_f32(brine_sb *sb, float v) { br_fmt_float(sb, (double)v, 1); }
-#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_sb_bool(brine_sb *sb, bool v) { br_sb_cstr(sb, v ? "true" : "false"); }
 static void br_sb_bin(brine_sb *sb, uint64_t v) {
     char b[65];
@@ -2491,7 +2493,6 @@ void brine_sb_fmt_u64(brine_sb *sb, uint64_t v, int kind) {
     else
         brine_sb_u64(sb, v);
 }
-#endif
 void brine_sb_fmt_f64(brine_sb *sb, double v, int prec, int kind) {
     char b[400];
     /* spelled the same everywhere (C libraries print `-nan(ind)`, `nan`, ...) */
@@ -2509,7 +2510,6 @@ void brine_sb_fmt_f64(brine_sb *sb, double v, int prec, int kind) {
     } else
         brine_sb_f64(sb, v);
 }
-#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 /* `{x:,}`: commas between groups of three digits in the integer part of the
  * number written from `start` on */
 void brine_sb_group(brine_sb *sb, int64_t start) {
