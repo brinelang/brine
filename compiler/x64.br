@@ -88,6 +88,8 @@ const F_GLOBAL = 3
 # an element address used only by loads and stores just after it, which
 # address [a + b * n] themselves (fval: the Elem's index in the code)
 const F_ELEM = 4
+# a float constant, read from .rodata where it is used (fval: its symbol)
+const F_FCONST = 5
 
 # call argument sources
 const A_VAL = 0
@@ -288,6 +290,8 @@ struct X:
     xdata_sym: int
     # symbols of the overflow panic texts ("addition", ...), -1 until used
     ovf: [int]
+    # .rodata symbols of float constants, by their bits (and 1 << 64 for f32)
+    fpool: {i128: int}
     # the function being compiled
     code: [Inst]
     vk: [K]
@@ -400,6 +404,28 @@ struct X:
     fn direct(self, s: int) -> bool:
         return self.win or self.o.syms[s].sec != SEC_UNDEF
 
+    # The symbol of 8 bytes of .rodata holding a float constant's bits (an f32
+    # in the low 4, zero above, as the canonical form of a vreg has it)
+    fn fconst_sym(ref self, bits: int, k: K) -> int:
+        var b = bits
+        var key = i128(bits)
+        if k == K.F32:
+            b = bits & 4294967295
+            key = i128(b) + (i128(1) << 64)
+        match self.fpool.get(key):
+            case Some(s):
+                return s
+            case None:
+                pass
+        while len(self.o.rodata) % 8 != 0:
+            self.o.rodata.push(0)
+        self.o.rodata_align = max(self.o.rodata_align, 8)
+        let off = len(self.o.rodata)
+        put64(ref self.o.rodata, b)
+        let s = self.sym_def(f"__brx_f{len(self.fpool)}", SEC_RODATA, off, false, false)
+        self.fpool[key] = s
+        return s
+
     fn ovf_sym(ref self, kind: int) -> int:
         if self.ovf[kind] < 0:
             let names = ["addition", "subtraction", "multiplication"]
@@ -488,6 +514,16 @@ struct X:
     fn mov_rr(ref self, d: int, s: int):
         if d != s:
             self.rr(0, 1, 137, s, d)
+
+    # Does x emit no code? (A label, a line, a move within one register.)
+    fn no_code(self, x: Inst) -> bool:
+        if x.op == Op.Label or x.op == Op.Line:
+            return true
+        if x.op != Op.Mov or x.d < 0 or x.a < 0 or self.fold[x.a] != F_NONE:
+            return x.op == Op.Mov and x.d == x.a
+        if self.reg[x.d] >= 0:
+            return self.reg[x.d] == self.reg[x.a]
+        return self.freg[x.d] >= 0 and self.freg[x.d] == self.freg[x.a]
 
     fn lea(ref self, r: int, m: Mem):
         self.rm(0, 1, 141, r, m, 0)
@@ -703,6 +739,8 @@ struct X:
 
     # ------------------------------------------------------------ vregs
     fn vm(self, v: int) -> Mem:
+        if self.fold[v] == F_FCONST:
+            return mrip(self.fval[v], 0)
         return mrb(self.home[v])
 
     # the memory n bytes into slot s
@@ -766,6 +804,8 @@ struct X:
             self.mov_ri(r, self.fval[v])
         elif f == F_SLOT:
             self.lea(r, self.smem(self.fval[v], 0))
+        elif f == F_FCONST:
+            self.mov_rm(r, self.vm(v))
         else:
             self.ld_sym(r, self.fval[v])
 
@@ -807,7 +847,10 @@ struct X:
 
     # op r, v (r is never rcx)
     fn alu_v(ref self, op: int, r: int, v: int):
-        if self.imm(v):
+        if op == CMP and self.imm(v) and self.fval[v] == 0:
+            # test r, r: the same flags
+            self.rr(0, 1, 133, r, r)
+        elif self.imm(v):
             self.alu_ri(op, r, self.fval[v])
         elif self.fold[v] == F_NONE and self.reg[v] >= 0:
             self.alu_rr(op, r, self.reg[v])
@@ -1158,6 +1201,9 @@ struct X:
                 elif x.op == Op.Global:
                     self.fold[v] = F_GLOBAL
                     self.fval[v] = self.sym_ref(x.s)
+                elif x.op == Op.FConst and not self.dbg:
+                    self.fold[v] = F_FCONST
+                    self.fval[v] = self.fconst_sym(x.n, k)
         if not self.dbg:
             self.fold_elems(f, ndef)
         # (after the folding: it tells which indirect calls return 128 bits)
@@ -1763,10 +1809,10 @@ struct X:
             case Op.AddO | Op.SubO | Op.MulO:
                 self.checked(x)
             case Op.IdxChk:
-                self.ld(RAX, x.a)
-                self.alu_v(CMP, RAX, x.b)
+                let r = self.use(RAX, x.a)
+                self.alu_v(CMP, r, x.b)
                 self.jcc_stub(CC_AE, S_IDX, x.a, x.b, x.c)
-                self.st(RAX, x.d)
+                self.st(r, x.d)
             case Op.SlotAddr:
                 self.lea(RAX, self.smem(x.a, 0))
                 self.st(RAX, x.d)
@@ -1812,8 +1858,8 @@ struct X:
             case Op.Jmp:
                 # no jump to the next instruction
                 var j = i + 1
-                while j < len(self.code) and self.code[j].op == Op.Label:
-                    if self.code[j].n == x.n:
+                while j < len(self.code) and self.no_code(self.code[j]):
+                    if self.code[j].op == Op.Label and self.code[j].n == x.n:
                         return i + 1
                     j += 1
                 self.jmp_label(x.n)
@@ -1916,6 +1962,22 @@ struct X:
         let k = self.vk[x.d]
         match x.op:
             case Op.Add | Op.Sub | Op.And | Op.Or | Op.Xor:
+                # b just computed (in the cache register) goes first when the
+                # order doesn't matter: then its store can go
+                # (d may share a's register, never b's)
+                let ra = self.reg[x.a] if self.fold[x.a] == F_NONE else -1
+                if (
+                    x.op != Op.Sub
+                    and self.cached(x.b)
+                    and not self.cached(x.a)
+                    and ra != self.dst(x.d)
+                    and x.a != x.d
+                ):
+                    var y = x
+                    y.a = x.b
+                    y.b = x.a
+                    self.int_bin(y)
+                    return
                 # compute in d's own register unless that would clobber b
                 var r = self.dst(x.d)
                 if x.b == x.d:
@@ -2086,24 +2148,29 @@ struct X:
             self.st(RAX, x.d)
             self.mov_mr(moff(self.vm(x.d), 8), RDX)
             return
-        self.ld(RAX, x.a)
-        if k.is_float():
-            # flip the sign bit: btc rax, 63 / btc eax, 31
-            if k == K.F64:
-                self.rr(0, 1, 4026, 7, RAX)
-                self.b(63)
+        if not k.is_float():
+            let r = self.dst(x.d)
+            self.ld(r, x.a)
+            if x.op == Op.Neg:
+                self.rr(0, 1, 247, 3, r)
+                self.norm(r, k)
+            elif k == K.Bool:
+                self.rr(0, 0, 131, XOR, r)
+                self.b(1)
             else:
-                self.rr(0, 0, 4026, 7, RAX)
-                self.b(31)
-        elif x.op == Op.Neg:
-            self.rr(0, 1, 247, 3, RAX)
-            self.norm(RAX, k)
-        elif k == K.Bool:
-            self.rr(0, 0, 131, XOR, RAX)
-            self.b(1)
+                self.rr(0, 1, 247, 2, r)
+                self.norm(r, k)
+            if r == RAX:
+                self.st(RAX, x.d)
+            return
+        self.ld(RAX, x.a)
+        # a float's negation flips the sign bit: btc rax, 63 / btc eax, 31
+        if k == K.F64:
+            self.rr(0, 1, 4026, 7, RAX)
+            self.b(63)
         else:
-            self.rr(0, 1, 247, 2, RAX)
-            self.norm(RAX, k)
+            self.rr(0, 0, 4026, 7, RAX)
+            self.b(31)
         self.st(RAX, x.d)
 
     # Sets the flags for a comparison; returns the condition that means true.
@@ -2117,9 +2184,12 @@ struct X:
             if x.op == Op.Lt or x.op == Op.Le:
                 p = x.b
                 q = x.a
-            self.fld(fl, 0, p)
-            # ucomisd / ucomiss xmm0, q
-            self.fop(102 if fl == 1 else 0, 3886, 0, q)
+            var r = self.freg[p]
+            if r < 0:
+                r = 0
+                self.fld(fl, 0, p)
+            # ucomisd / ucomiss r, q
+            self.fop(102 if fl == 1 else 0, 3886, r, q)
             match x.op:
                 case Op.Eq:
                     return CC_FEQ
@@ -2861,6 +2931,7 @@ fn emit(
         text_sym=0,
         xdata_sym=0,
         ovf=[-1, -1, -1],
+        fpool={},
         code=[],
         vk=[],
         nparams=0,
