@@ -203,8 +203,200 @@ fn copy_chains(f: Func) -> Func:
     g.code = [x for i, x in enumerate(code) if not drop[i]]
     return g
 
+# The unsigned kind of n bytes (1, 2, 4 or 8).
+fn ukind(n: int) -> K:
+    if n == 1:
+        return K.U8
+    if n == 2:
+        return K.U16
+    if n == 4:
+        return K.U32
+    return K.U64
+
+# A store to a slot that a copy reads right after: bytes off..off + size of
+# the slot are v.
+struct Piece:
+    off: int
+    size: int
+    v: int
+
+# A copy out of a slot just after stores to it (an Option or a Result made
+# to be returned or kept: `store [s + 0], tag; store [s + 4], x; copy p <- s, 8`)
+# would load 8 bytes from narrower stores, which the CPU can't forward to a
+# load (only from one store that holds all of it): the load waits until they
+# reach the cache. Instead the copy stores the values themselves, 8 bytes at
+# a time, put together in a register; and the slot, now only stored to, can
+# go to vregs.
+fn pack_copies(f: Func) -> Func:
+    let slot = slot_vregs(f)
+    var g = f
+    var code: [Inst] = []
+    for i, x in enumerate(f.code):
+        if x.op != Op.Copy or slot[x.b] < 0 or slot[x.a] == slot[x.b] or x.n > 32:
+            code.push(x)
+            continue
+        let s = slot[x.b]
+        let n = x.n
+        # the stores to s since anything else may have written it, the last
+        # first, with values that are still the same at the copy
+        var ps: [Piece] = []
+        var cov = [false] * n
+        var set: [int] = []
+        var j = len(code) - 1
+        while j >= 0 and len(code) - j <= 64:
+            let y = code[j]
+            if y.op == Op.Store and slot[y.a] == s:
+                let k = g.vk[y.b]
+                let sz = k.size()
+                if k.is_wide() or y.b in set or y.n < 0 or y.n % sz != 0 or y.n + sz > n:
+                    if y.n >= n or y.n + sz <= 0:
+                        j -= 1
+                        continue
+                    break
+                var some = false
+                var all = true
+                for b in y.n..y.n + sz:
+                    if cov[b]:
+                        some = true
+                    else:
+                        all = false
+                if all:
+                    j -= 1
+                    continue
+                if some:
+                    break
+                for b in y.n..y.n + sz:
+                    cov[b] = true
+                ps.push(Piece(off=y.n, size=sz, v=y.b))
+            elif y.op == Op.Store and slot[y.a] < 0:
+                break
+            elif (
+                y.op == Op.Label
+                or y.op == Op.Copy
+                or y.op == Op.Zero
+                or y.op == Op.Call
+                or y.op == Op.CallInd
+                or y.op == Op.Phi
+            ):
+                break
+            if y.d >= 0:
+                set.push(y.d)
+            j -= 1
+        if len(ps) == 0:
+            code.push(x)
+            continue
+        # 8 bytes at a time (and 4, 2, 1 for the rest)
+        var c = 0
+        while c < n:
+            var cs = 8
+            while c + cs > n:
+                cs /= 2
+            let ck = ukind(cs)
+            var inp: [Piece] = []
+            var mixed = false
+            for p in ps:
+                if p.off < c + cs and p.off + p.size > c:
+                    if p.off < c or p.off + p.size > c + cs:
+                        mixed = true
+                    if g.vk[p.v].is_float() and p.size < cs:
+                        mixed = true
+                    inp.push(p)
+            if len(inp) == 1 and inp[0].off == c and inp[0].size == cs:
+                code.push(Inst(op=Op.Store, d=-1, a=x.a, b=inp[0].v, c=-1, n=c, s="", args=[]))
+            elif len(inp) == 0 or mixed:
+                let t = len(g.vk)
+                g.vk.push(ck)
+                code.push(Inst(op=Op.Load, d=t, a=x.b, b=-1, c=-1, n=c, s="", args=[]))
+                code.push(Inst(op=Op.Store, d=-1, a=x.a, b=t, c=-1, n=c, s="", args=[]))
+            else:
+                # the pieces, and loads of the bytes between them (aligned)
+                var parts: [Piece] = []
+                for p in inp:
+                    parts.push(p)
+                var b = c
+                while b < c + cs:
+                    var hit = false
+                    for p in inp:
+                        if p.off <= b and b < p.off + p.size:
+                            hit = true
+                    if hit:
+                        b += 1
+                        continue
+                    var gs = 4
+                    while b % gs != 0 or b + gs > c + cs or gs >= cs:
+                        gs /= 2
+                    var free = true
+                    for p in inp:
+                        if p.off < b + gs and p.off + p.size > b:
+                            free = false
+                    while not free:
+                        gs /= 2
+                        free = true
+                        for p in inp:
+                            if p.off < b + gs and p.off + p.size > b:
+                                free = false
+                    let t = len(g.vk)
+                    g.vk.push(ukind(gs))
+                    code.push(Inst(op=Op.Load, d=t, a=x.b, b=-1, c=-1, n=b, s="", args=[]))
+                    parts.push(Piece(off=b, size=gs, v=t))
+                    b += gs
+                if slot[x.a] >= 0:
+                    # into a slot: the same fields, so it can go to vregs
+                    # too (and a copy out of it gets the same treatment)
+                    for p in parts:
+                        code.push(
+                            Inst(op=Op.Store, d=-1, a=x.a, b=p.v, c=-1, n=p.off, s="", args=[])
+                        )
+                    c += cs
+                    continue
+                var acc = -1
+                for p in parts:
+                    # zero-extended to the chunk's kind, then shifted into place
+                    var v = p.v
+                    let uk = ukind(p.size)
+                    if g.vk[v] != uk:
+                        let t = len(g.vk)
+                        g.vk.push(uk)
+                        code.push(Inst(op=Op.Conv, d=t, a=v, b=-1, c=-1, n=0, s="", args=[]))
+                        v = t
+                    if uk != ck:
+                        let t = len(g.vk)
+                        g.vk.push(ck)
+                        code.push(Inst(op=Op.Conv, d=t, a=v, b=-1, c=-1, n=0, s="", args=[]))
+                        v = t
+                    if p.off > c:
+                        let sh = len(g.vk)
+                        g.vk.push(ck)
+                        code.push(
+                            Inst(
+                                op=Op.Const,
+                                d=sh,
+                                a=-1,
+                                b=-1,
+                                c=0,
+                                n=8 * (p.off - c),
+                                s="",
+                                args=[]
+                            )
+                        )
+                        let t = len(g.vk)
+                        g.vk.push(ck)
+                        code.push(Inst(op=Op.Shl, d=t, a=v, b=sh, c=-1, n=0, s="", args=[]))
+                        v = t
+                    if acc < 0:
+                        acc = v
+                    else:
+                        let t = len(g.vk)
+                        g.vk.push(ck)
+                        code.push(Inst(op=Op.Or, d=t, a=acc, b=v, c=-1, n=0, s="", args=[]))
+                        acc = t
+                code.push(Inst(op=Op.Store, d=-1, a=x.a, b=acc, c=-1, n=c, s="", args=[]))
+            c += cs
+    g.code = code
+    return g
+
 fn promote(f0: Func) -> Func:
-    let f = copy_chains(f0)
+    let f = pack_copies(copy_chains(f0))
     let slot = slot_vregs(f)
     let fs = promotable(f, slot)
     var g = f
