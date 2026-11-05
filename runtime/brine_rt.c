@@ -101,7 +101,12 @@ _Static_assert(offsetof(brine_map, keys) == 48 && sizeof(brine_map) == 88, "brin
 _Static_assert(sizeof(brine_map_ty) == 80 && sizeof(brine_sb) == 24, "brine_map_ty/brine_sb layout");
 
 /* ============================================================ platform layer */
+#ifdef BRINE_RT_BR /* runtime/rt.br has the heap */
+void brine_x_heap_exit(void);
+#define br_heap_exit brine_x_heap_exit
+#else
 static void br_heap_exit(void);
+#endif
 /* Every thread brine code runs on, `main` included, has a stack this big
  * (reserved, not committed). */
 #define BR_STACK ((size_t)64 << 20)
@@ -388,6 +393,7 @@ void brine_unreachable(void) {
 #define BR_RESERVE ((uintptr_t)1 << 36)
 #endif
 #define BR_SPARE ((int64_t)1 << 16) /* bytes a thread may keep free per class */
+#ifndef BRINE_RT_BR
 static uintptr_t br_heap_base, br_heap_end, br_heap_next;
 static uint8_t br_chunk_class[BR_RESERVE / BR_CHUNK];
 static br_mutex br_heap_mu;
@@ -483,6 +489,7 @@ static char *br_chunk_new(int c) {
     return (char *)ch;
 }
 
+#ifndef BRINE_RT_BR
 static void *br_big(size_t n) {
     void *p = malloc(n ? n : 1);
     if (!p) {
@@ -528,6 +535,9 @@ static void *br_alloc_slow(br_heap_th *h, int c, size_t n) {
     h->end[c] = ch + BR_CHUNK;
     return ch;
 }
+#endif
+
+#endif
 
 /* the common cases of br_alloc and br_free inline and without a stack frame;
    the rest out of line */
@@ -538,6 +548,7 @@ static void *br_alloc_slow(br_heap_th *h, int c, size_t n) {
 #define BR_HOT inline
 #define BR_COLD
 #endif
+#ifndef BRINE_RT_BR
 static BR_COLD void *br_alloc_miss(size_t n) {
     if (n > BR_SMALL || !br_heap_base) return br_big(n);
     int c = br_class_of(n ? n : 1);
@@ -624,6 +635,12 @@ static void br_heap_exit(void) {
     }
     br_th_done(h);
 }
+#else
+void *brine_x_realloc(void *p, int64_t n);
+#define br_alloc(n) brine_alloc((int64_t)(n))
+#define br_free(p) brine_free(p)
+#define br_realloc(p, n) brine_x_realloc((p), (int64_t)(n))
+#endif
 
 #define free(p) br_free(p)
 #define realloc(p, n) br_realloc(p, n)
@@ -647,13 +664,16 @@ static void *br_thread_ptr(void) {
 }
 void *brine_x_thread_ptr(void) { return br_thread_ptr(); }
 
+#ifndef BRINE_RT_BR
 void *brine_alloc(int64_t n) { return br_alloc(n > 0 ? (size_t)n : 1); }
 void brine_free(void *p) { br_free(p); }
+#endif
 /* live string/array count, reported at exit when BRINE_LEAKCHECK is set */
 static int64_t br_live;
 /* counted only for BRINE_LEAKCHECK: a locked add on every allocation costs */
 static bool br_leakcheck;
 
+#ifndef BRINE_RT_BR
 /* What native code's inline allocation (runtime/rt.br) reads: a thread's
    heap is at its thread pointer plus th_off, or at the address stored there
    when th_ind; the heap's range; each chunk's size class. fast is 0 when
@@ -688,6 +708,7 @@ static void br_heap_info_init(void) {
 #endif
     hi->fast = 1;
 }
+#endif
 #define BR_LIVE(d) (BR_UNLIKELY(br_leakcheck) ? (void)__atomic_fetch_add(&br_live, (d), __ATOMIC_RELAXED) : (void)0)
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 void brine_str_free(brine_str *s) {
@@ -695,6 +716,7 @@ void brine_str_free(brine_str *s) {
     free(s);
 }
 #endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 /* Freeing an object frees what it holds first, so a deep structure (a long
    enum list, a tree 100k levels deep) would recurse once per level and
    overflow the stack. `fn(p)` finishes freeing a dead object; past
@@ -732,6 +754,7 @@ void brine_drop(void *p, void (*fn)(void *)) {
     }
     h->drop_depth--;
 }
+#endif
 static void br_arr_drop(void *p) {
     brine_arr *a = (brine_arr *)p;
     for (int64_t i = 0; i < a->len; i++) a->release(a->data + i * a->esz);
@@ -794,11 +817,6 @@ void *brine_x_calloc(int64_t n) {
         fprintf(stderr, "out of memory\n");
         abort();
     }
-    return p;
-}
-void *brine_x_realloc(void *p, int64_t n) {
-    p = realloc(p, (size_t)n);
-    if (!p) abort();
     return p;
 }
 brine_str *brine_x_str_grow(brine_str *s, int64_t n) {
@@ -2657,16 +2675,21 @@ static struct {
 
 /* whether this thread runs a parallel region (a field of the per-thread heap
    struct: MinGW gcc would emulate a _Thread_local with libwinpthread) */
+#ifdef BRINE_RT_BR
+int64_t brine_x_in_par_get(void);
+void brine_x_in_par_set(int64_t v);
+static int br_in_par_get(void) { return (int)brine_x_in_par_get(); }
+static void br_in_par_set(int v) { brine_x_in_par_set(v); }
+#else
 static int br_in_par_get(void) {
     br_heap_th *h = br_th_peek();
     return h ? h->in_par : 0;
 }
 static void br_in_par_set(int v) { br_th_get()->in_par = v; }
+#endif
 /* see brine_rt.h */
 int64_t brine_mt = 0;
 #ifdef BRINE_RT_BR
-int64_t brine_x_in_par_get(void) { return br_in_par_get(); }
-void brine_x_in_par_set(int64_t v) { br_in_par_set((int)v); }
 void brine_x_thread_enter(void) { br_stack_enter(); }
 void brine_x_thread_leave(void) {
     br_heap_exit();
@@ -2674,6 +2697,7 @@ void brine_x_thread_leave(void) {
 }
 int64_t brine_x_threads(void);
 void brine_x_pool_init(void);
+void brine_x_heap_init(int64_t leakcheck);
 static int br_threads(void) { return (int)brine_x_threads(); }
 #else
 static int64_t br_task_budget = 0;
@@ -5540,8 +5564,12 @@ void brine_rt_init(int argc, char **argv) {
     }
 #endif
     br_leakcheck = getenv("BRINE_LEAKCHECK") != NULL;
+#ifdef BRINE_RT_BR
+    brine_x_heap_init(br_leakcheck);
+#else
     br_heap_init();
     br_heap_info_init();
+#endif
     br_argc = argc;
     br_argv = argv;
 #ifdef _WIN32

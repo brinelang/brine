@@ -41,18 +41,18 @@ const APP_ROOM = 16
 const APP_LIM = 24
 const APP_W0 = 32
 
-# brine_heap_info (brine_rt.c): where a thread's heap is, the heap's range,
-# each chunk's size class, whether allocation may skip C, and how many free
-# blocks of each class a thread keeps
+# heap_info (the memory section): where a thread keeps the address of its
+# heap (an offset from its thread pointer), the heap's range, each chunk's
+# size class, whether blocks may be taken inline, and how many free blocks
+# of each class a thread keeps
 const HI_OFF = 0
-const HI_IND = 8
 const HI_BASE = 16
 const HI_END = 24
 const HI_CLASSES = 32
 const HI_FAST = 40
 const HI_KEEP = 48
 
-# br_heap_th: a free list and a count of free blocks per size class
+# a thread's heap: a free list and a count of free blocks per size class
 const TH_HEAD = 0
 const TH_COUNT = 96
 
@@ -244,12 +244,9 @@ fn app_close(ps: ptr, ap: ptr):
     if n >= 8:
         store_u8(d, n, 0)
 
-# This thread's heap (br_th_peek), at address 0 when there is none yet.
+# This thread's heap, at address 0 when there is none yet (when HI_FAST).
 fn th_heap(hi: ptr) -> ptr:
-    let at = thread_ptr() + load_i64(hi, HI_OFF)
-    if load_i64(hi, HI_IND) != 0:
-        return load_ptr(at, 0)
-    return at
+    return load_ptr(thread_ptr(), load_i64(hi, HI_OFF))
 
 # The size class of a block of n bytes, 1 <= n <= 256 (br_class_of), and
 # the size of its blocks.
@@ -263,17 +260,13 @@ fn class_size(c: int) -> int:
         return (c + 1) * 16
     return 128 + (c - 7) * 32
 
-extern fn brine_alloc(n: int) -> ptr
-
-extern fn brine_free(p: ptr)
-
 # n bytes of brine_alloc's, counted for BRINE_LEAKCHECK (strings, arrays)
 extern fn brine_x_counted(n: int) -> ptr
 
 # A block of n bytes (1 <= n <= SMALL) off the thread's free list, or 0
 # when C must make it: the list is empty, or BRINE_LEAKCHECK counts blocks.
 fn pop_free(n: int) -> ptr:
-    let hi = symbol("brine_heap_info")
+    let hi = heap_info()
     if load_i64(hi, HI_FAST) != 0:
         let h = th_heap(hi)
         if addr(h) != 0:
@@ -290,7 +283,7 @@ fn pop_free(n: int) -> ptr:
 # Block p back on the thread's free list; false when C must take it (not
 # our heap's, or the list holds enough: C hands some to other threads).
 fn push_free(p: ptr) -> bool:
-    let hi = symbol("brine_heap_info")
+    let hi = heap_info()
     let base = load_u64(hi, HI_BASE)
     let off = addr(p) - base
     if load_i64(hi, HI_FAST) != 0 and off < load_u64(hi, HI_END) - base:
@@ -629,7 +622,6 @@ extern fn memmove(d: ptr, s: ptr, n: u64) -> ptr
 extern fn memset(d: ptr, c: i32, n: u64) -> ptr
 
 # p's block (from brine_alloc) made n bytes; it may move
-extern fn brine_x_realloc(p: ptr, n: int) -> ptr
 
 # pairs of decimal digits, 00 to 99
 const DIGITS = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
@@ -4961,9 +4953,9 @@ extern fn memchr(p: ptr, c: i32, n: u64) -> ptr
 
 extern fn brine_panic_idx(i: int, len: int, loc: ptr)
 
-# Is block p from our own heap (brine_rt.c's br_in_heap)?
+# Is block p from our own heap?
 fn in_heap(p: ptr) -> bool:
-    let hi = symbol("brine_heap_info")
+    let hi = heap_info()
     let base = load_u64(hi, HI_BASE)
     return addr(p) - base < load_u64(hi, HI_END) - base
 
@@ -8606,11 +8598,6 @@ const JB_ID = 48
 # parallel regions run, so threads busy-wait a little before they sleep.
 const SPINS = 20000
 
-# (brine_rt.c: a field of the per-thread heap)
-extern fn brine_x_in_par_get() -> int
-
-extern fn brine_x_in_par_set(v: int)
-
 fn pool() -> ptr:
     return global_mem("pool", 320)
 
@@ -8767,3 +8754,407 @@ fn brine_par_tasks(k: int, f: ptr, ctx: ptr):
 
 fn brine_x_task_main(t: ptr):
     call_void(load_ptr(t, 0), load_ptr(t, 8), load_i64(t, 16))
+
+# ---------------------------------------------------------------- memory
+
+# Small blocks (strings, boxes, array headers) come from a heap of our own:
+# one big reserved address range cut into 64 KiB chunks, each holding blocks
+# of one size class, with a free list per class and thread. A range check
+# tells its blocks from malloc's, so brine_free and brine_x_realloc take
+# either. A thread that frees far more than it allocates (one consuming
+# what others made), or that exits, hands its free blocks over in batches of
+# about SPARE bytes, and a thread that runs out takes one batch, so memory
+# doesn't pile up on any one thread.
+const NCLASS = 12
+const CHUNK = 65536
+const RESERVE = 68719476736
+# bytes of free blocks a thread may keep per class
+const SPARE = 65536
+# the chunks' size classes: a byte per chunk of RESERVE
+const NCHUNKS = 1048576
+
+# the rest of heap_info: where the next chunk starts, the key of the
+# threads' heaps, and whether HI_OFF locates them
+const HI_NEXT = 144
+const HI_KEY = 152
+const HI_TH = 160
+
+# the rest of a thread's heap: where each class's last chunk has room
+# left, the in-par flag, and brine_drop's state: how deep the frees nest,
+# and the dead objects left for the outermost one (pairs: object, function)
+const TH_BUMP = 192
+const TH_END = 288
+const TH_IN_PAR = 384
+const TH_DROP_DEPTH = 392
+const TH_DROPS = 400
+const TH_NDROPS = 408
+const TH_CAPDROPS = 416
+const TH_SIZE = 424
+
+# past this many nested frees, brine_drop leaves objects for later
+const DROP_DEPTH = 200
+
+extern fn TlsAlloc() -> u32
+
+extern fn TlsGetValue(i: u32) -> ptr
+
+extern fn TlsSetValue(i: u32, v: ptr) -> i32
+
+extern fn VirtualAlloc(p: ptr, n: u64, kind: u32, prot: u32) -> ptr
+
+extern fn _write(fd: i32, p: ptr, n: u32) -> i32
+
+extern fn pthread_key_create(k: ptr, dtor: ptr) -> i32
+
+extern fn pthread_getspecific(k: u32) -> ptr
+
+extern fn pthread_setspecific(k: u32, v: ptr) -> i32
+
+extern fn mmap(p: ptr, n: u64, prot: i32, flags: i32, fd: i32, off: i64) -> ptr
+
+extern fn mprotect(p: ptr, n: u64, prot: i32) -> i32
+
+extern fn write(fd: i32, p: ptr, n: u64) -> int
+
+extern fn calloc(n: u64, k: u64) -> ptr
+
+extern fn realloc(p: ptr, n: u64) -> ptr
+
+extern fn abort()
+
+fn heap_info() -> ptr:
+    return global_mem("heap_info", 176)
+
+# a stack of free batches per class: a batch is a free list, and its first
+# block's second word links the next batch
+fn heap_batches() -> ptr:
+    return global_mem("heap_batches", 96)
+
+fn heap_mu() -> ptr:
+    return global_mem("heap_mu", 64)
+
+fn oom_cold():
+    let m = ptr_of("out of memory\n") + STR_DATA
+    if os_is("windows"):
+        _write(i32(2), m, u32(14))
+    else:
+        write(i32(2), m, u64(14))
+    abort()
+
+# n zeroed bytes of fresh pages, or 0
+fn os_pages(n: int) -> ptr:
+    if os_is("windows"):
+        # (MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        return VirtualAlloc(null_ptr(), u64(n), u32(12288), u32(4))
+    else:
+        let m = mmap(null_ptr(), u64(n), i32(3), map_anon(), i32(-1), i64(0))
+        return null_ptr() if addr(m) == 18446744073709551615 else m
+
+# MAP_PRIVATE | MAP_ANONYMOUS
+fn map_anon() -> i32:
+    return i32(4098) if os_is("macos") else i32(34)
+
+fn heap_key() -> u32:
+    return u32(load_i64(heap_info(), HI_KEY))
+
+# This thread's heap, at address 0 when there is none yet.
+fn th_peek() -> ptr:
+    let hi = heap_info()
+    if load_i64(hi, HI_TH) != 0:
+        return th_heap(hi)
+    return th_peek_cold()
+
+fn th_peek_cold() -> ptr:
+    if os_is("windows"):
+        return TlsGetValue(heap_key())
+    else:
+        return pthread_getspecific(heap_key())
+
+fn th_set(h: ptr):
+    if os_is("windows"):
+        TlsSetValue(heap_key(), h)
+    else:
+        pthread_setspecific(heap_key(), h)
+
+fn th_get() -> ptr:
+    let h = th_peek()
+    if addr(h) != 0:
+        return h
+    return th_new_cold()
+
+fn th_new_cold() -> ptr:
+    let h = calloc(u64(1), u64(TH_SIZE))
+    if addr(h) == 0:
+        oom_cold()
+    th_set(h)
+    return h
+
+# Where the thread block keeps this thread's heap (key k's value h), as an
+# offset from the thread pointer, the same in every thread; 1 when it
+# isn't found. glibc keeps the first 32 keys' values in the thread block,
+# above the thread pointer on x86-64 and below it on AArch64. The search
+# stops at the first match, which a second value then confirms, so it
+# reads nothing past the slot.
+fn th_slot(k: u32, h: ptr) -> int:
+    if os_is("linux"):
+        if k >= 32:
+            return 1
+        let tp = thread_ptr()
+        let step = 8 if os_is("x86_64") else -8
+        var off = 0 if step > 0 else -8
+        for _ in 0..256:
+            if addr(load_ptr(tp, off)) == addr(h):
+                pthread_setspecific(k, h + 8)
+                let ok = addr(load_ptr(tp, off)) == addr(h) + 8
+                pthread_setspecific(k, h)
+                if ok:
+                    return off
+            off += step
+        return 1
+    else:
+        return 1
+
+# (brine_rt_init, once, before any thread starts; without the reservation
+# every block is malloc's)
+fn brine_x_heap_init(leakcheck: int):
+    let hi = heap_info()
+    lock_init(heap_mu())
+    for c in 0..NCLASS:
+        store_i64(hi, HI_KEEP + c * 8, SPARE / class_size(c))
+    var b = 0
+    if os_is("windows"):
+        let k = TlsAlloc()
+        store_i64(hi, HI_KEY, int(k))
+        # (TLS_OUT_OF_INDEXES)
+        if k == u32(4294967295):
+            return
+        # (MEM_RESERVE, PAGE_NOACCESS: reservations are 64 KiB aligned)
+        b = int(addr(VirtualAlloc(null_ptr(), u64(RESERVE), u32(8192), u32(1))))
+    else:
+        let ks = stack_mem(8)
+        store_i64(ks, 0, 0)
+        if pthread_key_create(ks, null_ptr()) != 0:
+            return
+        store_i64(hi, HI_KEY, int(load_u32(ks, 0)))
+        # (PROT_NONE, MAP_NORESERVE)
+        let flags = map_anon() | (i32(64) if os_is("macos") else i32(16384))
+        let m = mmap(null_ptr(), u64(RESERVE + CHUNK), i32(0), flags, i32(-1), i64(0))
+        if addr(m) != 18446744073709551615:
+            b = (int(addr(m)) + CHUNK - 1) & -CHUNK
+    let classes = os_pages(NCHUNKS)
+    if b == 0 or addr(classes) == 0:
+        return
+    store_ptr(hi, HI_CLASSES, classes)
+    store_i64(hi, HI_NEXT, b)
+    store_i64(hi, HI_END, b + RESERVE)
+    store_i64(hi, HI_BASE, b)
+    # where native code finds a thread's heap
+    if os_is("windows"):
+        let k = int(heap_key())
+        if k >= 64:
+            return
+        # TEB.TlsSlots[k]
+        store_i64(hi, HI_OFF, 5248 + k * 8)
+    else:
+        let off = th_slot(heap_key(), th_get())
+        if off == 1:
+            return
+        store_i64(hi, HI_OFF, off)
+    store_i64(hi, HI_TH, 1)
+    if leakcheck == 0:
+        store_i64(hi, HI_FAST, 1)
+
+fn chunk_new(c: int) -> ptr:
+    let hi = heap_info()
+    let ch = atomic_add(hi + HI_NEXT, CHUNK)
+    if ch + CHUNK > load_i64(hi, HI_END):
+        return null_ptr()
+    let p = null_ptr() + ch
+    if os_is("windows"):
+        # (MEM_COMMIT, PAGE_READWRITE)
+        if addr(VirtualAlloc(p, u64(CHUNK), u32(4096), u32(4))) == 0:
+            return null_ptr()
+    else:
+        if mprotect(p, u64(CHUNK), i32(3)) != 0:
+            return null_ptr()
+    store_u8(load_ptr(hi, HI_CLASSES), (ch - load_i64(hi, HI_BASE)) / CHUNK, u8(c))
+    return p
+
+fn big(n: int) -> ptr:
+    let p = malloc(u64(n if n > 0 else 1))
+    if addr(p) == 0:
+        oom_cold()
+    return p
+
+# hands a thread's free list for class c over as one batch
+fn give(h: ptr, c: int):
+    let p = load_ptr(h, TH_HEAD + c * 8)
+    if addr(p) == 0:
+        return
+    let bs = heap_batches()
+    lock(heap_mu())
+    store_ptr(p, 8, load_ptr(bs, c * 8))
+    store_ptr(bs, c * 8, p)
+    unlock(heap_mu())
+    store_ptr(h, TH_HEAD + c * 8, null_ptr())
+    store_i64(h, TH_COUNT + c * 8, 0)
+
+fn alloc_slow_cold(h: ptr, c: int, n: int) -> ptr:
+    let sz = class_size(c)
+    let bump = load_ptr(h, TH_BUMP + c * 8)
+    if addr(bump) != 0 and addr(load_ptr(h, TH_END + c * 8)) - addr(bump) >= u64(sz):
+        store_ptr(h, TH_BUMP + c * 8, bump + sz)
+        return bump
+    let bs = heap_batches()
+    if atomic_load(bs + c * 8) != 0:
+        lock(heap_mu())
+        let b = load_ptr(bs, c * 8)
+        if addr(b) != 0:
+            store_ptr(bs, c * 8, load_ptr(b, 8))
+        unlock(heap_mu())
+        if addr(b) != 0:
+            store_ptr(h, TH_HEAD + c * 8, load_ptr(b, 0))
+            store_i64(h, TH_COUNT + c * 8, 0)
+            return b
+    let ch = chunk_new(c)
+    if addr(ch) == 0:
+        return big(n)
+    store_ptr(h, TH_BUMP + c * 8, ch + sz)
+    store_ptr(h, TH_END + c * 8, ch + CHUNK)
+    return ch
+
+fn alloc_miss_cold(n: int) -> ptr:
+    if n > SMALL or load_u64(heap_info(), HI_BASE) == 0:
+        return big(n)
+    let c = size_class(n)
+    let h = th_get()
+    let p = load_ptr(h, TH_HEAD + c * 8)
+    if addr(p) != 0:
+        store_ptr(h, TH_HEAD + c * 8, load_ptr(p, 0))
+        let k = load_i64(h, TH_COUNT + c * 8)
+        if k > 0:
+            store_i64(h, TH_COUNT + c * 8, k - 1)
+        return p
+    return alloc_slow_cold(h, c, n)
+
+fn brine_alloc(n: int) -> ptr:
+    let m = n if n > 0 else 1
+    if m <= SMALL:
+        let p = pop_free(m)
+        if addr(p) != 0:
+            return p
+    return alloc_miss_cold(m)
+
+fn free_miss_cold(p: ptr):
+    if not in_heap(p):
+        free(p)
+        return
+    let hi = heap_info()
+    let c = int(load_u8(load_ptr(hi, HI_CLASSES), (addr(p) - load_u64(hi, HI_BASE)) >> 16))
+    let h = th_get()
+    store_ptr(p, 0, load_ptr(h, TH_HEAD + c * 8))
+    store_ptr(h, TH_HEAD + c * 8, p)
+    let k = load_i64(h, TH_COUNT + c * 8) + 1
+    store_i64(h, TH_COUNT + c * 8, k)
+    if k * class_size(c) > SPARE:
+        give(h, c)
+
+fn brine_free(p: ptr):
+    if not push_free(p):
+        free_miss_cold(p)
+
+# realloc for either heap's blocks; out of memory aborts
+fn brine_x_realloc(p: ptr, n: int) -> ptr:
+    if addr(p) == 0:
+        return brine_alloc(n)
+    if not in_heap(p):
+        let q = realloc(p, u64(n if n > 0 else 1))
+        if addr(q) == 0:
+            abort()
+        return q
+    let hi = heap_info()
+    let have = class_size(
+        int(load_u8(load_ptr(hi, HI_CLASSES), (addr(p) - load_u64(hi, HI_BASE)) >> 16))
+    )
+    if n <= have:
+        return p
+    let q = brine_alloc(n)
+    memcpy(q, p, u64(have))
+    brine_free(p)
+    return q
+
+# a thread's last act: its free blocks, and what is left of its chunks, go
+# to the shared lists
+fn brine_x_heap_exit():
+    if load_u64(heap_info(), HI_BASE) == 0:
+        return
+    let h = th_peek()
+    if addr(h) == 0:
+        return
+    for c in 0..NCLASS:
+        let sz = class_size(c)
+        while true:
+            let bump = load_ptr(h, TH_BUMP + c * 8)
+            if addr(bump) == 0 or addr(load_ptr(h, TH_END + c * 8)) - addr(bump) < u64(sz):
+                break
+            store_ptr(h, TH_BUMP + c * 8, bump + sz)
+            store_ptr(bump, 0, load_ptr(h, TH_HEAD + c * 8))
+            store_ptr(h, TH_HEAD + c * 8, bump)
+        give(h, c)
+    th_set(null_ptr())
+    free(h)
+
+# whether this thread runs a parallel region
+fn brine_x_in_par_get() -> int:
+    let h = th_peek()
+    return 0 if addr(h) == 0 else load_i64(h, TH_IN_PAR)
+
+fn brine_x_in_par_set(v: int):
+    store_i64(th_get(), TH_IN_PAR, v)
+
+# Freeing an object frees what it holds first, so a deep structure (a long
+# enum list, a tree 100k levels deep) would recurse once per level and
+# overflow the stack. `f(p)` finishes freeing a dead object; past
+# DROP_DEPTH nested calls the object waits on a list instead, which the
+# outermost call works through.
+fn brine_drop(p: ptr, f: ptr):
+    drop(p, f)
+
+# (in place of brine_drop in native code: inline)
+fn drop(p: ptr, f: ptr):
+    let h = th_get()
+    let depth = load_i64(h, TH_DROP_DEPTH)
+    if depth >= DROP_DEPTH:
+        drop_later_cold(h, p, f)
+        return
+    store_i64(h, TH_DROP_DEPTH, depth + 1)
+    call_void(f, p)
+    if depth == 0 and addr(load_ptr(h, TH_DROPS)) != 0:
+        drop_rest_cold(h)
+    store_i64(h, TH_DROP_DEPTH, depth)
+
+fn drop_later_cold(h: ptr, p: ptr, f: ptr):
+    let n = load_i64(h, TH_NDROPS)
+    let cap = load_i64(h, TH_CAPDROPS)
+    if n + 2 > cap:
+        let nc = cap * 2 if cap != 0 else 256
+        let d = realloc(load_ptr(h, TH_DROPS), u64(nc * 8))
+        if addr(d) == 0:
+            oom_cold()
+        store_ptr(h, TH_DROPS, d)
+        store_i64(h, TH_CAPDROPS, nc)
+    let d = load_ptr(h, TH_DROPS)
+    store_ptr(d, n * 8, p)
+    store_ptr(d, n * 8 + 8, f)
+    store_i64(h, TH_NDROPS, n + 2)
+
+# the outermost brine_drop: the objects left (more may come)
+fn drop_rest_cold(h: ptr):
+    while load_i64(h, TH_NDROPS) > 0:
+        let n = load_i64(h, TH_NDROPS) - 2
+        store_i64(h, TH_NDROPS, n)
+        let d = load_ptr(h, TH_DROPS)
+        call_void(load_ptr(d, n * 8 + 8), load_ptr(d, n * 8))
+    free(load_ptr(h, TH_DROPS))
+    store_ptr(h, TH_DROPS, null_ptr())
+    store_i64(h, TH_CAPDROPS, 0)
