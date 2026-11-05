@@ -144,7 +144,67 @@ fn arith(op: Op) -> bool:
 fn mov(d: int, a: int) -> Inst:
     return Inst(op=Op.Mov, d=d, a=a, b=-1, c=-1, n=0, s="", args=[])
 
-fn promote(f: Func) -> Func:
+# Copies through a slot used for nothing else, `copy t <- p; copy u <- t`
+# (a value read out of an array, then into a variable), copy p to u
+# directly, when nothing between them changes memory or p.
+fn copy_chains(f: Func) -> Func:
+    let slot = slot_vregs(f)
+    let ns = len(f.slots)
+    # by slot: the copy into it, the copy out of it, and whether it has any
+    # other use
+    var into = [-1] * ns
+    var out = [-1] * ns
+    var other = [false] * ns
+    let nv = len(f.vk)
+    for i, x in enumerate(f.code):
+        if x.op == Op.SlotAddr or same_slot(x, slot):
+            continue
+        var skip = -1
+        if x.op == Op.Copy and slot[x.a] >= 0 and slot[x.b] != slot[x.a]:
+            let s = slot[x.a]
+            if into[s] < 0:
+                into[s] = i
+                skip = x.a
+            else:
+                other[s] = true
+        if x.op == Op.Copy and slot[x.b] >= 0 and slot[x.a] != slot[x.b]:
+            let s = slot[x.b]
+            if out[s] < 0 and into[s] >= 0:
+                out[s] = i
+                skip = x.b
+            else:
+                other[s] = true
+        for v in reads(x, nv):
+            if v != skip and slot[v] >= 0:
+                other[slot[v]] = true
+    var drop = [false] * len(f.code)
+    var code = f.code
+    for s in 0..ns:
+        let a = into[s]
+        let b = out[s]
+        if other[s] or a < 0 or b < 0 or drop[b] or code[a].n != code[b].n or slot[code[b].a] < 0:
+            continue
+        # (code[a] may already copy from further back: a chain of three)
+        let p = code[a].b
+        var ok = true
+        for i in a + 1..b:
+            let y = f.code[i]
+            if y.d == p:
+                ok = false
+            match y.op:
+                case Op.Const | Op.FConst | Op.Mov | Op.SlotAddr | Op.Global | Op.Elem | Op.Load | Op.Line:
+                    pass
+                case _:
+                    ok = false
+        if ok:
+            drop[a] = true
+            code[b].b = p
+    var g = f
+    g.code = [x for i, x in enumerate(code) if not drop[i]]
+    return g
+
+fn promote(f0: Func) -> Func:
+    let f = copy_chains(f0)
     let slot = slot_vregs(f)
     let fs = promotable(f, slot)
     var g = f
