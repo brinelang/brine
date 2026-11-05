@@ -98,6 +98,31 @@ fn callish(x: Inst, vk: [K]) -> bool:
             return true
     return false
 
+# Does x64.br's code for x leave r10 and r11 alone? Then they can hold vregs
+# live across it, and its operands and result.
+fn keeps_r10(x: Inst, vk: [K]) -> bool:
+    if x.d >= 0 and vk[x.d].is_wide():
+        return false
+    match x.op:
+        case Op.Const | Op.Mov | Op.SlotAddr | Op.Global | Op.Elem:
+            return x.d < 0 or not vk[x.d].is_float() or x.op == Op.Mov
+        case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
+            return not vk[x.d].is_float()
+        case Op.Neg | Op.Not | Op.AddO | Op.SubO | Op.MulO | Op.IdxChk:
+            return not vk[x.d].is_float()
+        case Op.Eq | Op.Ne | Op.Lt | Op.Le | Op.Gt | Op.Ge:
+            return not vk[x.a].is_float() and not vk[x.a].is_wide()
+        case Op.Conv:
+            return not vk[x.d].is_float() and not vk[x.a].is_float() and not vk[x.a].is_wide()
+        case Op.Load:
+            return not vk[x.d].is_wide()
+        case Op.Store:
+            return not vk[x.b].is_wide()
+        case Op.Label | Op.Jmp | Op.Br | Op.BrNot | Op.Line:
+            return true
+        case _:
+            return false
+
 # Is this `d = a op b` with d written before b is read?
 fn two_address(x: Inst, vk: [K]) -> bool:
     if x.d < 0 or x.b < 0 or x.b == x.d:
@@ -264,6 +289,8 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool, cold: {str: bo
     var copies: [(int, int, int)] = []
     var cross = [false] * nc
     var noarg = [false] * nc
+    # live across, or read or written by, an instruction that changes r10 or r11
+    var nor10 = [false] * nc
     var fcalls: [int] = []
     var flive: [[int]] = []
     var ccalls: [int] = []
@@ -304,6 +331,18 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool, cold: {str: bo
                 if two_address(x, f.vk) and ci[x.b] >= 0 and isf[ci[x.b]] == isf[cd]:
                     add_edge(ref mat, ref adj, wn, cd, ci[x.b])
             let rs = reads_x(x, nv, ea, eb)
+            if not keeps_r10(x, f.vk):
+                for k in 0..wn:
+                    var wd = live[k]
+                    while wd != 0:
+                        let t = wd.trailing_zeros()
+                        wd ^= 1 << t
+                        nor10[k * 64 + t] = true
+                if cd >= 0:
+                    nor10[cd] = true
+                for u in rs:
+                    if ci[u] >= 0:
+                        nor10[ci[u]] = true
             if callish(x, f.vk):
                 let slow = x.op == Op.Call and x.s in cold
                 var fl: [int] = []
@@ -340,6 +379,7 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool, cold: {str: bo
                 if cp < 0:
                     continue
                 noarg[cp] = true
+                nor10[cp] = true
                 live[cp >> 6] |= 1 << (cp & 63)
             for p in 0..f.nparams:
                 let cp = ci[p]
@@ -376,6 +416,7 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool, cold: {str: bo
         w[b] = 0
         cross[a] = cross[a] or cross[b]
         noarg[a] = noarg[a] or noarg[b]
+        nor10[a] = nor10[a] or nor10[b]
         let nb_ = adj[b]
         for n in nb_:
             add_edge(ref mat, ref adj, wn, a, find(rep, n))
@@ -398,12 +439,22 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool, cold: {str: bo
         let free = not cross[j] and not noarg[j]
         let cs = fcaller if isf[j] else caller
         let ce = fcallee if isf[j] else callee
+        let r10 = not isf[j] and not nor10[j]
         var pick = -1
         for p in moves[j]:
             let c = color[find(rep, p)]
-            if c >= 0 and (forbid >> c) & 1 == 0 and (c in ce or (free and c in cs)):
+            if (
+                c >= 0
+                and (forbid >> c) & 1 == 0
+                and (c in ce or (free and c in cs) or (r10 and (c == 10 or c == 11)))
+            ):
                 pick = c
                 break
+        if pick < 0 and r10:
+            for c in [10, 11]:
+                if (forbid >> c) & 1 == 0:
+                    pick = c
+                    break
         if pick < 0 and free:
             for c in cs:
                 if (forbid >> c) & 1 == 0:

@@ -964,11 +964,16 @@ struct X:
 
     # The memory at pointer vreg p plus n; may load p into r.
     fn addr(ref self, p: int, n: int, r: int) -> Mem:
+        return self.addr2(p, n, r, R11)
+
+    # Same, with ri for the index (Load and Store use rdx and rcx, leaving
+    # r10 and r11 to vregs: see ra.br)
+    fn addr2(ref self, p: int, n: int, r: int, ri: int) -> Mem:
         let f = self.fold[p]
         if f == F_ELEM:
             let e = self.code[self.fval[p]]
             let base = self.use(r, e.a)
-            let ix = self.use(R11, e.b)
+            let ix = self.use(ri, e.b)
             return Mem(base=base, index=ix, scale=e.n, disp=n, sym=-1)
         if f == F_SLOT:
             return self.smem(self.fval[p], n)
@@ -1337,7 +1342,7 @@ struct X:
         if op == 33:
             # not rax
             self.rr(0, 1, 247, 2, RAX)
-        self.rm(0, 1, op, RAX, self.addr(x.a, x.n, R10), 0)
+        self.rm(0, 1, op, RAX, self.addr2(x.a, x.n, RDX, RCX), 0)
         return j + 2 - i
 
     # branch on (w >> b) & 1 (compared with 0) on 64 bits: bt w, b, then jc
@@ -1706,8 +1711,18 @@ struct X:
             self.cpos = -1
             if s.kind == S_IDX:
                 self.ld(RAX, s.a)
-                self.ld(R10, s.b)
-                self.ld(R11, s.c)
+                # (b or c may be in r10 or r11 themselves)
+                let bi = self.fold[s.b] == F_NONE and self.reg[s.b] == R11
+                let cj = self.fold[s.c] == F_NONE and self.reg[s.c] == R10
+                if bi and cj:
+                    # xchg r10, r11
+                    self.rr(0, 1, 135, R10, R11)
+                elif cj:
+                    self.ld(R11, s.c)
+                    self.ld(R10, s.b)
+                else:
+                    self.ld(R10, s.b)
+                    self.ld(R11, s.c)
                 self.call_rt(
                     "brine_panic_idx",
                     [
@@ -2604,6 +2619,10 @@ struct X:
                 ea[v] = e.a
                 eb[v] = e.b
         let r = ra.allocate(f, ok, ea, eb, self.win, self.cold)
+        # (stubs and the templates rely on these not holding vregs)
+        for v in 0..nv:
+            if r.reg[v] == RAX or r.reg[v] == RCX or r.reg[v] == RDX:
+                panic("x64: a vreg in a scratch register")
         self.reg = r.reg
         self.freg = r.freg
         self.saved = r.saved
@@ -2734,7 +2753,7 @@ struct X:
                 self.st(RAX, x.d)
             case Op.Load:
                 let k = self.vk[x.d]
-                let m = self.addr(x.a, x.n, R10)
+                let m = self.addr2(x.a, x.n, RDX, RCX)
                 if k.is_wide():
                     self.copy16(self.vm(x.d), m)
                 elif self.freg[x.d] >= 0:
@@ -2746,7 +2765,7 @@ struct X:
                         self.st(RAX, x.d)
             case Op.Store:
                 let k = self.vk[x.b]
-                let m = self.addr(x.a, x.n, R10)
+                let m = self.addr2(x.a, x.n, RDX, RCX)
                 if k.is_wide():
                     self.copy16(m, self.vm(x.b))
                 elif self.freg[x.b] >= 0:
