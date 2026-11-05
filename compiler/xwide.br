@@ -1,0 +1,617 @@
+# AVX-512 versions of the vector kernels (kernel.br finds them, slp.br lays
+# out their lanes), for x64.br to run when the CPU has AVX-512 instead of
+# xkern.br's SSE2 ones. The operations are those of the C kernel slp.br
+# writes for the same width, lane for lane, so the results are the same
+# bits. AVX-512 has 32 registers and its operations don't overwrite their
+# operands, so a kernel rarely spills.
+from ir import KOp, KFunc
+from ir import KW_LD, KW_LDH, KW_LDD, KW_LDP, KW_LDV, KW_INS, KW_BC, KW_BCA, KW_OP, KW_SQRT
+from ir import KW_PERM, KW_LDK, KW_ALIGN, KW_ST, KW_STH, KW_SPILL, KW_FILL, KW_MOV, KW_ARG
+import slp
+from slp import Dag, Layout, LOAD, PARAM, CONST, MUL, DIV, NEG, SQRT
+
+const SIGN = -9223372036854775808
+const MINUS_ONE = -4616189618054758400
+const ONE = 4607182418800017408
+
+# opcodes in the 0F map
+const OP_ADD = 88
+const OP_MUL = 89
+const OP_SUB = 92
+const OP_DIV = 94
+const OP_XOR = 87
+const SCALAR = 256
+
+# registers 30 and 31 are for building loads; the others are allocated
+const NREG = 30
+const SCRATCH = 30
+const SCRATCH2 = 31
+
+# value-level operations
+# d = the lanes at [arr + offs[i]] / the double at [arr + n]
+const W_LOAD = 0
+const W_LD1 = 1
+# d = the constant k
+const W_KV = 2
+# d = lane 0 of a in every lane
+const W_BC = 3
+# d = a op b, or a op the constant k when b < 0; n: opcode + SCALAR
+const W_OP = 4
+# d = sqrt(a); n: SCALAR or 0
+const W_SQRT = 5
+# d = the lanes of a and b that the constant k picks
+const W_PERM = 6
+# d = a's lanes from lane n on
+const W_ALIGN = 7
+# [arr + n] = lane m (0 or 1) of a
+const W_ST = 8
+const W_RET = 9
+
+struct WOp:
+    op: int
+    d: int
+    a: int
+    b: int
+    k: int
+    arr: int
+    n: int
+    m: int
+    offs: [int]
+
+struct WGen:
+    d: Dag
+    l: Layout
+    w: int
+    ops: [WOp]
+    nval: int
+    # the value of each pack
+    pv: [int]
+    gathers: {str: (int, int)}
+    # the constants, 8 lanes each, and their values once loaded
+    ks: [[int]]
+    kidx: {str: int}
+    kvals: {int: int}
+    # pack * 8 + lane -> a value with that lane in lane 0
+    lanes: {int: int}
+    # value -> it in every lane
+    bcs: {int: int}
+    # parameter j -> its value
+    params: {int: int}
+
+    fn val(ref self) -> int:
+        self.nval += 1
+        return self.nval - 1
+
+    fn emit(ref self, op: int, a: int, b: int, k: int, n: int) -> int:
+        let d = self.val()
+        self.ops.push(WOp(op=op, d=d, a=a, b=b, k=k, arr=-1, n=n, m=0, offs=[]))
+        return d
+
+    # the constant with these lanes (the rest 0)
+    fn konst(ref self, lanes: [int]) -> int:
+        var ls = lanes
+        while len(ls) < 8:
+            ls.push(0)
+        let key = slp.list_key(ls)
+        match self.kidx.get(key):
+            case Some(k):
+                return k
+            case None:
+                pass
+        let k = len(self.ks)
+        self.ks.push(ls)
+        self.kidx[key] = k
+        return k
+
+    fn kval(ref self, k: int) -> int:
+        match self.kvals.get(k):
+            case Some(v):
+                return v
+            case None:
+                pass
+        let v = self.emit(W_KV, -1, -1, k, 0)
+        self.kvals[k] = v
+        return v
+
+    # (value, constant): an operand, a value or else a constant
+    fn reg(ref self, v: (int, int)) -> int:
+        if v.0 >= 0:
+            return v.0
+        return self.kval(v.1)
+
+    fn param(ref self, j: int) -> int:
+        match self.params.get(j):
+            case Some(v):
+                return v
+            case None:
+                pass
+        let v = self.val()
+        self.params[j] = v
+        return v
+
+    fn is_vec(self, p: int) -> bool:
+        return len(self.l.packs[p].lanes) > 1
+
+    # pack p's lane with lane 0 holding lane i
+    fn lane(ref self, p: int, i: int) -> int:
+        if i == 0:
+            return self.pv[p]
+        let key = p * 8 + i
+        match self.lanes.get(key):
+            case Some(v):
+                return v
+            case None:
+                pass
+        let v = self.emit(W_ALIGN, self.pv[p], -1, -1, i)
+        self.lanes[key] = v
+        return v
+
+    # node n in lane 0 (slp's Emit.scal)
+    fn scal(ref self, n: int) -> (int, int):
+        let x = self.d.nodes[n]
+        if x.op == CONST:
+            return (-1, self.konst([x.off]))
+        let p = self.l.pack_of[n]
+        if self.is_vec(p):
+            return (self.lane(p, self.l.lane_of[n]), -1)
+        return (self.pv[p], -1)
+
+    # node n in every lane
+    fn bcast(ref self, n: int) -> int:
+        let x = self.d.nodes[n]
+        if x.op == CONST:
+            return self.kval(self.konst([x.off] * self.w))
+        let v = self.reg(self.scal(n))
+        match self.bcs.get(v):
+            case Some(b):
+                return b
+            case None:
+                pass
+        let b = self.emit(W_BC, v, -1, -1, 0)
+        self.bcs[v] = b
+        return b
+
+    fn perm(ref self, a: int, b: int, idx: [int]) -> int:
+        return self.emit(W_PERM, a, b, self.konst(idx), 0)
+
+    # the nodes ns as one value, lane i holding ns[i] (slp's Emit.gather)
+    fn gather(ref self, ns: [int]) -> (int, int):
+        let w = self.w
+        var same = true
+        let p0 = self.l.pack_of[ns[0]]
+        for i, x in enumerate(ns):
+            if self.l.pack_of[x] != p0 or self.l.lane_of[x] != i:
+                same = false
+        if same and p0 >= 0 and self.is_vec(p0):
+            return (self.pv[p0], -1)
+        let key = slp.list_key(ns)
+        match self.gathers.get(key):
+            case Some(t):
+                return t
+            case None:
+                pass
+        var srcs: [int] = []
+        var all_const = true
+        for x in ns:
+            let p = self.l.pack_of[x]
+            if p >= 0 and self.is_vec(p) and p not in srcs:
+                srcs.push(p)
+            if self.d.nodes[x].op != CONST:
+                all_const = false
+        var out = (-1, -1)
+        if len(srcs) == 0:
+            var es: [int] = []
+            for i in 0..w:
+                es.push(ns[i] if i < len(ns) else ns[0])
+            if all_const:
+                out = (-1, self.konst([self.d.nodes[x].off for x in es]))
+            else:
+                # each node in every lane, then the lanes of each picked
+                var t = self.bcast(es[0])
+                var put: [int] = [es[0]]
+                for x in es:
+                    if x in put:
+                        continue
+                    put.push(x)
+                    var idx = [i for i in 0..w]
+                    for i, y in enumerate(es):
+                        if y == x:
+                            idx[i] = w + i
+                    t = self.perm(t, self.bcast(x), idx)
+                out = (t, -1)
+            self.gathers[key] = out
+            return out
+        # the first two vector sources, then one more at a time
+        var done = [false] * w
+        var idx = [0] * w
+        let a = srcs[0]
+        let b = srcs[1] if len(srcs) > 1 else srcs[0]
+        for i, x in enumerate(ns):
+            let p = self.l.pack_of[x]
+            if p == a:
+                idx[i] = self.l.lane_of[x]
+                done[i] = true
+            elif p == b:
+                idx[i] = w + self.l.lane_of[x]
+                done[i] = true
+        var t = self.perm(self.pv[a], self.pv[b], idx)
+        for si in 2..len(srcs):
+            let s = srcs[si]
+            var ix = [i for i in 0..w]
+            for i, x in enumerate(ns):
+                if self.l.pack_of[x] == s:
+                    ix[i] = w + self.l.lane_of[x]
+                    done[i] = true
+            t = self.perm(t, self.pv[s], ix)
+        for i, x in enumerate(ns):
+            if not done[i]:
+                var ix = [j for j in 0..w]
+                ix[i] = w + i
+                t = self.perm(t, self.bcast(x), ix)
+        out = (t, -1)
+        self.gathers[key] = out
+        return out
+
+    fn operand(ref self, ns: [int], vec: bool) -> (int, int):
+        if vec:
+            return self.gather(ns)
+        return self.scal(ns[0])
+
+    fn addr(self, n: int) -> int:
+        let x = self.d.nodes[n]
+        return x.k * self.d.sizes[x.arr] + x.off
+
+    fn op(ref self, a: (int, int), b: (int, int), opc: int, vec: bool) -> int:
+        let n = opc if vec else opc + SCALAR
+        return self.emit(W_OP, self.reg(a), b.0, b.1 if b.0 < 0 else -1, n)
+
+    fn pack(ref self, p: int):
+        let ls = self.l.packs[p].lanes
+        let vec = len(ls) > 1
+        let w = self.w
+        let x0 = self.d.nodes[ls[0]]
+        if x0.op == LOAD:
+            if not vec:
+                let v = self.val()
+                self.ops.push(
+                    WOp(
+                        op=W_LD1,
+                        d=v,
+                        a=-1,
+                        b=-1,
+                        k=-1,
+                        arr=x0.arr,
+                        n=self.addr(ls[0]),
+                        m=0,
+                        offs=[]
+                    )
+                )
+                self.pv[p] = v
+                return
+            var offs: [int] = []
+            for i in 0..w:
+                offs.push(self.addr(ls[i] if i < len(ls) else ls[0]))
+            let v = self.val()
+            self.ops.push(WOp(op=W_LOAD, d=v, a=-1, b=-1, k=-1, arr=x0.arr, n=0, m=0, offs=offs))
+            self.pv[p] = v
+            return
+        if x0.op == PARAM:
+            self.pv[p] = self.param(x0.arr)
+            return
+        let a = self.operand([self.d.nodes[x].a for x in ls], vec)
+        if x0.op == NEG:
+            self.pv[p] = self.op(a, (-1, self.konst([SIGN] * w)), OP_XOR, vec)
+            return
+        if x0.op == SQRT:
+            self.pv[p] = self.emit(W_SQRT, self.reg(a), -1, -1, 0 if vec else SCALAR)
+            return
+        let b = self.operand([self.d.nodes[x].b for x in ls], vec)
+        if x0.op == MUL:
+            self.pv[p] = self.op(a, b, OP_MUL, vec)
+            return
+        if x0.op == DIV:
+            self.pv[p] = self.op(a, b, OP_DIV, vec)
+            return
+        var subs = 0
+        for x in ls:
+            if self.d.nodes[x].sub:
+                subs += 1
+        if subs == 0:
+            self.pv[p] = self.op(a, b, OP_ADD, vec)
+        elif subs == len(ls):
+            self.pv[p] = self.op(a, b, OP_SUB, vec)
+        else:
+            # some lanes subtract: b * -1 is exactly -b, and a + -b is a - b
+            var sg: [int] = []
+            for i in 0..w:
+                sg.push(MINUS_ONE if i < len(ls) and self.d.nodes[ls[i]].sub else ONE)
+            let t = self.op(b, (-1, self.konst(sg)), OP_MUL, true)
+            self.pv[p] = self.op(a, (t, -1), OP_ADD, true)
+
+# The value-level code of a kernel for vectors of w (4 or 8) doubles.
+fn gen(d: Dag, w: int) -> WGen:
+    let l = slp.layout(d, w)
+    var g = WGen(
+        d=d,
+        l=l,
+        w=w,
+        ops=[],
+        nval=0,
+        pv=[-1] * len(l.packs),
+        gathers={},
+        ks=[],
+        kidx={},
+        kvals={},
+        lanes={},
+        bcs={},
+        params={}
+    )
+    for c in l.order:
+        for p in l.cpacks[c]:
+            g.pack(p)
+    for s in d.stores:
+        let (n, arr, k, off) = s
+        let x = d.nodes[n]
+        var v = -1
+        var hi = 0
+        if x.op == CONST:
+            v = g.kval(g.konst([x.off]))
+        else:
+            let p = l.pack_of[n]
+            if g.is_vec(p):
+                let i = l.lane_of[n]
+                # lane 1 stores from lane 1, so lanes come in pairs
+                v = g.lane(p, i - i % 2)
+                hi = i % 2
+            else:
+                v = g.pv[p]
+        g.ops.push(
+            WOp(op=W_ST, d=-1, a=v, b=-1, k=-1, arr=arr, n=k * d.sizes[arr] + off, m=hi, offs=[])
+        )
+    if d.ret >= 0:
+        let v = g.reg(g.scal(d.ret))
+        g.ops.push(WOp(op=W_RET, d=-1, a=v, b=-1, k=-1, arr=-1, n=0, m=0, offs=[]))
+    return g
+
+# The width of a kernel's AVX-512 version, as slp.kernel_c picks it for
+# x86-64-v4: the cheapest of 2, 4 and 8 lanes that saves a tenth of the
+# work. 0 when that is 2 or none (the SSE2 version runs), or when
+# BRINE_VLOOP caps vectors below AVX-512 (as x64.vloop_width does).
+fn width(d: Dag) -> int:
+    match getenv("BRINE_VLOOP"):
+        case Some(v):
+            if v == "sse2" or v == "avx2":
+                return 0
+        case None:
+            pass
+    let base = slp.scalar_cost(d)
+    var best = 0
+    var cost = 0
+    for w in [2, 4, 8]:
+        let (_, c) = slp.emit_body(d, w)
+        if c * 10 <= base * 9 and (best == 0 or c < cost):
+            best = w
+            cost = c
+    return best if best > 2 else 0
+
+# ================================================================ registers
+
+struct WAlloc:
+    ops: [KOp]
+    # by value: its register (-1: none), its stack slot (-1: none), the ops
+    # reading it and how many of those are done, the constant it is (-1:
+    # not one, made again rather than spilled), and the rbp offset of a
+    # parameter passed on the stack (-1: not one)
+    reg: [int]
+    slot: [int]
+    uses: [[int]]
+    used: [int]
+    kv: [int]
+    arg: [int]
+    # by register: its value (-1: free), whether the operation being done
+    # reads it
+    held: [int]
+    pinned: [bool]
+    # the registers in the order to take them: the ones calls may change
+    # first (Windows keeps xmm6..15)
+    order: [int]
+    nslots: int
+
+    fn op(ref self, op: int, a: int, b: int, n: int, m: int):
+        self.ops.push(KOp(op=op, a=a, b=b, n=n, m=m))
+
+    fn next_use(self, v: int) -> int:
+        let u = self.used[v]
+        if u >= len(self.uses[v]):
+            return 1000000000
+        return self.uses[v][u]
+
+    fn free_reg(ref self) -> int:
+        for r in self.order:
+            if self.held[r] < 0 and not self.pinned[r]:
+                return r
+        var best = -1
+        var far = -1
+        for r in self.order:
+            if self.pinned[r]:
+                continue
+            let nu = self.next_use(self.held[r])
+            if nu > far:
+                far = nu
+                best = r
+        assert best >= 0, "xwide: every register is pinned"
+        let v = self.held[best]
+        if self.kv[v] < 0 and self.arg[v] < 0 and self.slot[v] < 0:
+            self.slot[v] = self.nslots
+            self.nslots += 1
+            self.op(KW_SPILL, best, -1, self.slot[v], 0)
+        self.reg[v] = -1
+        self.held[best] = -1
+        return best
+
+    # v in a register, pinned for the operation
+    fn need(ref self, v: int) -> int:
+        if self.reg[v] < 0:
+            let r = self.free_reg()
+            if self.kv[v] >= 0:
+                self.op(KW_LDK, r, -1, self.kv[v], 0)
+            elif self.arg[v] >= 0:
+                self.op(KW_ARG, r, -1, self.arg[v], 0)
+            else:
+                assert self.slot[v] >= 0, "xwide: a value read before it is made"
+                self.op(KW_FILL, r, -1, self.slot[v], 0)
+            self.reg[v] = r
+            self.held[r] = v
+        self.pinned[self.reg[v]] = true
+        return self.reg[v]
+
+    # done reading v: its register is free after its last read
+    fn read(ref self, v: int):
+        self.used[v] += 1
+        if self.used[v] >= len(self.uses[v]) and self.reg[v] >= 0:
+            self.held[self.reg[v]] = -1
+            self.reg[v] = -1
+
+    fn unpin(ref self):
+        for r in 0..32:
+            self.pinned[r] = false
+
+    fn define(ref self, v: int, r: int):
+        if len(self.uses[v]) > 0:
+            self.reg[v] = r
+            self.held[r] = v
+
+    # two lanes from [arr + o0] and [arr + o1] in r's low 128 bits
+    fn pair(ref self, r: int, arr: int, o0: int, o1: int):
+        if o1 == o0 + 8:
+            self.op(KW_LDP, r, arr, o0, 0)
+        elif o1 == o0:
+            self.op(KW_LDD, r, arr, o0, 0)
+        else:
+            self.op(KW_LD, r, arr, o0, 0)
+            self.op(KW_LDH, r, arr, o1, 0)
+
+    fn load(ref self, r: int, arr: int, offs: [int]):
+        var dense = true
+        for i, o in enumerate(offs):
+            if o != offs[0] + 8 * i:
+                dense = false
+        if dense:
+            self.op(KW_LDV, r, arr, offs[0], 0)
+            return
+        self.pair(r, arr, offs[0], offs[1])
+        self.pair(SCRATCH, arr, offs[2], offs[3])
+        self.op(KW_INS, r, SCRATCH, 0, 1)
+        if len(offs) == 8:
+            self.pair(SCRATCH, arr, offs[4], offs[5])
+            self.pair(SCRATCH2, arr, offs[6], offs[7])
+            self.op(KW_INS, SCRATCH, SCRATCH2, 0, 1)
+            self.op(KW_INS, r, SCRATCH, 0, 2)
+
+# k with its AVX-512 version (wide, wl, wslots and wk): `pargs` as for
+# xkern.compile.
+fn compile(g: WGen, pargs: [int], win: bool, k: KFunc) -> KFunc:
+    let nv = g.nval
+    var order: [int] = []
+    if win:
+        order = [0, 1, 2, 3, 4, 5]
+        for r in 16..30:
+            order.push(r)
+        for r in 6..16:
+            order.push(r)
+    else:
+        order = [r for r in 0..NREG]
+    var al = WAlloc(
+        ops=[],
+        reg=[-1] * nv,
+        slot=[-1] * nv,
+        uses=[[] for _ in 0..nv],
+        used=[0] * nv,
+        kv=[-1] * nv,
+        arg=[-1] * nv,
+        held=[-1] * 32,
+        pinned=[false] * 32,
+        order=order,
+        nslots=0
+    )
+    for i, x in enumerate(g.ops):
+        if x.a >= 0:
+            al.uses[x.a].push(i)
+        if x.b >= 0 and x.b != x.a:
+            al.uses[x.b].push(i)
+        if x.op == W_KV:
+            al.kv[x.d] = x.k
+    # the parameters where they come in
+    for j in g.params:
+        let v = g.params[j]
+        let at = pargs[j]
+        if at >= 100:
+            al.arg[v] = at - 100
+        elif len(al.uses[v]) > 0:
+            al.reg[v] = at
+            al.held[at] = v
+    for i, x in enumerate(g.ops):
+        match x.op:
+            case W_KV:
+                # loaded where it is read
+                pass
+            case W_LOAD | W_LD1:
+                let r = al.free_reg()
+                if x.op == W_LD1:
+                    al.op(KW_LD, r, x.arr, x.n, 0)
+                else:
+                    al.load(r, x.arr, x.offs)
+                al.define(x.d, r)
+            case W_BC | W_SQRT | W_ALIGN:
+                let ra = al.need(x.a)
+                al.unpin()
+                al.read(x.a)
+                let r = al.free_reg()
+                if x.op == W_BC:
+                    al.op(KW_BC, r, ra, 0, 0)
+                elif x.op == W_SQRT:
+                    al.op(KW_SQRT, r, ra, 0, 1 if x.n == SCALAR else 0)
+                else:
+                    al.op(KW_ALIGN, r, ra, x.n, 0)
+                al.define(x.d, r)
+            case W_OP:
+                let ra = al.need(x.a)
+                var n = 1000 + x.k
+                if x.b >= 0:
+                    n = al.need(x.b)
+                al.unpin()
+                al.read(x.a)
+                if x.b >= 0 and x.b != x.a:
+                    al.read(x.b)
+                let r = al.free_reg()
+                al.op(KW_OP, r, ra, n, x.n)
+                al.define(x.d, r)
+            case W_PERM:
+                # the index goes in the destination first, so not over a or b
+                let ra = al.need(x.a)
+                let rb = al.need(x.b)
+                let r = al.free_reg()
+                al.op(KW_PERM, r, ra, rb, x.k)
+                al.unpin()
+                al.read(x.a)
+                if x.b != x.a:
+                    al.read(x.b)
+                al.define(x.d, r)
+            case W_ST:
+                let ra = al.need(x.a)
+                al.op(KW_STH if x.m == 1 else KW_ST, ra, x.arr, x.n, 0)
+                al.unpin()
+                al.read(x.a)
+            case _:
+                # W_RET: the result in xmm0
+                let ra = al.need(x.a)
+                if ra != 0:
+                    al.op(KW_MOV, 0, ra, 0, 0)
+                al.unpin()
+                al.read(x.a)
+    var out = k
+    out.wide = al.ops
+    out.wl = 2 if g.w == 8 else 1
+    out.wslots = al.nslots
+    out.wk = g.ks
+    return out
