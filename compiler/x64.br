@@ -19,7 +19,9 @@
 # keep values in registers across instructions, so whenever a debugger stops
 # at a line, variables are in memory where the debug info says.
 
-from ir import K, Op, Inst, Func, Module
+from ir import K, Op, Inst, Func, Module, KFunc
+from ir import KO_MOV, KO_LD, KO_LDP, KO_LDH, KO_ST, KO_STH, KO_OP, KO_SQRT, KO_SHUF
+from ir import KO_CONST, KO_CONST2, KO_SPILL, KO_FILL, KO_ARG, PFX_PD, PFX_SD
 from opt import promote, reads, switches, inline_small
 import ssa
 import ra
@@ -292,6 +294,8 @@ struct X:
     ovf: [int]
     # .rodata symbols of float constants, by their bits (and 1 << 64 for f32)
     fpool: {i128: int}
+    # 16-byte constants (vector kernels), by "lo,hi"
+    vpool: {str: int}
     # the function being compiled
     code: [Inst]
     vk: [K]
@@ -1429,6 +1433,110 @@ struct X:
             self.b(93)
         self.u.epis.push(self.pos())
         self.b(195)
+
+    # The symbol of 16 bytes of .rodata: lo, then hi.
+    fn vconst_sym(ref self, lo: int, hi: int) -> int:
+        let key = f"{lo},{hi}"
+        match self.vpool.get(key):
+            case Some(s):
+                return s
+            case None:
+                pass
+        while len(self.o.rodata) % 16 != 0:
+            self.o.rodata.push(0)
+        self.o.rodata_align = max(self.o.rodata_align, 16)
+        let off = len(self.o.rodata)
+        put64(ref self.o.rodata, lo)
+        put64(ref self.o.rodata, hi)
+        let s = self.sym_def(f"__brx_v{len(self.vpool)}", SEC_RODATA, off, false, false)
+        self.vpool[key] = s
+        return s
+
+    # ------------------------------------------------------------ kernels
+    # A vector kernel (xkern.br): its array pointers stay in their argument
+    # registers, its xmm registers are the ones xkern.br chose. The frame is
+    # rbp-based like a function's, with no general registers saved, then the
+    # callee-saved xmm registers it writes (Windows) and its 16-byte slots.
+    fn kernel(ref self, k: KFunc):
+        let gp = [RCX, RDX, R8, R9] if self.win else [RDI, RSI, RDX, RCX]
+        self.saved = []
+        self.fsaved = []
+        self.fsave_at = []
+        if self.win:
+            for r in k.regs:
+                if r >= 6:
+                    self.fsaved.push(r)
+        var off = 0
+        for _ in self.fsaved:
+            off += 16
+            self.fsave_at.push(-off)
+        let slots = off
+        off += 16 * k.nslots
+        let grow = align_up(off, 16)
+        while len(self.o.text) % 16 != 0:
+            self.o.text.push(204)
+        self.sym_def(k.name, SEC_TEXT, self.pos(), false, true)
+        self.u = Unw(
+            start=self.pos(),
+            pushes=[],
+            pad=-1,
+            fp=0,
+            alloc=0,
+            grow=grow,
+            pro_end=0,
+            epis=[]
+        )
+        self.b(85)
+        self.mov_rr(RBP, RSP)
+        self.u.fp = self.pos()
+        if grow > 0:
+            self.alu_ri(SUB, RSP, grow)
+        self.u.alloc = self.pos()
+        self.u.pro_end = self.pos()
+        for i, x in enumerate(self.fsaved):
+            self.xsave(mrb(self.fsave_at[i]), x)
+        for o in k.ops:
+            match o.op:
+                case KO_MOV:
+                    # movapd
+                    self.rr(PFX_PD, 0, 3880, o.a, o.b)
+                case KO_LD:
+                    # movsd
+                    self.rm(PFX_SD, 0, 3856, o.a, mreg(gp[o.b], o.n), 0)
+                case KO_LDP:
+                    # movupd
+                    self.rm(PFX_PD, 0, 3856, o.a, mreg(gp[o.b], o.n), 0)
+                case KO_LDH:
+                    # movhpd xmm, m64
+                    self.rm(PFX_PD, 0, 3862, o.a, mreg(gp[o.b], o.n), 0)
+                case KO_ST:
+                    self.rm(PFX_SD, 0, 3857, o.a, mreg(gp[o.b], o.n), 0)
+                case KO_STH:
+                    # movhpd m64, xmm
+                    self.rm(PFX_PD, 0, 3863, o.a, mreg(gp[o.b], o.n), 0)
+                case KO_OP | KO_SQRT:
+                    self.rr(o.m, 0, o.n, o.a, o.b)
+                case KO_SHUF:
+                    # shufpd
+                    self.rr(PFX_PD, 0, 4038, o.a, o.b)
+                    self.b(o.n)
+                case KO_CONST:
+                    self.rm(PFX_SD, 0, 3856, o.a, mrip(self.fconst_sym(o.n, K.F64), 0), 0)
+                case KO_CONST2:
+                    self.rm(PFX_PD, 0, 3856, o.a, mrip(self.vconst_sym(o.n, o.m), 0), 0)
+                case KO_SPILL:
+                    # movapd m128, xmm
+                    self.rm(PFX_PD, 0, 3881, o.a, mrb(-slots - 16 * (o.n + 1)), 0)
+                case KO_FILL:
+                    self.rm(PFX_PD, 0, 3880, o.a, mrb(-slots - 16 * (o.n + 1)), 0)
+                case _:
+                    # KO_ARG
+                    self.rm(PFX_SD, 0, 3856, o.a, mrb(o.n), 0)
+        self.epilogue()
+        if self.win:
+            self.unwind_coff()
+        else:
+            self.unwind_elf()
 
     # ------------------------------------------------------------ unwind tables
     # Windows: the function's UNWIND_INFO in .xdata and its RUNTIME_FUNCTION in
@@ -2932,6 +3040,7 @@ fn emit(
         xdata_sym=0,
         ovf=[-1, -1, -1],
         fpool={},
+        vpool={},
         code=[],
         vk=[],
         nparams=0,
@@ -3011,6 +3120,8 @@ fn emit(
     x.entry_main = dbg and any(f.name == "main__main" for f in m.funcs)
     for f in emit_order(m.funcs if dbg else inline_small(m.funcs), dbg):
         x.func(f if dbg else opt_func(f, on))
+    for k in m.kernels:
+        x.kernel(k)
     # references inside .text need no relocation
     var keep: [ORel] = []
     for r in x.o.trel:
