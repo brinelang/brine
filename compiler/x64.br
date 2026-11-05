@@ -229,6 +229,32 @@ fn wide_rt_helpers() -> {str: bool}:
     m["brine_neg_i128"] = true
     return m
 
+# Runtime calls compiled inline that fall back to the call itself (and so read
+# their arguments a second time)
+fn slow_call(n: str) -> bool:
+    return n == "brine_bytes_rotl" or n == "brine_bytes_copy" or ra.int_div_rt(n)
+
+const TWO64: i128 = 18446744073709551616
+
+# (m, p) with x / c == (x * m) >> p for every x below 2^nbits, m below 2^64 (as
+# an int: its bits) and p from 64 on, so that the product's high half shifted
+# right by p - 64 is the quotient; p = 0 when there's no such m. With
+# m = ceil(2^p / c) = (2^p + e) / c that holds when x * e < 2^p.
+fn div_magic(c: int, nbits: int) -> (int, int):
+    var l = 0
+    while (1 << l) < c:
+        l += 1
+    let top: i128 = (i128(1) << nbits) - 1
+    let ci = i128(c)
+    for p in 64..65 + l:
+        let tp: i128 = i128(1) << p
+        let m = (tp + ci - 1) / ci
+        if m < TWO64 and (m * ci - tp) * top < tp:
+            if m >= TWO64 / 2:
+                return (int(m - TWO64), p)
+            return (int(m), p)
+    return (0, 0)
+
 # The CIE of .eh_frame, shared by every FDE: on entry the CFA is rsp + 8 and
 # the return address is at CFA - 8; FDEs give their code range pc-relative.
 fn elf_cie(ref out: [u8]):
@@ -1020,6 +1046,9 @@ struct X:
             if x.s == "brine_bytes_copy":
                 self.bytes_copy(x)
                 return
+            if ra.int_div_rt(x.s) and not self.vk[x.d].is_wide():
+                self.int_div(x)
+                return
         var args: [CArg] = []
         let ind = x.op == Op.CallInd
         var name = x.s
@@ -1112,6 +1141,10 @@ struct X:
                 self.once[x.c] = false
             elif x.op == Op.AddO or x.op == Op.SubO or x.op == Op.MulO:
                 self.once[x.c] = false
+            elif x.op == Op.Call and x.b == 1 and slow_call(x.s):
+                # so does the runtime call the inline code falls back to
+                for a in x.args:
+                    self.once[a] = false
         for v in f.nparams..nv:
             if ndef[v] == 1:
                 let x = f.code[dpos[v]]
@@ -1906,6 +1939,9 @@ struct X:
                 self.mul_rax(x.a, x.b)
                 self.norm(RAX, k)
             case Op.Div | Op.Rem:
+                if not k.is_signed() and self.const_div(x.op == Op.Rem, x.a, x.b, k, false):
+                    self.st(RAX, x.d)
+                    return
                 self.ld(RAX, x.a)
                 let ext = 7 if k.is_signed() else 6
                 if k.is_signed():
@@ -2526,6 +2562,123 @@ struct X:
         self.here32(s2)
         self.idiom_call(x)
         self.here32(e)
+
+    # ------------------------------------------------------------ integer division
+    # The runtime's integer division (see int_div_rt) inline: `/` rounds down
+    # and `%` takes the sign of the divisor. A constant divisor becomes a
+    # multiplication; otherwise idiv, then a branchless fix for the rounding.
+    # Only the checked ones call the runtime, to panic.
+    fn int_div(ref self, x: Inst):
+        let k = self.vk[x.d]
+        let rem = x.s.starts_with("brine_fmod_") or x.s.starts_with("brine_mod_")
+        let checked = len(x.args) == 3
+        if self.const_div(rem, x.args[0], x.args[1], k, k.is_signed()):
+            self.st(RAX, x.d)
+            return
+        self.ld(RCX, x.args[1])
+        self.ld(RAX, x.args[0])
+        var slow: [int] = []
+        if checked:
+            self.rr(0, 1, 133, RCX, RCX)
+            slow.push(self.j32(CC_E))
+        if not k.is_signed():
+            self.rr(0, 0, 49, RDX, RDX)
+            self.rr(0, 1, 247, 6, RCX)
+            if rem:
+                self.mov_rr(RAX, RDX)
+        else:
+            # b = -1: idiv faults on the smallest a; the quotient is -a (the
+            # checked version panics on that a), the remainder 0
+            self.alu_ri(CMP, RCX, -1)
+            var m1 = -1
+            if checked and not rem:
+                slow.push(self.j32(CC_E))
+            else:
+                m1 = self.j8(CC_E)
+            # cqo; idiv rcx
+            self.b(72)
+            self.b(153)
+            self.rr(0, 1, 247, 7, RCX)
+            # r10 = -1 when the remainder is nonzero and its sign isn't b's:
+            # then q - 1 and r + b
+            self.mov_rr(R10, RDX)
+            self.alu_rr(XOR, R10, RCX)
+            self.shift_i(SAR, R10, 63)
+            self.rr(0, 1, 133, RDX, RDX)
+            self.cmov(CC_E, R10, RDX)
+            if rem:
+                self.alu_rr(AND, R10, RCX)
+                self.alu_rr(ADD, RDX, R10)
+                self.mov_rr(RAX, RDX)
+            else:
+                self.alu_rr(ADD, RAX, R10)
+            if m1 >= 0:
+                let e = self.jmp8()
+                self.here8(m1)
+                if rem:
+                    self.rr(0, 0, 49, RAX, RAX)
+                else:
+                    # neg rax
+                    self.rr(0, 1, 247, 3, RAX)
+                self.here8(e)
+        if len(slow) == 0:
+            self.st(RAX, x.d)
+            return
+        self.st(RAX, x.d)
+        let e = self.jmp32()
+        for j in slow:
+            self.here32(j)
+        self.idiom_call(x)
+        self.here32(e)
+
+    # rax = a / c or a % c (rem) for a constant c > 1, if it's one, by a
+    # multiplication: floor(n / c) = (n * m) >> p. A signed a below 0 divides
+    # as ~a, which isn't: floor(a / c) = ~floor(~a / c) for c > 0.
+    fn const_div(ref self, rem: bool, a: int, b: int, k: K, signed: bool) -> bool:
+        if self.fold[b] != F_CONST:
+            return false
+        let c = self.fval[b]
+        if c < 2 or c >= 1 << 61:
+            return false
+        let bits = 8 * k.size()
+        let mp = div_magic(c, bits - 1 if signed else bits)
+        if mp.1 == 0:
+            return false
+        self.ld(RAX, a)
+        if c & (c - 1) == 0 and not signed:
+            if rem:
+                if fits32(c - 1):
+                    self.alu_ri(AND, RAX, c - 1)
+                    return true
+                self.mov_ri(RCX, c - 1)
+                self.alu_rr(AND, RAX, RCX)
+            else:
+                self.shift_i(SHR, RAX, c.trailing_zeros())
+            return true
+        if signed:
+            self.mov_rr(R10, RAX)
+            self.shift_i(SAR, R10, 63)
+            self.alu_rr(XOR, RAX, R10)
+        self.mov_ri(RCX, mp.0)
+        # mul rcx: rdx = the high half of rax * rcx
+        self.rr(0, 1, 247, 4, RCX)
+        if mp.1 > 64:
+            self.shift_i(SHR, RDX, mp.1 - 64)
+        if signed:
+            self.alu_rr(XOR, RDX, R10)
+        if not rem:
+            self.mov_rr(RAX, RDX)
+            return true
+        # a - q * c
+        if fits32(c):
+            self.rr(0, 1, 105, RDX, RDX)
+            self.b32(c)
+        else:
+            self.mov_ri(RCX, c)
+            self.rr(0, 1, 4015, RDX, RCX)
+        self.ld(RAX, a)
+        self.alu_rr(SUB, RAX, RDX)
+        return true
 
     # ------------------------------------------------------------ conversions
     fn conv(ref self, x: Inst):
