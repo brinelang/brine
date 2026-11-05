@@ -1336,6 +1336,33 @@ struct X:
                 )
                 self.here32(e)
                 return
+            if x.s == "brine_abs_i128" and x.d >= 0:
+                # negated when negative, as above; the runtime panics for
+                # the one that overflows
+                let ma = self.vm(x.args[0])
+                self.mov_rm(RAX, ma)
+                self.mov_rm(RDX, moff(ma, 8))
+                self.rr(0, 1, 133, RDX, RDX)
+                let pos = self.j8(CC_S ^ 1)
+                self.rr(0, 1, 247, 3, RAX)
+                self.alu_ri(ADC, RDX, 0)
+                self.rr(0, 1, 247, 3, RDX)
+                let j = self.j32(CC_O)
+                self.here8(pos)
+                self.st(RAX, x.d)
+                self.mov_mr(moff(self.vm(x.d), 8), RDX)
+                let e = self.jmp32()
+                self.here32(j)
+                self.call_rt(
+                    "brine_x_abs_i128",
+                    [
+                        CArg(how=A_ADDR, v=x.d, fl=0),
+                        CArg(how=A_ADDR, v=x.args[0], fl=0),
+                        CArg(how=A_VAL, v=x.args[1], fl=0)
+                    ]
+                )
+                self.here32(e)
+                return
             if x.s == "brine_bswap_u64":
                 self.ld(RAX, x.args[0])
                 self.bswap(RAX)
@@ -3244,15 +3271,36 @@ struct X:
                 self.st(RAX, x.d)
                 self.mov_mr(moff(self.vm(x.d), 8), RDX)
             case Op.Shl | Op.Shr:
-                let nm = "shl" if x.op == Op.Shl else "shr"
-                self.call_rt(
-                    f"brine_x_{w128(k)}_{nm}",
-                    [
-                        CArg(how=A_ADDR, v=x.d, fl=0),
-                        CArg(how=A_ADDR, v=x.a, fl=0),
-                        CArg(how=A_VAL, v=x.b, fl=0)
-                    ]
-                )
+                # shld / shrd by cl, then (cl >= 64: the shifts above use
+                # cl mod 64) one half moves to the other
+                let ma = self.vm(x.a)
+                self.ld(RCX, x.b)
+                self.mov_rm(RAX, ma)
+                self.mov_rm(RDX, moff(ma, 8))
+                if x.op == Op.Shl:
+                    # shld rdx, rax, cl; shl rax, cl
+                    self.rr(0, 1, 4005, RAX, RDX)
+                    self.rr(0, 1, 211, SHL, RAX)
+                else:
+                    # shrd rax, rdx, cl; shr / sar rdx, cl
+                    self.rr(0, 1, 4013, RDX, RAX)
+                    self.rr(0, 1, 211, SAR if k.is_signed() else SHR, RDX)
+                # test cl, 64
+                self.rr(0, 0, 246, 0, RCX)
+                self.b(64)
+                let small = self.j8(CC_E)
+                if x.op == Op.Shl:
+                    self.mov_rr(RDX, RAX)
+                    self.rr(0, 0, 49, RAX, RAX)
+                else:
+                    self.mov_rr(RAX, RDX)
+                    if k.is_signed():
+                        self.shift_i(SAR, RDX, 63)
+                    else:
+                        self.rr(0, 0, 49, RDX, RDX)
+                self.here8(small)
+                self.st(RAX, x.d)
+                self.mov_mr(moff(self.vm(x.d), 8), RDX)
             case _:
                 var nm = "mul"
                 if x.op == Op.Div:
@@ -3452,6 +3500,40 @@ struct X:
                 self.mov_mr(moff(self.vm(x.d), 8), RDX)
                 e = self.jmp32()
                 self.here32(j)
+            else:
+                # a and b both fit in 64 bits: one widening multiply, which
+                # can't overflow 128
+                let ma = self.vm(x.a)
+                let mb = self.vm(x.b)
+                var j1 = -1
+                var j2 = -1
+                if k.is_signed():
+                    # cqo: each high half is its low half's sign
+                    self.mov_rm(RAX, mb)
+                    self.b(72)
+                    self.b(153)
+                    self.alu_rm(CMP, RDX, moff(mb, 8))
+                    j1 = self.j32(CC_NE)
+                    self.mov_rm(RAX, ma)
+                    self.b(72)
+                    self.b(153)
+                    self.alu_rm(CMP, RDX, moff(ma, 8))
+                    j2 = self.j32(CC_NE)
+                    # imul qword [b]
+                    self.rm(0, 1, 247, 5, mb, 0)
+                else:
+                    self.mov_rm(RDX, moff(ma, 8))
+                    self.alu_rm(OR, RDX, moff(mb, 8))
+                    j1 = self.j32(CC_NE)
+                    self.mov_rm(RAX, ma)
+                    # mul qword [b]
+                    self.rm(0, 1, 247, 4, mb, 0)
+                self.st(RAX, x.d)
+                self.mov_mr(moff(self.vm(x.d), 8), RDX)
+                e = self.jmp32()
+                self.here32(j1)
+                if j2 >= 0:
+                    self.here32(j2)
             self.call_rt(
                 f"brine_x_{nm}_{w128(k)}",
                 [
