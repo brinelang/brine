@@ -762,6 +762,48 @@ struct X:
     # xorps x, x: cvtsi2sd, cvtss2sd and sqrtsd keep x's upper bits, so without
     # it each one waits for whatever last wrote x (a dependency across loop
     # iterations)
+    # The runtime module's atomics (`atomic_add` etc. in check.br), on the
+    # 8 bytes at args[0]: rax, rcx and rdx hold no vregs. A locked or xchg
+    # instruction is a full barrier, so each is sequentially consistent.
+    fn atomic(ref self, x: Inst):
+        let n = x.s[13:]
+        if x.s == "brine_cpu_relax":
+            # pause
+            self.b(0xF3)
+            self.b(0x90)
+            return
+        self.ld(RCX, x.args[0])
+        if n == "load":
+            # mov rax, [rcx]
+            self.b(0x48)
+            self.b(0x8B)
+            self.b(0x01)
+        elif n == "cas":
+            self.ld(RAX, x.args[1])
+            self.ld(RDX, x.args[2])
+            # lock cmpxchg [rcx], rdx
+            self.b(0xF0)
+            self.b(0x48)
+            self.b(0x0F)
+            self.b(0xB1)
+            self.b(0x11)
+        else:
+            self.ld(RAX, x.args[1])
+            if n == "add":
+                # lock xadd [rcx], rax
+                self.b(0xF0)
+                self.b(0x48)
+                self.b(0x0F)
+                self.b(0xC1)
+                self.b(0x01)
+            else:
+                # xchg [rcx], rax (store and xchg)
+                self.b(0x48)
+                self.b(0x87)
+                self.b(0x01)
+        if x.d >= 0:
+            self.st(RAX, x.d)
+
     fn xzero(ref self, x: int):
         self.rr(0, 0, 3927, x, x)
 
@@ -1406,6 +1448,9 @@ struct X:
                     ]
                 )
                 self.here32(e)
+                return
+            if x.s.starts_with("brine_atomic_") or x.s == "brine_cpu_relax":
+                self.atomic(x)
                 return
             if x.s == "brine_bswap_u64":
                 self.ld(RAX, x.args[0])
