@@ -2980,13 +2980,27 @@ struct X:
                     self.st(RDX, x.d)
                     return
             case _:
-                let r = self.dst(x.d)
+                var r = self.dst(x.d)
                 var ext = SHL
                 if x.op == Op.Shr:
                     ext = SAR if k.is_signed() else SHR
                 if self.fold[x.b] == F_CONST:
+                    # (just the next shift's count: straight into rcx)
+                    let n = self.cur + 1
+                    if (
+                        r == RAX
+                        and self.nuse[x.d] == 1
+                        and n < len(self.code)
+                        and (self.code[n].op == Op.Shl or self.code[n].op == Op.Shr)
+                        and self.code[n].b == x.d
+                        and self.code[n].a != x.d
+                    ):
+                        r = RCX
                     self.ld(r, x.a)
                     self.shift_i(ext, r, self.fval[x.b] & 63)
+                    if r == RCX:
+                        self.st(RCX, x.d)
+                        return
                 else:
                     # the count first: b may live in d's register
                     self.ld(RCX, x.b)
@@ -3221,10 +3235,18 @@ struct X:
     # The branch code[i] on flags cc; when a jump follows it and its own
     # target comes right after, the condition is flipped and goes to the
     # jump's target instead. Returns the next instruction's index.
+    # Likewise when the jump goes back (a loop's next iteration) and the branch
+    # forward (out of it): the branch goes back, and the jump out.
     fn cond_jump(ref self, i: int, cc: int, want: bool, l: int) -> int:
-        if i + 1 < len(self.code) and self.code[i + 1].op == Op.Jmp and self.falls_to(i + 2, l):
-            self.branch_cc(cc, not want, self.code[i + 1].n)
-            return i + 2
+        if i + 1 < len(self.code) and self.code[i + 1].op == Op.Jmp and not self.dead[i + 1]:
+            let j = self.code[i + 1].n
+            if self.falls_to(i + 2, l):
+                self.branch_cc(cc, not want, j)
+                return i + 2
+            if self.lpos[j] >= 0 and self.lpos[l] < 0 and not self.falls_to(i + 2, j):
+                self.branch_cc(cc, not want, j)
+                self.jmp_label(l)
+                return i + 2
         self.branch_cc(cc, want, l)
         return i + 1
 
@@ -3262,6 +3284,28 @@ struct X:
             )
             return
         let signed = k.is_signed()
+        # in d's register, when that isn't b's or the panic's location's
+        var r = self.dst(x.d)
+        if (
+            (self.fold[x.b] == F_NONE and self.reg[x.b] == r)
+            or (self.fold[x.c] == F_NONE and self.reg[x.c] == r)
+            or x.b == x.d
+        ):
+            r = RAX
+        if k.size() == 8 and signed and (kind != S_MUL or self.imm(x.b)):
+            if kind == S_MUL:
+                if self.inmem(x.a):
+                    self.rm(0, 1, 105, r, self.vm(x.a), 4)
+                else:
+                    let s = self.use(r, x.a)
+                    self.rr(0, 1, 105, r, s)
+                self.b32(self.fval[x.b])
+            else:
+                self.ld(r, x.a)
+                self.alu_v(ADD if kind == S_ADD else SUB, r, x.b)
+            self.jcc_stub(CC_O, kind, x.a, x.b, x.c)
+            self.st(r, x.d)
+            return
         if k.size() == 8:
             if kind == S_MUL and not signed:
                 self.ld(RAX, x.a)
