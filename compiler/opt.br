@@ -3,9 +3,11 @@
 #
 # The lowering keeps every local variable in a stack slot and reads and writes
 # it through its address. `promote` moves the slots that are only read and
-# written whole (their address goes nowhere else) into vregs, so the register
-# allocator can keep them in registers, and then removes the copies that this
-# leaves behind.
+# written (their address goes nowhere else) into vregs, one per field, so the
+# register allocator can keep them in registers, and then removes the copies
+# that this leaves behind. A slot whose address is also passed to calls (the
+# appender of `s += t[i]`, to the runtime's slow paths) is in memory only
+# during those calls.
 
 from ir import K, Op, Inst, Func
 
@@ -28,6 +30,15 @@ fn slot_vregs(f: Func) -> [int]:
     for v in 0..nv:
         if ndef[v] != 1 or v < f.nparams:
             slot[v] = -1
+    # a copy of an address, made once (an inlined function's parameter)
+    var more = true
+    while more:
+        more = false
+        for x in f.code:
+            if x.op == Op.Mov and slot[x.d] < 0 and slot[x.a] >= 0:
+                if ndef[x.d] == 1 and x.d >= f.nparams:
+                    slot[x.d] = slot[x.a]
+                    more = true
     return slot
 
 fn same_slot(x: Inst, slot: [int]) -> bool:
@@ -56,41 +67,70 @@ fn reads(x: Inst, nv: int) -> [int]:
         r.extend(x.args)
     return r
 
-# Which slots can live in a vreg, and the kind they hold (K.I64 when not).
-fn promotable(f: Func, slot: [int]) -> ([bool], [K]):
+# The fields of the slots that can live in vregs: their offsets and kinds
+# (none: it can't), and whether calls are passed the slot's address.
+struct Fields:
+    off: [[int]]
+    kind: [[K]]
+    calls: [bool]
+
+fn field_of(fs: Fields, s: int, n: int) -> int:
+    for i, o in enumerate(fs.off[s]):
+        if o == n:
+            return i
+    return -1
+
+fn promotable(f: Func, slot: [int]) -> Fields:
     let ns = len(f.slots)
     let nv = len(f.vk)
     var ok = [true] * ns
-    var seen = [false] * ns
-    var kind = [K.I64] * ns
+    var fs = Fields(off=[[] for _ in 0..ns], kind=[[] for _ in 0..ns], calls=[false] * ns)
     for x in f.code:
-        if x.op == Op.SlotAddr or same_slot(x, slot):
+        if x.op == Op.SlotAddr:
+            # (an address in a vreg set more than once: not followed)
+            if slot[x.d] < 0:
+                ok[x.a] = false
             continue
-        # a slot address used as anything but the address of a whole load or store
+        if x.op == Op.Mov and slot[x.d] >= 0 and slot[x.a] == slot[x.d]:
+            continue
+        # a slot address used as anything but the address of a load or store
+        # or a call's argument
         var addr = -1
         var k = K.I64
-        if x.op == Op.Load and x.n == 0 and slot[x.a] >= 0:
+        if x.op == Op.Load and slot[x.a] >= 0:
             addr = x.a
             k = f.vk[x.d]
-        elif x.op == Op.Store and x.n == 0 and slot[x.a] >= 0 and slot[x.b] < 0:
+        elif x.op == Op.Store and slot[x.a] >= 0 and slot[x.b] < 0:
             addr = x.a
             k = f.vk[x.b]
+        elif x.op == Op.Call:
+            for v in x.args:
+                if slot[v] >= 0:
+                    fs.calls[slot[v]] = true
+            continue
         for v in reads(x, nv):
             if v != addr and slot[v] >= 0:
                 ok[slot[v]] = false
         if addr >= 0:
             let s = slot[addr]
-            if k.is_wide():
+            let i = field_of(fs, s, x.n)
+            if k.is_wide() or x.n < 0:
                 ok[s] = false
-            elif not seen[s]:
-                seen[s] = true
-                kind[s] = k
-            elif kind[s] != k:
+            elif i < 0:
+                fs.off[s].push(x.n)
+                fs.kind[s].push(k)
+            elif fs.kind[s][i] != k:
                 ok[s] = false
     for s in 0..ns:
-        if not seen[s]:
-            ok[s] = false
-    return (ok, kind)
+        # fields that overlap: no
+        for i, a in enumerate(fs.off[s]):
+            for j, b in enumerate(fs.off[s]):
+                if i != j and a <= b and b < a + fs.kind[s][i].size():
+                    ok[s] = false
+        if not ok[s] or len(fs.off[s]) == 0:
+            fs.off[s] = []
+            fs.kind[s] = []
+    return fs
 
 fn arith(op: Op) -> bool:
     match op:
@@ -106,25 +146,47 @@ fn mov(d: int, a: int) -> Inst:
 
 fn promote(f: Func) -> Func:
     let slot = slot_vregs(f)
-    let (ok, kind) = promotable(f, slot)
+    let fs = promotable(f, slot)
     var g = f
+    # the vreg of each field: home[s] + field
     var home = [-1] * len(f.slots)
     for s in 0..len(f.slots):
-        if ok[s]:
-            g.vk.push(kind[s])
-            home[s] = len(g.vk) - 1
+        home[s] = len(g.vk)
+        g.vk.extend(fs.kind[s])
     var code: [Inst] = []
     for x in f.code:
-        if x.op == Op.SlotAddr and slot[x.d] >= 0 and ok[x.a]:
+        # the address, when nothing needs it any more
+        if x.op == Op.SlotAddr or x.op == Op.Mov:
+            let t = slot[x.d] if x.d >= 0 else -1
+            if t >= 0 and (x.op == Op.SlotAddr or slot[x.a] == t):
+                if len(fs.off[t]) > 0 and not fs.calls[t]:
+                    continue
+        let s = slot[x.a] if (x.op == Op.Load or x.op == Op.Store) else -1
+        if s >= 0 and len(fs.off[s]) > 0:
+            let v = home[s] + field_of(fs, s, x.n)
+            if x.op == Op.Load:
+                code.push(mov(x.d, v))
+            else:
+                code.push(mov(v, x.b))
             continue
-        if same_slot(x, slot) and ok[slot[x.d]]:
-            continue
-        if x.op == Op.Load and x.n == 0 and slot[x.a] >= 0 and ok[slot[x.a]]:
-            code.push(mov(x.d, home[slot[x.a]]))
-        elif x.op == Op.Store and x.n == 0 and slot[x.a] >= 0 and ok[slot[x.a]]:
-            code.push(mov(home[slot[x.a]], x.b))
-        else:
+        if x.op != Op.Call:
             code.push(x)
+            continue
+        # the slots it is passed, in memory for the call
+        var ss: [int] = []
+        var at: [int] = []
+        for a in x.args:
+            let t = slot[a]
+            if t >= 0 and len(fs.off[t]) > 0 and t not in ss:
+                ss.push(t)
+                at.push(a)
+        for i, t in enumerate(ss):
+            for j, n in enumerate(fs.off[t]):
+                code.push(Inst(op=Op.Store, d=-1, a=at[i], b=home[t] + j, c=-1, n=n, s="", args=[]))
+        code.push(x)
+        for i, t in enumerate(ss):
+            for j, n in enumerate(fs.off[t]):
+                code.push(Inst(op=Op.Load, d=home[t] + j, a=at[i], b=-1, c=-1, n=n, s="", args=[]))
     g.code = code
     return forward(g)
 
@@ -379,47 +441,107 @@ fn switches(f: Func) -> Func:
 # code, not debug builds): the calls of float code made of little helpers
 # (`fmin`, a dot product) cost more than the helpers do. Tiny ones that do
 # call are too (a release function that frees through `brine_drop`): one
-# call instead of two.
+# call instead of two. `hot` ones (the runtime's fast paths, a map's hash and
+# key comparison) up to a larger size, calls and all; an indirect call of a
+# function the caller names becomes a direct one, inlined in the next round.
 const INLINE_MAX = 40
 const INLINE_CALLS = 12
+const INLINE_HOT = 160
+const INLINE_ROUNDS = 3
 
 fn inlinable(f: Func) -> bool:
-    if len(f.code) > INLINE_MAX or f.public:
+    if f.public:
+        return false
+    if len(f.code) > (INLINE_HOT if f.hot else INLINE_MAX):
         return false
     var calls = false
     for x in f.code:
-        if x.op == Op.CallInd or x.op == Op.Switch:
+        if x.op == Op.Switch:
             return false
+        if x.op == Op.CallInd:
+            if not f.hot:
+                return false
+            calls = true
         if x.op == Op.Call:
             if x.b == 0 and x.s == f.name:
                 return false
             calls = true
-    return not calls or len(f.code) <= INLINE_CALLS
+    return f.hot or not calls or len(f.code) <= INLINE_CALLS
 
 fn inline_small(fs: [Func]) -> [Func]:
-    var small: {str: int} = {}
-    for i, f in enumerate(fs):
+    var cur = fs
+    for _ in 0..INLINE_ROUNDS:
+        let (next, changed) = inline_round(cur)
+        cur = next
+        if not changed:
+            break
+    return cur
+
+fn inline_round(fs: [Func]) -> ([Func], bool):
+    var small: {str: Func} = {}
+    var names: {str: bool} = {}
+    for f in fs:
+        names[f.name] = true
         if inlinable(f):
-            small[f.name] = i
-    if len(small) == 0:
-        return fs
+            # its parameters in vregs rather than slots
+            small[f.name] = promote(f)
+    var changed = false
     var out: [Func] = []
     for f in fs:
-        if not any(x.op == Op.Call and x.b == 0 and x.s in small for x in f.code):
-            out.push(f)
+        let (g0, direct) = direct_calls(f, names)
+        if direct:
+            changed = true
+        if not any(x.op == Op.Call and x.b == 0 and x.s in small for x in g0.code):
+            out.push(g0)
             continue
-        var g = f
+        var g = g0
         var code: [Inst] = []
-        for x in f.code:
+        for x in g0.code:
             if x.op == Op.Call and x.b == 0 and x.s in small:
-                let c = fs[small[x.s]]
+                let c = small[x.s]
                 if len(x.args) == c.nparams and c.name != f.name:
                     inline_call(ref g, ref code, x, c)
+                    changed = true
                     continue
             code.push(x)
         g.code = code
         out.push(g)
-    return out
+    return (out, changed)
+
+# An indirect call whose target is, through copies, the address of a function
+# of the module: a call of that function.
+fn direct_calls(f: Func, names: {str: bool}) -> (Func, bool):
+    var def = [-1] * len(f.vk)
+    var ndef = [0] * len(f.vk)
+    for i, x in enumerate(f.code):
+        if x.d >= 0:
+            def[x.d] = i
+            ndef[x.d] += 1
+    var g = f
+    var done = false
+    for i, x in enumerate(f.code):
+        if x.op != Op.CallInd:
+            continue
+        var v = x.a
+        var sym = ""
+        var hops = 0
+        while v >= 0 and ndef[v] == 1 and hops < 16:
+            let y = f.code[def[v]]
+            if y.op == Op.Mov:
+                v = y.a
+                hops += 1
+            elif y.op == Op.Global:
+                sym = y.s
+                break
+            else:
+                break
+        if sym != "" and sym in names:
+            g.code[i].op = Op.Call
+            g.code[i].a = -1
+            g.code[i].b = 0
+            g.code[i].s = sym
+            done = true
+    return (g, done)
 
 # Appends a copy of `c`'s body for `call` to `code`, with c's vregs, labels
 # and slots after g's.
@@ -450,6 +572,9 @@ fn inline_call(ref g: Func, ref code: [Inst], call: Inst, c: Func):
                 y.a += vb
                 y.n += lb
             case Op.Call:
+                y.args = [a + vb for a in y.args]
+            case Op.CallInd:
+                y.a += vb
                 y.args = [a + vb for a in y.args]
             case Op.Ret:
                 if y.a >= 0 and call.d >= 0:

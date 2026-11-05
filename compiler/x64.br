@@ -323,9 +323,11 @@ struct X:
     # prologue saves them
     fsaved: [int]
     fsave_at: [int]
-    # System V (no callee-saved xmm): per instruction, the float vregs in
-    # registers live across the call it makes, saved around it
+    # per instruction, the vregs live across the call it makes in registers
+    # that call changes, saved around it (ra.br)
     keep: [[int]]
+    # the functions whose calls are slow paths (Module.cold)
+    cold: {str: bool}
     fold: [int]
     fval: [int]
     nuse: [int]
@@ -962,11 +964,16 @@ struct X:
 
     # The memory at pointer vreg p plus n; may load p into r.
     fn addr(ref self, p: int, n: int, r: int) -> Mem:
+        return self.addr2(p, n, r, R11)
+
+    # Same, with ri for the index (Load and Store use rdx and rcx, leaving
+    # r10 and r11 to vregs: see ra.br)
+    fn addr2(ref self, p: int, n: int, r: int, ri: int) -> Mem:
         let f = self.fold[p]
         if f == F_ELEM:
             let e = self.code[self.fval[p]]
             let base = self.use(r, e.a)
-            let ix = self.use(R11, e.b)
+            let ix = self.use(ri, e.b)
             return Mem(base=base, index=ix, scale=e.n, disp=n, sym=-1)
         if f == F_SLOT:
             return self.smem(self.fval[p], n)
@@ -1034,6 +1041,16 @@ struct X:
 
     # calls symbol `sym` (or, with sym < 0, the pointer in vreg fp)
     fn do_call(ref self, sym: int, fp: int, args: [CArg]):
+        # what the call changes and is live across it goes to its home and
+        # back (before the arguments: they may go to those registers)
+        var keep: [int] = []
+        if self.cur >= 0 and self.cur < len(self.keep):
+            keep = self.keep[self.cur]
+        for v in keep:
+            if self.freg[v] >= 0:
+                self.fstore(fl_of(self.vk[v]), self.vm(v), self.freg[v])
+            else:
+                self.mov_mr(self.vm(v), self.reg[v])
         var fls: [int] = []
         for a in args:
             fls.push(a.fl)
@@ -1042,23 +1059,45 @@ struct X:
             if locs[i] >= L_STACK:
                 self.arg_int(RAX, a)
                 self.mov_mr(mreg(RSP, self.stack_off(locs[i] - L_STACK)), RAX)
+        var todo: [int] = []
+        var src: [int] = []
+        var regs: [CArg] = args
         for i, a in enumerate(args):
             let l = locs[i]
+            src.push(-1)
             if l >= L_STACK:
                 pass
             elif l >= L_XMM:
                 self.fld(a.fl, l - L_XMM, a.v)
             else:
-                self.arg_int(self.int_reg(l), a)
+                todo.push(i)
+                if a.how == A_REG:
+                    src[i] = a.v
+                elif a.how == A_VAL and self.fold[a.v] == F_NONE and self.reg[a.v] >= 0:
+                    src[i] = self.reg[a.v]
+        # an argument register is set once no argument left to set is in it
+        # (a slow path's arguments can be in any register: ra.br), in order
+        # when none is; a cycle goes through rax
+        while len(todo) > 0:
+            var at = -1
+            for t, i in enumerate(todo):
+                let r = self.int_reg(locs[i])
+                if not any(j != i and src[j] == r for j in todo):
+                    at = t
+                    break
+            if at < 0:
+                let r = self.int_reg(locs[todo[0]])
+                self.mov_rr(RAX, r)
+                for j in todo:
+                    if src[j] == r:
+                        regs[j] = CArg(how=A_REG, v=RAX, fl=0)
+                        src[j] = RAX
+                continue
+            let i = todo[at]
+            self.arg_int(self.int_reg(locs[i]), regs[i])
+            todo.pop(at)
         if sym < 0:
             self.ld(R11, fp)
-        # System V: calls change every xmm register, so floats live across
-        # this one go to their homes and back
-        var keep: [int] = []
-        if self.cur >= 0 and self.cur < len(self.keep):
-            keep = self.keep[self.cur]
-            for v in keep:
-                self.fstore(fl_of(self.vk[v]), self.vm(v), self.freg[v])
         if sym >= 0:
             self.b(232)
             self.reloc(R_CALL, sym, -4)
@@ -1066,7 +1105,10 @@ struct X:
         else:
             self.rr(0, 0, 255, 2, R11)
         for v in keep:
-            self.fload(fl_of(self.vk[v]), self.freg[v], self.vm(v))
+            if self.freg[v] >= 0:
+                self.fload(fl_of(self.vk[v]), self.freg[v], self.vm(v))
+            else:
+                self.mov_rm(self.reg[v], self.vm(v))
 
     fn call_rt(ref self, name: str, args: [CArg]):
         let s = self.sym_ref(name)
@@ -1189,6 +1231,11 @@ struct X:
                 return
             if x.s == "brine_bytes_copy":
                 self.bytes_copy(x)
+                return
+            if x.s == "brine_bswap_u64":
+                self.ld(RAX, x.args[0])
+                self.bswap(RAX)
+                self.st(RAX, x.d)
                 return
             if ra.int_div_rt(x.s) and not self.vk[x.d].is_wide():
                 self.int_div(x)
@@ -1324,7 +1371,7 @@ struct X:
         if op == 33:
             # not rax
             self.rr(0, 1, 247, 2, RAX)
-        self.rm(0, 1, op, RAX, self.addr(x.a, x.n, R10), 0)
+        self.rm(0, 1, op, RAX, self.addr2(x.a, x.n, RDX, RCX), 0)
         return j + 2 - i
 
     # branch on (w >> b) & 1 (compared with 0) on 64 bits: bt w, b, then jc
@@ -1557,11 +1604,16 @@ struct X:
             elif self.win:
                 self.home[i] = 16 + 8 * (i + h)
                 has_home[i] = true
+        # (a register saved around a call goes to its vreg's home)
+        var kept = [false] * nv
+        for ks in self.keep:
+            for v in ks:
+                kept[v] = true
         for v in 0..nv:
             if (
                 has_home[v]
                 or self.fold[v] != F_NONE
-                or self.reg[v] >= 0
+                or (self.reg[v] >= 0 and not kept[v])
                 or (ndef[v] == 0 and self.nuse[v] == 0)
             ):
                 continue
@@ -1688,8 +1740,18 @@ struct X:
             self.cpos = -1
             if s.kind == S_IDX:
                 self.ld(RAX, s.a)
-                self.ld(R10, s.b)
-                self.ld(R11, s.c)
+                # (b or c may be in r10 or r11 themselves)
+                let bi = self.fold[s.b] == F_NONE and self.reg[s.b] == R11
+                let cj = self.fold[s.c] == F_NONE and self.reg[s.c] == R10
+                if bi and cj:
+                    # xchg r10, r11
+                    self.rr(0, 1, 135, R10, R11)
+                elif cj:
+                    self.ld(R11, s.c)
+                    self.ld(R10, s.b)
+                else:
+                    self.ld(R10, s.b)
+                    self.ld(R11, s.c)
                 self.call_rt(
                     "brine_panic_idx",
                     [
@@ -2585,7 +2647,11 @@ struct X:
                 let e = f.code[self.fval[v]]
                 ea[v] = e.a
                 eb[v] = e.b
-        let r = ra.allocate(f, ok, ea, eb, self.win)
+        let r = ra.allocate(f, ok, ea, eb, self.win, self.cold)
+        # (stubs and the templates rely on these not holding vregs)
+        for v in 0..nv:
+            if r.reg[v] == RAX or r.reg[v] == RCX or r.reg[v] == RDX:
+                panic("x64: a vreg in a scratch register")
         self.reg = r.reg
         self.freg = r.freg
         self.saved = r.saved
@@ -2716,7 +2782,7 @@ struct X:
                 self.st(RAX, x.d)
             case Op.Load:
                 let k = self.vk[x.d]
-                let m = self.addr(x.a, x.n, R10)
+                let m = self.addr2(x.a, x.n, RDX, RCX)
                 if k.is_wide():
                     self.copy16(self.vm(x.d), m)
                 elif self.freg[x.d] >= 0:
@@ -2728,7 +2794,7 @@ struct X:
                         self.st(RAX, x.d)
             case Op.Store:
                 let k = self.vk[x.b]
-                let m = self.addr(x.a, x.n, R10)
+                let m = self.addr2(x.a, x.n, RDX, RCX)
                 if k.is_wide():
                     self.copy16(m, self.vm(x.b))
                 elif self.freg[x.b] >= 0:
@@ -2914,13 +2980,27 @@ struct X:
                     self.st(RDX, x.d)
                     return
             case _:
-                let r = self.dst(x.d)
+                var r = self.dst(x.d)
                 var ext = SHL
                 if x.op == Op.Shr:
                     ext = SAR if k.is_signed() else SHR
                 if self.fold[x.b] == F_CONST:
+                    # (just the next shift's count: straight into rcx)
+                    let n = self.cur + 1
+                    if (
+                        r == RAX
+                        and self.nuse[x.d] == 1
+                        and n < len(self.code)
+                        and (self.code[n].op == Op.Shl or self.code[n].op == Op.Shr)
+                        and self.code[n].b == x.d
+                        and self.code[n].a != x.d
+                    ):
+                        r = RCX
                     self.ld(r, x.a)
                     self.shift_i(ext, r, self.fval[x.b] & 63)
+                    if r == RCX:
+                        self.st(RCX, x.d)
+                        return
                 else:
                     # the count first: b may live in d's register
                     self.ld(RCX, x.b)
@@ -3155,10 +3235,18 @@ struct X:
     # The branch code[i] on flags cc; when a jump follows it and its own
     # target comes right after, the condition is flipped and goes to the
     # jump's target instead. Returns the next instruction's index.
+    # Likewise when the jump goes back (a loop's next iteration) and the branch
+    # forward (out of it): the branch goes back, and the jump out.
     fn cond_jump(ref self, i: int, cc: int, want: bool, l: int) -> int:
-        if i + 1 < len(self.code) and self.code[i + 1].op == Op.Jmp and self.falls_to(i + 2, l):
-            self.branch_cc(cc, not want, self.code[i + 1].n)
-            return i + 2
+        if i + 1 < len(self.code) and self.code[i + 1].op == Op.Jmp and not self.dead[i + 1]:
+            let j = self.code[i + 1].n
+            if self.falls_to(i + 2, l):
+                self.branch_cc(cc, not want, j)
+                return i + 2
+            if self.lpos[j] >= 0 and self.lpos[l] < 0 and not self.falls_to(i + 2, j):
+                self.branch_cc(cc, not want, j)
+                self.jmp_label(l)
+                return i + 2
         self.branch_cc(cc, want, l)
         return i + 1
 
@@ -3196,6 +3284,28 @@ struct X:
             )
             return
         let signed = k.is_signed()
+        # in d's register, when that isn't b's or the panic's location's
+        var r = self.dst(x.d)
+        if (
+            (self.fold[x.b] == F_NONE and self.reg[x.b] == r)
+            or (self.fold[x.c] == F_NONE and self.reg[x.c] == r)
+            or x.b == x.d
+        ):
+            r = RAX
+        if k.size() == 8 and signed and (kind != S_MUL or self.imm(x.b)):
+            if kind == S_MUL:
+                if self.inmem(x.a):
+                    self.rm(0, 1, 105, r, self.vm(x.a), 4)
+                else:
+                    let s = self.use(r, x.a)
+                    self.rr(0, 1, 105, r, s)
+                self.b32(self.fval[x.b])
+            else:
+                self.ld(r, x.a)
+                self.alu_v(ADD if kind == S_ADD else SUB, r, x.b)
+            self.jcc_stub(CC_O, kind, x.a, x.b, x.c)
+            self.st(r, x.d)
+            return
         if k.size() == 8:
             if kind == S_MUL and not signed:
                 self.ld(RAX, x.a)
@@ -3941,6 +4051,7 @@ fn emit(
         fsaved=[],
         fsave_at=[],
         keep=[],
+        cold={},
         fold=[],
         fval=[],
         nuse=[],
@@ -3973,6 +4084,8 @@ fn emit(
         entry_main=false,
         entry=(-1, -1)
     )
+    for n in m.cold:
+        x.cold[n] = true
     x.text_sym = x.sym_def("__brx_text", SEC_TEXT, 0, false, false)
     if windows:
         x.xdata_sym = x.sym_def("__brx_xdata", SEC_UNWIND, 0, false, false)

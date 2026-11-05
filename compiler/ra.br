@@ -1,14 +1,18 @@
 # Register allocation for the x86-64 backend: which vregs live in registers.
 #
 # Liveness over the flat code's control flow gives an interference graph.
-# Vregs are colored in order of priority (their uses, weighted by loop depth),
-# each preferring the register of a vreg it is copied to or from, so that most
-# copies (the ones out of SSA especially) go away. A vreg live across a call
+# Vregs copied to one another that don't interfere are merged first (the
+# copies out of SSA especially: a loop's variable is several vregs), most
+# frequent copies first. Then they are colored in order of priority (their
+# uses, weighted by loop depth), each preferring the register of a vreg it is
+# copied to or from. A vreg live across a call
 # gets a callee-saved register (on System V, xmm8-15 for floats, which do_call
 # saves around the calls in `keep`); one that isn't, and isn't a call's
 # argument or a parameter, can also take a caller-saved one that no
 # instruction template uses (r8 r9, and rsi rdi on System V; xmm2-5, xmm2-7
-# on System V). The templates in x64.br write a result's register only after
+# on System V). Calls of `cold` functions (slow paths) are the exception:
+# what is live across one may be in any register, and the call saves the
+# ones it changes (`keep`). The templates in x64.br write a result's register only after
 # reading the operands, except `d = a op b` for integer add, sub, and, or, xor
 # and float add, sub, mul, div, which write d before reading b: there d and b
 # interfere even when b dies.
@@ -23,8 +27,9 @@ struct RA:
     # callee-saved registers used: general ones, and xmm ones on Windows
     saved: [int]
     fsaved: [int]
-    # System V: per instruction, the float vregs in xmm registers live across
-    # the call it makes
+    # per instruction, the vregs live across the call it makes in registers
+    # that call changes: on System V floats in xmm registers, and for a call
+    # of a `cold` function anything in a caller-saved register
     keep: [[int]]
 
 fn is_term(op: Op) -> bool:
@@ -74,6 +79,7 @@ fn inline_call(x: Inst) -> bool:
         or n == "brine_box_dec"
         or (n == "brine_bytes_rev" and x.d >= 0)
         or (n == "brine_bytes_rev0" and x.d >= 0)
+        or (n == "brine_bswap_u64" and x.d >= 0)
         or (int_div_rt(n) and len(x.args) == 2 and x.d >= 0)
     )
 
@@ -91,6 +97,31 @@ fn callish(x: Inst, vk: [K]) -> bool:
         if vk[v].is_wide():
             return true
     return false
+
+# Does x64.br's code for x leave r10 and r11 alone? Then they can hold vregs
+# live across it, and its operands and result.
+fn keeps_r10(x: Inst, vk: [K]) -> bool:
+    if x.d >= 0 and vk[x.d].is_wide():
+        return false
+    match x.op:
+        case Op.Const | Op.Mov | Op.SlotAddr | Op.Global | Op.Elem:
+            return x.d < 0 or not vk[x.d].is_float() or x.op == Op.Mov
+        case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
+            return not vk[x.d].is_float()
+        case Op.Neg | Op.Not | Op.AddO | Op.SubO | Op.MulO | Op.IdxChk:
+            return not vk[x.d].is_float()
+        case Op.Eq | Op.Ne | Op.Lt | Op.Le | Op.Gt | Op.Ge:
+            return not vk[x.a].is_float() and not vk[x.a].is_wide()
+        case Op.Conv:
+            return not vk[x.d].is_float() and not vk[x.a].is_float() and not vk[x.a].is_wide()
+        case Op.Load:
+            return not vk[x.d].is_wide()
+        case Op.Store:
+            return not vk[x.b].is_wide()
+        case Op.Label | Op.Jmp | Op.Br | Op.BrNot | Op.Line:
+            return true
+        case _:
+            return false
 
 # Is this `d = a op b` with d written before b is read?
 fn two_address(x: Inst, vk: [K]) -> bool:
@@ -113,6 +144,15 @@ fn same_reg_ok(x: Inst, vk: [K]) -> bool:
             return not vk[x.d].is_float()
         case _:
             return false
+
+fn find(rep: [int], j: int) -> int:
+    var r = j
+    while rep[r] != r:
+        r = rep[r]
+    return r
+
+fn interferes(mat: [int], wn: int, j: int, k: int) -> bool:
+    return mat[j * wn + (k >> 6)] & (1 << (k & 63)) != 0
 
 fn add_edge(ref mat: [int], ref adj: [[int]], wn: int, j: int, k: int):
     if j == k:
@@ -139,7 +179,7 @@ fn reads_x(x: Inst, nv: int, ea: [int], eb: [int]) -> [int]:
     return out
 
 # ok[v]: may v live in a register? (Not folded into its uses, not 128 bits.)
-fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
+fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool, cold: {str: bool}) -> RA:
     let nv = len(f.vk)
     let ncode = len(f.code)
     var out = RA(reg=[-1] * nv, freg=[-1] * nv, saved=[], fsaved=[], keep=[])
@@ -229,11 +269,13 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
                 depth[i + 1] -= 1
                 loops = true
     var w = [0] * nc
+    var iw = [0] * ncode
     var dd = 0
     for i in 0..ncode:
         let x = f.code[i]
         dd += depth[i]
         let u = 1 << (3 * min(dd, 3))
+        iw[i] = u
         if x.d >= 0 and ci[x.d] >= 0:
             w[ci[x.d]] += u
         for v in reads_x(x, nv, ea, eb):
@@ -243,10 +285,16 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
     var mat = [0] * (nc * wn)
     var adj: [[int]] = [[] for _ in 0..nc]
     var moves: [[int]] = [[] for _ in 0..nc]
+    # the copies: (-weight, d, a)
+    var copies: [(int, int, int)] = []
     var cross = [false] * nc
     var noarg = [false] * nc
+    # live across, or read or written by, an instruction that changes r10 or r11
+    var nor10 = [false] * nc
     var fcalls: [int] = []
     var flive: [[int]] = []
+    var ccalls: [int] = []
+    var clive: [[int]] = []
     var live = [0] * wn
     for b in 0..nb:
         for k in 0..wn:
@@ -264,6 +312,7 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
                     if ca >= 0 and ca != cd and isf[ca] == isf[cd]:
                         moves[cd].push(ca)
                         moves[ca].push(cd)
+                        copies.push((-iw[i], cd, ca))
                 elif same_reg_ok(x, f.vk) and ci[x.a] >= 0:
                     # d = a op b computes in d's register from a: better
                     # the same one, when a dies here
@@ -282,6 +331,21 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
                 if two_address(x, f.vk) and ci[x.b] >= 0 and isf[ci[x.b]] == isf[cd]:
                     add_edge(ref mat, ref adj, wn, cd, ci[x.b])
             let rs = reads_x(x, nv, ea, eb)
+            # a slow path's integer arguments can be in any register (x64.br
+            # sets them in an order that reads each before it is changed)
+            let slow = x.op == Op.Call and x.s in cold
+            if not keeps_r10(x, f.vk):
+                for k in 0..wn:
+                    var wd = live[k]
+                    while wd != 0:
+                        let t = wd.trailing_zeros()
+                        wd ^= 1 << t
+                        nor10[k * 64 + t] = true
+                if cd >= 0:
+                    nor10[cd] = true
+                for u in rs:
+                    if ci[u] >= 0 and (not slow or isf[ci[u]]):
+                        nor10[ci[u]] = true
             if callish(x, f.vk):
                 var fl: [int] = []
                 for k in 0..wn:
@@ -290,14 +354,20 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
                         let t = wd.trailing_zeros()
                         wd ^= 1 << t
                         let j = k * 64 + t
-                        cross[j] = true
-                        if isf[j]:
+                        if slow:
                             fl.push(j)
-                if not win and len(fl) > 0:
+                        else:
+                            cross[j] = true
+                            if isf[j]:
+                                fl.push(j)
+                if slow:
+                    ccalls.push(i)
+                    clive.push(fl)
+                elif not win and len(fl) > 0:
                     fcalls.push(i)
                     flive.push(fl)
                 for u in rs:
-                    if ci[u] >= 0:
+                    if ci[u] >= 0 and (not slow or isf[ci[u]]):
                         noarg[ci[u]] = true
             for u in rs:
                 let j = ci[u]
@@ -311,6 +381,7 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
                 if cp < 0:
                     continue
                 noarg[cp] = true
+                nor10[cp] = true
                 live[cp >> 6] |= 1 << (cp & 63)
             for p in 0..f.nparams:
                 let cp = ci[p]
@@ -334,29 +405,58 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
             fcaller.push(16 + x)
         else:
             fcallee.push(16 + x)
+    # merging copies
+    var rep = [j for j in 0..nc]
+    copies.sort()
+    for (_, c, d) in copies:
+        let a = find(rep, c)
+        let b = find(rep, d)
+        if a == b or interferes(mat, wn, a, b):
+            continue
+        rep[b] = a
+        w[a] += w[b]
+        w[b] = 0
+        cross[a] = cross[a] or cross[b]
+        noarg[a] = noarg[a] or noarg[b]
+        nor10[a] = nor10[a] or nor10[b]
+        let nb_ = adj[b]
+        for n in nb_:
+            add_edge(ref mat, ref adj, wn, a, find(rep, n))
+        moves[a].extend(moves[b])
     # without loops, a callee-saved register only pays off for a vreg used a lot
     let least = 3 if loops else 6
     var order: [(int, int)] = []
     for j in 0..nc:
-        if w[j] > 0:
+        if w[j] > 0 and rep[j] == j:
             order.push((-w[j], j))
     order.sort()
     var color = [-1] * nc
     var used = [false] * 32
     for (_, j) in order:
         var forbid = 0
-        for k in adj[j]:
+        for k0 in adj[j]:
+            let k = find(rep, k0)
             if color[k] >= 0:
                 forbid |= 1 << color[k]
         let free = not cross[j] and not noarg[j]
         let cs = fcaller if isf[j] else caller
         let ce = fcallee if isf[j] else callee
+        let r10 = not isf[j] and not nor10[j]
         var pick = -1
         for p in moves[j]:
-            let c = color[p]
-            if c >= 0 and (forbid >> c) & 1 == 0 and (c in ce or (free and c in cs)):
+            let c = color[find(rep, p)]
+            if (
+                c >= 0
+                and (forbid >> c) & 1 == 0
+                and (c in ce or (free and c in cs) or (r10 and (c == 10 or c == 11)))
+            ):
                 pick = c
                 break
+        if pick < 0 and r10:
+            for c in [10, 11]:
+                if (forbid >> c) & 1 == 0:
+                    pick = c
+                    break
         if pick < 0 and free:
             for c in cs:
                 if (forbid >> c) & 1 == 0:
@@ -376,6 +476,8 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
             color[j] = pick
             used[pick] = true
     for j in 0..nc:
+        color[j] = color[find(rep, j)]
+    for j in 0..nc:
         let c = color[j]
         if c >= 16:
             out.freg[cv[j]] = c - 16
@@ -384,14 +486,19 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool) -> RA:
     for c in callee:
         if used[c]:
             out.saved.push(c)
+    out.keep = [[] for _ in 0..ncode]
     if win:
         for c in fcallee:
             if used[c]:
                 out.fsaved.push(c - 16)
     else:
-        out.keep = [[] for _ in 0..ncode]
         for n, i in enumerate(fcalls):
             for j in flive[n]:
                 if color[j] >= 16:
                     out.keep[i].push(cv[j])
+    for n, i in enumerate(ccalls):
+        for j in clive[n]:
+            let c = color[j]
+            if c >= 0 and (c in caller or c in fcaller or (not win and c in fcallee)):
+                out.keep[i].push(cv[j])
     return out
