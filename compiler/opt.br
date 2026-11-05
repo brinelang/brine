@@ -453,10 +453,14 @@ fn switches(f: Func) -> Func:
 # call instead of two. `hot` ones (the runtime's fast paths, a map's hash and
 # key comparison) up to a larger size, calls and all; an indirect call of a
 # function the caller names becomes a direct one, inlined in the next round.
+# A small function that calls itself gets its body in place of those calls,
+# once: half the calls of a walk over a tree.
 const INLINE_MAX = 40
 const INLINE_CALLS = 12
 const INLINE_HOT = 160
 const INLINE_ROUNDS = 3
+# the most code a function calling itself may end up with
+const INLINE_SELF = 160
 
 fn inlinable(f: Func) -> bool:
     if f.public:
@@ -484,7 +488,29 @@ fn inline_small(fs: [Func]) -> [Func]:
         cur = next
         if not changed:
             break
-    return cur
+    return [self_inline(f) for f in cur]
+
+fn self_inline(f: Func) -> Func:
+    if f.public or f.hot:
+        return f
+    var n = 0
+    for x in f.code:
+        if x.op == Op.Switch:
+            return f
+        if x.op == Op.Call and x.b == 0 and x.s == f.name and len(x.args) == f.nparams:
+            n += 1
+    if n == 0 or len(f.code) * (n + 1) > INLINE_SELF:
+        return f
+    let c = promote(f)
+    var g = f
+    var code: [Inst] = []
+    for x in f.code:
+        if x.op == Op.Call and x.b == 0 and x.s == f.name and len(x.args) == f.nparams:
+            inline_call(ref g, ref code, x, c)
+        else:
+            code.push(x)
+    g.code = code
+    return g
 
 fn inline_round(fs: [Func]) -> ([Func], bool):
     var small: {str: Func} = {}
