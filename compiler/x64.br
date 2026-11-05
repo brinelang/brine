@@ -22,6 +22,7 @@
 from ir import K, Op, Inst, Func, Module
 from opt import promote, reads, switches, inline_small
 import ssa
+import ra
 from dwarf import Dwarf, DFn, DRow, DLocal, new_dwarf, loc_breg, loc_deref, write_dwarf
 from obj import ObjFile, OSym, ORel, new_obj, write_coff, write_elf, put16, put32, put64, set32, uleb, sleb, log2
 from obj import SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, SEC_UNWIND, R_PC32, R_CALL, R_ABS64, R_GOT, R_RVA32
@@ -91,6 +92,7 @@ const A_ADDR = 1
 const A_IMM = 2
 const A_SYM = 3
 const A_FRAME = 4
+const A_REG = 5
 
 # argument locations: integer register i, xmm register 100 + i, stack 1000 + i
 const L_XMM = 100
@@ -262,20 +264,19 @@ struct X:
     vk: [K]
     nparams: int
     home: [int]
-    # the callee-saved register holding the vreg for the whole function, or -1
+    # the register holding the vreg (see ra.br), or -1
     reg: [int]
     # callee-saved registers the function uses (pushed after rbp)
     saved: [int]
-    # the xmm register holding a float vreg for the whole function, or -1
+    # the xmm register holding a float vreg, or -1
     freg: [int]
     # Windows: the xmm registers used (callee-saved there) and where the
     # prologue saves them
     fsaved: [int]
     fsave_at: [int]
-    # Linux (no callee-saved xmm): the code range in which a float vreg
-    # in a register is live, to save it around calls
-    flo: [int]
-    fhi: [int]
+    # System V (no callee-saved xmm): per instruction, the float vregs in
+    # registers live across the call it makes, saved around it
+    keep: [[int]]
     fold: [int]
     fval: [int]
     nuse: [int]
@@ -845,8 +846,10 @@ struct X:
                 self.mov_ri(r, a.v)
             case 3:
                 self.ld_sym(r, a.v)
-            case _:
+            case 4:
                 self.lea(r, mrb(a.v))
+            case _:
+                self.mov_rr(r, a.v)
 
     # calls symbol `sym` (or, with sym < 0, the pointer in vreg fp)
     fn do_call(ref self, sym: int, fp: int, args: [CArg]):
@@ -871,11 +874,10 @@ struct X:
         # System V: calls change every xmm register, so floats live across
         # this one go to their homes and back
         var keep: [int] = []
-        if not self.win:
-            for v in 0..len(self.freg):
-                if self.freg[v] >= 0 and self.flo[v] < self.cur and self.cur <= self.fhi[v]:
-                    keep.push(v)
-                    self.fstore(fl_of(self.vk[v]), self.vm(v), self.freg[v])
+        if self.cur >= 0 and self.cur < len(self.keep):
+            keep = self.keep[self.cur]
+            for v in keep:
+                self.fstore(fl_of(self.vk[v]), self.vm(v), self.freg[v])
         if sym >= 0:
             self.b(232)
             self.reloc(R_CALL, sym, -4)
@@ -986,10 +988,11 @@ struct X:
             and (x.s == "brine_f_sqrt" or x.s == "brine_f_sqrtf")
             and x.d >= 0
         ):
-            # sqrtsd / sqrtss
+            # sqrtsd / sqrtss, into d's own register if it has one
             let fl = fl_of(self.vk[x.d])
-            self.fop(242 if fl == 1 else 243, 3921, 0, x.args[0])
-            self.fst(fl, x.d, 0)
+            let r = max(self.freg[x.d], 0)
+            self.fop(242 if fl == 1 else 243, 3921, r, x.args[0])
+            self.fst(fl, x.d, r)
             return
         var args: [CArg] = []
         let ind = x.op == Op.CallInd
@@ -1104,13 +1107,12 @@ struct X:
         self.freg = [-1] * nv
         self.fsaved = []
         self.fsave_at = []
-        self.flo = []
-        self.fhi = []
+        self.keep = []
         if self.dbg:
             self.reg = [-1] * nv
             self.saved = []
         else:
-            self.alloc_regs(f, ndef)
+            self.alloc(f, ndef)
         # incoming parameters (the hidden 128-bit result pointer first)
         let hidden = f.has_ret and f.ret.is_wide()
         var fls: [int] = []
@@ -1263,23 +1265,30 @@ struct X:
         ):
             # falling off the end returns
             self.epilogue()
-        # cold stubs
+        # cold stubs (the operands go through scratch registers first, since
+        # they may be in argument registers; nothing is kept around the calls)
+        self.cur = -1
         for s in self.stubs:
             set32(ref self.o.text, s.at, self.pos() - (s.at + 4))
+            self.cpos = -1
             if s.kind == S_IDX:
+                self.ld(RAX, s.a)
+                self.ld(R10, s.b)
+                self.ld(R11, s.c)
                 self.call_rt(
                     "brine_panic_idx",
                     [
-                        CArg(how=A_VAL, v=s.a, fl=0),
-                        CArg(how=A_VAL, v=s.b, fl=0),
-                        CArg(how=A_VAL, v=s.c, fl=0)
+                        CArg(how=A_REG, v=RAX, fl=0),
+                        CArg(how=A_REG, v=R10, fl=0),
+                        CArg(how=A_REG, v=R11, fl=0)
                     ]
                 )
             else:
                 let msg = self.ovf_sym(s.kind)
+                self.ld(R11, s.c)
                 self.call_rt(
                     "brine_panic_ovf",
-                    [CArg(how=A_SYM, v=msg, fl=0), CArg(how=A_VAL, v=s.c, fl=0)]
+                    [CArg(how=A_SYM, v=msg, fl=0), CArg(how=A_REG, v=R11, fl=0)]
                 )
         for j in 0..len(self.jat):
             set32(ref self.o.text, self.jat[j], self.lpos[self.jlab[j]] - (self.jat[j] + 4))
@@ -1529,265 +1538,40 @@ struct X:
 
     # Keeps the most used integer vregs (uses in loops count more) in
     # callee-saved registers for the whole function.
-    fn alloc_regs(ref self, f: Func, ndef: [int]):
+    fn alloc(ref self, f: Func, ndef: [int]):
         let nv = len(f.vk)
-        let ncode = len(f.code)
-        self.reg = [-1] * nv
-        self.saved = []
-        # loop depth: a backward jump to label L puts L..jump in a loop
-        var lat = [-1] * f.nlabels
-        for i in 0..ncode:
-            if f.code[i].op == Op.Label:
-                lat[f.code[i].n] = i
-        var depth = [0] * (ncode + 1)
-        var loops = false
-        for i in 0..ncode:
-            let x = f.code[i]
-            if x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot:
-                let l = lat[x.n]
-                if l >= 0 and l <= i:
-                    depth[l] += 1
-                    depth[i + 1] -= 1
-                    loops = true
-        var w = [0] * nv
-        var d = 0
-        for i in 0..ncode:
-            let x = f.code[i]
-            d += depth[i]
-            let u = 1 << (3 * min(d, 3))
-            if x.d >= 0:
-                w[x.d] += u
-            if x.a >= 0 and x.a < nv:
-                w[x.a] += u
-            if x.b >= 0 and x.b < nv:
-                w[x.b] += u
-            if x.c >= 0 and x.c < nv:
-                w[x.c] += u
-            if x.op == Op.Call or x.op == Op.CallInd:
-                for a in x.args:
-                    w[a] += u
-            elif (
-                x.op == Op.Eq
-                or x.op == Op.Ne
-                or x.op == Op.Lt
-                or x.op == Op.Le
-                or x.op == Op.Gt
-                or x.op == Op.Ge
-            ):
-                # a compare fused into the next branch never lives anywhere
-                if i + 1 < ncode and self.nuse[x.d] == 1:
-                    let y = f.code[i + 1]
-                    if (y.op == Op.Br or y.op == Op.BrNot) and y.a == x.d:
-                        w[x.d] = -1000000000
-        # Short-lived vregs share registers below instead of taking one for
-        # the whole function, each over an interval: a vreg made once and read
-        # only before the next label (a temporary) from its write to its last
-        # read; or one first mentioned by a write at lo and last mentioned at
-        # hi where every loop is outside lo..hi or inside it, so that every
-        # path between its mentions stays in lo..hi (the lowering never reads
-        # a vreg on a path that doesn't write it first).
-        var temp = [false] * nv
-        var tlo = [-1] * nv
-        var tend = [-1] * nv
-        var bad = [false] * nv
-        var tlab = [-1] * nv
-        var wfirst = [false] * nv
-        var lab = -1
-        var back: [int] = []
-        for i in 0..ncode:
-            let x = f.code[i]
-            if x.op == Op.Label:
-                lab = i
-            elif x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot:
-                let l = lat[x.n]
-                if l >= 0 and l <= i:
-                    back.push(l)
-                    back.push(i)
-            for v in reads(x, nv):
-                if not temp[v] or tlab[v] != lab:
-                    bad[v] = true
-                if tlo[v] < 0:
-                    tlo[v] = i
-                tend[v] = i
-            let xd = x.d
-            if xd >= 0:
-                if tlo[xd] < 0:
-                    tlo[xd] = i
-                    wfirst[xd] = true
-                tend[xd] = i
-                if ndef[xd] == 1 and xd >= f.nparams:
-                    temp[xd] = true
-                    tlab[xd] = lab
+        var ok = [false] * nv
         for v in 0..nv:
-            var ok = temp[v] and not bad[v]
-            if not ok and wfirst[v] and v >= f.nparams:
-                ok = true
-                var j = 0
-                while j < len(back):
-                    let l = back[j]
-                    let e = back[j + 1]
-                    j += 2
-                    if not (e < tlo[v] or l > tend[v] or (tlo[v] <= l and e <= tend[v])):
-                        ok = false
-                        break
-            temp[v] = (
-                ok
-                and tend[v] > tlo[v]
-                and w[v] > 0
-                and self.fold[v] == F_NONE
+            ok[v] = (
+                self.fold[v] == F_NONE
                 and not f.vk[v].is_wide()
+                and (ndef[v] > 0 or v < f.nparams or self.nuse[v] > 0)
             )
-        let pool = [RBX, RSI, RDI, R12, R13, R14, R15] if self.win else [RBX, R12, R13, R14, R15]
-        # without loops, a register only pays off for a vreg used a lot
-        let least = 3 if loops else 6
-        for r in pool:
-            var best = -1
-            var bw = least - 1
-            for v in 0..nv:
-                if (
-                    w[v] > bw
-                    and not temp[v]
-                    and self.reg[v] < 0
-                    and self.fold[v] == F_NONE
-                    and (ndef[v] > 0 or v < f.nparams)
-                ):
-                    let k = f.vk[v]
-                    if not k.is_float() and not k.is_wide():
-                        best = v
-                        bw = w[v]
-            if best < 0:
-                break
-            self.reg[best] = r
-            self.saved.push(r)
-        # floats: xmm6-15 are callee-saved on Windows (the prologue saves the
-        # ones used); System V has none, so xmm8-15 are kept across calls by
-        # do_call, which needs to know where each float is live
-        let first = 6 if self.win else 8
-        for x in first..16:
-            var best = -1
-            var bw = least - 1
-            for v in 0..nv:
-                if (
-                    w[v] > bw
-                    and not temp[v]
-                    and self.freg[v] < 0
-                    and self.fold[v] == F_NONE
-                    and (ndef[v] > 0 or v < f.nparams)
-                ):
-                    if f.vk[v].is_float():
-                        best = v
-                        bw = w[v]
-            if best < 0:
-                break
-            self.freg[best] = x
-            if self.win:
-                self.fsaved.push(x)
-        # Then the temporaries, in order: each takes a register free since
-        # before it is made (closed intervals, so an instruction's result never
-        # shares a register with its operands), preferring one already saved.
-        # busy[r]: where r's last temporary dies; -2: r holds a vreg for the
-        # whole function
-        var busy = [-1] * 32
-        for v in 0..nv:
-            if self.reg[v] >= 0:
-                busy[self.reg[v]] = -2
-            if self.freg[v] >= 0:
-                busy[16 + self.freg[v]] = -2
-        var fpool: [int] = []
-        for xr in first..16:
-            fpool.push(16 + xr)
-        var starts: [[int]] = [[] for _ in 0..ncode]
-        for v in 0..nv:
-            if temp[v]:
-                starts[tlo[v]].push(v)
-        for i in 0..ncode:
-            for td in starts[i]:
-                let fl = f.vk[td].is_float()
-                let rs = fpool if fl else pool
-                var pick = -1
-                for r in rs:
-                    if busy[r] != -2 and busy[r] < i:
-                        let used = (
-                            busy[r] >= 0
-                            or (not fl and r in self.saved)
-                            or (fl and r - 16 in self.fsaved)
-                        )
-                        if pick < 0 or used:
-                            pick = r
-                        if used:
-                            break
-                if pick < 0:
-                    continue
-                if busy[pick] == -1:
-                    if not fl:
-                        if pick not in self.saved:
-                            self.saved.push(pick)
-                    elif self.win and pick - 16 not in self.fsaved:
-                        self.fsaved.push(pick - 16)
-                busy[pick] = tend[td]
-                if fl:
-                    self.freg[td] = pick - 16
-                else:
-                    self.reg[td] = pick
-        if not self.win:
-            self.live_ranges(f, lat, ndef)
-
-    # flo[v]..fhi[v]: the instructions where float register vreg v may be live.
-    # From its first to its last mention, and over any loop it is live around.
-    fn live_ranges(ref self, f: Func, lat: [int], ndef: [int]):
-        let nv = len(f.vk)
-        let ncode = len(f.code)
-        var lo = [ncode] * nv
-        var hi = [-1] * nv
-        var dat = [-1] * nv
-        for v in 0..f.nparams:
-            lo[v] = -1
-            dat[v] = -1
-        for i in 0..ncode:
-            let x = f.code[i]
-            if x.d >= 0 and self.freg[x.d] >= 0:
-                lo[x.d] = min(lo[x.d], i)
-                hi[x.d] = max(hi[x.d], i)
-                dat[x.d] = i
-            for v in reads(x, nv):
-                if self.freg[v] >= 0:
-                    lo[v] = min(lo[v], i)
-                    hi[v] = max(hi[v], i)
-        var back: [int] = []
-        for i in 0..ncode:
-            let x = f.code[i]
-            if x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot:
-                let l = lat[x.n]
-                if l >= 0 and l <= i:
-                    back.push(l)
-                    back.push(i)
-        var changed = true
-        while changed:
-            changed = false
-            for v in 0..nv:
-                if self.freg[v] < 0:
-                    continue
-                var j = 0
-                while j < len(back):
-                    let l = back[j]
-                    let i = back[j + 1]
-                    j += 2
-                    if hi[v] < l or lo[v] > i or (lo[v] <= l and hi[v] >= i):
-                        continue
-                    # made once in the loop before any use, and used only there
-                    if (
-                        ndef[v] == 1
-                        and v >= f.nparams
-                        and dat[v] == lo[v]
-                        and lo[v] >= l
-                        and hi[v] <= i
-                    ):
-                        continue
-                    lo[v] = min(lo[v], l)
-                    hi[v] = max(hi[v], i)
-                    changed = true
-        self.flo = lo
-        self.fhi = hi
+        # a compare fused into the branch right after it never lives anywhere
+        for i in 1..len(f.code):
+            let x = f.code[i - 1]
+            let y = f.code[i]
+            if (
+                (y.op == Op.Br or y.op == Op.BrNot)
+                and x.d >= 0
+                and y.a == x.d
+                and self.nuse[x.d] == 1
+                and (
+                    x.op == Op.Eq
+                    or x.op == Op.Ne
+                    or x.op == Op.Lt
+                    or x.op == Op.Le
+                    or x.op == Op.Gt
+                    or x.op == Op.Ge
+                )
+            ):
+                ok[x.d] = false
+        let r = ra.allocate(f, ok, self.win)
+        self.reg = r.reg
+        self.freg = r.freg
+        self.saved = r.saved
+        self.fsaved = r.fsaved
+        self.keep = r.keep
 
     fn store_params(ref self, f: Func):
         let h = 1 if f.has_ret and f.ret.is_wide() else 0
@@ -2361,13 +2145,17 @@ struct X:
             and fits32(self.fval[x.b] * n)
         ):
             let off = self.fval[x.b] * n
+            let r = self.dst(x.d)
             if self.fold[x.a] == F_SLOT and fits32(self.slot_off[self.fval[x.a]] + off):
-                self.lea(RAX, self.smem(self.fval[x.a], off))
+                self.lea(r, self.smem(self.fval[x.a], off))
             else:
-                self.ld(RAX, x.a)
+                let ra = self.use(RAX, x.a)
                 if off != 0:
-                    self.lea(RAX, mreg(RAX, off))
-            self.st(RAX, x.d)
+                    self.lea(r, mreg(ra, off))
+                else:
+                    self.mov_rr(r, ra)
+            if r == RAX:
+                self.st(RAX, x.d)
             return
         if n == 1 or n == 2 or n == 4 or n == 8:
             let ra = self.use(RAX, x.a)
@@ -2376,11 +2164,27 @@ struct X:
             self.lea(r, Mem(base=ra, index=rb, scale=n, disp=0, sym=-1))
             if r != RAX:
                 return
+        elif fits32(n):
+            # imul r, b, n; add r, a (through rcx when r is a's register)
+            let r = self.dst(x.d)
+            let t = RCX if self.fold[x.a] == F_NONE and self.reg[x.a] == r else r
+            if self.inmem(x.b):
+                self.rm(0, 1, 105, t, self.vm(x.b), 4)
+            else:
+                let s = self.use(RCX, x.b)
+                self.rr(0, 1, 105, t, s)
+            self.b32(n)
+            if t == RCX:
+                self.alu_rr(ADD, r, RCX)
+            else:
+                self.alu_v(ADD, r, x.a)
+            if r != RAX:
+                return
         else:
             self.ld(RAX, x.a)
             self.ld(RCX, x.b)
-            self.rr(0, 1, 105, RCX, RCX)
-            self.b32(n)
+            self.mov_ri(RDX, n)
+            self.rr(0, 1, 4015, RCX, RDX)
             self.alu_rr(ADD, RAX, RCX)
         self.st(RAX, x.d)
 
@@ -2572,26 +2376,44 @@ fn emit_order(fs: [Func], dbg: bool) -> [Func]:
     return out
 
 # The module as non-debug native code gets it: small functions inlined,
-# slots promoted to vregs, jump tables.
-fn optimized(m: Module) -> Module:
+# slots promoted to vregs, jump tables, and in release builds the SSA
+# optimizations (ssa.br).
+fn optimized(m: Module, release: bool) -> Module:
     var out = m
-    out.funcs = [opt_func(f) for f in inline_small(m.funcs)]
+    let on = use_ssa(release)
+    out.funcs = [opt_func(f, on) for f in inline_small(m.funcs)]
     return out
 
-fn opt_func(f: Func) -> Func:
-    if getenv("BRINE_SSA").is_some():
+# Release builds only, since it takes longer: `BRINE_SSA=1` or `=0` overrides.
+fn use_ssa(release: bool) -> bool:
+    match getenv("BRINE_SSA"):
+        case Some(v):
+            return v != "0"
+        case None:
+            return release
+
+fn opt_func(f: Func, on: bool) -> Func:
+    if on:
         return switches(ssa.optimize(promote(f)))
     return switches(promote(f))
 
-fn emit_object(m: Module, windows: bool) -> [u8]:
-    return emit(m, windows, false, "", "", "")
+fn emit_object(m: Module, windows: bool, release: bool) -> [u8]:
+    return emit(m, windows, false, use_ssa(release), "", "", "")
 
 # The same with DWARF debug info. `src` is the main source file, `comp_dir`
 # the directory relative source paths start from.
 fn emit_object_debug(m: Module, windows: bool, src: str, comp_dir: str, producer: str) -> [u8]:
-    return emit(m, windows, true, src, comp_dir, producer)
+    return emit(m, windows, true, false, src, comp_dir, producer)
 
-fn emit(m: Module, windows: bool, dbg: bool, src: str, comp_dir: str, producer: str) -> [u8]:
+fn emit(
+    m: Module,
+    windows: bool,
+    dbg: bool,
+    on: bool,
+    src: str,
+    comp_dir: str,
+    producer: str
+) -> [u8]:
     var x = X(
         win=windows,
         o=new_obj(),
@@ -2610,8 +2432,7 @@ fn emit(m: Module, windows: bool, dbg: bool, src: str, comp_dir: str, producer: 
         freg=[],
         fsaved=[],
         fsave_at=[],
-        flo=[],
-        fhi=[],
+        keep=[],
         fold=[],
         fval=[],
         nuse=[],
@@ -2680,7 +2501,7 @@ fn emit(m: Module, windows: bool, dbg: bool, src: str, comp_dir: str, producer: 
                 x.o.drel.push(rel)
     x.entry_main = dbg and any(f.name == "main__main" for f in m.funcs)
     for f in emit_order(m.funcs if dbg else inline_small(m.funcs), dbg):
-        x.func(f if dbg else opt_func(f))
+        x.func(f if dbg else opt_func(f, on))
     # references inside .text need no relocation
     var keep: [ORel] = []
     for r in x.o.trel:

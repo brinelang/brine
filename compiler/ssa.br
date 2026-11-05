@@ -980,6 +980,46 @@ fn simplify(ref sf: SF):
         entry.extend(sf.bs[0].code)
         sf.bs[0].code = entry
 
+# Loads and stores through `p = elem q + c * n` with a constant c (field and
+# fixed-index addresses) use q and an offset instead, so the address needs no
+# register and alias analysis sees the base.
+fn addressing(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var is_c = [false] * nv
+    var cv = [0] * nv
+    for b in sf.bs:
+        for x in b.code:
+            if x.op == Op.Const and tracked(sf.f.vk[x.d]):
+                is_c[x.d] = true
+                cv[x.d] = x.n
+    let lim = 1 << 30
+    var base = [-1] * nv
+    var off = [0] * nv
+    for b in sf.bs:
+        for x in b.code:
+            if x.op == Op.Elem and x.b >= 0 and is_c[x.b] and abs(cv[x.b]) < lim and x.n < lim:
+                base[x.d] = x.a
+                off[x.d] = cv[x.b] * x.n
+    # chains of them (each step shortens one; SSA has no cycles here)
+    var changed = true
+    while changed:
+        changed = false
+        for v in 0..nv:
+            let q = base[v]
+            if q >= 0 and base[q] >= 0 and abs(off[v] + off[q]) < lim:
+                base[v] = base[q]
+                off[v] += off[q]
+                changed = true
+    for bi in 0..len(sf.bs):
+        for i in 0..len(sf.bs[bi].code):
+            let x = sf.bs[bi].code[i]
+            if (x.op == Op.Load or x.op == Op.Store) and base[x.a] >= 0:
+                if abs(x.n + off[x.a]) < lim:
+                    var y = x
+                    y.a = base[x.a]
+                    y.n = x.n + off[x.a]
+                    sf.bs[bi].code[i] = y
+
 fn log2i(v: int) -> int:
     var n = 0
     while (1 << n) < v:
@@ -1595,16 +1635,37 @@ fn from_ssa(sf0: SF) -> Func:
             pc.push(t)
             sf.bs[p].code = pc
         sf.bs[s].code = sf.bs[s].code[np:]
-    # flat code, in block order
+    # Flat code, in block order, except that a loop header ending in a branch
+    # goes right after its latch (the one block jumping back to it): then an
+    # iteration ends in one conditional branch instead of a jump and a branch.
+    var order: [int] = [i for i in 0..n]
+    var latch = [-1] * n
+    for l in 0..n:
+        let t = sf.bs[l].code[len(sf.bs[l].code) - 1]
+        if t.op == Op.Jmp:
+            let h = sf.lab[t.n]
+            if h > 0 and h < l:
+                latch[h] = l if latch[h] == -1 else -2
+    for h in 1..n:
+        let t = sf.bs[h].code[len(sf.bs[h].code) - 1]
+        if latch[h] >= 0 and (t.op == Op.Br or t.op == Op.BrNot):
+            var at = 0
+            while order[at] != h:
+                at += 1
+            order.pop(at)
+            at = 0
+            while order[at] != latch[h]:
+                at += 1
+            order.insert(at + 1, h)
     var code: [Inst] = []
-    for i in 0..n:
-        let b = sf.bs[i]
+    for oi in 0..n:
+        let b = sf.bs[order[oi]]
         code.push(mk(Op.Label, -1, -1, -1, -1, b.label))
         let m = len(b.code)
         for j in 0..m - 1:
             code.push(b.code[j])
         let t = b.code[m - 1]
-        let next = sf.bs[i + 1].label if i + 1 < n else -1
+        let next = sf.bs[order[oi + 1]].label if oi + 1 < n else -1
         match t.op:
             case Op.Jmp:
                 if t.n != next:
@@ -1633,6 +1694,7 @@ fn optimize(f: Func) -> Func:
     sccp(ref sf)
     simplify(ref sf)
     copies(ref sf)
+    addressing(ref sf)
     gvn(ref sf)
     copies(ref sf)
     licm(ref sf)
