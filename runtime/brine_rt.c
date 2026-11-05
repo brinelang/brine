@@ -1638,7 +1638,6 @@ int brine_str_cmp(brine_str *a, brine_str *b) {
     if (c) return c;
     return a->len < b->len ? -1 : (a->len > b->len ? 1 : 0);
 }
-#endif
 /* Integer text as `int()` reads it: blanks around it, a sign, decimal digits,
  * and `_` between two digits, as in literals (`1_000`). By hand: the C
  * library stops at 64 bits and knows no `_`. False if it isn't one or
@@ -1710,7 +1709,6 @@ brine_u128 brine_parse_u128(brine_str *s, const char *loc) {
     if (!br_parse_128(s, &neg, &u) || (neg && u != 0)) br_panicf(loc, "invalid integer: \"%.*s\"", (int)s->len, s->data);
     return u;
 }
-#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 /* Exact powers of ten: a double holds 10^k exactly up to 10^22. */
 static const double br_pow10[23] = {1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
                                     1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
@@ -2344,7 +2342,6 @@ void brine_sb_u64(brine_sb *sb, uint64_t v) {
     int n = snprintf(b, sizeof b, "%llu", (unsigned long long)v);
     brine_sb_cat(sb, b, n);
 }
-#endif
 static void br_sb_u128_base(brine_sb *sb, brine_u128 v, unsigned base) {
     char b[130];
     int n = sizeof b;
@@ -2377,7 +2374,6 @@ void brine_sb_fmt_i128(brine_sb *sb, brine_i128 v, int kind) {
     else
         brine_sb_i128(sb, v);
 }
-#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 /* |v| rounded to p significant digits: the digits go to d, the result is the
  * decimal exponent. Whether they read back as v is in *back. */
 static int br_digits(double v, int p, char *d, int is_f32, bool *back) {
@@ -7436,6 +7432,7 @@ BR_X_COMMON128(brine_i128, i128)
 BR_X_COMMON128(brine_u128, u128)
 void brine_x_neg_i128(brine_i128 *r, const brine_i128 *a, const char *loc) { *r = brine_neg_i128(*a, loc); }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 /* runtime functions that take or return 128-bit integers */
 void brine_x_parse_i128(brine_i128 *r, brine_str *s, const char *loc) { *r = brine_parse_i128(s, loc); }
 void brine_x_parse_u128(brine_u128 *r, brine_str *s, const char *loc) { *r = brine_parse_u128(s, loc); }
@@ -7443,6 +7440,7 @@ void brine_x_sb_i128(brine_sb *sb, const brine_i128 *v) { brine_sb_i128(sb, *v);
 void brine_x_sb_u128(brine_sb *sb, const brine_u128 *v) { brine_sb_u128(sb, *v); }
 void brine_x_sb_fmt_i128(brine_sb *sb, const brine_i128 *v, int kind) { brine_sb_fmt_i128(sb, *v, kind); }
 void brine_x_sb_fmt_u128(brine_sb *sb, const brine_u128 *v, int kind) { brine_sb_fmt_u128(sb, *v, kind); }
+#endif
 
 /* plain 128-bit operations (wrapping; division by zero is excluded by the caller) */
 #define BR_X_W128(T, S)                                                                             \
