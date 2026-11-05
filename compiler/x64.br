@@ -19,9 +19,10 @@
 # keep values in registers across instructions, so whenever a debugger stops
 # at a line, variables are in memory where the debug info says.
 
-from ir import K, Op, Inst, Func, Module, KFunc
+from ir import K, Op, Inst, Func, Module, KFunc, KOp
 from ir import KO_MOV, KO_LD, KO_LDP, KO_LDH, KO_ST, KO_STH, KO_OP, KO_SQRT, KO_SHUF
-from ir import KO_CONST, KO_CONST2, KO_SPILL, KO_FILL, KO_ARG, PFX_PD, PFX_SD
+from ir import KO_CONST, KO_CONST2, KO_SPILL, KO_FILL, KO_ARG, KO_STP, KO_CHK, PFX_PD, PFX_SD
+from ir import KO_VLD, KO_VST, KO_VOP, KO_VBC
 from opt import promote, reads, switches, inline_small
 import ssa
 import ra
@@ -296,6 +297,9 @@ struct X:
     fpool: {i128: int}
     # 16-byte constants (vector kernels), by "lo,hi"
     vpool: {str: int}
+    # the .data byte where loop kernels keep the CPU level (0: not known
+    # yet, 1: SSE2, 3: AVX2 too), -1 until used
+    cpu_sym: int
     # the function being compiled
     code: [Inst]
     # code[i] can't be reached: a block no jump goes to, after a jump
@@ -503,6 +507,25 @@ struct X:
         if x != 64:
             self.b(x)
         self.opc(op)
+        self.b(192 | ((reg & 7) << 3) | (r & 7))
+
+    # VEX (three-byte form) op reg, v, [m]: map 1 is 0F, 2 is 0F38; pp 1 is
+    # 66; l 1 is 256 bits. v 0 when unused.
+    fn vex_m(ref self, map: int, pp: int, l: int, op: int, reg: int, v: int, m: Mem):
+        let x = self.rex_m(0, reg, m)
+        self.b(196)
+        self.b(
+            ((((x >> 2) & 1) ^ 1) << 7) | ((((x >> 1) & 1) ^ 1) << 6) | (((x & 1) ^ 1) << 5) | map
+        )
+        self.b(((15 - v) << 3) | (l << 2) | pp)
+        self.b(op)
+        self.modrm(reg, m, 0)
+
+    fn vex_r(ref self, map: int, pp: int, l: int, op: int, reg: int, v: int, r: int):
+        self.b(196)
+        self.b((((reg >> 3) ^ 1) << 7) | 64 | (((r >> 3) ^ 1) << 5) | map)
+        self.b(((15 - v) << 3) | (l << 2) | pp)
+        self.b(op)
         self.b(192 | ((reg & 7) << 3) | (r & 7))
 
     fn rr8(ref self, op: int, reg: int, r: int):
@@ -1683,6 +1706,9 @@ struct X:
             self.fsave_at.push(-off)
         let slots = off
         off += 16 * k.nslots
+        if len(k.abody) > 0:
+            # rbx, rcx and rdx around cpuid
+            off += 32
         let grow = align_up(off, 16)
         while len(self.o.text) % 16 != 0:
             self.o.text.push(204)
@@ -1706,48 +1732,188 @@ struct X:
         self.u.pro_end = self.pos()
         for i, x in enumerate(self.fsaved):
             self.xsave(mrb(self.fsave_at[i]), x)
-        for o in k.ops:
-            match o.op:
-                case KO_MOV:
-                    # movapd
-                    self.rr(PFX_PD, 0, 3880, o.a, o.b)
-                case KO_LD:
-                    # movsd
-                    self.rm(PFX_SD, 0, 3856, o.a, mreg(gp[o.b], o.n), 0)
-                case KO_LDP:
-                    # movupd
-                    self.rm(PFX_PD, 0, 3856, o.a, mreg(gp[o.b], o.n), 0)
-                case KO_LDH:
-                    # movhpd xmm, m64
-                    self.rm(PFX_PD, 0, 3862, o.a, mreg(gp[o.b], o.n), 0)
-                case KO_ST:
-                    self.rm(PFX_SD, 0, 3857, o.a, mreg(gp[o.b], o.n), 0)
-                case KO_STH:
-                    # movhpd m64, xmm
-                    self.rm(PFX_PD, 0, 3863, o.a, mreg(gp[o.b], o.n), 0)
-                case KO_OP | KO_SQRT:
-                    self.rr(o.m, 0, o.n, o.a, o.b)
-                case KO_SHUF:
-                    # shufpd
-                    self.rr(PFX_PD, 0, 4038, o.a, o.b)
-                    self.b(o.n)
-                case KO_CONST:
-                    self.rm(PFX_SD, 0, 3856, o.a, mrip(self.fconst_sym(o.n, K.F64), 0), 0)
-                case KO_CONST2:
-                    self.rm(PFX_PD, 0, 3856, o.a, mrip(self.vconst_sym(o.n, o.m), 0), 0)
-                case KO_SPILL:
-                    # movapd m128, xmm
-                    self.rm(PFX_PD, 0, 3881, o.a, mrb(-slots - 16 * (o.n + 1)), 0)
-                case KO_FILL:
-                    self.rm(PFX_PD, 0, 3880, o.a, mrb(-slots - 16 * (o.n + 1)), 0)
-                case _:
-                    # KO_ARG
-                    self.rm(PFX_SD, 0, 3856, o.a, mrb(o.n), 0)
+        if k.loop:
+            self.kernel_loop(k, gp, slots)
+        else:
+            for o in k.ops:
+                self.kop(o, gp, false, slots)
         self.epilogue()
         if self.win:
             self.unwind_coff()
         else:
             self.unwind_elf()
+
+    # A loop kernel's code: rax counts the elements done, r10 is the count
+    # rounded down to a multiple of the lanes.
+    fn kernel_loop(ref self, k: KFunc, gp: [int], slots: int):
+        self.rr(0, 0, 49, RAX, RAX)
+        var outs: [int] = []
+        for o in k.ops:
+            if o.op == KO_CHK:
+                # out when 0 < (b + n) - a < 8m: r11 = that - 1, unsigned
+                self.lea(R11, mreg(gp[o.b], o.n - 1))
+                self.alu_rr(SUB, R11, gp[o.a])
+                self.alu_ri(CMP, R11, 8 * o.m - 2)
+                outs.push(self.j32(CC_BE))
+        var sse = -1
+        if len(k.abody) > 0:
+            self.cpu_level(slots)
+            self.alu_ri(CMP, RAX, 3)
+            sse = self.j32(CC_B)
+            self.rr(0, 0, 49, RAX, RAX)
+            for o in k.apre:
+                self.kop(o, gp, false, slots)
+            self.here32(self.lanes(k.abody, 4, gp[k.narr], gp, slots))
+            # vzeroupper, so SSE code after runs at full speed
+            self.b(197)
+            self.b(248)
+            self.b(119)
+            self.b(233)
+            self.b32(0)
+            outs.push(self.pos() - 4)
+            self.here32(sse)
+            self.rr(0, 0, 49, RAX, RAX)
+        for o in k.ops:
+            if o.op != KO_CHK:
+                self.kop(o, gp, false, slots)
+        outs.push(self.lanes(k.body, 2, gp[k.narr], gp, slots))
+        for at in outs:
+            self.here32(at)
+
+    # The loop over the elements, w at a time: rax counts them, r10 is the
+    # count rounded down. Returns the jump to patch to after it, taken when
+    # there are fewer than w.
+    fn lanes(ref self, body: [KOp], w: int, cnt: int, gp: [int], slots: int) -> int:
+        self.mov_rr(R10, cnt)
+        self.alu_ri(AND, R10, -w)
+        let skip = self.j32(CC_LE)
+        let top = self.pos()
+        for o in body:
+            self.kop(o, gp, true, slots)
+        self.alu_ri(ADD, RAX, w)
+        self.alu_rr(CMP, RAX, R10)
+        # jl top
+        self.b(15)
+        self.b(128 + CC_L)
+        self.b32(top - (self.pos() + 4))
+        return skip
+
+    # rax = the CPU level (see cpu_sym), found with cpuid the first time.
+    # rbx, rcx and rdx are kept in the 24 bytes below `slots`.
+    fn cpu_level(ref self, slots: int):
+        if self.cpu_sym < 0:
+            let off = len(self.o.data)
+            self.o.data.push(0)
+            self.cpu_sym = self.sym_def("__brx_cpu", SEC_DATA, off, false, false)
+        let lvl = mrip(self.cpu_sym, 0)
+        # movzx eax, byte [lvl]; test eax, eax
+        self.rm(0, 0, 4022, RAX, lvl, 0)
+        self.rr(0, 0, 133, RAX, RAX)
+        let have = self.j32(CC_NE)
+        let keep = [RBX, RCX, RDX]
+        for i, r in enumerate(keep):
+            self.mov_mr(mrb(-slots - 8 * (i + 1)), r)
+        self.mov_ri(R10, 1)
+        var no: [int] = []
+        # AVX and OSXSAVE (cpuid 1, ecx bits 28 and 27)
+        self.mov_ri(RAX, 1)
+        self.cpuid()
+        self.mov_ri(R11, 402653184)
+        self.alu_rr(AND, RCX, R11)
+        self.alu_rr(CMP, RCX, R11)
+        no.push(self.j32(CC_NE))
+        # the OS saves the xmm and ymm registers (xgetbv 0, bits 1 and 2)
+        self.rr(0, 0, 49, RCX, RCX)
+        self.b(15)
+        self.b(1)
+        self.b(208)
+        self.alu_ri(AND, RAX, 6)
+        self.alu_ri(CMP, RAX, 6)
+        no.push(self.j32(CC_NE))
+        # AVX2 (cpuid 7, ebx bit 5)
+        self.mov_ri(RAX, 7)
+        self.rr(0, 0, 49, RCX, RCX)
+        self.cpuid()
+        self.alu_ri(AND, RBX, 32)
+        no.push(self.j32(CC_E))
+        self.mov_ri(R10, 3)
+        for at in no:
+            self.here32(at)
+        # mov [lvl], r10b
+        self.rm8(136, R10, lvl, 0)
+        for i, r in enumerate(keep):
+            self.mov_rm(r, mrb(-slots - 8 * (i + 1)))
+        self.mov_rr(RAX, R10)
+        self.here32(have)
+
+    fn cpuid(ref self):
+        self.b(15)
+        self.b(162)
+
+    # One kernel operation; `ix`: memory operands also add 8 * rax. Stack
+    # slots start `slots` bytes below rbp.
+    fn kop(ref self, o: KOp, gp: [int], ix: bool, slots: int):
+        var m = mrb(0)
+        if (
+            o.op == KO_LD
+            or o.op == KO_LDP
+            or o.op == KO_LDH
+            or o.op == KO_ST
+            or o.op == KO_STH
+            or o.op == KO_STP
+            or o.op == KO_VLD
+            or o.op == KO_VST
+        ):
+            m = Mem(base=gp[o.b], index=RAX if ix else -1, scale=8, disp=o.n, sym=-1)
+        match o.op:
+            case KO_MOV:
+                # movapd
+                self.rr(PFX_PD, 0, 3880, o.a, o.b)
+            case KO_LD:
+                # movsd
+                self.rm(PFX_SD, 0, 3856, o.a, m, 0)
+            case KO_LDP:
+                # movupd
+                self.rm(PFX_PD, 0, 3856, o.a, m, 0)
+            case KO_LDH:
+                # movhpd xmm, m64
+                self.rm(PFX_PD, 0, 3862, o.a, m, 0)
+            case KO_ST:
+                self.rm(PFX_SD, 0, 3857, o.a, m, 0)
+            case KO_STH:
+                # movhpd m64, xmm
+                self.rm(PFX_PD, 0, 3863, o.a, m, 0)
+            case KO_STP:
+                # movupd m128, xmm
+                self.rm(PFX_PD, 0, 3857, o.a, m, 0)
+            case KO_OP | KO_SQRT:
+                self.rr(o.m, 0, o.n, o.a, o.b)
+            case KO_SHUF:
+                # shufpd
+                self.rr(PFX_PD, 0, 4038, o.a, o.b)
+                self.b(o.n)
+            case KO_CONST:
+                self.rm(PFX_SD, 0, 3856, o.a, mrip(self.fconst_sym(o.n, K.F64), 0), 0)
+            case KO_CONST2:
+                self.rm(PFX_PD, 0, 3856, o.a, mrip(self.vconst_sym(o.n, o.m), 0), 0)
+            case KO_SPILL:
+                # movapd m128, xmm
+                self.rm(PFX_PD, 0, 3881, o.a, mrb(-slots - 16 * (o.n + 1)), 0)
+            case KO_FILL:
+                self.rm(PFX_PD, 0, 3880, o.a, mrb(-slots - 16 * (o.n + 1)), 0)
+            case KO_VLD:
+                # vmovupd ymm, m256
+                self.vex_m(1, 1, 1, 16, o.a, 0, m)
+            case KO_VST:
+                self.vex_m(1, 1, 1, 17, o.a, 0, m)
+            case KO_VOP:
+                self.vex_r(1, 1, 1, o.n, o.a, o.b, o.m)
+            case KO_VBC:
+                # vbroadcastsd ymm, xmm
+                self.vex_r(2, 1, 1, 25, o.a, 0, o.b)
+            case _:
+                # KO_ARG
+                self.rm(PFX_SD, 0, 3856, o.a, mrb(o.n), 0)
 
     # ------------------------------------------------------------ unwind tables
     # Windows: the function's UNWIND_INFO in .xdata and its RUNTIME_FUNCTION in
@@ -3224,7 +3390,12 @@ fn emit_order(fs: [Func], dbg: bool) -> [Func]:
 fn optimized(m: Module, release: bool) -> Module:
     var out = m
     let on = use_ssa(release)
-    out.funcs = [opt_func(f, on) for f in inline_small(m.funcs)]
+    out.funcs = []
+    let avx = use_avx()
+    for f in inline_small(m.funcs):
+        let (g, ks) = opt_func(f, on, os.name() == "windows", avx)
+        out.funcs.push(g)
+        out.kernels.extend(ks)
     return out
 
 # Release builds only, since it takes longer: `BRINE_SSA=1` or `=0` overrides.
@@ -3235,10 +3406,20 @@ fn use_ssa(release: bool) -> bool:
         case None:
             return release
 
-fn opt_func(f: Func, on: bool) -> Func:
+# Loop kernels get an AVX version too; `BRINE_VLOOP=sse2` leaves it out
+# (for tests on machines with AVX2).
+fn use_avx() -> bool:
+    match getenv("BRINE_VLOOP"):
+        case Some(v):
+            return v != "sse2"
+        case None:
+            return true
+
+fn opt_func(f: Func, on: bool, win: bool, avx: bool) -> (Func, [KFunc]):
     if on:
-        return switches(ssa.optimize(promote(f)))
-    return switches(promote(f))
+        let (g, ks) = ssa.optimize(promote(f), win, avx)
+        return (switches(g), ks)
+    return (switches(promote(f)), [])
 
 fn emit_object(m: Module, windows: bool, release: bool) -> [u8]:
     return emit(m, windows, false, use_ssa(release), "", "", "")
@@ -3268,6 +3449,7 @@ fn emit(
         ovf=[-1, -1, -1],
         fpool={},
         vpool={},
+        cpu_sym=-1,
         code=[],
         dead=[],
         lrefs=[],
@@ -3347,9 +3529,16 @@ fn emit(
             else:
                 x.o.drel.push(rel)
     x.entry_main = dbg and any(f.name == "main__main" for f in m.funcs)
+    var ks = m.kernels
+    let avx = use_avx()
     for f in emit_order(m.funcs if dbg else inline_small(m.funcs), dbg):
-        x.func(f if dbg else opt_func(f, on))
-    for k in m.kernels:
+        if dbg:
+            x.func(f)
+        else:
+            let (g, fks) = opt_func(f, on, windows, avx)
+            x.func(g)
+            ks.extend(fks)
+    for k in ks:
         x.kernel(k)
     # references inside .text need no relocation
     var keep: [ORel] = []

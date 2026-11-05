@@ -20,12 +20,16 @@
 #   header, where they run on every trip, and only before anything with an
 #   effect.
 # * Dead code: instructions whose results nothing reads.
+# * Vectors: innermost loops over arrays of doubles that vloop.br can run
+#   several elements at a time get its kernel, called before the loop.
 #
 # Back in flat code every phi becomes copies at the end of its predecessors
 # (critical edges are split first, and the copies on one edge are made in an
 # order that doesn't overwrite a value another copy still reads).
 
-from ir import K, Op, Inst, Func
+from ir import K, Op, Inst, Func, KFunc
+import vloop
+from vloop import LOp, L_LD, L_ST, L_ADD, L_SUB, L_MUL, L_DIV
 
 struct Block:
     label: int
@@ -1801,7 +1805,330 @@ fn from_ssa(sf0: SF) -> Func:
 
 # ================================================================ the pipeline
 
-fn optimize(f: Func) -> Func:
+# ---------------------------------------------------------------- vector loops
+
+# Gives each innermost loop vloop.br can run several elements at a time a call
+# to its kernel (named `name`_0, _1, ...) before the loop, which then starts
+# where the kernel stopped. Returns the kernels.
+fn vector_loops(ref sf: SF, name: str, win: bool, avx: bool) -> [KFunc]:
+    var out: [KFunc] = []
+    preheaders(ref sf)
+    let loops = find_loops(sf)
+    var is_head = [false] * len(sf.bs)
+    for lp in loops:
+        is_head[lp.header] = true
+    for lp in loops:
+        let (ok, k) = vector_loop(ref sf, lp, is_head, f"{name}_{len(out)}", win, avx)
+        if ok:
+            out.push(k)
+    return out
+
+fn new_v(ref sf: SF, k: K) -> int:
+    sf.f.vk.push(k)
+    return len(sf.f.vk) - 1
+
+fn no_kernel() -> (bool, KFunc):
+    return (false, vloop.no_kernel(""))
+
+# The loop must be: a header with only `j = phi(lo, j + 1)`, `j < hi` and
+# the branch; then blocks in a row that compute `p + 8 * j` addresses, load
+# and store doubles there, do + - * / on doubles, and add 1 to j.
+fn vector_loop(
+    ref sf: SF,
+    lp: Loop,
+    is_head: [bool],
+    name: str,
+    win: bool,
+    avx: bool
+) -> (bool, KFunc):
+    let nb = len(sf.bs)
+    let nv = len(sf.f.vk)
+    let h = lp.header
+    var inb = [false] * nb
+    for b in lp.body:
+        inb[b] = true
+        if b != h and is_head[b]:
+            return no_kernel()
+    var hx: [Inst] = []
+    var phi_at = -1
+    for i, x in enumerate(sf.bs[h].code):
+        if x.op != Op.Line:
+            if x.op == Op.Phi:
+                phi_at = i
+            hx.push(x)
+    if len(hx) != 3 or hx[0].op != Op.Phi or hx[1].op != Op.Lt:
+        return no_kernel()
+    if hx[2].op != Op.Br and hx[2].op != Op.BrNot:
+        return no_kernel()
+    let phi = hx[0]
+    let lt = hx[1]
+    let br = hx[2]
+    if len(phi.args) != 4 or sf.f.vk[phi.d] != K.I64 or lt.a != phi.d or br.a != lt.d:
+        return no_kernel()
+    var first = br.n
+    var exitl = br.c
+    if br.op == Op.BrNot:
+        first = br.c
+        exitl = br.n
+    if first < 0 or exitl < 0 or sf.lab[first] < 0 or not inb[sf.lab[first]]:
+        return no_kernel()
+    if sf.lab[exitl] < 0 or inb[sf.lab[exitl]]:
+        return no_kernel()
+    var pre = -1
+    var pre_q = -1
+    var jn = -1
+    var q = 0
+    while q < 4:
+        let pb = sf.lab[phi.args[q]]
+        if pb >= 0 and inb[pb]:
+            jn = phi.args[q + 1]
+        else:
+            pre = pb
+            pre_q = q + 1
+        q += 2
+    if pre < 0 or jn < 0 or pre_q < 0:
+        return no_kernel()
+    let lo = phi.args[pre_q]
+    var def_b = [-1] * nv
+    for b in 0..nb:
+        for x in sf.bs[b].code:
+            if x.d >= 0:
+                def_b[x.d] = b
+    if (def_b[lt.b] >= 0 and inb[def_b[lt.b]]) or (def_b[lo] >= 0 and inb[def_b[lo]]):
+        return no_kernel()
+    # the body, in order
+    var chain: [Inst] = []
+    var b = sf.lab[first]
+    var nblocks = 1
+    while true:
+        let code = sf.bs[b].code
+        for i in 0..len(code) - 1:
+            chain.push(code[i])
+        let t = code[len(code) - 1]
+        nblocks += 1
+        if t.op != Op.Jmp or sf.lab[t.n] < 0 or nblocks > len(lp.body):
+            return no_kernel()
+        let nxt = sf.lab[t.n]
+        if nxt == h:
+            break
+        if not inb[nxt]:
+            return no_kernel()
+        b = nxt
+    if nblocks != len(lp.body):
+        return no_kernel()
+    # vreg -> the array it addresses (Elem); float parameter; value in the kernel
+    var arr_of = [-1] * nv
+    var flt_of = [-1] * nv
+    var val_of = [-1] * nv
+    var bases: [int] = []
+    var binv: [int] = []
+    var flts: [int] = []
+    var stores = 0
+    var inc = false
+    # vreg -> v when it is j + v, v from outside the loop; whether it is j
+    var idx_of = [-1] * nv
+    var is_j = [false] * nv
+    is_j[phi.d] = true
+    # bounds checks of j (-1) or j + v: v and the length
+    var cinv: [int] = []
+    var clen: [int] = []
+    for x in chain:
+        match x.op:
+            case Op.Line:
+                pass
+            case Op.IdxChk:
+                if (not is_j[x.a] and idx_of[x.a] < 0) or (def_b[x.b] >= 0 and inb[def_b[x.b]]):
+                    return no_kernel()
+                is_j[x.d] = is_j[x.a]
+                idx_of[x.d] = idx_of[x.a]
+                cinv.push(idx_of[x.a])
+                clen.push(x.b)
+            case Op.Elem:
+                if (
+                    (not is_j[x.b] and idx_of[x.b] < 0)
+                    or x.n != 8
+                    or (def_b[x.a] >= 0 and inb[def_b[x.a]])
+                ):
+                    return no_kernel()
+                let iv = -1 if is_j[x.b] else idx_of[x.b]
+                var a = -1
+                for i, v in enumerate(bases):
+                    if v == x.a and binv[i] == iv:
+                        a = i
+                if a < 0:
+                    a = len(bases)
+                    bases.push(x.a)
+                    binv.push(iv)
+                arr_of[x.d] = a
+            case Op.Load:
+                if sf.f.vk[x.d] != K.F64 or arr_of[x.a] < 0:
+                    return no_kernel()
+                val_of[x.d] = 0
+            case Op.Store:
+                if sf.f.vk[x.b] != K.F64 or arr_of[x.a] < 0:
+                    return no_kernel()
+                stores += 1
+            case Op.Add | Op.Sub | Op.Mul | Op.Div:
+                if sf.f.vk[x.d] == K.F64:
+                    val_of[x.d] = 0
+                elif x.op == Op.Add and x.d == jn and x.a == phi.d and not inc:
+                    let cb = def_b[x.b]
+                    if cb < 0 or inb[cb]:
+                        return no_kernel()
+                    var one = false
+                    for y in sf.bs[cb].code:
+                        if y.d == x.b and y.op == Op.Const and y.n == 1:
+                            one = true
+                    if not one:
+                        return no_kernel()
+                    inc = true
+                elif x.op == Op.Add and sf.f.vk[x.d] == K.I64 and (is_j[x.a] or is_j[x.b]):
+                    let o = x.b if is_j[x.a] else x.a
+                    if is_j[o] or (def_b[o] >= 0 and inb[def_b[o]]):
+                        return no_kernel()
+                    idx_of[x.d] = o
+                else:
+                    return no_kernel()
+            case _:
+                return no_kernel()
+    if not inc or stores == 0 or len(bases) == 0 or len(bases) > 3:
+        return no_kernel()
+    # float operands from outside the loop are parameters; ones from inside
+    # are made earlier in the body
+    for x in chain:
+        var rs: [int] = []
+        if x.op == Op.Store:
+            rs = [x.b]
+        elif x.op != Op.Load and x.d >= 0 and sf.f.vk[x.d] == K.F64:
+            rs = [x.a, x.b]
+        for v in rs:
+            if def_b[v] < 0 or not inb[def_b[v]]:
+                if sf.f.vk[v] != K.F64:
+                    return no_kernel()
+                if flt_of[v] < 0:
+                    flt_of[v] = len(flts)
+                    flts.push(v)
+            elif val_of[v] < 0:
+                return no_kernel()
+    # nothing made in the loop is read after it, but j
+    for bb in 0..nb:
+        if not inb[bb]:
+            for x in sf.bs[bb].code:
+                for u in uses(x):
+                    if u != phi.d and def_b[u] >= 0 and inb[def_b[u]]:
+                        return no_kernel()
+    var ops: [LOp] = []
+    var nval = len(flts)
+    for v in 0..nv:
+        val_of[v] = -1
+    for i, v in enumerate(flts):
+        val_of[v] = i
+    for x in chain:
+        match x.op:
+            case Op.Load:
+                ops.push(LOp(op=L_LD, a=-1, b=-1, arr=arr_of[x.a], off=x.n))
+                val_of[x.d] = nval
+                nval += 1
+            case Op.Store:
+                if val_of[x.b] < 0:
+                    return no_kernel()
+                ops.push(LOp(op=L_ST, a=val_of[x.b], b=-1, arr=arr_of[x.a], off=x.n))
+            case Op.Add | Op.Sub | Op.Mul | Op.Div:
+                if sf.f.vk[x.d] == K.F64:
+                    if val_of[x.a] < 0 or val_of[x.b] < 0:
+                        return no_kernel()
+                    var op = L_ADD
+                    if x.op == Op.Sub:
+                        op = L_SUB
+                    elif x.op == Op.Mul:
+                        op = L_MUL
+                    elif x.op == Op.Div:
+                        op = L_DIV
+                    ops.push(LOp(op=op, a=val_of[x.a], b=val_of[x.b], arr=-1, off=0))
+                    val_of[x.d] = nval
+                    nval += 1
+            case _:
+                pass
+    let (ok, k) = vloop.compile(
+        vloop.Loop(narr=len(bases), nflt=len(flts), ops=ops),
+        name,
+        win,
+        avx
+    )
+    if not ok:
+        return no_kernel()
+    # the call, at the end of the preheader
+    var code = sf.bs[pre].code
+    let term = code.pop()
+    var args: [int] = []
+    for i, base in enumerate(bases):
+        var at = lo
+        if binv[i] >= 0:
+            at = new_v(ref sf, K.I64)
+            code.push(mk(Op.Add, at, binv[i], lo, -1, 0))
+        let p = new_v(ref sf, K.Ptr)
+        code.push(mk(Op.Elem, p, base, at, -1, 8))
+        args.push(p)
+    # the count, or 0 unless lo < hi and every bounds check passes for every
+    # j: the loop then does it all, and panics where it should
+    let hi = lt.b
+    var all = new_v(ref sf, K.Bool)
+    code.push(mk(Op.Lt, all, lo, hi, -1, 0))
+    if len(clen) > 0:
+        let zero = new_v(ref sf, K.I64)
+        code.push(mk(Op.Const, zero, -1, -1, -1, 0))
+        let one = new_v(ref sf, K.I64)
+        code.push(mk(Op.Const, one, -1, -1, -1, 1))
+        let last = new_v(ref sf, K.I64)
+        code.push(mk(Op.Sub, last, hi, one, -1, 0))
+        for i, len_v in enumerate(clen):
+            var f = lo
+            var l = last
+            # 0 <= f <= l < the length, for the first and the last index
+            var ca = [zero]
+            var cb = [f]
+            if cinv[i] >= 0:
+                # j + v as the loop computes it, which mustn't wrap around
+                # between the first and the last j
+                f = new_v(ref sf, K.I64)
+                code.push(mk(Op.Add, f, lo, cinv[i], -1, 0))
+                l = new_v(ref sf, K.I64)
+                code.push(mk(Op.Add, l, last, cinv[i], -1, 0))
+                ca = [zero, f]
+                cb = [f, l]
+            for ci in 0..len(ca):
+                let c = new_v(ref sf, K.Bool)
+                code.push(mk(Op.Le, c, ca[ci], cb[ci], -1, 0))
+                let o2 = new_v(ref sf, K.Bool)
+                code.push(mk(Op.And, o2, all, c, -1, 0))
+                all = o2
+            let c = new_v(ref sf, K.Bool)
+            code.push(mk(Op.Lt, c, l, len_v, -1, 0))
+            let o3 = new_v(ref sf, K.Bool)
+            code.push(mk(Op.And, o3, all, c, -1, 0))
+            all = o3
+    let okn = new_v(ref sf, K.I64)
+    code.push(mk(Op.Conv, okn, all, -1, -1, 0))
+    let mask = new_v(ref sf, K.I64)
+    code.push(mk(Op.Neg, mask, okn, -1, -1, 0))
+    let span = new_v(ref sf, K.I64)
+    code.push(mk(Op.Sub, span, hi, lo, -1, 0))
+    let cnt = new_v(ref sf, K.I64)
+    code.push(mk(Op.And, cnt, span, mask, -1, 0))
+    args.push(cnt)
+    args.extend(flts)
+    let done = new_v(ref sf, K.I64)
+    code.push(Inst(op=Op.Call, d=done, a=-1, b=-1, c=-1, n=0, s=name, args=args))
+    let lo2 = new_v(ref sf, K.I64)
+    code.push(mk(Op.Add, lo2, lo, done, -1, 0))
+    code.push(term)
+    sf.bs[pre].code = code
+    sf.bs[h].code[phi_at].args[pre_q] = lo2
+    return (true, k)
+
+# f optimized, and the vector loop kernels it calls (x86-64 with SSE2, and
+# AVX when `avx`; `win`: the Windows calling convention).
+fn optimize(f: Func, win: bool, avx: bool) -> (Func, [KFunc]):
     var sf = build(f)
     to_ssa(ref sf)
     copies(ref sf)
@@ -1814,5 +2141,6 @@ fn optimize(f: Func) -> Func:
     licm(ref sf)
     gvn(ref sf)
     copies(ref sf)
+    let ks = vector_loops(ref sf, f"brv_{f.name}", win, avx)
     dce(ref sf)
-    return from_ssa(sf)
+    return (from_ssa(sf), ks)
