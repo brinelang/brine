@@ -11,6 +11,59 @@
 
 from ir import K, Op, Inst, Func, Module
 
+# m without the runtime module's functions (runtime/rt.br) that nothing
+# reaches. The roots are the program's own functions, everything data points
+# to, and the exports C or the backends may call by name, except the math ones
+# (`brine_x_f_<name>`), which only calls the backends didn't inline make.
+fn prune_rt(m: Module) -> Module:
+    var at: {str: int} = {}
+    for i, f in enumerate(m.funcs):
+        at[f.name] = i
+    let n = len(m.funcs)
+    var live = [false] * n
+    var work: [int] = []
+    for i, f in enumerate(m.funcs):
+        let rt = f.name.starts_with("__rt__") and not f.export
+        let math = (
+            f.export
+            and f.name.starts_with("brine_x_f_")
+            and not f.name.starts_with("brine_x_f_fmod")
+        )
+        if not rt and not math:
+            live[i] = true
+            work.push(i)
+    for d in m.data:
+        for r in d.relocs:
+            match at.get(r.sym):
+                case Some(j):
+                    if not live[j]:
+                        live[j] = true
+                        work.push(j)
+                case None:
+                    pass
+    while len(work) > 0:
+        let i = work.pop()
+        for x in m.funcs[i].code:
+            var names: [str] = []
+            if x.op == Op.Call or x.op == Op.Global:
+                names.push(x.s)
+                if x.op == Op.Call and x.b == 1 and x.s.starts_with("brine_"):
+                    names.push("brine_x_" + x.s[6:])
+            for s in names:
+                match at.get(s):
+                    case Some(j):
+                        if not live[j]:
+                            live[j] = true
+                            work.push(j)
+                    case None:
+                        pass
+    var out = m
+    out.funcs = []
+    for i, f in enumerate(m.funcs):
+        if live[i]:
+            out.funcs.push(f)
+    return out
+
 # The constant arrays (lower.br's `br_ca` objects): their data pointer, the 8
 # bytes at 48, is their own address + 56, and nothing ever writes it.
 fn const_arrs(m: Module) -> {str: bool}:

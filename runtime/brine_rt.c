@@ -89,8 +89,11 @@ static void br_ws_start(void) {
 #include <netdb.h>
 #endif
 
-/* sin, exp, pow, ...: the same bits on every target */
+/* sin, exp, pow, ...: the same bits on every target (native code has
+   runtime/rt.br's port of the same code) */
+#ifndef BRINE_RT_BR
 #include "brine_math.c"
+#endif
 
 /* generated code hardcodes these (lower.br) */
 _Static_assert(offsetof(brine_arr, data) == 48, "brine_arr layout");
@@ -7336,6 +7339,7 @@ uint64_t brine_x_hash_u128(const brine_u128 *x) { return brine_hash_u128(*x); }
 int64_t brine_x_idx(int64_t i, int64_t len, const char *loc) { return brine_idx(i, len, loc); }
 int64_t brine_x_par_plan(int64_t n) { return brine_par_plan(n); }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 #define BR_X_MATH1(name) \
     double brine_x_f_##name(double x) { return brine_f_##name(x); } \
     float brine_x_f_##name##f(float x) { return brine_f_##name##f(x); }
@@ -7366,7 +7370,14 @@ double brine_x_f_atan2(double y, double x) { return brine_f_atan2(y, x); }
 double brine_x_f_hypot(double x, double y) { return brine_f_hypot(x, y); }
 float brine_x_f_powf(float a, float b) { return brine_f_powf(a, b); }
 float brine_x_f_atan2f(float y, float x) { return brine_f_atan2f(y, x); }
+double brine_x_f_fmod(double a, double b) { return brine_f_fmod(a, b); }
+float brine_x_f_fmodf(float a, float b) { return brine_f_fmodf(a, b); }
+double brine_x_f_fmin(double a, double b) { return brine_f_fmin(a, b); }
+double brine_x_f_fmax(double a, double b) { return brine_f_fmax(a, b); }
+float brine_x_f_fminf(float a, float b) { return brine_f_fminf(a, b); }
+float brine_x_f_fmaxf(float a, float b) { return brine_f_fmaxf(a, b); }
 float brine_x_f_hypotf(float x, float y) { return brine_f_hypotf(x, y); }
+#endif
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
 int64_t brine_x_popcnt_u64(uint64_t x) { return brine_popcnt_u64(x); }
 uint64_t brine_x_bswap_u64(uint64_t x) { return __builtin_bswap64(x); }
@@ -7376,12 +7387,6 @@ int64_t brine_x_popcnt_u128(const brine_u128 *x) { return brine_popcnt_u128(*x);
 int64_t brine_x_clz_u128(const brine_u128 *x) { return brine_clz_u128(*x); }
 int64_t brine_x_ctz_u128(const brine_u128 *x) { return brine_ctz_u128(*x); }
 #endif
-double brine_x_f_fmod(double a, double b) { return brine_f_fmod(a, b); }
-float brine_x_f_fmodf(float a, float b) { return brine_f_fmodf(a, b); }
-double brine_x_f_fmin(double a, double b) { return brine_f_fmin(a, b); }
-double brine_x_f_fmax(double a, double b) { return brine_f_fmax(a, b); }
-float brine_x_f_fminf(float a, float b) { return brine_f_fminf(a, b); }
-float brine_x_f_fmaxf(float a, float b) { return brine_f_fmaxf(a, b); }
 
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
 /* integer helpers for types up to 64 bits */
