@@ -1,12 +1,20 @@
-# The runtime's fast paths, in brine. Native code calls these instead of the
-# C runtime's (brine_rt.h has the same functions, with the same parameters
-# and results) and inlines them; the slow paths stay in C for now.
+# The runtime, in brine, for native code; what isn't here yet is still C
+# (brine_rt.c). A function `f` here is used in place of the C runtime's
+# `brine_f` (brine_rt.h has the same functions, with the same parameters
+# and results) and native code inlines it. A function named `brine_f`
+# replaces the C one outright: it is the program's `brine_f`, which the C
+# runtime calls too, so brine_rt.c leaves its own out (BRINE_RT_BR).
 #
 # This module alone has `ptr`, a raw address, with `p + n` and `p - n`, and
-# the memory operations `load_<t>(p, off)`, `store_<t>(p, off, v)` (t is
-# i64, u64, u8 or ptr), `call_bool(f, ...)`, `bswap(x)`, `thread_ptr()`,
-# `addr(p)` (p as a number) and `symbol("name")` (a C symbol's address).
-# Its arithmetic wraps, and the prover doesn't look at it.
+# the memory operations `load_<t>(p, off)` and `store_<t>(p, off, v)` (t is
+# i8 to i64, u8 to u64, f32, f64, bool or ptr), `call_<t>(f, ...)` (a call
+# of the C function at f; `call_void` has no result), `str_retain(p)` and
+# `str_release(p)` (also arr_ and map_), `str_of(p)` and `ptr_of(s)` (a
+# string's block as a `str` and back, borrowed), `stack_mem(n)` (n bytes of
+# the frame), `bswap(x)`, `thread_ptr()`, `addr(p)` (p as a number) and
+# `symbol("name")` (a C symbol's address). Its arithmetic wraps, and the
+# prover doesn't look at it. Code here can't use what lowers to the function
+# it is in (`a + b` on strings in brine_str_concat).
 
 # brine_str: a reference count (negative: immortal), the length, then the
 # bytes and a NUL. Every string can be read to the end of the 8-byte word
@@ -48,8 +56,6 @@ const SMALL = 256
 const SPARE = 65536
 
 const ONES: u64 = 0xffffffffffffffff
-
-extern fn brine_str_eq_long(a: ptr, b: ptr) -> bool
 
 extern fn brine_hash_long(p: ptr, n: u64) -> u64
 
@@ -295,3 +301,457 @@ fn box_free(p: ptr):
                 store_i64(h, TH_COUNT + c * 8, n)
                 return
     brine_box_free(p)
+
+# ------------------------------------------------------------ strings
+# What C still does for them (brine_rt.c), and the C library.
+
+extern fn memcpy(d: ptr, s: ptr, n: u64) -> ptr
+
+extern fn memcmp(a: ptr, b: ptr, n: u64) -> i32
+
+# a block for a string of n bytes: count 1, length n, the NUL (br_str_alloc)
+extern fn brine_x_str_alloc(n: int) -> ptr
+
+# s's block made big enough for a string of n bytes; it may move
+extern fn brine_x_str_grow(s: ptr, n: int) -> ptr
+
+extern fn brine_panic_at(loc: ptr, msg: str)
+
+extern fn brine_arr_new(n: int, esz: int, rt: ptr, rl: ptr, loc: ptr) -> ptr
+
+extern fn brine_arr_push(pa: ptr, elem: ptr)
+
+# n bytes from s to d; short copies a byte at a time rather than a call
+fn copy_bytes(d: ptr, s: ptr, n: int):
+    if n > 16:
+        memcpy(d, s, u64(n))
+        return
+    for i in 0..n:
+        store_u8(d, i, load_u8(s, i))
+
+# the one-character string of byte c (brine_bytes: brine_str1, 24 bytes each)
+fn byte_str(c: u8) -> ptr:
+    return symbol("brine_bytes") + int(c) * 24
+
+fn brine_str_new(p: ptr, n: int) -> ptr:
+    let s = brine_x_str_alloc(n)
+    if n != 0:
+        memcpy(s + STR_DATA, p, u64(n))
+    return s
+
+fn brine_str_concat(a: ptr, b: ptr) -> ptr:
+    let la = load_i64(a, STR_LEN)
+    let lb = load_i64(b, STR_LEN)
+    let s = brine_x_str_alloc(la + lb)
+    copy_bytes(s + STR_DATA, a + STR_DATA, la)
+    copy_bytes(s + STR_DATA + la, b + STR_DATA, lb)
+    return s
+
+# `s += b`: grows s in place when nothing else holds it
+fn brine_str_append(ps: ptr, b: ptr):
+    let a = load_ptr(ps, 0)
+    let lb = load_i64(b, STR_LEN)
+    if lb == 0:
+        return
+    if load_i64(a, STR_RC) != 1:
+        store_ptr(ps, 0, brine_str_concat(a, b))
+        str_release(a)
+        return
+    let la = load_i64(a, STR_LEN)
+    let n = la + lb
+    let own = a == b
+    let s = brine_x_str_grow(a, n)
+    memcpy(s + STR_DATA + la, (s if own else b) + STR_DATA, u64(lb))
+    store_i64(s, STR_LEN, n)
+    store_u8(s, STR_DATA + n, 0)
+    store_ptr(ps, 0, s)
+
+# brine_str_add_byte when s is shared or full: the usual case is the first
+# `+=` to a literal (`var w = ""`), which gets a block of its own
+fn brine_str_add_byte_slow(ps: ptr, c: u8):
+    let a = load_ptr(ps, 0)
+    let la = load_i64(a, STR_LEN)
+    if load_i64(a, STR_RC) == 1:
+        # grows the block
+        brine_str_append(ps, byte_str(c))
+        return
+    let s = brine_x_str_alloc(la + 1)
+    if la < 8:
+        let w = load_u64(a, STR_DATA) & lowmask(u64(la))
+        store_u64(s, STR_DATA, w | u64(c) << u64(8 * la))
+        store_u8(s, STR_DATA + 8, 0)
+    else:
+        memcpy(s + STR_DATA, a + STR_DATA, u64(la))
+        store_u8(s, STR_DATA + la, c)
+    str_release(a)
+    store_ptr(ps, 0, s)
+
+fn brine_str_eq_long(a: ptr, b: ptr) -> bool:
+    return memcmp(a + STR_DATA, b + STR_DATA, load_u64(a, STR_LEN)) == 0
+
+fn brine_str_contains(s: ptr, sub: ptr) -> bool:
+    return find_from(s, sub, 0) >= 0
+
+# The first i >= from where sub is in s, or -1 (an empty sub is at from).
+fn find_from(s: ptr, sub: ptr, from: int) -> int:
+    let n = load_i64(sub, STR_LEN)
+    let d = s + STR_DATA
+    let last = load_i64(s, STR_LEN) - n
+    if n == 0:
+        return from if from <= last else -1
+    let first = load_u8(sub, STR_DATA)
+    var i = from
+    while i <= last:
+        if load_u8(d, i) == first and memcmp(d + i, sub + STR_DATA, u64(n)) == 0:
+            return i
+        i += 1
+    return -1
+
+# s[lo:hi] (in bounds, whole characters)
+fn sub_str(s: ptr, lo: int, hi: int) -> ptr:
+    if lo == 0 and hi == load_i64(s, STR_LEN):
+        str_retain(s)
+        return s
+    if hi - lo == 1:
+        return byte_str(load_u8(s, STR_DATA + lo))
+    return brine_str_new(s + STR_DATA + lo, hi - lo)
+
+# The length of the UTF-8 character at p (1 for an invalid byte).
+fn utf8_len(p: ptr, avail: int) -> int:
+    let b = load_u8(p, 0)
+    var n = 1
+    if b >= 0x80:
+        if b >> 5 == 6:
+            n = 2
+        elif b >> 4 == 14:
+            n = 3
+        elif b >> 3 == 30:
+            n = 4
+    if n > avail:
+        return 1
+    for i in 1..n:
+        if load_u8(p, i) & 0xc0 != 0x80:
+            return 1
+    return n
+
+# Is byte i of s inside a character, not at its start?
+fn mid_char(s: ptr, i: int) -> bool:
+    return i > 0 and i < load_i64(s, STR_LEN) and load_u8(s, STR_DATA + i) & 0xc0 == 0x80
+
+fn slice_splits(s: ptr, lo: int, hi: int, loc: ptr):
+    let b = lo if mid_char(s, lo) else hi
+    var a = b
+    while a > 0 and b - a < 3 and mid_char(s, a):
+        a -= 1
+    let n = utf8_len(s + STR_DATA + a, load_i64(s, STR_LEN) - a)
+    if a + n <= b:
+        brine_panic_at(loc, f"slice [{lo}:{hi}] starts or ends inside a character (byte {b})")
+    let c = brine_str_new(s + STR_DATA + a, n)
+    brine_panic_at(
+        loc,
+        f"slice [{lo}:{hi}] splits the character \"{str_of(c)}\" (bytes {a}..{a + n})"
+    )
+
+# Strings are UTF-8, so a slice must not cut a character in two.
+fn brine_str_slice(s: ptr, lo: int, hi: int, loc: ptr) -> ptr:
+    let n = load_i64(s, STR_LEN)
+    if lo < 0 or lo > hi or hi > n:
+        brine_panic_at(loc, f"slice [{lo}:{hi}] is out of bounds for a string of length {n}")
+    if mid_char(s, lo) or mid_char(s, hi):
+        slice_splits(s, lo, hi, loc)
+    return sub_str(s, lo, hi)
+
+fn brine_ord(s: ptr, loc: ptr) -> int:
+    let len = load_i64(s, STR_LEN)
+    let p = s + STR_DATA
+    let n = utf8_len(p, len) if len != 0 else 0
+    if n == 0 or n != len:
+        brine_panic_at(loc, f"ord() needs exactly one character, got a string of length {len}")
+    if n == 1:
+        return int(load_u8(p, 0))
+    var c = int(load_u8(p, 0)) & (0x7f >> n)
+    for i in 1..n:
+        c = (c << 6) | (int(load_u8(p, i)) & 0x3f)
+    return c
+
+fn brine_chr(c: int, loc: ptr) -> ptr:
+    if c < 0 or c > 0x10ffff or (c >= 0xd800 and c <= 0xdfff):
+        brine_panic_at(loc, f"chr({c}) is not a valid character")
+    if c < 0x80:
+        return byte_str(u8(c))
+    let b = stack_mem(8)
+    var n = 4
+    if c < 0x800:
+        store_u8(b, 0, u8(0xc0 | (c >> 6)))
+        store_u8(b, 1, u8(0x80 | (c & 0x3f)))
+        n = 2
+    elif c < 0x10000:
+        store_u8(b, 0, u8(0xe0 | (c >> 12)))
+        store_u8(b, 1, u8(0x80 | ((c >> 6) & 0x3f)))
+        store_u8(b, 2, u8(0x80 | (c & 0x3f)))
+        n = 3
+    else:
+        store_u8(b, 0, u8(0xf0 | (c >> 18)))
+        store_u8(b, 1, u8(0x80 | ((c >> 12) & 0x3f)))
+        store_u8(b, 2, u8(0x80 | ((c >> 6) & 0x3f)))
+        store_u8(b, 3, u8(0x80 | (c & 0x3f)))
+    return brine_str_new(b, n)
+
+fn brine_s_find(s: ptr, sub: ptr, loc: ptr) -> int:
+    return find_from(s, sub, 0)
+
+fn brine_s_find_from(s: ptr, sub: ptr, start: int, loc: ptr) -> int:
+    let n = load_i64(s, STR_LEN)
+    if start < 0 or start > n:
+        brine_panic_at(loc, f"find() start {start} is out of range for a string of {n} bytes")
+    return find_from(s, sub, start)
+
+fn brine_start_chk(start: int, len: int, loc: ptr) -> int:
+    if start < 0 or start > len:
+        brine_panic_at(loc, f"index() start {start} is out of range for an array of length {len}")
+    return start
+
+fn push_str(pa: ptr, s: ptr):
+    let slot = stack_mem(8)
+    store_ptr(slot, 0, s)
+    brine_arr_push(pa, slot)
+
+fn brine_s_split(s: ptr, sep: ptr, loc: ptr) -> ptr:
+    let ns = load_i64(sep, STR_LEN)
+    if ns == 0:
+        brine_panic_at(loc, "split() separator is empty")
+    let pa = stack_mem(8)
+    let none = ptr_of("") + STR_DATA
+    store_ptr(pa, 0, brine_arr_new(0, 8, symbol("brine_rt_str"), symbol("brine_rl_str"), none))
+    var at = 0
+    while true:
+        let i = find_from(s, sep, at)
+        if i < 0:
+            break
+        push_str(pa, sub_str(s, at, i))
+        at = i + ns
+    push_str(pa, sub_str(s, at, load_i64(s, STR_LEN)))
+    return load_ptr(pa, 0)
+
+# ------------------------------------------------------------ string builder
+# brine_sb: the bytes (a block of brine_alloc's), the length, the room
+
+const SB_P = 0
+const SB_LEN = 8
+const SB_CAP = 16
+
+extern fn memmove(d: ptr, s: ptr, n: u64) -> ptr
+
+extern fn memset(d: ptr, c: i32, n: u64) -> ptr
+
+extern fn brine_alloc(n: int) -> ptr
+
+extern fn brine_free(p: ptr)
+
+# p's block (from brine_alloc) made n bytes; it may move
+extern fn brine_x_realloc(p: ptr, n: int) -> ptr
+
+extern fn brine_sb_fmt_f64(sb: ptr, v: float, prec: int, kind: int)
+
+# pairs of decimal digits, 00 to 99
+const DIGITS = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
+
+const HEX = "0123456789abcdef"
+
+fn brine_sb_init(sb: ptr):
+    store_i64(sb, SB_CAP, 64)
+    store_i64(sb, SB_LEN, 0)
+    store_ptr(sb, SB_P, brine_alloc(64))
+
+# Room for `extra` more bytes; the address they go at.
+fn sb_room(sb: ptr, extra: int) -> ptr:
+    let len = load_i64(sb, SB_LEN)
+    let cap = load_i64(sb, SB_CAP)
+    if len + extra > cap:
+        var nc = cap * 2
+        while nc < len + extra:
+            nc *= 2
+        store_ptr(sb, SB_P, brine_x_realloc(load_ptr(sb, SB_P), nc))
+        store_i64(sb, SB_CAP, nc)
+    return load_ptr(sb, SB_P) + len
+
+fn brine_sb_cat(sb: ptr, p: ptr, n: int):
+    copy_bytes(sb_room(sb, n), p, n)
+    store_i64(sb, SB_LEN, load_i64(sb, SB_LEN) + n)
+
+fn sb_byte(sb: ptr, c: u8):
+    store_u8(sb_room(sb, 1), 0, c)
+    store_i64(sb, SB_LEN, load_i64(sb, SB_LEN) + 1)
+
+fn sb_lit(sb: ptr, s: str):
+    let p = ptr_of(s)
+    brine_sb_cat(sb, p + STR_DATA, load_i64(p, STR_LEN))
+
+fn brine_sb_str(sb: ptr, s: ptr):
+    brine_sb_cat(sb, s + STR_DATA, load_i64(s, STR_LEN))
+
+fn brine_sb_repr_str(sb: ptr, s: ptr):
+    sb_byte(sb, 34)
+    let n = load_i64(s, STR_LEN)
+    for i in 0..n:
+        let c = load_u8(s, STR_DATA + i)
+        if c == 34:
+            sb_lit(sb, "\\\"")
+        elif c == 92:
+            sb_lit(sb, "\\\\")
+        elif c == 10:
+            sb_lit(sb, "\\n")
+        elif c == 9:
+            sb_lit(sb, "\\t")
+        elif c == 13:
+            sb_lit(sb, "\\r")
+        elif c < 0x20:
+            sb_lit(sb, "\\u{")
+            sb_base(sb, u64(c), 4)
+            sb_byte(sb, 125)
+        else:
+            sb_byte(sb, c)
+    sb_byte(sb, 34)
+
+# The number of decimal digits of u.
+fn dec_len(u: u64) -> int:
+    var n = 1
+    var t: u64 = 10
+    while u >= t:
+        n += 1
+        if n == 20:
+            return 20
+        t *= 10
+    return n
+
+# u in decimal, its last digit at d + n - 1 (n is dec_len(u))
+fn put_dec(d: ptr, n: int, u0: u64):
+    let t = ptr_of(DIGITS) + STR_DATA
+    var u = u0
+    var i = n
+    while u >= 100:
+        let r = int(u % 100)
+        u = u / 100
+        i -= 2
+        store_u16(d, i, load_u16(t, r * 2))
+    if u >= 10:
+        store_u16(d, i - 2, load_u16(t, int(u) * 2))
+    else:
+        store_u8(d, i - 1, u8(48 + u))
+
+fn brine_sb_u64(sb: ptr, v: u64):
+    let n = dec_len(v)
+    put_dec(sb_room(sb, n), n, v)
+    store_i64(sb, SB_LEN, load_i64(sb, SB_LEN) + n)
+
+fn brine_sb_i64(sb: ptr, v: int):
+    if v >= 0:
+        brine_sb_u64(sb, u64(v))
+        return
+    # (wraps for the smallest int)
+    let u = u64(0) - u64(v)
+    let n = dec_len(u)
+    let d = sb_room(sb, n + 1)
+    store_u8(d, 0, 45)
+    put_dec(d + 1, n, u)
+    store_i64(sb, SB_LEN, load_i64(sb, SB_LEN) + n + 1)
+
+fn brine_sb_bool(sb: ptr, v: bool):
+    sb_lit(sb, "true" if v else "false")
+
+# u in base 2^bits (hex: 4, binary: 1)
+fn sb_base(sb: ptr, u: u64, bits: u64):
+    let most = int(64 / bits)
+    var n = 1
+    while n < most and u >> (u64(n) * bits) != 0:
+        n += 1
+    let d = sb_room(sb, n)
+    let t = ptr_of(HEX) + STR_DATA
+    let mask = (u64(1) << bits) - 1
+    var x = u
+    var i = n
+    while i > 0:
+        i -= 1
+        store_u8(d, i, load_u8(t, int(x & mask)))
+        x = x >> bits
+    store_i64(sb, SB_LEN, load_i64(sb, SB_LEN) + n)
+
+fn brine_sb_fmt_i64(sb: ptr, v: int, kind: int):
+    if kind == 120 or kind == 98:
+        if v < 0:
+            sb_byte(sb, 45)
+        let u = u64(0) - u64(v) if v < 0 else u64(v)
+        sb_base(sb, u, 4 if kind == 120 else 1)
+        return
+    if kind == 102 or kind == 101 or kind == 103:
+        brine_sb_fmt_f64(sb, float(v), -1, kind)
+        return
+    brine_sb_i64(sb, v)
+
+fn brine_sb_fmt_u64(sb: ptr, v: u64, kind: int):
+    if kind == 120 or kind == 98:
+        sb_base(sb, v, 4 if kind == 120 else 1)
+    elif kind == 102 or kind == 101 or kind == 103:
+        brine_sb_fmt_f64(sb, float(v), -1, kind)
+    else:
+        brine_sb_u64(sb, v)
+
+fn is_digit(c: u8) -> bool:
+    return c >= 48 and c <= 57
+
+# `{x:,}`: commas between groups of three digits in the integer part of the
+# number written from `start` on
+fn brine_sb_group(sb: ptr, start: int):
+    var p = load_ptr(sb, SB_P)
+    let len = load_i64(sb, SB_LEN)
+    var a = start
+    if a < len and (load_u8(p, a) == 45 or load_u8(p, a) == 43):
+        a += 1
+    var b = a
+    while b < len and is_digit(load_u8(p, b)):
+        b += 1
+    let n = b - a
+    let k = (n - 1) / 3
+    if n <= 3:
+        return
+    sb_room(sb, k)
+    p = load_ptr(sb, SB_P)
+    memmove(p + b + k, p + b, u64(len - b))
+    store_i64(sb, SB_LEN, len + k)
+    # from the right: copy digits, a comma after every third
+    var from = b - 1
+    var to = b + k - 1
+    var i = 0
+    while from >= a:
+        if i > 0 and i % 3 == 0:
+            store_u8(p, to, 44)
+            to -= 1
+        store_u8(p, to, load_u8(p, from))
+        to -= 1
+        from -= 1
+        i += 1
+
+fn brine_sb_pad(sb: ptr, start: int, width: int, left: bool, zero: bool):
+    let len = load_i64(sb, SB_LEN)
+    let n = len - start
+    if n >= width:
+        return
+    let pad = width - n
+    sb_room(sb, pad)
+    let p = load_ptr(sb, SB_P)
+    if left:
+        memset(p + len, 32, u64(pad))
+    else:
+        var at = start
+        if zero and n > 0 and (load_u8(p, start) == 45 or load_u8(p, start) == 43):
+            at += 1
+        memmove(p + at + pad, p + at, u64(len - at))
+        memset(p + at, 48 if zero else 32, u64(pad))
+    store_i64(sb, SB_LEN, len + pad)
+
+fn brine_sb_finish(sb: ptr) -> ptr:
+    let p = load_ptr(sb, SB_P)
+    let s = brine_str_new(p, load_i64(sb, SB_LEN))
+    brine_free(p)
+    store_u64(sb, SB_P, 0)
+    return s
