@@ -27,9 +27,10 @@
 # (critical edges are split first, and the copies on one edge are made in an
 # order that doesn't overwrite a value another copy still reads).
 
-from ir import K, Op, Inst, Func, KFunc
+from ir import K, Op, Inst, Func, KFunc, Slot
 import vloop
-from vloop import LOp, L_LD, L_ST, L_ADD, L_SUB, L_MUL, L_DIV
+from vloop import LOp, L_LD, L_ST, L_ADD, L_SUB, L_MUL, L_DIV, L_IADD, L_ISUB, L_IMUL, L_IAND
+from vloop import L_IOR, L_IXOR, L_SHL, L_SAR, L_SHR, L_CONV, L_RED
 
 struct Block:
     label: int
@@ -1809,8 +1810,8 @@ fn from_ssa(sf0: SF) -> Func:
 
 # Gives each innermost loop vloop.br can run several elements at a time a call
 # to its kernel (named `name`_0, _1, ...) before the loop, which then starts
-# where the kernel stopped. Returns the kernels.
-fn vector_loops(ref sf: SF, name: str, win: bool, avx: bool) -> [KFunc]:
+# where the kernel stopped. Returns the kernels; `vw`: the most lanes.
+fn vector_loops(ref sf: SF, name: str, vw: int) -> [KFunc]:
     var out: [KFunc] = []
     preheaders(ref sf)
     let loops = find_loops(sf)
@@ -1818,7 +1819,7 @@ fn vector_loops(ref sf: SF, name: str, win: bool, avx: bool) -> [KFunc]:
     for lp in loops:
         is_head[lp.header] = true
     for lp in loops:
-        let (ok, k) = vector_loop(ref sf, lp, is_head, f"{name}_{len(out)}", win, avx)
+        let (ok, k) = vector_loop(ref sf, lp, is_head, f"{name}_{len(out)}", vw)
         if ok:
             out.push(k)
     return out
@@ -1830,17 +1831,27 @@ fn new_v(ref sf: SF, k: K) -> int:
 fn no_kernel() -> (bool, KFunc):
     return (false, vloop.no_kernel(""))
 
-# The loop must be: a header with only `j = phi(lo, j + 1)`, `j < hi` and
-# the branch; then blocks in a row that compute `p + 8 * j` addresses, load
-# and store doubles there, do + - * / on doubles, and add 1 to j.
-fn vector_loop(
-    ref sf: SF,
-    lp: Loop,
-    is_head: [bool],
-    name: str,
-    win: bool,
-    avx: bool
-) -> (bool, KFunc):
+# The argument of a phi that comes from outside the loop, or -1.
+fn outside_arg(sf: SF, phi: Inst, inb: [bool]) -> int:
+    if len(phi.args) != 4:
+        return -1
+    var at = -1
+    var q = 0
+    while q < 4:
+        let pb = sf.lab[phi.args[q]]
+        if pb < 0 or not inb[pb]:
+            if at >= 0:
+                return -1
+            at = q + 1
+        q += 2
+    return at
+
+# The loop must be: a header with only `j = phi(lo, j + 1)`, sums of doubles
+# `s = phi(s0, s op x)`, `j < hi` and the branch; then blocks in a row that
+# compute `p + 8 * (j + v)` addresses, load and store doubles there, do
+# + - * / on doubles, + - * & | ^ and shifts on integers, convert integers to
+# doubles, update the sums and add 1 to j.
+fn vector_loop(ref sf: SF, lp: Loop, is_head: [bool], name: str, vw: int) -> (bool, KFunc):
     let nb = len(sf.bs)
     let nv = len(sf.f.vk)
     let h = lp.header
@@ -1850,21 +1861,25 @@ fn vector_loop(
         if b != h and is_head[b]:
             return no_kernel()
     var hx: [Inst] = []
-    var phi_at = -1
+    var phis: [Inst] = []
+    var phi_ats: [int] = []
     for i, x in enumerate(sf.bs[h].code):
-        if x.op != Op.Line:
-            if x.op == Op.Phi:
-                phi_at = i
+        if x.op == Op.Phi:
+            phis.push(x)
+            phi_ats.push(i)
+        elif x.op != Op.Line:
             hx.push(x)
-    if len(hx) != 3 or hx[0].op != Op.Phi or hx[1].op != Op.Lt:
+    if len(hx) != 2 or hx[0].op != Op.Lt or (hx[1].op != Op.Br and hx[1].op != Op.BrNot):
         return no_kernel()
-    if hx[2].op != Op.Br and hx[2].op != Op.BrNot:
+    let lt = hx[0]
+    let br = hx[1]
+    var ji = -1
+    for i, x in enumerate(phis):
+        if x.d == lt.a:
+            ji = i
+    if ji < 0 or sf.f.vk[lt.a] != K.I64 or br.a != lt.d:
         return no_kernel()
-    let phi = hx[0]
-    let lt = hx[1]
-    let br = hx[2]
-    if len(phi.args) != 4 or sf.f.vk[phi.d] != K.I64 or lt.a != phi.d or br.a != lt.d:
-        return no_kernel()
+    let phi = phis[ji]
     var first = br.n
     var exitl = br.c
     if br.op == Op.BrNot:
@@ -1874,28 +1889,39 @@ fn vector_loop(
         return no_kernel()
     if sf.lab[exitl] < 0 or inb[sf.lab[exitl]]:
         return no_kernel()
-    var pre = -1
-    var pre_q = -1
-    var jn = -1
-    var q = 0
-    while q < 4:
-        let pb = sf.lab[phi.args[q]]
-        if pb >= 0 and inb[pb]:
-            jn = phi.args[q + 1]
-        else:
-            pre = pb
-            pre_q = q + 1
-        q += 2
-    if pre < 0 or jn < 0 or pre_q < 0:
+    let pre_q = outside_arg(sf, phi, inb)
+    if pre_q < 0:
+        return no_kernel()
+    let pre = sf.lab[phi.args[pre_q - 1]]
+    let jn = phi.args[4 - pre_q]
+    if pre < 0:
         return no_kernel()
     let lo = phi.args[pre_q]
     var def_b = [-1] * nv
+    var cval = [-1] * nv
     for b in 0..nb:
         for x in sf.bs[b].code:
             if x.d >= 0:
                 def_b[x.d] = b
+                if x.op == Op.Const and x.n >= 0 and x.n < 64:
+                    cval[x.d] = x.n
     if (def_b[lt.b] >= 0 and inb[def_b[lt.b]]) or (def_b[lo] >= 0 and inb[def_b[lo]]):
         return no_kernel()
+    # the sums: their phis, where their first value comes in, and the update
+    var sum_of = [-1] * nv
+    var sphi: [int] = []
+    var sq: [int] = []
+    var sback: [int] = []
+    for i, x in enumerate(phis):
+        if i == ji:
+            continue
+        let q = outside_arg(sf, x, inb)
+        if q < 0 or sf.f.vk[x.d] != K.F64:
+            return no_kernel()
+        sum_of[x.d] = len(sphi)
+        sphi.push(i)
+        sq.push(q)
+        sback.push(x.args[4 - q])
     # the body, in order
     var chain: [Inst] = []
     var b = sf.lab[first]
@@ -1916,12 +1942,12 @@ fn vector_loop(
         b = nxt
     if nblocks != len(lp.body):
         return no_kernel()
-    # vreg -> the array it addresses (Elem); float parameter; value in the kernel
+    # vreg -> the array it addresses (Elem); its value in the kernel
     var arr_of = [-1] * nv
-    var flt_of = [-1] * nv
     var val_of = [-1] * nv
     var bases: [int] = []
     var binv: [int] = []
+    var ints: [int] = []
     var flts: [int] = []
     var stores = 0
     var inc = false
@@ -1929,26 +1955,42 @@ fn vector_loop(
     var idx_of = [-1] * nv
     var is_j = [false] * nv
     is_j[phi.d] = true
+    # vregs made in the loop that are integers or doubles the kernel has
+    var is_i = [false] * nv
+    var is_f = [false] * nv
+    is_i[phi.d] = true
     # bounds checks of j (-1) or j + v: v and the length
     var cinv: [int] = []
     var clen: [int] = []
+    # how often each sum's phi and update are read in the loop
+    var sreads = [0] * len(sphi)
     for x in chain:
+        for u in uses(x):
+            if sum_of[u] >= 0:
+                sreads[sum_of[u]] += 1
+            for k in 0..len(sphi):
+                if u == sback[k]:
+                    return no_kernel()
+    for k in 0..len(sphi):
+        if sreads[k] != 1:
+            return no_kernel()
+    var ops: [LOp] = []
+    # first pass: what the body is, and the parameters
+    for x in chain:
+        let vd = sf.f.vk[x.d] if x.d >= 0 else K.I64
         match x.op:
             case Op.Line:
                 pass
             case Op.IdxChk:
-                if (not is_j[x.a] and idx_of[x.a] < 0) or (def_b[x.b] >= 0 and inb[def_b[x.b]]):
+                if (not is_j[x.a] and idx_of[x.a] < 0) or ins(def_b, inb, x.b):
                     return no_kernel()
                 is_j[x.d] = is_j[x.a]
                 idx_of[x.d] = idx_of[x.a]
+                is_i[x.d] = true
                 cinv.push(idx_of[x.a])
                 clen.push(x.b)
             case Op.Elem:
-                if (
-                    (not is_j[x.b] and idx_of[x.b] < 0)
-                    or x.n != 8
-                    or (def_b[x.a] >= 0 and inb[def_b[x.a]])
-                ):
+                if (not is_j[x.b] and idx_of[x.b] < 0) or x.n != 8 or ins(def_b, inb, x.a):
                     return no_kernel()
                 let iv = -1 if is_j[x.b] else idx_of[x.b]
                 var a = -1
@@ -1961,106 +2003,152 @@ fn vector_loop(
                     binv.push(iv)
                 arr_of[x.d] = a
             case Op.Load:
-                if sf.f.vk[x.d] != K.F64 or arr_of[x.a] < 0:
+                if vd != K.F64 or arr_of[x.a] < 0:
                     return no_kernel()
-                val_of[x.d] = 0
+                is_f[x.d] = true
             case Op.Store:
                 if sf.f.vk[x.b] != K.F64 or arr_of[x.a] < 0:
                     return no_kernel()
-                stores += 1
-            case Op.Add | Op.Sub | Op.Mul | Op.Div:
-                if sf.f.vk[x.d] == K.F64:
-                    val_of[x.d] = 0
-                elif x.op == Op.Add and x.d == jn and x.a == phi.d and not inc:
-                    let cb = def_b[x.b]
-                    if cb < 0 or inb[cb]:
-                        return no_kernel()
-                    var one = false
-                    for y in sf.bs[cb].code:
-                        if y.d == x.b and y.op == Op.Const and y.n == 1:
-                            one = true
-                    if not one:
-                        return no_kernel()
-                    inc = true
-                elif x.op == Op.Add and sf.f.vk[x.d] == K.I64 and (is_j[x.a] or is_j[x.b]):
-                    let o = x.b if is_j[x.a] else x.a
-                    if is_j[o] or (def_b[o] >= 0 and inb[def_b[o]]):
-                        return no_kernel()
-                    idx_of[x.d] = o
-                else:
+                if not param(sf, x.b, K.F64, is_f, ins(def_b, inb, x.b), ref flts):
                     return no_kernel()
+                stores += 1
+            case Op.Add | Op.Sub | Op.Mul | Op.Div if vd == K.F64:
+                if sum_of[x.a] >= 0:
+                    # s op x: the sum's update
+                    if x.d != sback[sum_of[x.a]] or x.op == Op.Div or sum_of[x.b] >= 0:
+                        return no_kernel()
+                elif not param(sf, x.a, K.F64, is_f, ins(def_b, inb, x.a), ref flts):
+                    return no_kernel()
+                if not param(sf, x.b, K.F64, is_f, ins(def_b, inb, x.b), ref flts):
+                    return no_kernel()
+                is_f[x.d] = true
+            case Op.Add if x.d == jn and x.a == phi.d and not inc:
+                if ins(def_b, inb, x.b) or cval[x.b] != 1:
+                    return no_kernel()
+                inc = true
+            case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor if vd == K.I64:
+                if x.op == Op.Add and (is_j[x.a] or is_j[x.b]):
+                    let o = x.b if is_j[x.a] else x.a
+                    if not is_j[o] and not ins(def_b, inb, o):
+                        idx_of[x.d] = o
+                for v in [x.a, x.b]:
+                    if not param(sf, v, K.I64, is_i, ins(def_b, inb, v), ref ints):
+                        return no_kernel()
+                is_i[x.d] = true
+            case Op.Shl | Op.Shr if vd == K.I64:
+                if (
+                    cval[x.b] < 0
+                    or ins(def_b, inb, x.b)
+                    or not param(sf, x.a, K.I64, is_i, ins(def_b, inb, x.a), ref ints)
+                ):
+                    return no_kernel()
+                is_i[x.d] = true
+            case Op.Div if vd == K.I64:
+                # by a power of two, as shifts
+                let k = log2_exact(cval[x.b])
+                if (
+                    ins(def_b, inb, x.b)
+                    or k < 1
+                    or not param(sf, x.a, K.I64, is_i, ins(def_b, inb, x.a), ref ints)
+                ):
+                    return no_kernel()
+                is_i[x.d] = true
+            case Op.Conv if vd == K.F64 and sf.f.vk[x.a] == K.I64:
+                if not param(sf, x.a, K.I64, is_i, ins(def_b, inb, x.a), ref ints):
+                    return no_kernel()
+                is_f[x.d] = true
             case _:
                 return no_kernel()
-    if not inc or stores == 0 or len(bases) == 0 or len(bases) > 3:
+    if not inc or (stores == 0 and len(sphi) == 0) or len(bases) == 0 or len(bases) > 3:
         return no_kernel()
-    # float operands from outside the loop are parameters; ones from inside
-    # are made earlier in the body
-    for x in chain:
-        var rs: [int] = []
-        if x.op == Op.Store:
-            rs = [x.b]
-        elif x.op != Op.Load and x.d >= 0 and sf.f.vk[x.d] == K.F64:
-            rs = [x.a, x.b]
-        for v in rs:
-            if def_b[v] < 0 or not inb[def_b[v]]:
-                if sf.f.vk[v] != K.F64:
-                    return no_kernel()
-                if flt_of[v] < 0:
-                    flt_of[v] = len(flts)
-                    flts.push(v)
-            elif val_of[v] < 0:
-                return no_kernel()
-    # nothing made in the loop is read after it, but j
+    # nothing made in the loop is read after it, but j and the sums
     for bb in 0..nb:
         if not inb[bb]:
             for x in sf.bs[bb].code:
                 for u in uses(x):
-                    if u != phi.d and def_b[u] >= 0 and inb[def_b[u]]:
+                    if u != phi.d and sum_of[u] < 0 and ins(def_b, inb, u):
                         return no_kernel()
-    var ops: [LOp] = []
-    var nval = len(flts)
+    # second pass: the operations, on values numbered as vloop.br does
+    let nint = len(ints)
+    let nflt = len(flts)
     for v in 0..nv:
         val_of[v] = -1
-    for i, v in enumerate(flts):
+    for i, v in enumerate(ints):
         val_of[v] = i
+    for i, v in enumerate(flts):
+        val_of[v] = nint + i
+    val_of[phi.d] = nint + nflt
+    var nval = nint + nflt + 1
     for x in chain:
+        let vd = sf.f.vk[x.d] if x.d >= 0 else K.I64
+        var op = -1
+        var off = 0
         match x.op:
+            case Op.IdxChk:
+                val_of[x.d] = val_of[x.a]
             case Op.Load:
                 ops.push(LOp(op=L_LD, a=-1, b=-1, arr=arr_of[x.a], off=x.n))
                 val_of[x.d] = nval
                 nval += 1
             case Op.Store:
-                if val_of[x.b] < 0:
-                    return no_kernel()
                 ops.push(LOp(op=L_ST, a=val_of[x.b], b=-1, arr=arr_of[x.a], off=x.n))
-            case Op.Add | Op.Sub | Op.Mul | Op.Div:
-                if sf.f.vk[x.d] == K.F64:
-                    if val_of[x.a] < 0 or val_of[x.b] < 0:
-                        return no_kernel()
-                    var op = L_ADD
-                    if x.op == Op.Sub:
-                        op = L_SUB
-                    elif x.op == Op.Mul:
-                        op = L_MUL
-                    elif x.op == Op.Div:
-                        op = L_DIV
-                    ops.push(LOp(op=op, a=val_of[x.a], b=val_of[x.b], arr=-1, off=0))
-                    val_of[x.d] = nval
-                    nval += 1
+            case Op.Add | Op.Sub | Op.Mul | Op.Div if vd == K.F64:
+                op = L_ADD
+                if x.op == Op.Sub:
+                    op = L_SUB
+                elif x.op == Op.Mul:
+                    op = L_MUL
+                elif x.op == Op.Div:
+                    op = L_DIV
+                if sum_of[x.a] >= 0:
+                    ops.push(LOp(op=L_RED, a=val_of[x.b], b=-1, arr=sum_of[x.a], off=op))
+                    op = -1
+            case Op.Add if x.d == jn and x.a == phi.d:
+                pass
+            case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor if vd == K.I64:
+                op = L_IADD
+                if x.op == Op.Sub:
+                    op = L_ISUB
+                elif x.op == Op.Mul:
+                    op = L_IMUL
+                elif x.op == Op.And:
+                    op = L_IAND
+                elif x.op == Op.Or:
+                    op = L_IOR
+                elif x.op == Op.Xor:
+                    op = L_IXOR
+            case Op.Shl | Op.Shr if vd == K.I64:
+                op = L_SHL if x.op == Op.Shl else L_SAR
+                off = cval[x.b]
+            case Op.Div if vd == K.I64:
+                # truncating x / 2^k: (x + (x >> 63 as unsigned >> 64 - k)) >> k
+                let k = log2_exact(cval[x.b])
+                ops.push(LOp(op=L_SAR, a=val_of[x.a], b=-1, arr=-1, off=63))
+                ops.push(LOp(op=L_SHR, a=nval, b=-1, arr=-1, off=64 - k))
+                ops.push(LOp(op=L_IADD, a=val_of[x.a], b=nval + 1, arr=-1, off=0))
+                ops.push(LOp(op=L_SAR, a=nval + 2, b=-1, arr=-1, off=k))
+                val_of[x.d] = nval + 3
+                nval += 4
+            case Op.Conv:
+                ops.push(LOp(op=L_CONV, a=val_of[x.a], b=-1, arr=-1, off=0))
+                val_of[x.d] = nval
+                nval += 1
             case _:
                 pass
-    let (ok, k) = vloop.compile(
-        vloop.Loop(narr=len(bases), nflt=len(flts), ops=ops),
-        name,
-        win,
-        avx
-    )
+        if op >= 0:
+            ops.push(LOp(op=op, a=val_of[x.a], b=val_of[x.b], arr=-1, off=off))
+            val_of[x.d] = nval
+            nval += 1
+    let l = vloop.Loop(narr=len(bases), nint=nint, nflt=nflt, nred=len(sphi), ops=ops)
+    let (ok, k) = vloop.compile(l, name, vw)
     if not ok:
         return no_kernel()
-    # the call, at the end of the preheader
+    # the block and the call, at the end of the preheader
     var code = sf.bs[pre].code
     let term = code.pop()
-    var args: [int] = []
+    let blk = new_v(ref sf, K.Ptr)
+    sf.f.slots.push(Slot(size=8 * vloop.nwords(l), align=8, name="", typed=false, k=K.I64))
+    code.push(mk(Op.SlotAddr, blk, len(sf.f.slots) - 1, -1, -1, 0))
     for i, base in enumerate(bases):
         var at = lo
         if binv[i] >= 0:
@@ -2068,7 +2156,7 @@ fn vector_loop(
             code.push(mk(Op.Add, at, binv[i], lo, -1, 0))
         let p = new_v(ref sf, K.Ptr)
         code.push(mk(Op.Elem, p, base, at, -1, 8))
-        args.push(p)
+        code.push(mk(Op.Store, -1, blk, p, -1, 8 * i))
     # the count, or 0 unless lo < hi and every bounds check passes for every
     # j: the loop then does it all, and panics where it should
     let hi = lt.b
@@ -2083,8 +2171,8 @@ fn vector_loop(
         code.push(mk(Op.Sub, last, hi, one, -1, 0))
         for i, len_v in enumerate(clen):
             var f = lo
-            var l = last
-            # 0 <= f <= l < the length, for the first and the last index
+            var la = last
+            # 0 <= f <= la < the length, for the first and the last index
             var ca = [zero]
             var cb = [f]
             if cinv[i] >= 0:
@@ -2092,10 +2180,10 @@ fn vector_loop(
                 # between the first and the last j
                 f = new_v(ref sf, K.I64)
                 code.push(mk(Op.Add, f, lo, cinv[i], -1, 0))
-                l = new_v(ref sf, K.I64)
-                code.push(mk(Op.Add, l, last, cinv[i], -1, 0))
+                la = new_v(ref sf, K.I64)
+                code.push(mk(Op.Add, la, last, cinv[i], -1, 0))
                 ca = [zero, f]
-                cb = [f, l]
+                cb = [f, la]
             for ci in 0..len(ca):
                 let c = new_v(ref sf, K.Bool)
                 code.push(mk(Op.Le, c, ca[ci], cb[ci], -1, 0))
@@ -2103,7 +2191,7 @@ fn vector_loop(
                 code.push(mk(Op.And, o2, all, c, -1, 0))
                 all = o2
             let c = new_v(ref sf, K.Bool)
-            code.push(mk(Op.Lt, c, l, len_v, -1, 0))
+            code.push(mk(Op.Lt, c, la, len_v, -1, 0))
             let o3 = new_v(ref sf, K.Bool)
             code.push(mk(Op.And, o3, all, c, -1, 0))
             all = o3
@@ -2115,20 +2203,57 @@ fn vector_loop(
     code.push(mk(Op.Sub, span, hi, lo, -1, 0))
     let cnt = new_v(ref sf, K.I64)
     code.push(mk(Op.And, cnt, span, mask, -1, 0))
-    args.push(cnt)
-    args.extend(flts)
+    code.push(mk(Op.Store, -1, blk, cnt, -1, 8 * vloop.w_cnt(l)))
+    code.push(mk(Op.Store, -1, blk, lo, -1, 8 * vloop.w_lo(l)))
+    for i, v in enumerate(ints):
+        code.push(mk(Op.Store, -1, blk, v, -1, 8 * vloop.w_int(l, i)))
+    for i, v in enumerate(flts):
+        code.push(mk(Op.Store, -1, blk, v, -1, 8 * vloop.w_flt(l, i)))
+    for s in 0..len(sphi):
+        let init = phis[sphi[s]].args[sq[s]]
+        code.push(mk(Op.Store, -1, blk, init, -1, 8 * vloop.w_red(l, s)))
     let done = new_v(ref sf, K.I64)
-    code.push(Inst(op=Op.Call, d=done, a=-1, b=-1, c=-1, n=0, s=name, args=args))
+    code.push(Inst(op=Op.Call, d=done, a=-1, b=-1, c=-1, n=0, s=name, args=[blk]))
     let lo2 = new_v(ref sf, K.I64)
     code.push(mk(Op.Add, lo2, lo, done, -1, 0))
+    # the sums so far, where the loop goes on from
+    for s in 0..len(sphi):
+        let v = new_v(ref sf, K.F64)
+        code.push(mk(Op.Load, v, blk, -1, -1, 8 * vloop.w_red(l, s)))
+        sf.bs[h].code[phi_ats[sphi[s]]].args[sq[s]] = v
     code.push(term)
     sf.bs[pre].code = code
-    sf.bs[h].code[phi_at].args[pre_q] = lo2
+    sf.bs[h].code[phi_ats[ji]].args[pre_q] = lo2
     return (true, k)
 
-# f optimized, and the vector loop kernels it calls (x86-64 with SSE2, and
-# AVX when `avx`; `win`: the Windows calling convention).
-fn optimize(f: Func, win: bool, avx: bool) -> (Func, [KFunc]):
+# Whether v can be an operand in the kernel: made in the loop as a value of
+# the right type (`ok`), or from outside, which makes it a parameter (in `ps`).
+fn param(sf: SF, v: int, k: K, ok: [bool], inside: bool, ref ps: [int]) -> bool:
+    if inside:
+        return ok[v]
+    if sf.f.vk[v] != k:
+        return false
+    for p in ps:
+        if p == v:
+            return true
+    ps.push(v)
+    return true
+
+fn ins(def_b: [int], inb: [bool], v: int) -> bool:
+    return def_b[v] >= 0 and inb[def_b[v]]
+
+# k when n is 2^k, else -1
+fn log2_exact(n: int) -> int:
+    if n <= 0:
+        return -1
+    var k = 0
+    while (1 << k) < n:
+        k += 1
+    return k if (1 << k) == n else -1
+
+# f optimized, and the vector loop kernels it calls (x86-64; `vw`: their
+# most lanes).
+fn optimize(f: Func, vw: int) -> (Func, [KFunc]):
     var sf = build(f)
     to_ssa(ref sf)
     copies(ref sf)
@@ -2141,6 +2266,8 @@ fn optimize(f: Func, win: bool, avx: bool) -> (Func, [KFunc]):
     licm(ref sf)
     gvn(ref sf)
     copies(ref sf)
-    let ks = vector_loops(ref sf, f"brv_{f.name}", win, avx)
+    # dead phis (of inlined calls' results) would hide loops' shapes
+    dce(ref sf)
+    let ks = vector_loops(ref sf, f"brv_{f.name}", vw)
     dce(ref sf)
     return (from_ssa(sf), ks)
