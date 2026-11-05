@@ -351,6 +351,42 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
     )
     return g.run()
 
+# An `os_is("...")` of the runtime module, or `not` one: whether the program
+# is built for that OS, which is the compiler's own (native code is built for
+# the machine it runs on); None for any other expression. "posix" is every
+# OS but Windows.
+fn os_test(e: Expr) -> Option[bool]:
+    match e.kind:
+        case ExprKind.Unary(op, x):
+            match op:
+                case UnOp.Not:
+                    match os_test(x):
+                        case Some(v):
+                            return Some(not v)
+                        case None:
+                            return None
+                case _:
+                    return None
+        case ExprKind.Call(_, args):
+            match e.cres:
+                case CallRes.Prim(n):
+                    if n == "os_is":
+                        return Some(os_is_cond(args[0].expr))
+                    return None
+                case _:
+                    return None
+        case _:
+            return None
+
+fn os_is_cond(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Str(s):
+            if s == "posix":
+                return os.name() != "windows"
+            return os.name() == s
+        case _:
+            panic("os_is takes a string literal")
+
 struct Lower:
     prog: Program
     info: ProgramInfo
@@ -512,6 +548,26 @@ struct Lower:
                     self.funcs[fi].code[xi].b = 0
         return cold
 
+    # An `if` of the runtime module on `os_is`: only the branch taken is
+    # lowered, so the other OS's functions are never called.
+    fn os_if(ref self, branches: [(Expr, Block)], els: Option[Block]) -> bool:
+        if os_test(branches[0].0).is_none():
+            return false
+        for br_ in branches:
+            match os_test(br_.0):
+                case Some(v):
+                    if v:
+                        self.block(br_.1)
+                        return true
+                case None:
+                    panic("an `if` on os_is() tests only os_is() in every branch")
+        match els:
+            case Some(eb):
+                self.block(eb)
+            case None:
+                pass
+        return true
+
     # A memory operation of the runtime module (`prim_sig` in check.br).
     fn prim(ref self, n: str, args: [Arg]) -> int:
         if n == "symbol":
@@ -520,6 +576,19 @@ struct Lower:
                     return self.cx.fb.global(s)
                 case _:
                     panic("symbol takes a string literal")
+        if n == "os_is":
+            return self.cx.fb.konst(K.Bool, 1 if os_is_cond(args[0].expr) else 0)
+        if n == "global_mem":
+            match (args[0].expr.kind, args[1].expr.kind):
+                case (ExprKind.Str(s), ExprKind.Int(size)):
+                    let sym = "__rtg_" + s
+                    if sym not in self.dnames:
+                        self.dnames[sym] = true
+                        let b = [u8(0)] * int(size)
+                        self.data.push(Data(name=sym, align=16, bytes=b, relocs=[], readonly=false))
+                    return self.cx.fb.global(sym)
+                case _:
+                    panic("global_mem takes a string literal and an integer literal")
         var vs: [int] = []
         for a in args:
             vs.push(self.expr(a.expr))
@@ -3007,6 +3076,8 @@ struct Lower:
                 self.expr(e)
                 self.pop_frame()
             case StmtKind.If(branches, els):
+                if self.rt_body and self.os_if(branches, els):
+                    return
                 let end = self.cx.fb.label()
                 for br_ in branches:
                     self.push_frame()

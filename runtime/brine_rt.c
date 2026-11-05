@@ -2605,6 +2605,7 @@ void brine_eprint_sb(brine_sb *sb) {
 }
 
 /* ============================================================ misc */
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 double brine_clock(void) {
 #ifdef _WIN32
     static LARGE_INTEGER freq;
@@ -2618,6 +2619,7 @@ double brine_clock(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 #endif
 }
+#endif
 const char *brine_arg(int64_t i) { return i >= 0 && i < br_argc ? br_argv[i] : NULL; }
 brine_arr *brine_args(void) {
     brine_arr *a = br_strs();
@@ -6559,6 +6561,7 @@ brine_str *brine_os_arch(void) {
     return brine_str_new(n, (int64_t)strlen(n));
 }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 int64_t brine_os_pid(void) {
 #ifdef _WIN32
     return (int64_t)GetCurrentProcessId();
@@ -6568,6 +6571,7 @@ int64_t brine_os_pid(void) {
     return (int64_t)getpid();
 #endif
 }
+#endif
 
 int64_t brine_os_cpu_count(void) {
     int n = br_ncpu();
@@ -6575,6 +6579,7 @@ int64_t brine_os_cpu_count(void) {
 }
 int64_t brine_os_thread_count(void) { return br_threads(); }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 void brine_os_sleep(double seconds) {
     if (!(seconds > 0)) return;
 #ifdef _WIN32
@@ -6594,6 +6599,7 @@ void brine_os_sleep(double seconds) {
     }
 #endif
 }
+#endif
 
 #ifdef _WIN32
 /* an MSYS/Cygwin terminal is a named pipe called like `msys-...-pty0-to-master` (same test as Rust) */
