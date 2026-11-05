@@ -1073,6 +1073,1183 @@ fn sb_fmt_i128(sb: ptr, v: i128, kind: int):
     else:
         sb_i128(sb, v)
 
+# ------------------------------------------------------------ integer helpers
+# What native code calls for the integer operations it doesn't do inline:
+# checked arithmetic, conversions and 128-bit operations (brine_x_* in
+# brine_rt.c, 128-bit values by pointer, low word first). These use only
+# 64-bit unsigned division and shifts, since AArch64 sends signed division,
+# 128-bit operations and bswap back here.
+
+fn panic_cold(msg: str, loc: ptr):
+    brine_panic_at(loc, msg)
+
+fn in_range(x: int, lo: int, hi: int, msg: str, loc: ptr) -> int:
+    if x < lo or x > hi:
+        panic_cold(msg, loc)
+    return x
+
+fn shift_ok(b: int, n: int, loc: ptr) -> u64:
+    if b < 0 or b >= n:
+        panic_cold("shift amount out of range", loc)
+    return u64(b)
+
+fn nonzero(b: int, msg: str, loc: ptr):
+    if b == 0:
+        panic_cold(msg, loc)
+
+# a // b, rounded down
+fn floor_div(a: int, b: int) -> int:
+    let ua = u64(0) - u64(a) if a < 0 else u64(a)
+    let ub = u64(0) - u64(b) if b < 0 else u64(b)
+    let q = ua / ub
+    if (a < 0) == (b < 0):
+        return int(q)
+    return -int(q) - (1 if q * ub != ua else 0)
+
+# a % b, with the sign of b
+fn floor_mod(a: int, b: int) -> int:
+    return a - floor_div(a, b) * b
+
+fn mul_i64_ovf(a: int, b: int, loc: ptr) -> int:
+    let ua = u64(0) - u64(a) if a < 0 else u64(a)
+    let ub = u64(0) - u64(b) if b < 0 else u64(b)
+    let m = ua * ub
+    let neg = (a < 0) != (b < 0)
+    if umulh(ua, ub) != 0 or m > u64(9223372036854775807) + (u64(1) if neg else u64(0)):
+        panic_cold("integer overflow in multiplication", loc)
+    return -int(m) if neg else int(m)
+
+fn check(ok: bool, msg: str, loc: ptr):
+    if not ok:
+        panic_cold(msg, loc)
+
+fn popcnt64(x0: u64) -> int:
+    var x = x0 - ((x0 >> 1) & 0x5555555555555555)
+    x = (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333)
+    x = (x + (x >> 4)) & 0x0f0f0f0f0f0f0f0f
+    return int((x * 0x0101010101010101) >> 56)
+
+fn clz64(x0: u64) -> int:
+    var x = x0 | (x0 >> 1)
+    x = x | (x >> 2)
+    x = x | (x >> 4)
+    x = x | (x >> 8)
+    x = x | (x >> 16)
+    x = x | (x >> 32)
+    return 64 - popcnt64(x)
+
+fn ctz64(x: u64) -> int:
+    return popcnt64((x & (u64(0) - x)) - 1)
+
+fn brine_x_popcnt_u64(x: u64) -> int:
+    return popcnt64(x)
+
+fn brine_x_clz_u64(x: u64) -> int:
+    return clz64(x)
+
+fn brine_x_ctz_u64(x: u64) -> int:
+    return ctz64(x)
+
+fn brine_x_bswap_u64(x0: u64) -> u64:
+    var x = ((x0 >> 8) & 0x00ff00ff00ff00ff) | ((x0 & 0x00ff00ff00ff00ff) << 8)
+    x = ((x >> 16) & 0x0000ffff0000ffff) | ((x & 0x0000ffff0000ffff) << 16)
+    return (x >> 32) | (x << 32)
+
+fn brine_x_popcnt_u128(x: ptr) -> int:
+    return popcnt64(load_u64(x, 0)) + popcnt64(load_u64(x, 8))
+
+fn brine_x_clz_u128(x: ptr) -> int:
+    let hi = load_u64(x, 8)
+    return clz64(hi) if hi != 0 else 64 + clz64(load_u64(x, 0))
+
+fn brine_x_ctz_u128(x: ptr) -> int:
+    let lo = load_u64(x, 0)
+    return ctz64(lo) if lo != 0 else 64 + ctz64(load_u64(x, 8))
+
+# ---- 128 bits
+
+fn put128(r: ptr, lo: u64, hi: u64):
+    store_u64(r, 0, lo)
+    store_u64(r, 8, hi)
+
+fn copy128(r: ptr, a: ptr):
+    put128(r, load_u64(a, 0), load_u64(a, 8))
+
+fn neg128(r: ptr, a: ptr):
+    let lo = load_u64(a, 0)
+    put128(r, u64(0) - lo, (load_u64(a, 8) ^ ONES) + (u64(1) if lo == 0 else u64(0)))
+
+fn is_min128(a: ptr) -> bool:
+    return load_u64(a, 0) == 0 and load_u64(a, 8) == u64(1) << 63
+
+# (lo, hi) << n, for n below 128; `ar` shifts right arithmetically instead
+fn shl128(r: ptr, lo: u64, hi: u64, n: int):
+    if n == 0:
+        put128(r, lo, hi)
+    elif n < 64:
+        let s = u64(n)
+        put128(r, lo << s, (hi << s) | (lo >> (64 - s)))
+    else:
+        put128(r, 0, lo << u64(n - 64))
+
+fn shr128(r: ptr, lo: u64, hi: u64, n: int, ar: bool):
+    let fill = u64(int(hi) >> 63) if ar else u64(0)
+    if n == 0:
+        put128(r, lo, hi)
+    elif n < 64:
+        let s = u64(n)
+        let h = u64(int(hi) >> int(s)) if ar else hi >> s
+        put128(r, (lo >> s) | (hi << (64 - s)), h)
+    else:
+        put128(r, u64(int(hi) >> (n - 64)) if ar else hi >> u64(n - 64), fill)
+
+# a * b, wrapping
+fn mul128(r: ptr, a: ptr, b: ptr):
+    let al = load_u64(a, 0)
+    let bl = load_u64(b, 0)
+    put128(r, al * bl, umulh(al, bl) + al * load_u64(b, 8) + load_u64(a, 8) * bl)
+
+# a * b of two magnitudes (lo, hi); true if that doesn't fit in 128 bits
+fn umul128(r: ptr, al: u64, ah: u64, bl: u64, bh: u64) -> bool:
+    var bad = ah != 0 and bh != 0
+    if umulh(al, bh) != 0 or umulh(ah, bl) != 0:
+        bad = true
+    let cross = al * bh + ah * bl
+    let hi = umulh(al, bl) + cross
+    put128(r, al * bl, hi)
+    return bad or hi < cross
+
+fn mul_u128_ovf(r: ptr, a: ptr, b: ptr) -> bool:
+    return umul128(r, load_u64(a, 0), load_u64(a, 8), load_u64(b, 0), load_u64(b, 8))
+
+fn mul_i128_ovf(r: ptr, a: ptr, b: ptr) -> bool:
+    let ma = stack_mem(16)
+    let mb = stack_mem(16)
+    let an = load_i64(a, 8) < 0
+    let bn = load_i64(b, 8) < 0
+    if an:
+        neg128(ma, a)
+    else:
+        copy128(ma, a)
+    if bn:
+        neg128(mb, b)
+    else:
+        copy128(mb, b)
+    var bad = umul128(r, load_u64(ma, 0), load_u64(ma, 8), load_u64(mb, 0), load_u64(mb, 8))
+    let neg = an != bn
+    let hi = load_u64(r, 8)
+    # the magnitude must be below 2^127, or exactly 2^127 for a negative result
+    if hi > u64(1) << 63 or (hi == u64(1) << 63 and (not neg or load_u64(r, 0) != 0)):
+        bad = true
+    if neg:
+        neg128(r, r)
+    return bad
+
+# The `divlu` prim where there's no instruction for it (AArch64): u1 * 2^64 +
+# u0 divided by v0, for u1 < v0 (Hacker's Delight, divlu)
+fn brine_x_divlu_u64(u1: u64, u0: u64, v0: u64) -> u64:
+    if u1 == 0:
+        return u0 / v0
+    let b = u64(1) << 32
+    let s = u64(v0.leading_zeros())
+    let v = v0 << s
+    let vn1 = v >> 32
+    let vn0 = v & 0xffffffff
+    let un32 = (u1 << s) | ((u0 >> (64 - s)) if s > 0 else u64(0))
+    let un10 = u0 << s
+    let un1 = un10 >> 32
+    let un0 = un10 & 0xffffffff
+    var q1 = un32 / vn1
+    var rhat = un32 - q1 * vn1
+    while q1 >= b or q1 * vn0 > b * rhat + un1:
+        q1 -= 1
+        rhat += vn1
+        if rhat >= b:
+            break
+    let un21 = un32 * b + un1 - q1 * v
+    var q0 = un21 / vn1
+    rhat = un21 - q0 * vn1
+    while q0 >= b or q0 * vn0 > b * rhat + un0:
+        q0 -= 1
+        rhat += vn1
+        if rhat >= b:
+            break
+    return q1 * b + q0
+
+# a / b to q and a % b to m, of unsigned (lo, hi) pairs, b not zero
+fn udiv128(q: ptr, m: ptr, al: u64, ah: u64, bl: u64, bh: u64):
+    if bh == 0:
+        # (the remainders are the low words of what's left)
+        var qh: u64 = 0
+        var top = ah
+        if ah >= bl:
+            qh = ah / bl
+            top = ah - qh * bl
+        let ql = divlu(top, al, bl)
+        put128(q, ql, qh)
+        put128(m, al - ql * bl, 0)
+        return
+    # b has a high word, so the quotient fits in 64 bits: estimate it from the
+    # top 64 bits of b (Hacker's Delight, divlu applied to 128 bits)
+    let n = u64(bh.leading_zeros())
+    let v1 = (bh << n) | ((bl >> (64 - n)) if n > 0 else u64(0))
+    let q1 = divlu(ah >> 1, (al >> 1) | (ah << 63), v1)
+    var e = q1 >> (63 - n)
+    if e != 0:
+        e -= 1
+    # a - e * b, then one more if that is still at least b
+    let pl = e * bl
+    let ph = umulh(e, bl) + e * bh
+    var rl = al - pl
+    var rh = ah - ph - (u64(1) if al < pl else u64(0))
+    if rh > bh or (rh == bh and rl >= bl):
+        e += 1
+        let t = rl
+        rl = rl - bl
+        rh = rh - bh - (u64(1) if t < bl else u64(0))
+    put128(q, e, 0)
+    put128(m, rl, rh)
+
+fn udiv128p(r: ptr, a: ptr, b: ptr, want_rem: bool):
+    let al = load_u64(a, 0)
+    var ah = load_u64(a, 8)
+    let bl = load_u64(b, 0)
+    let bh = load_u64(b, 8)
+    if bh == 0:
+        var qh: u64 = 0
+        if ah >= bl:
+            qh = ah / bl
+            ah = ah - qh * bl
+        let ql = divlu(ah, al, bl)
+        if want_rem:
+            put128(r, al - ql * bl, 0)
+        else:
+            put128(r, ql, qh)
+        return
+    let t = stack_mem(16)
+    if want_rem:
+        udiv128(t, r, al, ah, bl, bh)
+    else:
+        udiv128(r, t, al, ah, bl, bh)
+
+# signed a / b truncated (`floor` rounds down instead); a % b with `want_rem`
+# takes the sign of a (or, with `floor`, of b)
+fn sdiv128(r: ptr, a: ptr, b: ptr, want_rem: bool, floor: bool):
+    var al = load_u64(a, 0)
+    var ah = load_u64(a, 8)
+    var bl = load_u64(b, 0)
+    var bh = load_u64(b, 8)
+    let x = int(al)
+    let y = int(bl)
+    # both fit in 64 bits (and b isn't -1, for -2^63 / -1): a 64-bit division
+    if int(ah) == x >> 63 and int(bh) == y >> 63 and y != -1:
+        var v = 0
+        if want_rem:
+            v = x % y
+            if not floor and v != 0 and (v < 0) != (x < 0):
+                v -= y
+        else:
+            v = x / y
+            if not floor and (x < 0) != (y < 0) and v * y != x:
+                v += 1
+        put128(r, u64(v), u64(v >> 63))
+        return
+    let an = int(ah) < 0
+    let bn = int(bh) < 0
+    if an:
+        ah = (ah ^ ONES) + (u64(1) if al == 0 else u64(0))
+        al = u64(0) - al
+    if bn:
+        bh = (bh ^ ONES) + (u64(1) if bl == 0 else u64(0))
+        bl = u64(0) - bl
+    var ql: u64 = 0
+    var qh: u64 = 0
+    var lo: u64 = 0
+    var hi: u64 = 0
+    if bh == 0:
+        # (as in udiv128, kept here in registers)
+        if ah >= bl:
+            qh = ah / bl
+            ah = ah - qh * bl
+        ql = divlu(ah, al, bl)
+        lo = al - ql * bl
+    else:
+        let q = stack_mem(16)
+        let m = stack_mem(16)
+        udiv128(q, m, al, ah, bl, bh)
+        ql = load_u64(q, 0)
+        qh = load_u64(q, 8)
+        lo = load_u64(m, 0)
+        hi = load_u64(m, 8)
+    let inexact = lo | hi != 0
+    if want_rem:
+        if an:
+            hi = (hi ^ ONES) + (u64(1) if lo == 0 else u64(0))
+            lo = u64(0) - lo
+        if floor and inexact and an != bn:
+            # m + b
+            let t = lo
+            lo = lo + load_u64(b, 0)
+            hi = hi + load_u64(b, 8) + (u64(1) if lo < t else u64(0))
+        put128(r, lo, hi)
+        return
+    lo = ql
+    hi = qh
+    if an != bn:
+        if floor and inexact:
+            lo += 1
+            if lo == 0:
+                hi += 1
+        hi = (hi ^ ONES) + (u64(1) if lo == 0 else u64(0))
+        lo = u64(0) - lo
+    put128(r, lo, hi)
+
+# x truncated to an integer (wrapping past 128 bits)
+fn from_f64_128(r: ptr, x: float):
+    let bits = x.to_bits()
+    let e = int((bits >> 52) & 0x7ff) - 1075
+    let m = (bits & 0xfffffffffffff) | (u64(1) << 52)
+    if e <= -53 or e >= 128:
+        put128(r, 0, 0)
+    elif e < 0:
+        put128(r, m >> u64(-e), 0)
+    else:
+        shl128(r, m, 0, e)
+    if bits >> 63 != 0:
+        neg128(r, r)
+
+# 2^k, k from 0 to 127
+fn pow2_f64(k: int) -> float:
+    return float.from_bits(u64(1023 + k) << 52)
+
+# (lo, hi) rounded once to the nearest float: its top 64 bits with a sticky
+# bit for the rest, which a u64 conversion then rounds correctly
+fn u128_top(lo: u64, hi: u64, out: ptr) -> u64:
+    let n = u64(hi.leading_zeros())
+    store_i64(out, 0, 64 - int(n))
+    if n == 0:
+        return hi | (u64(1) if lo != 0 else u64(0))
+    let t = (hi << n) | (lo >> (64 - n))
+    return t | (u64(1) if lo << n != 0 else u64(0))
+
+fn u128_to_f64(lo: u64, hi: u64) -> float:
+    if hi == 0:
+        return float(lo)
+    let k = stack_mem(8)
+    let t = u128_top(lo, hi, k)
+    return float(t) * pow2_f64(load_i64(k, 0))
+
+fn u128_to_f32(lo: u64, hi: u64) -> f32:
+    if hi == 0:
+        return f32(lo)
+    let k = stack_mem(8)
+    let t = u128_top(lo, hi, k)
+    return f32(t) * f32.from_bits(u32(127 + load_i64(k, 0)) << 23)
+
+fn i128_to_f64(a: ptr) -> float:
+    if load_i64(a, 8) < 0:
+        let m = stack_mem(16)
+        neg128(m, a)
+        return -u128_to_f64(load_u64(m, 0), load_u64(m, 8))
+    return u128_to_f64(load_u64(a, 0), load_u64(a, 8))
+
+fn i128_to_f32(a: ptr) -> f32:
+    if load_i64(a, 8) < 0:
+        let m = stack_mem(16)
+        neg128(m, a)
+        return -u128_to_f32(load_u64(m, 0), load_u64(m, 8))
+    return u128_to_f32(load_u64(a, 0), load_u64(a, 8))
+
+# i8
+fn brine_x_add_i8(a: i8, b: i8, loc: ptr) -> i8:
+    return i8(in_range(int(a) + int(b), -128, 127, "integer overflow in addition", loc))
+
+fn brine_x_sub_i8(a: i8, b: i8, loc: ptr) -> i8:
+    return i8(in_range(int(a) - int(b), -128, 127, "integer overflow in subtraction", loc))
+
+fn brine_x_mul_i8(a: i8, b: i8, loc: ptr) -> i8:
+    return i8(in_range(int(a) * int(b), -128, 127, "integer overflow in multiplication", loc))
+
+fn brine_x_shl_i8(a: i8, b: int, loc: ptr) -> i8:
+    return i8(u64(a) << shift_ok(b, 8, loc))
+
+fn brine_x_shr_i8(a: i8, b: int, loc: ptr) -> i8:
+    return i8(int(a) >> int(shift_ok(b, 8, loc)))
+
+fn brine_x_conv_i8_from_i64(x: int, loc: ptr) -> i8:
+    check(x >= -128 and x <= 127, "integer conversion out of range for i8", loc)
+    return i8(x)
+
+fn brine_x_conv_i8_from_u64(x: u64, loc: ptr) -> i8:
+    check(x <= 127, "integer conversion out of range for i8", loc)
+    return i8(x)
+
+fn brine_x_conv_i8_from_i128(x: ptr, loc: ptr) -> i8:
+    let v = load_i64(x, 0)
+    check(
+        load_i64(x, 8) == v >> 63 and v >= -128 and v <= 127,
+        "integer conversion out of range for i8",
+        loc
+    )
+    return i8(v)
+
+fn brine_x_conv_i8_from_u128(x: ptr, loc: ptr) -> i8:
+    let v = load_u64(x, 0)
+    check(load_u64(x, 8) == 0 and v <= 127, "integer conversion out of range for i8", loc)
+    return i8(v)
+
+fn brine_x_fdiv_i8(a: i8, b: i8) -> i8:
+    return i8(floor_div(int(a), int(b)))
+
+fn brine_x_fmod_i8(a: i8, b: i8) -> i8:
+    return i8(floor_mod(int(a), int(b)))
+
+fn brine_x_div_i8(a: i8, b: i8, loc: ptr) -> i8:
+    nonzero(int(b), "division by zero", loc)
+    check(b != -1 or a != -128, "integer overflow in division", loc)
+    return i8(floor_div(int(a), int(b)))
+
+fn brine_x_mod_i8(a: i8, b: i8, loc: ptr) -> i8:
+    nonzero(int(b), "remainder by zero", loc)
+    return i8(floor_mod(int(a), int(b)))
+
+fn brine_x_abs_i8(a: i8, loc: ptr) -> i8:
+    check(a != -128, "integer overflow in abs", loc)
+    return -a if a < 0 else a
+
+fn brine_x_neg_i8(a: i8, loc: ptr) -> i8:
+    check(a != -128, "integer overflow in negation", loc)
+    return -a
+
+fn brine_x_conv_i8_from_f64(x: float, loc: ptr) -> i8:
+    check(
+        x >= -128.0 and x < 128.0,
+        "float to integer conversion out of range (or NaN) for i8",
+        loc
+    )
+    return i8(x)
+
+# i16
+fn brine_x_add_i16(a: i16, b: i16, loc: ptr) -> i16:
+    return i16(in_range(int(a) + int(b), -32768, 32767, "integer overflow in addition", loc))
+
+fn brine_x_sub_i16(a: i16, b: i16, loc: ptr) -> i16:
+    return i16(in_range(int(a) - int(b), -32768, 32767, "integer overflow in subtraction", loc))
+
+fn brine_x_mul_i16(a: i16, b: i16, loc: ptr) -> i16:
+    return i16(in_range(int(a) * int(b), -32768, 32767, "integer overflow in multiplication", loc))
+
+fn brine_x_shl_i16(a: i16, b: int, loc: ptr) -> i16:
+    return i16(u64(a) << shift_ok(b, 16, loc))
+
+fn brine_x_shr_i16(a: i16, b: int, loc: ptr) -> i16:
+    return i16(int(a) >> int(shift_ok(b, 16, loc)))
+
+fn brine_x_conv_i16_from_i64(x: int, loc: ptr) -> i16:
+    check(x >= -32768 and x <= 32767, "integer conversion out of range for i16", loc)
+    return i16(x)
+
+fn brine_x_conv_i16_from_u64(x: u64, loc: ptr) -> i16:
+    check(x <= 32767, "integer conversion out of range for i16", loc)
+    return i16(x)
+
+fn brine_x_conv_i16_from_i128(x: ptr, loc: ptr) -> i16:
+    let v = load_i64(x, 0)
+    check(
+        load_i64(x, 8) == v >> 63 and v >= -32768 and v <= 32767,
+        "integer conversion out of range for i16",
+        loc
+    )
+    return i16(v)
+
+fn brine_x_conv_i16_from_u128(x: ptr, loc: ptr) -> i16:
+    let v = load_u64(x, 0)
+    check(load_u64(x, 8) == 0 and v <= 32767, "integer conversion out of range for i16", loc)
+    return i16(v)
+
+fn brine_x_fdiv_i16(a: i16, b: i16) -> i16:
+    return i16(floor_div(int(a), int(b)))
+
+fn brine_x_fmod_i16(a: i16, b: i16) -> i16:
+    return i16(floor_mod(int(a), int(b)))
+
+fn brine_x_div_i16(a: i16, b: i16, loc: ptr) -> i16:
+    nonzero(int(b), "division by zero", loc)
+    check(b != -1 or a != -32768, "integer overflow in division", loc)
+    return i16(floor_div(int(a), int(b)))
+
+fn brine_x_mod_i16(a: i16, b: i16, loc: ptr) -> i16:
+    nonzero(int(b), "remainder by zero", loc)
+    return i16(floor_mod(int(a), int(b)))
+
+fn brine_x_abs_i16(a: i16, loc: ptr) -> i16:
+    check(a != -32768, "integer overflow in abs", loc)
+    return -a if a < 0 else a
+
+fn brine_x_neg_i16(a: i16, loc: ptr) -> i16:
+    check(a != -32768, "integer overflow in negation", loc)
+    return -a
+
+fn brine_x_conv_i16_from_f64(x: float, loc: ptr) -> i16:
+    check(
+        x >= -32768.0 and x < 32768.0,
+        "float to integer conversion out of range (or NaN) for i16",
+        loc
+    )
+    return i16(x)
+
+# i32
+fn brine_x_add_i32(a: i32, b: i32, loc: ptr) -> i32:
+    return i32(
+        in_range(int(a) + int(b), -2147483648, 2147483647, "integer overflow in addition", loc)
+    )
+
+fn brine_x_sub_i32(a: i32, b: i32, loc: ptr) -> i32:
+    return i32(
+        in_range(int(a) - int(b), -2147483648, 2147483647, "integer overflow in subtraction", loc)
+    )
+
+fn brine_x_mul_i32(a: i32, b: i32, loc: ptr) -> i32:
+    return i32(
+        in_range(
+            int(a) * int(b),
+            -2147483648,
+            2147483647,
+            "integer overflow in multiplication",
+            loc
+        )
+    )
+
+fn brine_x_shl_i32(a: i32, b: int, loc: ptr) -> i32:
+    return i32(u64(a) << shift_ok(b, 32, loc))
+
+fn brine_x_shr_i32(a: i32, b: int, loc: ptr) -> i32:
+    return i32(int(a) >> int(shift_ok(b, 32, loc)))
+
+fn brine_x_conv_i32_from_i64(x: int, loc: ptr) -> i32:
+    check(x >= -2147483648 and x <= 2147483647, "integer conversion out of range for i32", loc)
+    return i32(x)
+
+fn brine_x_conv_i32_from_u64(x: u64, loc: ptr) -> i32:
+    check(x <= 2147483647, "integer conversion out of range for i32", loc)
+    return i32(x)
+
+fn brine_x_conv_i32_from_i128(x: ptr, loc: ptr) -> i32:
+    let v = load_i64(x, 0)
+    check(
+        load_i64(x, 8) == v >> 63 and v >= -2147483648 and v <= 2147483647,
+        "integer conversion out of range for i32",
+        loc
+    )
+    return i32(v)
+
+fn brine_x_conv_i32_from_u128(x: ptr, loc: ptr) -> i32:
+    let v = load_u64(x, 0)
+    check(load_u64(x, 8) == 0 and v <= 2147483647, "integer conversion out of range for i32", loc)
+    return i32(v)
+
+fn brine_x_fdiv_i32(a: i32, b: i32) -> i32:
+    return i32(floor_div(int(a), int(b)))
+
+fn brine_x_fmod_i32(a: i32, b: i32) -> i32:
+    return i32(floor_mod(int(a), int(b)))
+
+fn brine_x_div_i32(a: i32, b: i32, loc: ptr) -> i32:
+    nonzero(int(b), "division by zero", loc)
+    check(b != -1 or a != -2147483648, "integer overflow in division", loc)
+    return i32(floor_div(int(a), int(b)))
+
+fn brine_x_mod_i32(a: i32, b: i32, loc: ptr) -> i32:
+    nonzero(int(b), "remainder by zero", loc)
+    return i32(floor_mod(int(a), int(b)))
+
+fn brine_x_abs_i32(a: i32, loc: ptr) -> i32:
+    check(a != -2147483648, "integer overflow in abs", loc)
+    return -a if a < 0 else a
+
+fn brine_x_neg_i32(a: i32, loc: ptr) -> i32:
+    check(a != -2147483648, "integer overflow in negation", loc)
+    return -a
+
+fn brine_x_conv_i32_from_f64(x: float, loc: ptr) -> i32:
+    check(
+        x >= -2147483648.0 and x < 2147483648.0,
+        "float to integer conversion out of range (or NaN) for i32",
+        loc
+    )
+    return i32(x)
+
+# i64
+fn brine_x_add_i64(a: int, b: int, loc: ptr) -> int:
+    let r = a + b
+    check(((a ^ r) & (b ^ r)) >= 0, "integer overflow in addition", loc)
+    return r
+
+fn brine_x_sub_i64(a: int, b: int, loc: ptr) -> int:
+    let r = a - b
+    check(((a ^ b) & (a ^ r)) >= 0, "integer overflow in subtraction", loc)
+    return r
+
+fn brine_x_mul_i64(a: int, b: int, loc: ptr) -> int:
+    return mul_i64_ovf(a, b, loc)
+
+fn brine_x_shl_i64(a: int, b: int, loc: ptr) -> int:
+    return int(u64(a) << shift_ok(b, 64, loc))
+
+fn brine_x_shr_i64(a: int, b: int, loc: ptr) -> int:
+    return int(int(a) >> int(shift_ok(b, 64, loc)))
+
+fn brine_x_conv_i64_from_i64(x: int, loc: ptr) -> int:
+    return int(x)
+
+fn brine_x_conv_i64_from_u64(x: u64, loc: ptr) -> int:
+    check(x <= 9223372036854775807, "integer conversion out of range for i64", loc)
+    return int(x)
+
+fn brine_x_conv_i64_from_i128(x: ptr, loc: ptr) -> int:
+    let v = load_i64(x, 0)
+    check(load_i64(x, 8) == v >> 63, "integer conversion out of range for i64", loc)
+    return int(v)
+
+fn brine_x_conv_i64_from_u128(x: ptr, loc: ptr) -> int:
+    let v = load_u64(x, 0)
+    check(
+        load_u64(x, 8) == 0 and v <= 9223372036854775807,
+        "integer conversion out of range for i64",
+        loc
+    )
+    return int(v)
+
+fn brine_x_fdiv_i64(a: int, b: int) -> int:
+    return int(floor_div(int(a), int(b)))
+
+fn brine_x_fmod_i64(a: int, b: int) -> int:
+    return int(floor_mod(int(a), int(b)))
+
+fn brine_x_div_i64(a: int, b: int, loc: ptr) -> int:
+    nonzero(int(b), "division by zero", loc)
+    check(b != -1 or a != -9223372036854775808, "integer overflow in division", loc)
+    return int(floor_div(int(a), int(b)))
+
+fn brine_x_mod_i64(a: int, b: int, loc: ptr) -> int:
+    nonzero(int(b), "remainder by zero", loc)
+    return int(floor_mod(int(a), int(b)))
+
+fn brine_x_abs_i64(a: int, loc: ptr) -> int:
+    check(a != -9223372036854775808, "integer overflow in abs", loc)
+    return -a if a < 0 else a
+
+fn brine_x_neg_i64(a: int, loc: ptr) -> int:
+    check(a != -9223372036854775808, "integer overflow in negation", loc)
+    return -a
+
+fn brine_x_conv_i64_from_f64(x: float, loc: ptr) -> int:
+    check(
+        x >= -9223372036854775808.0 and x < 9223372036854775808.0,
+        "float to integer conversion out of range (or NaN) for i64",
+        loc
+    )
+    return int(x)
+
+# u8
+fn brine_x_add_u8(a: u8, b: u8, loc: ptr) -> u8:
+    return u8(in_range(int(a) + int(b), 0, 255, "integer overflow in addition", loc))
+
+fn brine_x_sub_u8(a: u8, b: u8, loc: ptr) -> u8:
+    return u8(in_range(int(a) - int(b), 0, 255, "integer overflow in subtraction", loc))
+
+fn brine_x_mul_u8(a: u8, b: u8, loc: ptr) -> u8:
+    return u8(in_range(int(a) * int(b), 0, 255, "integer overflow in multiplication", loc))
+
+fn brine_x_shl_u8(a: u8, b: int, loc: ptr) -> u8:
+    return u8(u64(a) << shift_ok(b, 8, loc))
+
+fn brine_x_shr_u8(a: u8, b: int, loc: ptr) -> u8:
+    return u8(u64(a) >> shift_ok(b, 8, loc))
+
+fn brine_x_conv_u8_from_i64(x: int, loc: ptr) -> u8:
+    check(x >= 0 and x <= 255, "integer conversion out of range for u8", loc)
+    return u8(x)
+
+fn brine_x_conv_u8_from_u64(x: u64, loc: ptr) -> u8:
+    check(x <= 255, "integer conversion out of range for u8", loc)
+    return u8(x)
+
+fn brine_x_conv_u8_from_i128(x: ptr, loc: ptr) -> u8:
+    let v = load_u64(x, 0)
+    check(load_u64(x, 8) == 0 and v <= 255, "integer conversion out of range for u8", loc)
+    return u8(v)
+
+fn brine_x_conv_u8_from_u128(x: ptr, loc: ptr) -> u8:
+    let v = load_u64(x, 0)
+    check(load_u64(x, 8) == 0 and v <= 255, "integer conversion out of range for u8", loc)
+    return u8(v)
+
+fn brine_x_fdiv_u8(a: u8, b: u8) -> u8:
+    return a / b
+
+fn brine_x_fmod_u8(a: u8, b: u8) -> u8:
+    return a % b
+
+fn brine_x_div_u8(a: u8, b: u8, loc: ptr) -> u8:
+    nonzero(int(b), "division by zero", loc)
+    return a / b
+
+fn brine_x_mod_u8(a: u8, b: u8, loc: ptr) -> u8:
+    nonzero(int(b), "remainder by zero", loc)
+    return a % b
+
+fn brine_x_abs_u8(a: u8, loc: ptr) -> u8:
+    return a
+
+fn brine_x_conv_u8_from_f64(x: float, loc: ptr) -> u8:
+    check(x >= 0.0 and x < 256.0, "float to integer conversion out of range (or NaN) for u8", loc)
+    return u8(x)
+
+# u16
+fn brine_x_add_u16(a: u16, b: u16, loc: ptr) -> u16:
+    return u16(in_range(int(a) + int(b), 0, 65535, "integer overflow in addition", loc))
+
+fn brine_x_sub_u16(a: u16, b: u16, loc: ptr) -> u16:
+    return u16(in_range(int(a) - int(b), 0, 65535, "integer overflow in subtraction", loc))
+
+fn brine_x_mul_u16(a: u16, b: u16, loc: ptr) -> u16:
+    return u16(in_range(int(a) * int(b), 0, 65535, "integer overflow in multiplication", loc))
+
+fn brine_x_shl_u16(a: u16, b: int, loc: ptr) -> u16:
+    return u16(u64(a) << shift_ok(b, 16, loc))
+
+fn brine_x_shr_u16(a: u16, b: int, loc: ptr) -> u16:
+    return u16(u64(a) >> shift_ok(b, 16, loc))
+
+fn brine_x_conv_u16_from_i64(x: int, loc: ptr) -> u16:
+    check(x >= 0 and x <= 65535, "integer conversion out of range for u16", loc)
+    return u16(x)
+
+fn brine_x_conv_u16_from_u64(x: u64, loc: ptr) -> u16:
+    check(x <= 65535, "integer conversion out of range for u16", loc)
+    return u16(x)
+
+fn brine_x_conv_u16_from_i128(x: ptr, loc: ptr) -> u16:
+    let v = load_u64(x, 0)
+    check(load_u64(x, 8) == 0 and v <= 65535, "integer conversion out of range for u16", loc)
+    return u16(v)
+
+fn brine_x_conv_u16_from_u128(x: ptr, loc: ptr) -> u16:
+    let v = load_u64(x, 0)
+    check(load_u64(x, 8) == 0 and v <= 65535, "integer conversion out of range for u16", loc)
+    return u16(v)
+
+fn brine_x_fdiv_u16(a: u16, b: u16) -> u16:
+    return a / b
+
+fn brine_x_fmod_u16(a: u16, b: u16) -> u16:
+    return a % b
+
+fn brine_x_div_u16(a: u16, b: u16, loc: ptr) -> u16:
+    nonzero(int(b), "division by zero", loc)
+    return a / b
+
+fn brine_x_mod_u16(a: u16, b: u16, loc: ptr) -> u16:
+    nonzero(int(b), "remainder by zero", loc)
+    return a % b
+
+fn brine_x_abs_u16(a: u16, loc: ptr) -> u16:
+    return a
+
+fn brine_x_conv_u16_from_f64(x: float, loc: ptr) -> u16:
+    check(
+        x >= 0.0 and x < 65536.0,
+        "float to integer conversion out of range (or NaN) for u16",
+        loc
+    )
+    return u16(x)
+
+# u32
+fn brine_x_add_u32(a: u32, b: u32, loc: ptr) -> u32:
+    return u32(in_range(int(a) + int(b), 0, 4294967295, "integer overflow in addition", loc))
+
+fn brine_x_sub_u32(a: u32, b: u32, loc: ptr) -> u32:
+    return u32(in_range(int(a) - int(b), 0, 4294967295, "integer overflow in subtraction", loc))
+
+fn brine_x_mul_u32(a: u32, b: u32, loc: ptr) -> u32:
+    let r = u64(a) * u64(b)
+    check(r <= 4294967295, "integer overflow in multiplication", loc)
+    return u32(r)
+
+fn brine_x_shl_u32(a: u32, b: int, loc: ptr) -> u32:
+    return u32(u64(a) << shift_ok(b, 32, loc))
+
+fn brine_x_shr_u32(a: u32, b: int, loc: ptr) -> u32:
+    return u32(u64(a) >> shift_ok(b, 32, loc))
+
+fn brine_x_conv_u32_from_i64(x: int, loc: ptr) -> u32:
+    check(x >= 0 and x <= 4294967295, "integer conversion out of range for u32", loc)
+    return u32(x)
+
+fn brine_x_conv_u32_from_u64(x: u64, loc: ptr) -> u32:
+    check(x <= 4294967295, "integer conversion out of range for u32", loc)
+    return u32(x)
+
+fn brine_x_conv_u32_from_i128(x: ptr, loc: ptr) -> u32:
+    let v = load_u64(x, 0)
+    check(load_u64(x, 8) == 0 and v <= 4294967295, "integer conversion out of range for u32", loc)
+    return u32(v)
+
+fn brine_x_conv_u32_from_u128(x: ptr, loc: ptr) -> u32:
+    let v = load_u64(x, 0)
+    check(load_u64(x, 8) == 0 and v <= 4294967295, "integer conversion out of range for u32", loc)
+    return u32(v)
+
+fn brine_x_fdiv_u32(a: u32, b: u32) -> u32:
+    return a / b
+
+fn brine_x_fmod_u32(a: u32, b: u32) -> u32:
+    return a % b
+
+fn brine_x_div_u32(a: u32, b: u32, loc: ptr) -> u32:
+    nonzero(int(b), "division by zero", loc)
+    return a / b
+
+fn brine_x_mod_u32(a: u32, b: u32, loc: ptr) -> u32:
+    nonzero(int(b), "remainder by zero", loc)
+    return a % b
+
+fn brine_x_abs_u32(a: u32, loc: ptr) -> u32:
+    return a
+
+fn brine_x_conv_u32_from_f64(x: float, loc: ptr) -> u32:
+    check(
+        x >= 0.0 and x < 4294967296.0,
+        "float to integer conversion out of range (or NaN) for u32",
+        loc
+    )
+    return u32(x)
+
+# u64
+fn brine_x_add_u64(a: u64, b: u64, loc: ptr) -> u64:
+    let r = a + b
+    check(r >= a, "integer overflow in addition", loc)
+    return r
+
+fn brine_x_sub_u64(a: u64, b: u64, loc: ptr) -> u64:
+    let r = a - b
+    check(a >= b, "integer overflow in subtraction", loc)
+    return r
+
+fn brine_x_mul_u64(a: u64, b: u64, loc: ptr) -> u64:
+    check(umulh(a, b) == 0, "integer overflow in multiplication", loc)
+    return a * b
+
+fn brine_x_shl_u64(a: u64, b: int, loc: ptr) -> u64:
+    return u64(u64(a) << shift_ok(b, 64, loc))
+
+fn brine_x_shr_u64(a: u64, b: int, loc: ptr) -> u64:
+    return u64(u64(a) >> shift_ok(b, 64, loc))
+
+fn brine_x_conv_u64_from_i64(x: int, loc: ptr) -> u64:
+    check(x >= 0, "integer conversion out of range for u64", loc)
+    return u64(x)
+
+fn brine_x_conv_u64_from_u64(x: u64, loc: ptr) -> u64:
+    return u64(x)
+
+fn brine_x_conv_u64_from_i128(x: ptr, loc: ptr) -> u64:
+    let v = load_u64(x, 0)
+    check(load_u64(x, 8) == 0, "integer conversion out of range for u64", loc)
+    return u64(v)
+
+fn brine_x_conv_u64_from_u128(x: ptr, loc: ptr) -> u64:
+    let v = load_u64(x, 0)
+    check(load_u64(x, 8) == 0, "integer conversion out of range for u64", loc)
+    return u64(v)
+
+fn brine_x_fdiv_u64(a: u64, b: u64) -> u64:
+    return a / b
+
+fn brine_x_fmod_u64(a: u64, b: u64) -> u64:
+    return a % b
+
+fn brine_x_div_u64(a: u64, b: u64, loc: ptr) -> u64:
+    nonzero(int(b), "division by zero", loc)
+    return a / b
+
+fn brine_x_mod_u64(a: u64, b: u64, loc: ptr) -> u64:
+    nonzero(int(b), "remainder by zero", loc)
+    return a % b
+
+fn brine_x_abs_u64(a: u64, loc: ptr) -> u64:
+    return a
+
+fn brine_x_conv_u64_from_f64(x: float, loc: ptr) -> u64:
+    check(
+        x >= 0.0 and x < 18446744073709551616.0,
+        "float to integer conversion out of range (or NaN) for u64",
+        loc
+    )
+    return u64(x)
+
+# i128
+fn brine_x_add_i128(r: ptr, a: ptr, b: ptr, loc: ptr):
+    let al = load_u64(a, 0)
+    let ah = load_u64(a, 8)
+    let bh = load_u64(b, 8)
+    let lo = al + load_u64(b, 0)
+    let hi = ah + bh + (u64(1) if lo < al else u64(0))
+    check(int((ah ^ hi) & (bh ^ hi)) >= 0, "integer overflow in addition", loc)
+    put128(r, lo, hi)
+
+fn brine_x_sub_i128(r: ptr, a: ptr, b: ptr, loc: ptr):
+    let al = load_u64(a, 0)
+    let ah = load_u64(a, 8)
+    let bl = load_u64(b, 0)
+    let bh = load_u64(b, 8)
+    let hi = ah - bh - (u64(1) if al < bl else u64(0))
+    check(int((ah ^ bh) & (ah ^ hi)) >= 0, "integer overflow in subtraction", loc)
+    put128(r, al - bl, hi)
+
+fn brine_x_mul_i128(r: ptr, a: ptr, b: ptr, loc: ptr):
+    check(not mul_i128_ovf(r, a, b), "integer overflow in multiplication", loc)
+
+fn brine_x_shl_i128(r: ptr, a: ptr, b: int, loc: ptr):
+    shl128(r, load_u64(a, 0), load_u64(a, 8), int(shift_ok(b, 128, loc)))
+
+fn brine_x_shr_i128(r: ptr, a: ptr, b: int, loc: ptr):
+    shr128(r, load_u64(a, 0), load_u64(a, 8), int(shift_ok(b, 128, loc)), true)
+
+fn brine_x_conv_i128_from_i64(r: ptr, x: int, loc: ptr):
+    put128(r, u64(x), u64(x >> 63))
+
+fn brine_x_conv_i128_from_u64(r: ptr, x: u64, loc: ptr):
+    put128(r, x, 0)
+
+fn brine_x_conv_i128_from_i128(r: ptr, x: ptr, loc: ptr):
+    copy128(r, x)
+
+fn brine_x_conv_i128_from_u128(r: ptr, x: ptr, loc: ptr):
+    check(load_i64(x, 8) >= 0, "integer conversion out of range for i128", loc)
+    copy128(r, x)
+
+fn brine_x_fdiv_i128(r: ptr, a: ptr, b: ptr):
+    sdiv128(r, a, b, false, true)
+
+fn brine_x_fmod_i128(r: ptr, a: ptr, b: ptr):
+    sdiv128(r, a, b, true, true)
+
+fn brine_x_div_i128(r: ptr, a: ptr, b: ptr, loc: ptr):
+    check(load_u64(b, 0) | load_u64(b, 8) != 0, "division by zero", loc)
+    check(
+        load_i64(b, 0) & load_i64(b, 8) != -1 or not is_min128(a),
+        "integer overflow in division",
+        loc
+    )
+    sdiv128(r, a, b, false, true)
+
+fn brine_x_mod_i128(r: ptr, a: ptr, b: ptr, loc: ptr):
+    check(load_u64(b, 0) | load_u64(b, 8) != 0, "remainder by zero", loc)
+    sdiv128(r, a, b, true, true)
+
+fn brine_x_abs_i128(r: ptr, a: ptr, loc: ptr):
+    check(not is_min128(a), "integer overflow in abs", loc)
+    if load_i64(a, 8) < 0:
+        neg128(r, a)
+    else:
+        copy128(r, a)
+
+fn brine_x_conv_i128_from_f64(r: ptr, x: float, loc: ptr):
+    check(
+        x >= -170141183460469231731687303715884105728.0
+        and x < 170141183460469231731687303715884105728.0,
+        "float to integer conversion out of range (or NaN) for i128",
+        loc
+    )
+    from_f64_128(r, x)
+
+fn brine_x_i128_add(r: ptr, a: ptr, b: ptr):
+    let al = load_u64(a, 0)
+    let lo = al + load_u64(b, 0)
+    put128(r, lo, load_u64(a, 8) + load_u64(b, 8) + (u64(1) if lo < al else u64(0)))
+
+fn brine_x_i128_sub(r: ptr, a: ptr, b: ptr):
+    let al = load_u64(a, 0)
+    let bl = load_u64(b, 0)
+    put128(r, al - bl, load_u64(a, 8) - load_u64(b, 8) - (u64(1) if al < bl else u64(0)))
+
+fn brine_x_i128_mul(r: ptr, a: ptr, b: ptr):
+    mul128(r, a, b)
+
+fn brine_x_i128_div(r: ptr, a: ptr, b: ptr):
+    sdiv128(r, a, b, false, false)
+
+fn brine_x_i128_rem(r: ptr, a: ptr, b: ptr):
+    sdiv128(r, a, b, true, false)
+
+fn brine_x_i128_shl(r: ptr, a: ptr, b: int):
+    shl128(r, load_u64(a, 0), load_u64(a, 8), b & 127)
+
+fn brine_x_i128_shr(r: ptr, a: ptr, b: int):
+    shr128(r, load_u64(a, 0), load_u64(a, 8), b & 127, true)
+
+fn brine_x_i128_neg(r: ptr, a: ptr):
+    neg128(r, a)
+
+fn brine_x_i128_cmp(a: ptr, b: ptr) -> i32:
+    let ah = load_i64(a, 8)
+    let bh = load_i64(b, 8)
+    if ah != bh:
+        return -1 if ah < bh else 1
+    let al = load_u64(a, 0)
+    let bl = load_u64(b, 0)
+    if al == bl:
+        return 0
+    return -1 if al < bl else 1
+
+fn brine_x_i128_from_i64(r: ptr, x: int):
+    put128(r, u64(x), u64(x >> 63))
+
+fn brine_x_i128_from_u64(r: ptr, x: u64):
+    put128(r, x, 0)
+
+fn brine_x_i128_from_f64(r: ptr, x: float):
+    from_f64_128(r, x)
+
+fn brine_x_i128_from_f32(r: ptr, x: f32):
+    from_f64_128(r, float(x))
+
+fn brine_x_i128_to_f64(a: ptr) -> float:
+    return i128_to_f64(a)
+
+fn brine_x_i128_to_f32(a: ptr) -> f32:
+    return i128_to_f32(a)
+
+# u128
+fn brine_x_add_u128(r: ptr, a: ptr, b: ptr, loc: ptr):
+    let al = load_u64(a, 0)
+    let ah = load_u64(a, 8)
+    let bh = load_u64(b, 8)
+    let lo = al + load_u64(b, 0)
+    let hi = ah + bh + (u64(1) if lo < al else u64(0))
+    check(hi > ah or (hi == ah and lo >= al), "integer overflow in addition", loc)
+    put128(r, lo, hi)
+
+fn brine_x_sub_u128(r: ptr, a: ptr, b: ptr, loc: ptr):
+    let al = load_u64(a, 0)
+    let ah = load_u64(a, 8)
+    let bl = load_u64(b, 0)
+    let bh = load_u64(b, 8)
+    let hi = ah - bh - (u64(1) if al < bl else u64(0))
+    check(ah > bh or (ah == bh and al >= bl), "integer overflow in subtraction", loc)
+    put128(r, al - bl, hi)
+
+fn brine_x_mul_u128(r: ptr, a: ptr, b: ptr, loc: ptr):
+    check(not mul_u128_ovf(r, a, b), "integer overflow in multiplication", loc)
+
+fn brine_x_shl_u128(r: ptr, a: ptr, b: int, loc: ptr):
+    shl128(r, load_u64(a, 0), load_u64(a, 8), int(shift_ok(b, 128, loc)))
+
+fn brine_x_shr_u128(r: ptr, a: ptr, b: int, loc: ptr):
+    shr128(r, load_u64(a, 0), load_u64(a, 8), int(shift_ok(b, 128, loc)), false)
+
+fn brine_x_conv_u128_from_i64(r: ptr, x: int, loc: ptr):
+    check(x >= 0, "integer conversion out of range for u128", loc)
+    put128(r, u64(x), u64(x >> 63))
+
+fn brine_x_conv_u128_from_u64(r: ptr, x: u64, loc: ptr):
+    put128(r, x, 0)
+
+fn brine_x_conv_u128_from_i128(r: ptr, x: ptr, loc: ptr):
+    check(load_i64(x, 8) >= 0, "integer conversion out of range for u128", loc)
+    copy128(r, x)
+
+fn brine_x_conv_u128_from_u128(r: ptr, x: ptr, loc: ptr):
+    copy128(r, x)
+
+fn brine_x_fdiv_u128(r: ptr, a: ptr, b: ptr):
+    udiv128p(r, a, b, false)
+
+fn brine_x_fmod_u128(r: ptr, a: ptr, b: ptr):
+    udiv128p(r, a, b, true)
+
+fn brine_x_div_u128(r: ptr, a: ptr, b: ptr, loc: ptr):
+    check(load_u64(b, 0) | load_u64(b, 8) != 0, "division by zero", loc)
+    udiv128p(r, a, b, false)
+
+fn brine_x_mod_u128(r: ptr, a: ptr, b: ptr, loc: ptr):
+    check(load_u64(b, 0) | load_u64(b, 8) != 0, "remainder by zero", loc)
+    udiv128p(r, a, b, true)
+
+fn brine_x_abs_u128(r: ptr, a: ptr, loc: ptr):
+    copy128(r, a)
+
+fn brine_x_conv_u128_from_f64(r: ptr, x: float, loc: ptr):
+    check(
+        x >= 0.0 and x < 340282366920938463463374607431768211456.0,
+        "float to integer conversion out of range (or NaN) for u128",
+        loc
+    )
+    from_f64_128(r, x)
+
+fn brine_x_u128_add(r: ptr, a: ptr, b: ptr):
+    let al = load_u64(a, 0)
+    let lo = al + load_u64(b, 0)
+    put128(r, lo, load_u64(a, 8) + load_u64(b, 8) + (u64(1) if lo < al else u64(0)))
+
+fn brine_x_u128_sub(r: ptr, a: ptr, b: ptr):
+    let al = load_u64(a, 0)
+    let bl = load_u64(b, 0)
+    put128(r, al - bl, load_u64(a, 8) - load_u64(b, 8) - (u64(1) if al < bl else u64(0)))
+
+fn brine_x_u128_mul(r: ptr, a: ptr, b: ptr):
+    mul128(r, a, b)
+
+fn brine_x_u128_div(r: ptr, a: ptr, b: ptr):
+    udiv128p(r, a, b, false)
+
+fn brine_x_u128_rem(r: ptr, a: ptr, b: ptr):
+    udiv128p(r, a, b, true)
+
+fn brine_x_u128_shl(r: ptr, a: ptr, b: int):
+    shl128(r, load_u64(a, 0), load_u64(a, 8), b & 127)
+
+fn brine_x_u128_shr(r: ptr, a: ptr, b: int):
+    shr128(r, load_u64(a, 0), load_u64(a, 8), b & 127, false)
+
+fn brine_x_u128_neg(r: ptr, a: ptr):
+    neg128(r, a)
+
+fn brine_x_u128_cmp(a: ptr, b: ptr) -> i32:
+    let ah = load_u64(a, 8)
+    let bh = load_u64(b, 8)
+    if ah != bh:
+        return -1 if ah < bh else 1
+    let al = load_u64(a, 0)
+    let bl = load_u64(b, 0)
+    if al == bl:
+        return 0
+    return -1 if al < bl else 1
+
+fn brine_x_u128_from_i64(r: ptr, x: int):
+    put128(r, u64(x), u64(x >> 63))
+
+fn brine_x_u128_from_u64(r: ptr, x: u64):
+    put128(r, x, 0)
+
+fn brine_x_u128_from_f64(r: ptr, x: float):
+    from_f64_128(r, x)
+
+fn brine_x_u128_from_f32(r: ptr, x: f32):
+    from_f64_128(r, float(x))
+
+fn brine_x_u128_to_f64(a: ptr) -> float:
+    return u128_to_f64(load_u64(a, 0), load_u64(a, 8))
+
+fn brine_x_u128_to_f32(a: ptr) -> f32:
+    return u128_to_f32(load_u64(a, 0), load_u64(a, 8))
+
+fn brine_x_neg_i128(r: ptr, a: ptr, loc: ptr):
+    check(not is_min128(a), "integer overflow in negation", loc)
+    neg128(r, a)
+
 # ------------------------------------------------------------ unicode
 # Unicode 16.0.0 tables, from the Unicode Character Database (as Python's
 # str.upper, str.lower, str.isalpha and str.isspace see it). A run is lo,
