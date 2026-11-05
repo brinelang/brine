@@ -12,7 +12,7 @@
 # `str_release(p)` (also arr_ and map_), `str_of(p)` and `ptr_of(s)` (a
 # string's block as a `str` and back, borrowed), `stack_mem(n)` (n bytes of
 # the frame), `bswap(x)`, `thread_ptr()`, `addr(p)` (p as a number) and
-# `symbol("name")` (a C symbol's address). Its arithmetic wraps, and the
+# `symbol("name")` (a C symbol's address) and `null_ptr()`. Its arithmetic wraps, and the
 # prover doesn't look at it. Code here can't use what lowers to the function
 # it is in (`a + b` on strings in brine_str_concat).
 
@@ -40,20 +40,21 @@ const APP_LIM = 24
 const APP_W0 = 32
 
 # brine_heap_info (brine_rt.c): where a thread's heap is, the heap's range,
-# each chunk's size class, and whether allocation may skip C
+# each chunk's size class, whether allocation may skip C, and how many free
+# blocks of each class a thread keeps
 const HI_OFF = 0
 const HI_IND = 8
 const HI_BASE = 16
 const HI_END = 24
 const HI_CLASSES = 32
 const HI_FAST = 40
+const HI_KEEP = 48
 
 # br_heap_th: a free list and a count of free blocks per size class
 const TH_HEAD = 0
 const TH_COUNT = 96
 
 const SMALL = 256
-const SPARE = 65536
 
 const ONES: u64 = 0xffffffffffffffff
 
@@ -266,27 +267,33 @@ fn class_size(c: int) -> int:
         return (c + 1) * 16
     return 128 + (c - 7) * 32
 
-# A box from the thread's free list; C makes more when it is empty.
-fn box_new(size: int, tag: int) -> ptr:
+extern fn brine_alloc(n: int) -> ptr
+
+extern fn brine_free(p: ptr)
+
+# n bytes of brine_alloc's, counted for BRINE_LEAKCHECK (strings, arrays)
+extern fn brine_x_counted(n: int) -> ptr
+
+# A block of n bytes (1 <= n <= SMALL) off the thread's free list, or 0
+# when C must make it: the list is empty, or BRINE_LEAKCHECK counts blocks.
+fn pop_free(n: int) -> ptr:
     let hi = symbol("brine_heap_info")
-    if size > 0 and size <= SMALL and load_i64(hi, HI_FAST) != 0:
+    if load_i64(hi, HI_FAST) != 0:
         let h = th_heap(hi)
         if addr(h) != 0:
-            let c = size_class(size)
+            let c = size_class(n)
             let p = load_ptr(h, TH_HEAD + c * 8)
             if addr(p) != 0:
                 store_ptr(h, TH_HEAD + c * 8, load_ptr(p, 0))
-                let n = load_i64(h, TH_COUNT + c * 8)
-                if n > 0:
-                    store_i64(h, TH_COUNT + c * 8, n - 1)
-                store_i64(p, 0, 1)
-                store_i64(p, 8, tag)
+                let k = load_i64(h, TH_COUNT + c * 8)
+                if k > 0:
+                    store_i64(h, TH_COUNT + c * 8, k - 1)
                 return p
-    return brine_box_new(size, tag)
+    return null_ptr()
 
-# A box back on the thread's free list, unless that holds enough already
-# (C hands some over to other threads then).
-fn box_free(p: ptr):
+# Block p back on the thread's free list; false when C must take it (not
+# our heap's, or the list holds enough: C hands some to other threads).
+fn push_free(p: ptr) -> bool:
     let hi = symbol("brine_heap_info")
     let base = load_u64(hi, HI_BASE)
     let off = addr(p) - base
@@ -295,12 +302,49 @@ fn box_free(p: ptr):
         if addr(h) != 0:
             let c = int(load_u8(load_ptr(hi, HI_CLASSES), off >> 16))
             let n = load_i64(h, TH_COUNT + c * 8) + 1
-            if n * class_size(c) <= SPARE:
+            if n <= load_i64(hi, HI_KEEP + c * 8):
                 store_ptr(p, 0, load_ptr(h, TH_HEAD + c * 8))
                 store_ptr(h, TH_HEAD + c * 8, p)
                 store_i64(h, TH_COUNT + c * 8, n)
-                return
-    brine_box_free(p)
+                return true
+    return false
+
+# brine_alloc's n bytes (n >= 1), and their freeing
+fn blk_alloc(n: int) -> ptr:
+    if n > 0 and n <= SMALL:
+        let p = pop_free(n)
+        if addr(p) != 0:
+            return p
+    return brine_alloc(n)
+
+fn blk_free(p: ptr):
+    if not push_free(p):
+        brine_free(p)
+
+# A block BRINE_LEAKCHECK counts (strings, arrays, boxes); the free list is
+# only used when it is off.
+fn new_counted(n: int) -> ptr:
+    if n > 0 and n <= SMALL:
+        let p = pop_free(n)
+        if addr(p) != 0:
+            return p
+    return brine_x_counted(n)
+
+fn free_counted(p: ptr):
+    if not push_free(p):
+        brine_box_free(p)
+
+fn box_new(size: int, tag: int) -> ptr:
+    if size > 0 and size <= SMALL:
+        let p = pop_free(size)
+        if addr(p) != 0:
+            store_i64(p, 0, 1)
+            store_i64(p, 8, tag)
+            return p
+    return brine_box_new(size, tag)
+
+fn box_free(p: ptr):
+    free_counted(p)
 
 # ------------------------------------------------------------ strings
 # What C still does for them (brine_rt.c), and the C library.
@@ -312,37 +356,81 @@ extern fn memcmp(a: ptr, b: ptr, n: u64) -> i32
 # a block for a string of n bytes: count 1, length n, the NUL (br_str_alloc)
 extern fn brine_x_str_alloc(n: int) -> ptr
 
+# The bytes a string of length n takes (brine_str_size): rounded up by at
+# most a quarter, so `+=` can usually grow it in place.
+fn str_block(n: int) -> int:
+    let t = 17 + n
+    if t <= 64:
+        return (t + 15) & ~15
+    let g = 1 << (61 - u64(t).leading_zeros())
+    return (t + g - 1) & ~(g - 1)
+
+# A string of n bytes with count 1 and its NUL; the bytes are not set.
+fn new_str(n: int) -> ptr:
+    let t = str_block(n)
+    if t <= SMALL:
+        let s = pop_free(t)
+        if addr(s) != 0:
+            store_i64(s, STR_RC, 1)
+            store_i64(s, STR_LEN, n)
+            store_u8(s, STR_DATA + n, 0)
+            return s
+    return brine_x_str_alloc(n)
+
+fn brine_str_free(s: ptr):
+    free_counted(s)
+
 # s's block made big enough for a string of n bytes; it may move
 extern fn brine_x_str_grow(s: ptr, n: int) -> ptr
 
 extern fn brine_panic_at(loc: ptr, msg: str)
 
-extern fn brine_arr_new(n: int, esz: int, rt: ptr, rl: ptr, loc: ptr) -> ptr
-
-extern fn brine_arr_push(pa: ptr, elem: ptr)
-
-# n bytes from s to d; short copies a byte at a time rather than a call
+# n bytes from s to d (apart, or the same bytes); a short copy is a few
+# loads and stores that overlap rather than a call
 fn copy_bytes(d: ptr, s: ptr, n: int):
-    if n > 16:
-        memcpy(d, s, u64(n))
-        return
-    for i in 0..n:
-        store_u8(d, i, load_u8(s, i))
+    if n >= 8:
+        if n > 32:
+            memcpy(d, s, u64(n))
+        elif n > 16:
+            let a = load_u64(s, 0)
+            let b = load_u64(s, 8)
+            let c = load_u64(s, n - 16)
+            let e = load_u64(s, n - 8)
+            store_u64(d, 0, a)
+            store_u64(d, 8, b)
+            store_u64(d, n - 16, c)
+            store_u64(d, n - 8, e)
+        else:
+            let a = load_u64(s, 0)
+            let b = load_u64(s, n - 8)
+            store_u64(d, 0, a)
+            store_u64(d, n - 8, b)
+    elif n >= 4:
+        let a = load_u32(s, 0)
+        let b = load_u32(s, n - 4)
+        store_u32(d, 0, a)
+        store_u32(d, n - 4, b)
+    elif n > 0:
+        let a = load_u8(s, 0)
+        let b = load_u8(s, n >> 1)
+        let c = load_u8(s, n - 1)
+        store_u8(d, 0, a)
+        store_u8(d, n >> 1, b)
+        store_u8(d, n - 1, c)
 
 # the one-character string of byte c (brine_bytes: brine_str1, 24 bytes each)
 fn byte_str(c: u8) -> ptr:
     return symbol("brine_bytes") + int(c) * 24
 
 fn brine_str_new(p: ptr, n: int) -> ptr:
-    let s = brine_x_str_alloc(n)
-    if n != 0:
-        memcpy(s + STR_DATA, p, u64(n))
+    let s = new_str(n)
+    copy_bytes(s + STR_DATA, p, n)
     return s
 
 fn brine_str_concat(a: ptr, b: ptr) -> ptr:
     let la = load_i64(a, STR_LEN)
     let lb = load_i64(b, STR_LEN)
-    let s = brine_x_str_alloc(la + lb)
+    let s = new_str(la + lb)
     copy_bytes(s + STR_DATA, a + STR_DATA, la)
     copy_bytes(s + STR_DATA + la, b + STR_DATA, lb)
     return s
@@ -361,7 +449,7 @@ fn brine_str_append(ps: ptr, b: ptr):
     let n = la + lb
     let own = a == b
     let s = brine_x_str_grow(a, n)
-    memcpy(s + STR_DATA + la, (s if own else b) + STR_DATA, u64(lb))
+    copy_bytes(s + STR_DATA + la, (s if own else b) + STR_DATA, lb)
     store_i64(s, STR_LEN, n)
     store_u8(s, STR_DATA + n, 0)
     store_ptr(ps, 0, s)
@@ -375,13 +463,13 @@ fn brine_str_add_byte_slow(ps: ptr, c: u8):
         # grows the block
         brine_str_append(ps, byte_str(c))
         return
-    let s = brine_x_str_alloc(la + 1)
+    let s = new_str(la + 1)
     if la < 8:
         let w = load_u64(a, STR_DATA) & lowmask(u64(la))
         store_u64(s, STR_DATA, w | u64(c) << u64(8 * la))
         store_u8(s, STR_DATA + 8, 0)
     else:
-        memcpy(s + STR_DATA, a + STR_DATA, u64(la))
+        copy_bytes(s + STR_DATA, a + STR_DATA, la)
         store_u8(s, STR_DATA + la, c)
     str_release(a)
     store_ptr(ps, 0, s)
@@ -544,10 +632,6 @@ extern fn memmove(d: ptr, s: ptr, n: u64) -> ptr
 
 extern fn memset(d: ptr, c: i32, n: u64) -> ptr
 
-extern fn brine_alloc(n: int) -> ptr
-
-extern fn brine_free(p: ptr)
-
 # p's block (from brine_alloc) made n bytes; it may move
 extern fn brine_x_realloc(p: ptr, n: int) -> ptr
 
@@ -561,7 +645,7 @@ const HEX = "0123456789abcdef"
 fn brine_sb_init(sb: ptr):
     store_i64(sb, SB_CAP, 64)
     store_i64(sb, SB_LEN, 0)
-    store_ptr(sb, SB_P, brine_alloc(64))
+    store_ptr(sb, SB_P, blk_alloc(64))
 
 # Room for `extra` more bytes; the address they go at.
 fn sb_room(sb: ptr, extra: int) -> ptr:
@@ -752,6 +836,327 @@ fn brine_sb_pad(sb: ptr, start: int, width: int, left: bool, zero: bool):
 fn brine_sb_finish(sb: ptr) -> ptr:
     let p = load_ptr(sb, SB_P)
     let s = brine_str_new(p, load_i64(sb, SB_LEN))
-    brine_free(p)
+    blk_free(p)
     store_u64(sb, SB_P, 0)
     return s
+
+# ------------------------------------------------------------ arrays
+# brine_arr: a count, the length, the room, the element size, the
+# functions that retain and release an element (0 for plain data), the
+# elements
+
+const ARR_RC = 0
+const ARR_LEN = 8
+const ARR_CAP = 16
+const ARR_ESZ = 24
+const ARR_RT = 32
+const ARR_RL = 40
+const ARR_DATA = 48
+const ARR_SIZE = 56
+
+# n zero bytes from the C library's heap
+extern fn brine_x_calloc(n: int) -> ptr
+
+extern fn memchr(p: ptr, c: i32, n: u64) -> ptr
+
+extern fn brine_panic_idx(i: int, len: int, loc: ptr)
+
+# Is block p from our own heap (brine_rt.c's br_in_heap)?
+fn in_heap(p: ptr) -> bool:
+    let hi = symbol("brine_heap_info")
+    let base = load_u64(hi, HI_BASE)
+    return addr(p) - base < load_u64(hi, HI_END) - base
+
+# an array header with count 1
+fn arr_header(len: int, cap: int, esz: int, rt: ptr, rl: ptr) -> ptr:
+    let a = new_counted(ARR_SIZE)
+    store_i64(a, ARR_RC, 1)
+    store_i64(a, ARR_LEN, len)
+    store_i64(a, ARR_CAP, cap)
+    store_i64(a, ARR_ESZ, esz)
+    store_ptr(a, ARR_RT, rt)
+    store_ptr(a, ARR_RL, rl)
+    store_u64(a, ARR_DATA, 0)
+    return a
+
+# frees the elements first, past a depth on a list (brine_drop)
+extern fn brine_x_arr_drop(a: ptr)
+
+fn brine_arr_free(a: ptr):
+    if addr(load_ptr(a, ARR_RL)) != 0:
+        brine_x_arr_drop(a)
+        return
+    let d = load_ptr(a, ARR_DATA)
+    if addr(d) != 0:
+        blk_free(d)
+    free_counted(a)
+
+fn neg_len(len: int, loc: ptr):
+    brine_panic_at(loc, f"cannot create an array with negative length {len}")
+
+fn brine_arr_new(len: int, esz: int, rt: ptr, rl: ptr, loc: ptr) -> ptr:
+    if len < 0:
+        neg_len(len, loc)
+    let a = arr_header(len, len, esz, rt, rl)
+    # no data until the first push: `xs[i] = []`, which takes an inner
+    # array out to change it, then costs one allocation, not two
+    if len == 0:
+        return a
+    if esz > 0 and len <= SMALL / esz:
+        # small: a block of our heap, whose spare room the first pushes use
+        # (`[]` then `push` doesn't reallocate)
+        let bytes = len * esz
+        let d = blk_alloc(bytes)
+        memset(d, 0, u64(bytes))
+        store_ptr(a, ARR_DATA, d)
+        if in_heap(d):
+            store_i64(a, ARR_CAP, class_size(size_class(bytes)) / esz)
+        return a
+    store_ptr(a, ARR_DATA, brine_x_calloc(len * esz))
+    return a
+
+# An integer array kept as bytes (narrow.br), zeroed, with 16 more bytes
+# than it needs for brine_bytes_rev and friends. It is never shared, so
+# never copied.
+fn brine_bytes_new(len: int, loc: ptr) -> ptr:
+    if len < 0:
+        neg_len(len, loc)
+    let a = arr_header(len, len + 16, 1, null_ptr(), null_ptr())
+    store_ptr(a, ARR_DATA, brine_x_calloc(len + 16))
+    return a
+
+# A `[bool]` kept as bits (the compiler's pack.br): `len` elements in 64-bit
+# words. `esz` 0 marks it; only indexing, `len` and freeing ever see one.
+fn brine_bits_new(len: int, fill: int, loc: ptr) -> ptr:
+    if len < 0:
+        neg_len(len, loc)
+    let a = arr_header(len, len, 0, null_ptr(), null_ptr())
+    let bytes = (len / 64 + 1) * 8
+    let d = brine_x_calloc(bytes)
+    if fill != 0:
+        memset(d, 0xff, u64(bytes))
+    store_ptr(a, ARR_DATA, d)
+    return a
+
+# Calls f (an element's retain or release) on each of the n elements at d.
+fn each_elem(f: ptr, d: ptr, n: int, esz: int):
+    for i in 0..n:
+        call_void(f, d + i * esz)
+
+fn brine_arr_unique(pa: ptr):
+    let a = load_ptr(pa, 0)
+    if load_i64(a, ARR_RC) == 1:
+        return
+    let n = new_counted(ARR_SIZE)
+    memcpy(n, a, u64(ARR_SIZE))
+    let len = load_i64(a, ARR_LEN)
+    let esz = load_i64(a, ARR_ESZ)
+    store_i64(n, ARR_RC, 1)
+    store_i64(n, ARR_CAP, len)
+    let bytes = len * esz if esz != 0 else (len / 64 + 1) * 8
+    let d = blk_alloc(bytes)
+    memcpy(d, load_ptr(a, ARR_DATA), u64(bytes))
+    store_ptr(n, ARR_DATA, d)
+    let rt = load_ptr(a, ARR_RT)
+    if addr(rt) != 0:
+        each_elem(rt, d, len, esz)
+    arr_release(a)
+    store_ptr(pa, 0, n)
+
+fn arr_reserve(a: ptr, need: int):
+    let cap = load_i64(a, ARR_CAP)
+    if need <= cap:
+        return
+    var nc = cap * 2 if cap != 0 else 4
+    if nc < need:
+        nc = need
+    let d = brine_x_realloc(load_ptr(a, ARR_DATA), nc * load_i64(a, ARR_ESZ))
+    store_ptr(a, ARR_DATA, d)
+    store_i64(a, ARR_CAP, nc)
+
+# the address of element i
+fn elem_at(a: ptr, i: int) -> ptr:
+    return load_ptr(a, ARR_DATA) + i * load_i64(a, ARR_ESZ)
+
+fn brine_arr_push(pa: ptr, elem: ptr):
+    brine_arr_unique(pa)
+    let a = load_ptr(pa, 0)
+    let len = load_i64(a, ARR_LEN)
+    arr_reserve(a, len + 1)
+    copy_bytes(elem_at(a, len), elem, load_i64(a, ARR_ESZ))
+    store_i64(a, ARR_LEN, len + 1)
+
+fn brine_arr_pop(pa: ptr, out: ptr, loc: ptr):
+    if load_i64(load_ptr(pa, 0), ARR_LEN) == 0:
+        brine_panic_at(loc, "pop() from an empty array")
+    brine_arr_unique(pa)
+    let a = load_ptr(pa, 0)
+    let len = load_i64(a, ARR_LEN) - 1
+    store_i64(a, ARR_LEN, len)
+    copy_bytes(out, elem_at(a, len), load_i64(a, ARR_ESZ))
+
+fn brine_arr_pop_at(pa: ptr, i: int, out: ptr, loc: ptr):
+    let len0 = load_i64(load_ptr(pa, 0), ARR_LEN)
+    if u64(i) >= u64(len0):
+        brine_panic_idx(i, len0, loc)
+    brine_arr_unique(pa)
+    let a = load_ptr(pa, 0)
+    let esz = load_i64(a, ARR_ESZ)
+    let len = load_i64(a, ARR_LEN)
+    copy_bytes(out, elem_at(a, i), esz)
+    memmove(elem_at(a, i), elem_at(a, i + 1), u64((len - i - 1) * esz))
+    store_i64(a, ARR_LEN, len - 1)
+
+fn brine_arr_insert(pa: ptr, i: int, elem: ptr, loc: ptr):
+    let a0 = load_ptr(pa, 0)
+    let len0 = load_i64(a0, ARR_LEN)
+    if i < 0 or i > len0:
+        let rl = load_ptr(a0, ARR_RL)
+        if addr(rl) != 0:
+            call_void(rl, elem)
+        brine_panic_at(loc, f"insert index {i} is out of bounds for length {len0}")
+    brine_arr_unique(pa)
+    let a = load_ptr(pa, 0)
+    let esz = load_i64(a, ARR_ESZ)
+    let len = load_i64(a, ARR_LEN)
+    arr_reserve(a, len + 1)
+    memmove(elem_at(a, i + 1), elem_at(a, i), u64((len - i) * esz))
+    copy_bytes(elem_at(a, i), elem, esz)
+    store_i64(a, ARR_LEN, len + 1)
+
+fn brine_arr_extend(pa: ptr, b: ptr):
+    let n = load_i64(b, ARR_LEN)
+    if n == 0:
+        return
+    # b may be *pa itself
+    arr_retain(b)
+    brine_arr_unique(pa)
+    let a = load_ptr(pa, 0)
+    let esz = load_i64(a, ARR_ESZ)
+    let len = load_i64(a, ARR_LEN)
+    arr_reserve(a, len + n)
+    let d = elem_at(a, len)
+    memcpy(d, load_ptr(b, ARR_DATA), u64(n * esz))
+    let rt = load_ptr(a, ARR_RT)
+    if addr(rt) != 0:
+        each_elem(rt, d, n, esz)
+    store_i64(a, ARR_LEN, len + n)
+    arr_release(b)
+
+# a `str` argument of an `extern fn`: a NUL-terminated copy for the call
+fn brine_cstr(s: ptr, loc: ptr) -> ptr:
+    let n = load_i64(s, STR_LEN)
+    let z = memchr(s + STR_DATA, 0, u64(n))
+    if addr(z) != 0:
+        let at = addr(z) - addr(s + STR_DATA)
+        brine_panic_at(loc, f"a string passed to an extern function contains a NUL byte (at {at})")
+    let p = blk_alloc(n + 1)
+    memcpy(p, s + STR_DATA, u64(n))
+    store_u8(p, n, 0)
+    return p
+
+fn brine_cstr_free(p: ptr):
+    blk_free(p)
+
+# A new array of the n elements at d, each retained.
+fn copy_elems(a: ptr, d: ptr, n: int, loc: ptr) -> ptr:
+    let esz = load_i64(a, ARR_ESZ)
+    let rt = load_ptr(a, ARR_RT)
+    let r = brine_arr_new(n, esz, rt, load_ptr(a, ARR_RL), loc)
+    memcpy(load_ptr(r, ARR_DATA), d, u64(n * esz))
+    if addr(rt) != 0:
+        each_elem(rt, load_ptr(r, ARR_DATA), n, esz)
+    return r
+
+# `a + b`: a new array (or a shared one when a side is empty)
+fn brine_arr_concat(a: ptr, b: ptr, loc: ptr) -> ptr:
+    let la = load_i64(a, ARR_LEN)
+    let lb = load_i64(b, ARR_LEN)
+    if la == 0 or lb == 0:
+        let r = b if la == 0 else a
+        arr_retain(r)
+        return r
+    let esz = load_i64(a, ARR_ESZ)
+    let rt = load_ptr(a, ARR_RT)
+    let r = brine_arr_new(la + lb, esz, rt, load_ptr(a, ARR_RL), loc)
+    let d = load_ptr(r, ARR_DATA)
+    memcpy(d, load_ptr(a, ARR_DATA), u64(la * esz))
+    memcpy(d + la * esz, load_ptr(b, ARR_DATA), u64(lb * load_i64(b, ARR_ESZ)))
+    if addr(rt) != 0:
+        each_elem(rt, d, la + lb, esz)
+    return r
+
+fn brine_arr_reverse(pa: ptr):
+    brine_arr_unique(pa)
+    let a = load_ptr(pa, 0)
+    let esz = load_i64(a, ARR_ESZ)
+    let small = stack_mem(64)
+    let t = small if esz <= 64 else blk_alloc(esz)
+    var i = 0
+    var j = load_i64(a, ARR_LEN) - 1
+    while i < j:
+        copy_bytes(t, elem_at(a, i), esz)
+        copy_bytes(elem_at(a, i), elem_at(a, j), esz)
+        copy_bytes(elem_at(a, j), t, esz)
+        i += 1
+        j -= 1
+    if esz > 64:
+        blk_free(t)
+
+fn brine_arr_clear(pa: ptr):
+    let a = load_ptr(pa, 0)
+    let esz = load_i64(a, ARR_ESZ)
+    let rl = load_ptr(a, ARR_RL)
+    if load_i64(a, ARR_RC) != 1:
+        store_ptr(pa, 0, brine_arr_new(0, esz, load_ptr(a, ARR_RT), rl, ptr_of("") + STR_DATA))
+        arr_release(a)
+        return
+    if addr(rl) != 0:
+        each_elem(rl, load_ptr(a, ARR_DATA), load_i64(a, ARR_LEN), esz)
+    store_i64(a, ARR_LEN, 0)
+
+# A stable merge sort of the n elements at d; tmp holds n / 2 + 1.
+fn msort(d: ptr, tmp: ptr, n: int, esz: int, cmp: ptr):
+    if n < 2:
+        return
+    let h = n / 2
+    msort(d, tmp, h, esz, cmp)
+    msort(d + h * esz, tmp, n - h, esz, cmp)
+    if call_i32(cmp, d + (h - 1) * esz, d + h * esz) <= 0:
+        return
+    memcpy(tmp, d, u64(h * esz))
+    var i = 0
+    var j = h
+    var k = 0
+    while i < h and j < n:
+        if call_i32(cmp, d + j * esz, tmp + i * esz) < 0:
+            copy_bytes(d + k * esz, d + j * esz, esz)
+            j += 1
+        else:
+            copy_bytes(d + k * esz, tmp + i * esz, esz)
+            i += 1
+        k += 1
+    while i < h:
+        copy_bytes(d + k * esz, tmp + i * esz, esz)
+        k += 1
+        i += 1
+
+fn brine_arr_sort(pa: ptr, cmp: ptr):
+    if load_i64(load_ptr(pa, 0), ARR_LEN) < 2:
+        return
+    brine_arr_unique(pa)
+    let a = load_ptr(pa, 0)
+    let len = load_i64(a, ARR_LEN)
+    let esz = load_i64(a, ARR_ESZ)
+    let tmp = blk_alloc((len / 2 + 1) * esz)
+    msort(load_ptr(a, ARR_DATA), tmp, len, esz, cmp)
+    blk_free(tmp)
+
+fn brine_arr_slice(a: ptr, lo: int, hi: int, loc: ptr) -> ptr:
+    let len = load_i64(a, ARR_LEN)
+    if lo < 0 or lo > hi or hi > len:
+        brine_panic_at(loc, f"slice [{lo}:{hi}] is out of bounds for an array of length {len}")
+    if lo == 0 and hi == len:
+        arr_retain(a)
+        return a
+    return copy_elems(a, elem_at(a, lo), hi - lo, loc)
