@@ -1205,8 +1205,85 @@ struct X:
             self.st(RAX, x.d)
         return true
 
+    # brine_arr_push_in as brine_rt.h has it, inline: when the array is this
+    # variable's alone and has room, the element is stored straight in;
+    # otherwise brine_arr_push.
+    fn inline_push(ref self, x: Inst) -> bool:
+        let lp = x.args[0]
+        let tp = x.args[1]
+        let n = self.fval[x.args[2]]
+        if self.fold[x.args[2]] != F_CONST or n <= 0 or n > 64:
+            return false
+        for v in [lp, tp]:
+            let f = self.fold[v]
+            if f != F_NONE and f != F_SLOT and f != F_GLOBAL:
+                return false
+        # both are read again by the call
+        self.once[lp] = false
+        self.once[tp] = false
+        # pa and elem stay where they are (the call reads them); the rest
+        # of the caller-saved registers are free, as for any call
+        var er = -1
+        var pr = -1
+        if self.fold[tp] == F_NONE and self.reg[tp] >= 0:
+            er = self.reg[tp]
+            pr = self.use(RAX if er != RAX else RCX, lp)
+        else:
+            pr = self.use(RAX, lp)
+            er = self.use(RCX if pr != RCX else RDX, tp)
+        var free: [int] = []
+        for r in [RAX, RCX, RDX, R8, R9, R10, R11]:
+            if r != pr and r != er:
+                free.push(r)
+        let a = free[0]
+        let c = free[1]
+        let t = free[2]
+        self.mov_rm(a, mreg(pr, 0))
+        self.mov_rm(c, mreg(a, 8))
+        self.alu_rm(CMP, c, mreg(a, 16))
+        let full = self.j32(CC_GE)
+        self.rm(0, 1, 131, CMP, mreg(a, 0), 1)
+        self.b(1)
+        let shared = self.j32(CC_NE)
+        # len += 1, then c = data + old len * n
+        self.rm(0, 1, 255, 0, mreg(a, 8), 0)
+        if (n & (n - 1)) == 0:
+            if n > 1:
+                # shl c, log2 n
+                self.rr(0, 1, 193, 4, c)
+                self.b(n.trailing_zeros())
+        else:
+            # imul c, c, n
+            self.rr(0, 1, 105, c, c)
+            self.b32(n)
+        self.alu_rm(ADD, c, mreg(a, 48))
+        var i = 0
+        while i + 8 <= n:
+            self.mov_rm(t, mreg(er, i))
+            self.mov_mr(mreg(c, i), t)
+            i += 8
+        if i + 4 <= n:
+            self.rm(0, 0, 139, t, mreg(er, i), 0)
+            self.store_sz(mreg(c, i), t, 4)
+            i += 4
+        if i + 2 <= n:
+            self.rm(0, 0, 4023, t, mreg(er, i), 0)
+            self.store_sz(mreg(c, i), t, 2)
+            i += 2
+        if i < n:
+            self.rm(0, 0, 4022, t, mreg(er, i), 0)
+            self.store_sz(mreg(c, i), t, 1)
+        let done = self.jmp32()
+        self.here32(full)
+        self.here32(shared)
+        self.call_rt("brine_arr_push", [CArg(how=A_VAL, v=lp, fl=0), CArg(how=A_VAL, v=tp, fl=0)])
+        self.here32(done)
+        return true
+
     fn ir_call(ref self, x: Inst):
         if x.op == Op.Call and x.b == 1 and self.inline_rc(x):
+            return
+        if x.op == Op.Call and x.b == 1 and x.s == "brine_arr_push_in" and self.inline_push(x):
             return
         if (
             x.op == Op.Call
