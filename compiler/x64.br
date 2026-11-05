@@ -25,6 +25,8 @@ from ir import KO_CONST, KO_CONST2, KO_SPILL, KO_FILL, KO_ARG, KO_CHK, PFX_PD, P
 from ir import KPath, KV_BCF, KV_BCI, KV_J, KV_JINC, KV_LD, KV_ST, KV_MOV, KV_FOP, KV_IOP, KV_SHI
 from ir import KV_CVT, KV_RLD, KV_RED, KV_RST
 from ir import KL_LD, KL_ST, KL_MOV, KL_OP, KL_CMP, KL_SEL, KL_NOT, KL_ANY
+from ir import KW_LD, KW_LDH, KW_LDD, KW_LDP, KW_LDV, KW_INS, KW_BC, KW_BCA, KW_OP, KW_SQRT
+from ir import KW_PERM, KW_LDK, KW_ALIGN, KW_ST, KW_STH, KW_SPILL, KW_FILL, KW_MOV, KW_ARG
 from opt import promote, reads, switches, inline_small
 import ssa
 import ra
@@ -530,7 +532,7 @@ struct X:
         self.b(op)
         self.b(192 | ((reg & 7) << 3) | (r & 7))
 
-    # EVEX op reg, v, rm (no masks, registers 0..15): map and pp as for VEX,
+    # EVEX op reg, v, rm (no masks, registers 0..31): map and pp as for VEX,
     # w EVEX.W, l 2 for 512 bits. `n`: what a one-byte displacement counts
     # in (the memory operand's size).
     fn evex_m(
@@ -551,11 +553,11 @@ struct X:
             ((((x >> 2) & 1) ^ 1) << 7)
             | ((((x >> 1) & 1) ^ 1) << 6)
             | (((x & 1) ^ 1) << 5)
-            | 16
+            | ((((reg >> 4) & 1) ^ 1) << 4)
             | map
         )
-        self.b((w << 7) | ((15 - v) << 3) | 4 | pp)
-        self.b((l << 5) | 8)
+        self.b((w << 7) | ((15 - (v & 15)) << 3) | 4 | pp)
+        self.b((l << 5) | ((((v >> 4) & 1) ^ 1) << 3))
         self.b(op)
         if m.base == RIP:
             self.modrm(reg, m, 0)
@@ -581,9 +583,15 @@ struct X:
 
     fn evex_r(ref self, map: int, pp: int, w: int, l: int, op: int, reg: int, v: int, r: int):
         self.b(98)
-        self.b((((reg >> 3) ^ 1) << 7) | 64 | (((r >> 3) ^ 1) << 5) | 16 | map)
-        self.b((w << 7) | ((15 - v) << 3) | 4 | pp)
-        self.b((l << 5) | 8)
+        self.b(
+            ((((reg >> 3) & 1) ^ 1) << 7)
+            | ((((r >> 4) & 1) ^ 1) << 6)
+            | ((((r >> 3) & 1) ^ 1) << 5)
+            | ((((reg >> 4) & 1) ^ 1) << 4)
+            | map
+        )
+        self.b((w << 7) | ((15 - (v & 15)) << 3) | 4 | pp)
+        self.b((l << 5) | ((((v >> 4) & 1) ^ 1) << 3))
         self.b(op)
         self.b(192 | ((reg & 7) << 3) | (r & 7))
 
@@ -1766,34 +1774,73 @@ struct X:
         self.vpool[key] = s
         return s
 
+    # The symbol of 64 bytes of .rodata: the 8 integers ls.
+    fn wconst_sym(ref self, ls: [int]) -> int:
+        var key = "w"
+        for x in ls:
+            key += f"{x},"
+        match self.vpool.get(key):
+            case Some(s):
+                return s
+            case None:
+                pass
+        while len(self.o.rodata) % 64 != 0:
+            self.o.rodata.push(0)
+        self.o.rodata_align = max(self.o.rodata_align, 64)
+        let off = len(self.o.rodata)
+        for x in ls:
+            put64(ref self.o.rodata, x)
+        let s = self.sym_def(f"__brx_v{len(self.vpool)}", SEC_RODATA, off, false, false)
+        self.vpool[key] = s
+        return s
+
     # ------------------------------------------------------------ kernels
     # A vector kernel (xkern.br): its array pointers stay in their argument
     # registers, its xmm registers are the ones xkern.br chose. The frame is
     # rbp-based like a function's, with no general registers saved, then the
     # callee-saved xmm registers it writes (Windows) and its 16-byte slots.
+    # One with an AVX-512 version is that, under the kernel's name, and the
+    # SSE2 version it jumps to when the CPU lacks AVX-512: each saves only
+    # the registers it writes.
     fn kernel(ref self, k: KFunc):
+        if len(k.wide) == 0:
+            self.kernel_fn(k, k.name, false, -1)
+            return
+        let sse = self.kernel_fn(k, k.name + "_sse2", false, -1)
+        self.kernel_fn(k, k.name, true, sse)
+
+    # One version of a kernel, at the position it returns: `wide` the
+    # AVX-512 one, which jumps to `sse` on other CPUs.
+    fn kernel_fn(ref self, k: KFunc, name: str, wide: bool, sse: int) -> int:
         let gp = [RCX, RDX, R8, R9] if self.win else [RDI, RSI, RDX, RCX]
         self.saved = []
         self.fsaved = []
         self.fsave_at = []
+        var regs = k.regs
+        if wide:
+            regs = []
+            for o in k.wide:
+                if o.op != KW_ST and o.op != KW_STH and o.op != KW_SPILL and o.a not in regs:
+                    regs.push(o.a)
         if self.win:
-            for r in k.regs:
-                if r >= 6:
+            for r in regs:
+                if r >= 6 and r < 16:
                     self.fsaved.push(r)
         var off = 0
         for _ in self.fsaved:
             off += 16
             self.fsave_at.push(-off)
         let slots = off
-        off += 16 * k.nslots
-        if k.loop or k.lanes:
+        off += 64 * k.wslots if wide else 16 * k.nslots
+        if k.loop or k.lanes or wide:
             # rbx, rcx and rdx around cpuid, then 128 bytes that hold 64
             # aligned ones for the lanes of sums
             off += 32 + 128
         let grow = align_up(off, 16)
         while len(self.o.text) % 16 != 0:
             self.o.text.push(204)
-        self.sym_def(k.name, SEC_TEXT, self.pos(), false, true)
+        let start = self.pos()
+        self.sym_def(name, SEC_TEXT, start, false, true)
         self.u = Unw(
             start=self.pos(),
             pushes=[],
@@ -1817,6 +1864,24 @@ struct X:
             self.kernel_loop(k, gp, slots)
         elif k.lanes:
             self.kernel_lanes(k, gp[0], slots)
+        elif wide:
+            self.cpu_level(slots)
+            self.alu_ri(CMP, RAX, 7)
+            let have = self.j32(CC_AE)
+            # no AVX-512: the SSE2 version, with this frame gone
+            for i, x in enumerate(self.fsaved):
+                self.xrestore(x, mrb(self.fsave_at[i]))
+            # leave; jmp sse
+            self.b(201)
+            self.b(233)
+            self.b32(sse - (self.pos() + 4))
+            self.here32(have)
+            for o in k.wide:
+                self.kw(o, gp, slots, k)
+            # vzeroupper
+            self.b(197)
+            self.b(248)
+            self.b(119)
         else:
             for o in k.ops:
                 self.kop(o, gp, slots)
@@ -1825,6 +1890,7 @@ struct X:
             self.unwind_coff()
         else:
             self.unwind_elf()
+        return start
 
     # A loop kernel (vloop.br). Its parameter, the block, stays in gp[0]; the
     # arrays' addresses go in `arr` registers. It runs the first of its paths
@@ -2136,6 +2202,89 @@ struct X:
             case _:
                 # KO_ARG
                 self.rm(PFX_SD, 0, 3856, o.a, mrb(o.n), 0)
+
+    # One operation of a kernel's AVX-512 version (xwide.br): EVEX, packed
+    # operations k.wl long (1 ymm, 2 zmm). Stack slots start `slots` bytes
+    # below rbp.
+    fn kw(ref self, o: KOp, gp: [int], slots: int, k: KFunc):
+        let l = k.wl
+        let vn = 16 << l
+        var m = mrb(0)
+        if o.op <= KW_LDV or o.op == KW_ST or o.op == KW_STH:
+            m = mreg(gp[o.b], o.n)
+        match o.op:
+            case KW_LD:
+                # vmovsd xmm, m64
+                self.evex_m(1, 3, 1, 0, 16, o.a, 0, m, 8)
+            case KW_LDH:
+                # vmovhpd xmm, xmm, m64
+                self.evex_m(1, 1, 1, 0, 22, o.a, o.a, m, 8)
+            case KW_LDD:
+                # vmovddup xmm, m64
+                self.evex_m(1, 3, 1, 0, 18, o.a, 0, m, 8)
+            case KW_LDP:
+                # vmovupd xmm, m128
+                self.evex_m(1, 1, 1, 0, 16, o.a, 0, m, 16)
+            case KW_LDV:
+                self.evex_m(1, 1, 1, l, 16, o.a, 0, m, vn)
+            case KW_INS:
+                if o.m == 1:
+                    # vinsertf32x4 ymm, ymm, xmm, 1
+                    self.evex_r(3, 1, 0, 1, 24, o.a, o.a, o.b)
+                else:
+                    # vinsertf64x4 zmm, zmm, ymm, 1
+                    self.evex_r(3, 1, 1, 2, 26, o.a, o.a, o.b)
+                self.b(1)
+            case KW_BC:
+                # vbroadcastsd
+                self.evex_r(2, 1, 1, l, 25, o.a, 0, o.b)
+            case KW_BCA:
+                self.evex_m(2, 1, 1, l, 25, o.a, 0, mrb(o.n), 8)
+            case KW_OP:
+                let op = o.m & 255
+                let scalar = o.m >= 256
+                # scalar ops are the F2 ones, on the low lane; xor has only
+                # a packed one (on all of xmm)
+                let pp = 3 if scalar and op != 87 else 1
+                let ll = 0 if scalar else l
+                let n = 8 if scalar and op != 87 else (16 if scalar else vn)
+                if o.n >= 1000:
+                    let ks = mrip(self.wconst_sym(k.wk[o.n - 1000]), 0)
+                    self.evex_m(1, pp, 1, ll, op, o.a, o.b, ks, n)
+                else:
+                    self.evex_r(1, pp, 1, ll, op, o.a, o.b, o.n)
+            case KW_SQRT:
+                if o.m == 1:
+                    # vsqrtsd a, b, b
+                    self.evex_r(1, 3, 1, 0, 81, o.a, o.b, o.b)
+                else:
+                    self.evex_r(1, 1, 1, l, 81, o.a, 0, o.b)
+            case KW_PERM:
+                # the index, then vpermi2pd a, b, n
+                self.evex_m(1, 1, 1, l, 16, o.a, 0, mrip(self.wconst_sym(k.wk[o.m]), 0), vn)
+                self.evex_r(2, 1, 1, l, 119, o.a, o.b, o.n)
+            case KW_LDK:
+                self.evex_m(1, 1, 1, l, 16, o.a, 0, mrip(self.wconst_sym(k.wk[o.n]), 0), vn)
+            case KW_ALIGN:
+                # valignq a, b, b, n
+                self.evex_r(3, 1, 1, l, 3, o.a, o.b, o.b)
+                self.b(o.n)
+            case KW_ST:
+                # vmovsd m64, xmm
+                self.evex_m(1, 3, 1, 0, 17, o.a, 0, m, 8)
+            case KW_STH:
+                # vmovhpd m64, xmm
+                self.evex_m(1, 1, 1, 0, 23, o.a, 0, m, 8)
+            case KW_SPILL:
+                self.evex_m(1, 1, 1, l, 17, o.a, 0, mrb(-slots - 64 * (o.n + 1)), vn)
+            case KW_FILL:
+                self.evex_m(1, 1, 1, l, 16, o.a, 0, mrb(-slots - 64 * (o.n + 1)), vn)
+            case KW_MOV:
+                # vmovapd
+                self.evex_r(1, 1, 1, l, 40, o.a, 0, o.b)
+            case _:
+                # KW_ARG: vmovsd xmm, [rbp + n]
+                self.evex_m(1, 3, 1, 0, 16, o.a, 0, mrb(o.n), 8)
 
     # ------------------------------------------------------------ unwind tables
     # Windows: the function's UNWIND_INFO in .xdata and its RUNTIME_FUNCTION in
