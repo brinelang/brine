@@ -1171,7 +1171,10 @@ struct X:
             return
         if x.op == Op.Call and x.b == 1 and x.d >= 0:
             if x.s == "brine_bytes_rev":
-                self.bytes_rev(x)
+                self.bytes_rev(x, -1)
+                return
+            if x.s == "brine_bytes_rev0":
+                self.bytes_rev0(x, -1)
                 return
             if x.s == "brine_bytes_rotl":
                 self.bytes_rotl(x)
@@ -2483,6 +2486,36 @@ struct X:
             let n = self.bit_test(i)
             if n > 0:
                 return n
+        # a reversal whose result only decides the branch right after it
+        if (
+            x.op == Op.Call
+            and x.b == 1
+            and x.d >= 0
+            and x.s == "brine_bytes_rev"
+            and i + 1 < len(self.code)
+            and self.code[i + 1].op == Op.BrNot
+            and self.code[i + 1].a == x.d
+            and self.nuse[x.d] == 1
+        ):
+            self.bytes_rev(x, self.code[i + 1].n)
+            return i + 2
+        # one whose result is only compared with 0 by the branch after that
+        if (
+            x.op == Op.Call
+            and x.b == 1
+            and x.d >= 0
+            and x.s == "brine_bytes_rev0"
+            and i + 2 < len(self.code)
+            and self.code[i + 1].op == Op.Ge
+            and self.code[i + 1].a == x.d
+            and self.fold[self.code[i + 1].b] == F_CONST
+            and self.fval[self.code[i + 1].b] == 0
+            and self.code[i + 2].op == Op.BrNot
+            and self.code[i + 2].a == self.code[i + 1].d
+            and self.nuse[self.code[i + 1].d] == 1
+        ):
+            self.bytes_rev0(x, self.code[i + 2].n)
+            return i + 3
         match x.op:
             case Op.Const:
                 self.op_const(x)
@@ -3178,58 +3211,132 @@ struct X:
 
     # brine_bytes_rev(d, n, i, j): bytes i..j reversed when they're in bounds
     # and at most 16; true then, or when i >= j. Without branches on k (it
-    # varies from call to call), in the scratch registers alone.
-    fn bytes_rev(ref self, x: Inst):
-        self.ld(RCX, x.args[2])
+    # varies from call to call), in the scratch registers alone. With `fail`
+    # (a label), it jumps there instead of returning false and falls through
+    # instead of returning true.
+    fn bytes_rev(ref self, x: Inst, fail: int):
+        # i is often a constant 0 (a reversal of a prefix)
+        let zero = self.fold[x.args[2]] == F_CONST and self.fval[x.args[2]] == 0
         self.ld(RDX, x.args[3])
         self.ld(R10, x.args[0])
         self.ld(R11, x.args[1])
-        self.alu_rr(CMP, RCX, RDX)
-        let done = self.j32(CC_GE)
-        self.rr(0, 1, 133, RCX, RCX)
-        let f1 = self.j32(CC_S)
+        var done = 0
+        var f1 = -1
+        if zero:
+            self.rr(0, 1, 133, RDX, RDX)
+            done = self.j32(CC_LE)
+        else:
+            self.ld(RCX, x.args[2])
+            self.alu_rr(CMP, RCX, RDX)
+            done = self.j32(CC_GE)
+            self.rr(0, 1, 133, RCX, RCX)
+            f1 = self.j32(CC_S)
         self.alu_rr(CMP, RDX, R11)
         let f2 = self.j32(CC_GE)
         # k = j - i, p = d + i
-        self.alu_rr(SUB, RDX, RCX)
+        if not zero:
+            self.alu_rr(SUB, RDX, RCX)
         self.alu_ri(CMP, RDX, 16)
         let f3 = self.j32(CC_GE)
-        self.alu_rr(ADD, R10, RCX)
+        if not zero:
+            self.alu_rr(ADD, R10, RCX)
+        self.rev16(false)
+        var fails = [f2, f3]
+        if f1 >= 0:
+            fails.push(f1)
+        if fail < 0:
+            self.idiom_end(x, [done], fails)
+            return
+        self.here32(done)
+        for j in fails:
+            self.j32_to(j, fail)
+
+    # Bytes 0..k (k = rdx, below 16) of the 16 at r10 reversed, the rest kept;
+    # with `first`, ecx is the new byte 0.
+    fn rev16(ref self, first: bool):
         # the 16 bytes byte-swapped, shifted down cl = 8 * (15 - k) bits, are
-        # the new bytes 0..k
-        self.mov_ri(RCX, 15)
-        self.alu_rr(SUB, RCX, RDX)
+        # the new bytes 0..k; m (r11 + 16) has the low k + 1 bytes set, from a
+        # table: computing it takes a chain of shifts the loads would wait on
+        self.mov_rr(RCX, RDX)
         self.shift_i(SHL, RCX, 3)
+        self.alu_ri(XOR, RCX, 120)
+        self.shift_i(SHL, RDX, 4)
+        self.lea(R11, mrip(self.lowtab_sym(), 0))
+        self.alu_rr(ADD, R11, RDX)
         self.mov_rm(RAX, mreg(R10, 8))
         self.bswap(RAX)
         self.mov_rm(RDX, mreg(R10, 0))
         self.bswap(RDX)
-        # Below 64, z = shrd(rax, rdx, cl) is the whole low half and
-        # y = (rdx >> cl) | (x_hi & ~(ones >> cl)) the high half; from 64 on,
-        # y (with x_lo) is the low half and the high half stays.
-        # shrd rax, rdx, cl
+        # Below 64, shrd(rax, rdx, cl) is the low half and rdx >> cl the high
+        # one; from 64 on, rdx >> cl is the low half and m keeps the high one.
         self.rr(0, 1, 4013, RDX, RAX)
         self.shift_cl(SHR, RDX)
-        self.mov_ri(R11, -1)
-        self.shift_cl(SHR, R11)
-        self.not_r(R11)
         self.test_cl64()
-        self.mov_rm(RCX, mreg(R10, 8))
-        # cmovne rcx, [p]
-        self.rm(0, 1, 3909, RCX, mreg(R10, 0), 0)
-        self.alu_rr(AND, R11, RCX)
-        self.alu_rr(OR, R11, RDX)
-        # from 64 on is k < 8 (k again, from i and j)
-        self.ld(RCX, x.args[3])
+        self.cmov(CC_NE, RAX, RDX)
+        if first:
+            # movzx ecx, al
+            self.rr8(4022, RCX, RAX)
+        # each half: x ^ ((x ^ y) & m)
+        self.alu_rm(XOR, RAX, mreg(R10, 0))
+        self.alu_rm(AND, RAX, mreg(R11, 16))
+        self.alu_mr(XOR, mreg(R10, 0), RAX)
+        self.alu_rm(XOR, RDX, mreg(R10, 8))
+        self.alu_rm(AND, RDX, mreg(R11, 24))
+        self.alu_mr(XOR, mreg(R10, 8), RDX)
+
+    # brine_bytes_rev0(d, n, j): bytes 0..j reversed and the new d[0] when j
+    # is in 0..min(n, 16), else -1, having done nothing. With `fail` (a label),
+    # it jumps there instead of returning -1.
+    fn bytes_rev0(ref self, x: Inst, fail: int):
         self.ld(RDX, x.args[2])
-        self.alu_rr(SUB, RCX, RDX)
-        self.alu_ri(CMP, RCX, 8)
-        self.cmov(CC_L, RAX, R11)
-        # cmovl r11, [p + 8]
-        self.rm(0, 1, 3916, R11, mreg(R10, 8), 0)
-        self.mov_mr(mreg(R10, 0), RAX)
-        self.mov_mr(mreg(R10, 8), R11)
-        self.idiom_end(x, [done], [f1, f2, f3])
+        self.ld(R10, x.args[0])
+        self.ld(R11, x.args[1])
+        self.alu_rr(CMP, RDX, R11)
+        let f1 = self.j32(CC_GE)
+        # unsigned: j < 0 fails too
+        self.alu_ri(CMP, RDX, 16)
+        let f2 = self.j32(CC_AE)
+        self.rev16(true)
+        if fail >= 0:
+            self.st(RCX, x.d)
+            self.j32_to(f1, fail)
+            self.j32_to(f2, fail)
+            return
+        let e = self.jmp8()
+        self.here32(f1)
+        self.here32(f2)
+        self.mov_ri(RCX, -1)
+        self.here8(e)
+        self.st(RCX, x.d)
+
+    # points the rel32 jump at `at` (from j32) to label l
+    fn j32_to(ref self, at: int, l: int):
+        let p = self.lpos[l]
+        if p >= 0:
+            set32(ref self.o.text, at, p - at - 4)
+        else:
+            self.jat.push(at)
+            self.jlab.push(l)
+
+    # The symbol of the 17 pairs of words with the low 0, 1, ..., 16 bytes set.
+    fn lowtab_sym(ref self) -> int:
+        match self.vpool.get("lowtab"):
+            case Some(s):
+                return s
+            case None:
+                pass
+        while len(self.o.rodata) % 16 != 0:
+            self.o.rodata.push(0)
+        self.o.rodata_align = max(self.o.rodata_align, 16)
+        let off = len(self.o.rodata)
+        for n in 0..17:
+            let lo = -1 if n >= 8 else (1 << (8 * n)) - 1
+            let hi = -1 if n == 16 else (0 if n <= 8 else (1 << (8 * (n - 8))) - 1)
+            put64(ref self.o.rodata, lo)
+            put64(ref self.o.rodata, hi)
+        let s = self.sym_def(f"__brx_v{len(self.vpool)}", SEC_RODATA, off, false, false)
+        self.vpool["lowtab"] = s
+        return s
 
     # test cl, 64: is a 128-bit shift by cl one of 64 or more?
     fn test_cl64(ref self):
