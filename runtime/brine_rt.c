@@ -5608,6 +5608,7 @@ static int64_t br_utf8_bad(const unsigned char *p, int64_t n) {
 }
 static int br_valid_utf8(const unsigned char *p, int64_t n) { return br_utf8_bad(p, n) < 0; }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_str_from_utf8(brine_arr *a, brine_str **out) {
     int64_t bad = br_utf8_bad((const unsigned char *)a->data, a->len);
     if (bad >= 0) {
@@ -5618,6 +5619,7 @@ bool brine_str_from_utf8(brine_arr *a, brine_str **out) {
     *out = brine_str_new(a->data, a->len);
     return true;
 }
+#endif
 
 /* text read from outside as a string: bytes that aren't UTF-8 become U+FFFD */
 static brine_str *br_lossy_str(const char *p, int64_t n) {
@@ -5695,6 +5697,7 @@ static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) 
     return !bad;
 }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_read_file(brine_str *path, brine_str **out) {
     char *buf;
     size_t len;
@@ -5710,7 +5713,9 @@ bool brine_read_file(brine_str *path, brine_str **out) {
     free(buf);
     return ok;
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_read_bytes(brine_str *path, brine_arr **out, brine_str **err) {
     char *buf;
     size_t len;
@@ -5721,6 +5726,7 @@ bool brine_os_read_bytes(brine_str *path, brine_arr **out, brine_str **err) {
     *out = a;
     return true;
 }
+#endif
 
 /* writes (mode "wb") or appends ("ab") n bytes to the file at `path` */
 static bool br_put_file(brine_str *path, const char *data, int64_t n, const char *mode, brine_str **err) {
@@ -5744,18 +5750,26 @@ static bool br_put_file(brine_str *path, const char *data, int64_t n, const char
     return !bad;
 }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_write_file(brine_str *path, brine_str *text, brine_str **err) {
     return br_put_file(path, text->data, text->len, "wb", err);
 }
+#endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_append_file(brine_str *path, brine_str *text, brine_str **err) {
     return br_put_file(path, text->data, text->len, "ab", err);
 }
+#endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err) {
     return br_put_file(path, data->data, data->len, "wb", err);
 }
+#endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_append_bytes(brine_str *path, brine_arr *data, brine_str **err) {
     return br_put_file(path, data->data, data->len, "ab", err);
 }
+#endif
 
 /* ============================================================ stdin */
 /* Read with read() / ReadFile, which return what has arrived, so a program
@@ -5850,6 +5864,7 @@ static bool br_in_fill(void) {
     br_in.len += got;
     return true;
 }
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_input(brine_str *prompt) {
     br_lock(&br_io_mu);
     if (prompt && prompt->len) fwrite(prompt->data, 1, (size_t)prompt->len, stdout);
@@ -5877,6 +5892,8 @@ brine_str *brine_input(brine_str *prompt) {
     if (n > 0 && line[n - 1] == '\r') n--;
     return br_lossy_str(line, n);
 }
+#endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_read_stdin(brine_str **out) {
     brine_flush();
     while (br_in_fill()) {
@@ -5895,7 +5912,9 @@ bool brine_read_stdin(brine_str **out) {
     *out = brine_str_new(n ? p : "", n);
     return true;
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_file_exists(brine_str *path) {
     char *p = br_cstr(path);
     if (!p) return false;
@@ -5912,8 +5931,10 @@ bool brine_file_exists(brine_str *path) {
     return r == 0;
 #endif
 }
+#endif
 
 /* the variable's value, or NULL when it isn't set */
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_getenv(brine_str *name) {
     char *n = br_cstr(name);
     if (!n || !n[0] || strchr(n, '=')) {
@@ -5945,6 +5966,7 @@ brine_str *brine_getenv(brine_str *name) {
     return v ? brine_str_new(v, (int64_t)strlen(v)) : NULL;
 #endif
 }
+#endif
 
 #ifdef _WIN32
 /* append one argument to a command line, quoted so the child's argv parser gets it back unchanged */

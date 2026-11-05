@@ -8371,3 +8371,560 @@ fn brine_os_sleep(seconds: float):
         # (interrupted by a signal: sleep the rest)
         while nanosleep(ts, ts) != 0:
             pass
+
+# ------------------------------------------------------------ files and stdin
+# brine_rt.c's "files and processes" (the files part) and "stdin". Messages
+# read as the C ones did: the C library's strerror, Windows' FormatMessageW.
+
+extern fn strlen(p: ptr) -> u64
+
+extern fn strerror(e: i32) -> ptr
+
+extern fn fopen(path: ptr, mode: ptr) -> ptr
+
+extern fn _wfopen(path: ptr, mode: ptr) -> ptr
+
+extern fn fread(p: ptr, size: u64, n: u64, f: ptr) -> u64
+
+extern fn fwrite(p: ptr, size: u64, n: u64, f: ptr) -> u64
+
+extern fn fclose(f: ptr) -> i32
+
+extern fn ferror(f: ptr) -> i32
+
+extern fn fflush(f: ptr) -> i32
+
+extern fn free(p: ptr)
+
+extern fn exit(code: i32)
+
+extern fn _errno() -> ptr
+
+extern fn __errno_location() -> ptr
+
+extern fn __error() -> ptr
+
+extern fn __acrt_iob_func(i: u32) -> ptr
+
+extern fn getenv(name: ptr) -> ptr
+
+extern fn wcslen(w: ptr) -> u64
+
+extern fn GetLastError() -> u32
+
+extern fn SetLastError(e: u32)
+
+extern fn MultiByteToWideChar(cp: u32, flags: u32, s: ptr, n: i32, w: ptr, wn: i32) -> i32
+
+extern fn WideCharToMultiByte(
+    cp: u32,
+    flags: u32,
+    w: ptr,
+    n: i32,
+    s: ptr,
+    sn: i32,
+    d: ptr,
+    u: ptr
+) -> i32
+
+extern fn GetFileAttributesW(path: ptr) -> u32
+
+extern fn GetEnvironmentVariableW(name: ptr, buf: ptr, n: u32) -> u32
+
+extern fn statx(dir: i32, path: ptr, flags: i32, mask: u32, buf: ptr) -> i32
+
+extern fn stat(path: ptr, buf: ptr) -> i32
+
+const CP_UTF8: u32 = 65001
+
+# GetFileAttributesW's failure
+const NO_ATTRS: u32 = 0xffffffff
+
+# struct statx (Linux, every processor): stx_mode, a u16
+const STATX_MODE = 28
+
+# struct stat (macOS): st_mode, a u16
+const MAC_ST_MODE = 4
+
+# The C library's errno.
+fn os_errno() -> int:
+    if os_is("windows"):
+        return int(load_i32(_errno(), 0))
+    elif os_is("macos"):
+        return int(load_i32(__error(), 0))
+    else:
+        return int(load_i32(__errno_location(), 0))
+
+fn os_set_errno(e: int):
+    if os_is("windows"):
+        store_i32(_errno(), 0, i32(e))
+    elif os_is("macos"):
+        store_i32(__error(), 0, i32(e))
+    else:
+        store_i32(__errno_location(), 0, i32(e))
+
+# The C library's stdout (1) or stderr (2).
+fn os_stdio(i: int) -> ptr:
+    if os_is("windows"):
+        return __acrt_iob_func(u32(i))
+    elif os_is("macos"):
+        return load_ptr(symbol("__stdoutp") if i == 1 else symbol("__stderrp"), 0)
+    else:
+        return load_ptr(symbol("stdout") if i == 1 else symbol("stderr"), 0)
+
+# A C string's text.
+fn os_text(p: ptr) -> ptr:
+    return brine_str_new(p, int(strlen(p)))
+
+fn os_strerror(e: int) -> ptr:
+    return os_text(strerror(i32(e)))
+
+# A reference to message s, cut at 1023 bytes as the C one's buffer did.
+fn os_msg(s: str) -> ptr:
+    let p = ptr_of(s)
+    if load_i64(p, STR_LEN) > 1023:
+        return brine_str_new(p + STR_DATA, 1023)
+    str_retain(p)
+    return p
+
+# s as a C string (its bytes end in a NUL already), or 0 when s holds a NUL,
+# which no path or argument can
+fn os_cstr(s: ptr) -> ptr:
+    let n = load_i64(s, STR_LEN)
+    if n != 0 and addr(memchr(s + STR_DATA, 0, u64(n))) != 0:
+        return null_ptr()
+    return s + STR_DATA
+
+# C string s in UTF-16, NUL-terminated (a block of brine_alloc's).
+fn os_wide(s: ptr) -> ptr:
+    let n = int(MultiByteToWideChar(CP_UTF8, 0, s, -1, null_ptr(), 0))
+    let w = blk_alloc(2 * (n if n > 0 else 1))
+    if n <= 0:
+        store_u16(w, 0, 0)
+    else:
+        MultiByteToWideChar(CP_UTF8, 0, s, -1, w, i32(n))
+    return w
+
+# n UTF-16 units (n < 0: up to the NUL) as a string; bad surrogates
+# become U+FFFD
+fn os_from_wide(w: ptr, n0: int) -> ptr:
+    let n = int(wcslen(w)) if n0 < 0 else n0
+    if n == 0:
+        return new_str(0)
+    let m = int(WideCharToMultiByte(CP_UTF8, 0, w, i32(n), null_ptr(), 0, null_ptr(), null_ptr()))
+    if m <= 0:
+        return new_str(0)
+    let s = new_str(m)
+    WideCharToMultiByte(CP_UTF8, 0, w, i32(n), s + STR_DATA, i32(m), null_ptr(), null_ptr())
+    return s
+
+# The index of the first of the n bytes at p that starts no UTF-8
+# character, or -1. (ASCII a word at a time.)
+fn os_utf8_bad(p: ptr, n: int) -> int:
+    var i = 0
+    while i < n:
+        if i + 8 <= n and load_u64(p, i) & 0x8080808080808080 == 0:
+            i += 8
+            continue
+        if load_u8(p, i) < 0x80:
+            i += 1
+            continue
+        let k = utf8_len(p + i, n - i)
+        if k == 1:
+            return i
+        i += k
+    return -1
+
+fn brine_str_from_utf8(a: ptr, out: ptr) -> bool:
+    let d = load_ptr(a, ARR_DATA)
+    let n = load_i64(a, ARR_LEN)
+    let bad = os_utf8_bad(d, n)
+    if bad >= 0:
+        let c = u64(load_u8(d, bad))
+        let h = ptr_of(HEX) + STR_DATA
+        let sb = stack_mem(24)
+        brine_sb_init(sb)
+        sb_lit(sb, f"invalid UTF-8: byte {bad} (0x")
+        sb_byte(sb, load_u8(h, c >> 4))
+        sb_byte(sb, load_u8(h, c & 15))
+        sb_lit(sb, ") starts no character")
+        store_ptr(out, 0, brine_sb_finish(sb))
+        return false
+    store_ptr(out, 0, brine_str_new(d, n))
+    return true
+
+# Text read from outside as a string: bytes that aren't UTF-8 become U+FFFD.
+fn os_lossy_str(p: ptr, n: int) -> ptr:
+    if os_utf8_bad(p, n) < 0:
+        return brine_str_new(p, n)
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    var i = 0
+    while i < n:
+        let c = load_u8(p, i)
+        let k = 1 if c < 0x80 else utf8_len(p + i, n - i)
+        if k == 1 and c >= 0x80:
+            sb_lit(sb, "\u{fffd}")
+        else:
+            brine_sb_cat(sb, p + i, k)
+        i += k
+    return brine_sb_finish(sb)
+
+# fopen of C strings path and mode
+fn os_fopen(path: ptr, mode: str) -> ptr:
+    let m = ptr_of(mode) + STR_DATA
+    if os_is("windows"):
+        let wp = os_wide(path)
+        let wm = os_wide(m)
+        let f = _wfopen(wp, wm)
+        # (freeing leaves errno as it is)
+        blk_free(wp)
+        blk_free(wm)
+        return f
+    else:
+        return fopen(path, m)
+
+# All of the file at `path`: its bytes (brine_alloc's) and their count in
+# out[0] and out[1], or false with the message in *err.
+fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
+    let p = os_cstr(path)
+    if addr(p) == 0:
+        store_ptr(err, 0, os_msg("cannot read a path containing a NUL byte"))
+        return false
+    let f = os_fopen(p, "rb")
+    if addr(f) == 0:
+        let e = os_strerror(os_errno())
+        store_ptr(err, 0, os_msg(f"cannot read {str_of(path)}: {str_of(e)}"))
+        str_release(e)
+        return false
+    var b = null_ptr()
+    var n = 0
+    var cap = 0
+    while true:
+        if n == cap:
+            cap = cap * 2 if cap != 0 else 65536
+            b = brine_x_realloc(b, cap)
+        let got = int(fread(b + n, 1, u64(cap - n), f))
+        n += got
+        if got == 0:
+            break
+    let bad = ferror(f) != 0
+    fclose(f)
+    if bad:
+        store_ptr(err, 0, os_msg(f"cannot read {str_of(path)}: read error"))
+        brine_free(b)
+        return false
+    store_ptr(out, 0, b)
+    store_i64(out, 8, n)
+    return true
+
+fn brine_read_file(path: ptr, out: ptr) -> bool:
+    let got = stack_mem(16)
+    if not os_slurp(path, got, out):
+        return false
+    let b = load_ptr(got, 0)
+    let n = load_i64(got, 8)
+    let ok = os_utf8_bad(b, n) < 0
+    if ok:
+        store_ptr(out, 0, brine_str_new(b, n))
+    else:
+        store_ptr(out, 0, os_msg(f"cannot read {str_of(path)}: the file is not valid UTF-8 text"))
+    brine_free(b)
+    return ok
+
+fn brine_os_read_bytes(path: ptr, out: ptr, err: ptr) -> bool:
+    let got = stack_mem(16)
+    if not os_slurp(path, got, err):
+        return false
+    let b = load_ptr(got, 0)
+    let n = load_i64(got, 8)
+    let a = brine_arr_new(n, 1, null_ptr(), null_ptr(), ptr_of("") + STR_DATA)
+    if n != 0:
+        memcpy(load_ptr(a, ARR_DATA), b, u64(n))
+    brine_free(b)
+    store_ptr(out, 0, a)
+    return true
+
+# Writes (mode "wb") or appends ("ab") the n bytes at d to the file at `path`.
+fn os_put_file(path: ptr, d: ptr, n: int, mode: str, err: ptr) -> bool:
+    let verb = "append to" if load_u8(ptr_of(mode), STR_DATA) == 97 else "write"
+    let p = os_cstr(path)
+    if addr(p) == 0:
+        store_ptr(err, 0, os_msg(f"cannot {verb} a path containing a NUL byte"))
+        return false
+    let f = os_fopen(p, mode)
+    if addr(f) == 0:
+        let e = os_strerror(os_errno())
+        store_ptr(err, 0, os_msg(f"cannot {verb} {str_of(path)}: {str_of(e)}"))
+        str_release(e)
+        return false
+    var bad = false
+    if n != 0:
+        bad = fwrite(d, 1, u64(n), f) != u64(n)
+    if fclose(f) != 0:
+        bad = true
+    if bad:
+        store_ptr(err, 0, os_msg(f"cannot {verb} {str_of(path)}: write error (is the disk full?)"))
+    return not bad
+
+fn brine_write_file(path: ptr, text: ptr, err: ptr) -> bool:
+    return os_put_file(path, text + STR_DATA, load_i64(text, STR_LEN), "wb", err)
+
+fn brine_append_file(path: ptr, text: ptr, err: ptr) -> bool:
+    return os_put_file(path, text + STR_DATA, load_i64(text, STR_LEN), "ab", err)
+
+fn brine_os_write_bytes(path: ptr, data: ptr, err: ptr) -> bool:
+    return os_put_file(path, load_ptr(data, ARR_DATA), load_i64(data, ARR_LEN), "wb", err)
+
+fn brine_os_append_bytes(path: ptr, data: ptr, err: ptr) -> bool:
+    return os_put_file(path, load_ptr(data, ARR_DATA), load_i64(data, ARR_LEN), "ab", err)
+
+# Does stat succeed on C string p (following links)? Its st_mode in *mode.
+fn os_stat(p: ptr, mode: ptr) -> bool:
+    if os_is("macos"):
+        let st = stack_mem(144)
+        if stat(p, st) != 0:
+            return false
+        store_u32(mode, 0, u32(load_u16(st, MAC_ST_MODE)))
+        return true
+    else:
+        # statx: one layout on every processor (and in glibc since 2.28)
+        let st = stack_mem(256)
+        # AT_FDCWD; STATX_TYPE | STATX_MODE
+        if statx(-100, p, 0, 3, st) != 0:
+            return false
+        store_u32(mode, 0, u32(load_u16(st, STATX_MODE)))
+        return true
+
+fn brine_file_exists(path: ptr) -> bool:
+    let p = os_cstr(path)
+    if addr(p) == 0:
+        return false
+    if os_is("windows"):
+        let w = os_wide(p)
+        let a = GetFileAttributesW(w)
+        blk_free(w)
+        return a != NO_ATTRS
+    else:
+        let mode = stack_mem(8)
+        return os_stat(p, mode)
+
+# The variable's value, or 0 when it isn't set.
+fn brine_getenv(name: ptr) -> ptr:
+    let n = os_cstr(name)
+    if addr(n) == 0 or load_u8(n, 0) == 0:
+        return null_ptr()
+    if addr(memchr(n, 61, u64(load_i64(name, STR_LEN)))) != 0:
+        return null_ptr()
+    if os_is("windows"):
+        let w = os_wide(n)
+        SetLastError(0)
+        let need = GetEnvironmentVariableW(w, null_ptr(), 0)
+        if need == 0:
+            blk_free(w)
+            return null_ptr()
+        let buf = blk_alloc(2 * int(need))
+        let got = GetEnvironmentVariableW(w, buf, need)
+        blk_free(w)
+        let s = new_str(0) if got == 0 else os_from_wide(buf, int(got))
+        blk_free(buf)
+        return s
+    else:
+        let v = getenv(n)
+        if addr(v) == 0:
+            return null_ptr()
+        return os_text(v)
+
+# ---- stdin
+# Read with read() / ReadFile, which return what has arrived, so a program
+# talking a line protocol through a pipe gets each line as it comes. A
+# Windows console is read as UTF-16 (ReadConsoleW), so typed text arrives
+# as UTF-8 whatever the code page.
+
+extern fn read(fd: i32, buf: ptr, n: u64) -> int
+
+extern fn GetStdHandle(which: u32) -> ptr
+
+extern fn GetConsoleMode(h: ptr, mode: ptr) -> i32
+
+extern fn SetConsoleMode(h: ptr, mode: u32) -> i32
+
+extern fn ReadConsoleW(h: ptr, buf: ptr, n: u32, got: ptr, ctl: ptr) -> i32
+
+extern fn ReadFile(h: ptr, buf: ptr, n: u32, got: ptr, ov: ptr) -> i32
+
+extern fn brine_flush()
+
+extern fn brine_out_sb(sb: ptr)
+
+# (DWORD)-10, -11, -12
+const STD_INPUT: u32 = 0xfffffff6
+const STD_OUTPUT: u32 = 0xfffffff5
+const STD_ERROR: u32 = 0xfffffff4
+
+const EINTR = 4
+const EIO = 5
+
+# global_mem("os_in"): what was read and not yet taken, p[pos..len), the
+# room, whether the input ended, its error (an errno); on Windows whether
+# stdin is a console (0: not known yet, 1: no, 2: yes) and a high
+# surrogate whose pair comes in the next read
+const IN_P = 0
+const IN_LEN = 8
+const IN_POS = 16
+const IN_CAP = 24
+const IN_EOF = 32
+const IN_ERR = 36
+const IN_CONSOLE = 40
+const IN_HI = 44
+
+fn os_in_eof(b: ptr, e: int) -> bool:
+    if e != 0:
+        store_i32(b, IN_ERR, i32(e))
+    store_u8(b, IN_EOF, 1)
+    return false
+
+# Reads more of stdin into p[len..]; false at its end or on an error.
+fn os_in_fill() -> bool:
+    let b = global_mem("os_in", 48)
+    while true:
+        if load_u8(b, IN_EOF) != 0:
+            return false
+        let pos = load_i64(b, IN_POS)
+        if pos > 0:
+            let len0 = load_i64(b, IN_LEN)
+            memmove(load_ptr(b, IN_P), load_ptr(b, IN_P) + pos, u64(len0 - pos))
+            store_i64(b, IN_LEN, len0 - pos)
+            store_i64(b, IN_POS, 0)
+        var cap = load_i64(b, IN_CAP)
+        if cap - load_i64(b, IN_LEN) < 16384:
+            cap = cap * 2 if cap != 0 else 65536
+            store_ptr(b, IN_P, brine_x_realloc(load_ptr(b, IN_P), cap))
+            store_i64(b, IN_CAP, cap)
+        let len = load_i64(b, IN_LEN)
+        let at = load_ptr(b, IN_P) + len
+        let room = cap - len
+        var got = 0
+        if os_is("windows"):
+            let h = GetStdHandle(STD_INPUT)
+            if addr(h) == 0 or addr(h) == ONES:
+                return os_in_eof(b, 0)
+            if load_u8(b, IN_CONSOLE) == 0:
+                let mode = stack_mem(8)
+                store_u8(b, IN_CONSOLE, 2 if GetConsoleMode(h, mode) != 0 else 1)
+            let nr = stack_mem(8)
+            store_u32(nr, 0, 0)
+            if load_u8(b, IN_CONSOLE) == 2:
+                # at most 3 UTF-8 bytes per UTF-16 unit (a pair makes 4)
+                let w = stack_mem(8192)
+                let hi = load_u16(b, IN_HI)
+                let k = 1 if hi != 0 else 0
+                store_u16(w, 0, hi)
+                store_u16(b, IN_HI, 0)
+                let lim = room / 3 - 1
+                let want = (lim if lim < 4095 else 4095) - k
+                if ReadConsoleW(h, w + k * 2, u32(want), nr, null_ptr()) == 0:
+                    return os_in_eof(b, EIO)
+                var n = int(load_u32(nr, 0)) + k
+                # Ctrl+Z at the start of a line ends the input, as in the C library
+                if n == 0 or load_u16(w, 0) == 0x1a:
+                    return os_in_eof(b, 0)
+                let last = load_u16(w, (n - 1) * 2)
+                if last >= 0xd800 and last < 0xdc00:
+                    store_u16(b, IN_HI, last)
+                    n -= 1
+                var m = 0
+                if n != 0:
+                    m = int(
+                        WideCharToMultiByte(
+                            CP_UTF8,
+                            0,
+                            w,
+                            i32(n),
+                            at,
+                            i32(room),
+                            null_ptr(),
+                            null_ptr()
+                        )
+                    )
+                # the console ends lines with \r\n
+                var j = 0
+                for i in 0..m:
+                    let c = load_u8(at, i)
+                    if not (c == 13 and i + 1 < m and load_u8(at, i + 1) == 10):
+                        store_u8(at, j, c)
+                        j += 1
+                got = j
+                if got == 0:
+                    continue
+            else:
+                let want = room if room < (1 << 30) else (1 << 30)
+                if ReadFile(h, at, u32(want), nr, null_ptr()) == 0:
+                    let e = GetLastError()
+                    # ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF: the writer is done
+                    return os_in_eof(b, 0 if e == 109 or e == 38 else EIO)
+                got = int(load_u32(nr, 0))
+        else:
+            var n = read(0, at, u64(room))
+            while n < 0 and os_errno() == EINTR:
+                n = read(0, at, u64(room))
+            if n < 0:
+                return os_in_eof(b, os_errno())
+            got = n
+        if got == 0:
+            return os_in_eof(b, 0)
+        store_i64(b, IN_LEN, len + got)
+        return true
+    return false
+
+fn brine_input(prompt: ptr) -> ptr:
+    if addr(prompt) != 0 and load_i64(prompt, STR_LEN) != 0:
+        let sb = stack_mem(24)
+        brine_sb_init(sb)
+        brine_sb_str(sb, prompt)
+        brine_out_sb(sb)
+    # what was printed before (a prompt with `end=""`) shows before the wait
+    brine_flush()
+    let b = global_mem("os_in", 48)
+    var seen = 0
+    var n = 0
+    while true:
+        let at = load_ptr(b, IN_P) + load_i64(b, IN_POS)
+        let have = load_i64(b, IN_LEN) - load_i64(b, IN_POS)
+        if have > seen:
+            let nl = memchr(at + seen, 10, u64(have - seen))
+            if addr(nl) != 0:
+                n = int(addr(nl) - addr(at))
+                break
+        seen = have
+        if not os_in_fill():
+            n = load_i64(b, IN_LEN) - load_i64(b, IN_POS)
+            if n == 0:
+                return null_ptr()
+            break
+    let pos = load_i64(b, IN_POS)
+    let line = load_ptr(b, IN_P) + pos
+    store_i64(b, IN_POS, pos + (n + 1 if n < load_i64(b, IN_LEN) - pos else n))
+    if n > 0 and load_u8(line, n - 1) == 13:
+        n -= 1
+    return os_lossy_str(line, n)
+
+fn brine_read_stdin(out: ptr) -> bool:
+    brine_flush()
+    while os_in_fill():
+        pass
+    let b = global_mem("os_in", 48)
+    let e = int(load_i32(b, IN_ERR))
+    if e != 0:
+        let m = os_strerror(e)
+        store_ptr(out, 0, os_msg(f"cannot read stdin: {str_of(m)}"))
+        str_release(m)
+        return false
+    let p = load_ptr(b, IN_P) + load_i64(b, IN_POS)
+    let n = load_i64(b, IN_LEN) - load_i64(b, IN_POS)
+    store_i64(b, IN_POS, load_i64(b, IN_LEN))
+    if os_utf8_bad(p, n) >= 0:
+        store_ptr(out, 0, os_msg("cannot read stdin: the input is not valid UTF-8 text"))
+        return false
+    store_ptr(out, 0, brine_str_new(p, n))
+    return true
