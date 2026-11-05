@@ -532,3 +532,226 @@ fn brine_s_split(s: ptr, sep: ptr, loc: ptr) -> ptr:
         at = i + ns
     push_str(pa, sub_str(s, at, load_i64(s, STR_LEN)))
     return load_ptr(pa, 0)
+
+# ------------------------------------------------------------ string builder
+# brine_sb: the bytes (a block of brine_alloc's), the length, the room
+
+const SB_P = 0
+const SB_LEN = 8
+const SB_CAP = 16
+
+extern fn memmove(d: ptr, s: ptr, n: u64) -> ptr
+
+extern fn memset(d: ptr, c: i32, n: u64) -> ptr
+
+extern fn brine_alloc(n: int) -> ptr
+
+extern fn brine_free(p: ptr)
+
+# p's block (from brine_alloc) made n bytes; it may move
+extern fn brine_x_realloc(p: ptr, n: int) -> ptr
+
+extern fn brine_sb_fmt_f64(sb: ptr, v: float, prec: int, kind: int)
+
+# pairs of decimal digits, 00 to 99
+const DIGITS = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
+
+const HEX = "0123456789abcdef"
+
+fn brine_sb_init(sb: ptr):
+    store_i64(sb, SB_CAP, 64)
+    store_i64(sb, SB_LEN, 0)
+    store_ptr(sb, SB_P, brine_alloc(64))
+
+# Room for `extra` more bytes; the address they go at.
+fn sb_room(sb: ptr, extra: int) -> ptr:
+    let len = load_i64(sb, SB_LEN)
+    let cap = load_i64(sb, SB_CAP)
+    if len + extra > cap:
+        var nc = cap * 2
+        while nc < len + extra:
+            nc *= 2
+        store_ptr(sb, SB_P, brine_x_realloc(load_ptr(sb, SB_P), nc))
+        store_i64(sb, SB_CAP, nc)
+    return load_ptr(sb, SB_P) + len
+
+fn brine_sb_cat(sb: ptr, p: ptr, n: int):
+    copy_bytes(sb_room(sb, n), p, n)
+    store_i64(sb, SB_LEN, load_i64(sb, SB_LEN) + n)
+
+fn sb_byte(sb: ptr, c: u8):
+    store_u8(sb_room(sb, 1), 0, c)
+    store_i64(sb, SB_LEN, load_i64(sb, SB_LEN) + 1)
+
+fn sb_lit(sb: ptr, s: str):
+    let p = ptr_of(s)
+    brine_sb_cat(sb, p + STR_DATA, load_i64(p, STR_LEN))
+
+fn brine_sb_str(sb: ptr, s: ptr):
+    brine_sb_cat(sb, s + STR_DATA, load_i64(s, STR_LEN))
+
+fn brine_sb_repr_str(sb: ptr, s: ptr):
+    sb_byte(sb, 34)
+    let n = load_i64(s, STR_LEN)
+    for i in 0..n:
+        let c = load_u8(s, STR_DATA + i)
+        if c == 34:
+            sb_lit(sb, "\\\"")
+        elif c == 92:
+            sb_lit(sb, "\\\\")
+        elif c == 10:
+            sb_lit(sb, "\\n")
+        elif c == 9:
+            sb_lit(sb, "\\t")
+        elif c == 13:
+            sb_lit(sb, "\\r")
+        elif c < 0x20:
+            sb_lit(sb, "\\u{")
+            sb_base(sb, u64(c), 4)
+            sb_byte(sb, 125)
+        else:
+            sb_byte(sb, c)
+    sb_byte(sb, 34)
+
+# The number of decimal digits of u.
+fn dec_len(u: u64) -> int:
+    var n = 1
+    var t: u64 = 10
+    while u >= t:
+        n += 1
+        if n == 20:
+            return 20
+        t *= 10
+    return n
+
+# u in decimal, its last digit at d + n - 1 (n is dec_len(u))
+fn put_dec(d: ptr, n: int, u0: u64):
+    let t = ptr_of(DIGITS) + STR_DATA
+    var u = u0
+    var i = n
+    while u >= 100:
+        let r = int(u % 100)
+        u = u / 100
+        i -= 2
+        store_u16(d, i, load_u16(t, r * 2))
+    if u >= 10:
+        store_u16(d, i - 2, load_u16(t, int(u) * 2))
+    else:
+        store_u8(d, i - 1, u8(48 + u))
+
+fn brine_sb_u64(sb: ptr, v: u64):
+    let n = dec_len(v)
+    put_dec(sb_room(sb, n), n, v)
+    store_i64(sb, SB_LEN, load_i64(sb, SB_LEN) + n)
+
+fn brine_sb_i64(sb: ptr, v: int):
+    if v >= 0:
+        brine_sb_u64(sb, u64(v))
+        return
+    # (wraps for the smallest int)
+    let u = u64(0) - u64(v)
+    let n = dec_len(u)
+    let d = sb_room(sb, n + 1)
+    store_u8(d, 0, 45)
+    put_dec(d + 1, n, u)
+    store_i64(sb, SB_LEN, load_i64(sb, SB_LEN) + n + 1)
+
+fn brine_sb_bool(sb: ptr, v: bool):
+    sb_lit(sb, "true" if v else "false")
+
+# u in base 2^bits (hex: 4, binary: 1)
+fn sb_base(sb: ptr, u: u64, bits: u64):
+    let most = int(64 / bits)
+    var n = 1
+    while n < most and u >> (u64(n) * bits) != 0:
+        n += 1
+    let d = sb_room(sb, n)
+    let t = ptr_of(HEX) + STR_DATA
+    let mask = (u64(1) << bits) - 1
+    var x = u
+    var i = n
+    while i > 0:
+        i -= 1
+        store_u8(d, i, load_u8(t, int(x & mask)))
+        x = x >> bits
+    store_i64(sb, SB_LEN, load_i64(sb, SB_LEN) + n)
+
+fn brine_sb_fmt_i64(sb: ptr, v: int, kind: int):
+    if kind == 120 or kind == 98:
+        if v < 0:
+            sb_byte(sb, 45)
+        let u = u64(0) - u64(v) if v < 0 else u64(v)
+        sb_base(sb, u, 4 if kind == 120 else 1)
+        return
+    if kind == 102 or kind == 101 or kind == 103:
+        brine_sb_fmt_f64(sb, float(v), -1, kind)
+        return
+    brine_sb_i64(sb, v)
+
+fn brine_sb_fmt_u64(sb: ptr, v: u64, kind: int):
+    if kind == 120 or kind == 98:
+        sb_base(sb, v, 4 if kind == 120 else 1)
+    elif kind == 102 or kind == 101 or kind == 103:
+        brine_sb_fmt_f64(sb, float(v), -1, kind)
+    else:
+        brine_sb_u64(sb, v)
+
+fn is_digit(c: u8) -> bool:
+    return c >= 48 and c <= 57
+
+# `{x:,}`: commas between groups of three digits in the integer part of the
+# number written from `start` on
+fn brine_sb_group(sb: ptr, start: int):
+    var p = load_ptr(sb, SB_P)
+    let len = load_i64(sb, SB_LEN)
+    var a = start
+    if a < len and (load_u8(p, a) == 45 or load_u8(p, a) == 43):
+        a += 1
+    var b = a
+    while b < len and is_digit(load_u8(p, b)):
+        b += 1
+    let n = b - a
+    let k = (n - 1) / 3
+    if n <= 3:
+        return
+    sb_room(sb, k)
+    p = load_ptr(sb, SB_P)
+    memmove(p + b + k, p + b, u64(len - b))
+    store_i64(sb, SB_LEN, len + k)
+    # from the right: copy digits, a comma after every third
+    var from = b - 1
+    var to = b + k - 1
+    var i = 0
+    while from >= a:
+        if i > 0 and i % 3 == 0:
+            store_u8(p, to, 44)
+            to -= 1
+        store_u8(p, to, load_u8(p, from))
+        to -= 1
+        from -= 1
+        i += 1
+
+fn brine_sb_pad(sb: ptr, start: int, width: int, left: bool, zero: bool):
+    let len = load_i64(sb, SB_LEN)
+    let n = len - start
+    if n >= width:
+        return
+    let pad = width - n
+    sb_room(sb, pad)
+    let p = load_ptr(sb, SB_P)
+    if left:
+        memset(p + len, 32, u64(pad))
+    else:
+        var at = start
+        if zero and n > 0 and (load_u8(p, start) == 45 or load_u8(p, start) == 43):
+            at += 1
+        memmove(p + at + pad, p + at, u64(len - at))
+        memset(p + at, 48 if zero else 32, u64(pad))
+    store_i64(sb, SB_LEN, len + pad)
+
+fn brine_sb_finish(sb: ptr) -> ptr:
+    let p = load_ptr(sb, SB_P)
+    let s = brine_str_new(p, load_i64(sb, SB_LEN))
+    brine_free(p)
+    store_u64(sb, SB_P, 0)
+    return s

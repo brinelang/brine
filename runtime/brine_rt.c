@@ -768,6 +768,11 @@ static brine_str *br_str_alloc(int64_t n) {
 #ifdef BRINE_RT_BR
 /* what runtime/rt.br's strings still take from here */
 brine_str *brine_x_str_alloc(int64_t n) { return br_str_alloc(n); }
+void *brine_x_realloc(void *p, int64_t n) {
+    p = realloc(p, (size_t)n);
+    if (!p) abort();
+    return p;
+}
 brine_str *brine_x_str_grow(brine_str *s, int64_t n) {
     if (br_str_size(n) > br_str_size(s->len)) {
         s = (brine_str *)realloc(s, br_str_size(n));
@@ -2243,6 +2248,7 @@ bool brine_map_eq(brine_map *a, brine_map *b) {
 }
 
 /* ============================================================ string builder */
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_sb_init(brine_sb *sb) {
     sb->cap = 64;
     sb->len = 0;
@@ -2261,7 +2267,9 @@ void brine_sb_cat(brine_sb *sb, const char *p, int64_t n) {
     memcpy(sb->p + sb->len, p, (size_t)n);
     sb->len += n;
 }
+#endif
 static void br_sb_cstr(brine_sb *sb, const char *s) { brine_sb_cat(sb, s, (int64_t)strlen(s)); }
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_sb_str(brine_sb *sb, brine_str *s) { brine_sb_cat(sb, s->data, s->len); }
 void brine_sb_repr_str(brine_sb *sb, brine_str *s) {
     brine_sb_cat(sb, "\"", 1);
@@ -2294,6 +2302,7 @@ void brine_sb_u64(brine_sb *sb, uint64_t v) {
     int n = snprintf(b, sizeof b, "%llu", (unsigned long long)v);
     brine_sb_cat(sb, b, n);
 }
+#endif
 static void br_sb_u128_base(brine_sb *sb, brine_u128 v, unsigned base) {
     char b[130];
     int n = sizeof b;
@@ -2403,6 +2412,7 @@ static void br_fmt_float(brine_sb *sb, double v, int is_f32) {
 }
 void brine_sb_f64(brine_sb *sb, double v) { br_fmt_float(sb, v, 0); }
 void brine_sb_f32(brine_sb *sb, float v) { br_fmt_float(sb, (double)v, 1); }
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_sb_bool(brine_sb *sb, bool v) { br_sb_cstr(sb, v ? "true" : "false"); }
 static void br_sb_bin(brine_sb *sb, uint64_t v) {
     char b[65];
@@ -2443,6 +2453,7 @@ void brine_sb_fmt_u64(brine_sb *sb, uint64_t v, int kind) {
     else
         brine_sb_u64(sb, v);
 }
+#endif
 void brine_sb_fmt_f64(brine_sb *sb, double v, int prec, int kind) {
     char b[400];
     /* spelled the same everywhere (C libraries print `-nan(ind)`, `nan`, ...) */
@@ -2460,6 +2471,7 @@ void brine_sb_fmt_f64(brine_sb *sb, double v, int prec, int kind) {
     } else
         brine_sb_f64(sb, v);
 }
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 /* `{x:,}`: commas between groups of three digits in the integer part of the
  * number written from `start` on */
 void brine_sb_group(brine_sb *sb, int64_t start) {
@@ -2500,6 +2512,7 @@ brine_str *brine_sb_finish(brine_sb *sb) {
     sb->p = NULL;
     return s;
 }
+#endif
 /* stdout going to a terminal or a pipe is flushed at the end of each line,
  * since something may be reading it as it comes (a person, or a program
  * talking a line protocol); to a file it's written when the buffer fills.
