@@ -539,6 +539,8 @@ struct Lower:
             return self.cx.fb.conv(K.U64, vs[0])
         if n == "str_of" or n == "ptr_of":
             return vs[0]
+        if n == "null_ptr":
+            return self.cx.fb.conv(K.Ptr, self.cx.fb.konst(K.U64, 0))
         if n == "stack_mem":
             match self.const_of(vs[0]):
                 case Some(c):
@@ -556,7 +558,38 @@ struct Lower:
                 var i = vs[1]
                 if self.cx.fb.f.vk[i] != K.I64:
                     i = self.cx.fb.conv(K.I64, i)
-                p = self.cx.fb.elem(vs[0], i, 1)
+                # `k + j * s` (the usual `FIELD + i * 8`): k in the load or
+                # store, j scaled in the address
+                var size = 1
+                let a = self.def_at(i)
+                if a >= 0 and (
+                    self.cx.fb.f.code[a].op == Op.Add or self.cx.fb.f.code[a].op == Op.AddO
+                ):
+                    let x = self.cx.fb.f.code[a]
+                    match self.const_of(x.b):
+                        case Some(c):
+                            off = c
+                            i = x.a
+                        case None:
+                            match self.const_of(x.a):
+                                case Some(c):
+                                    off = c
+                                    i = x.b
+                                case None:
+                                    pass
+                let m = self.def_at(i)
+                if m >= 0 and (
+                    self.cx.fb.f.code[m].op == Op.Mul or self.cx.fb.f.code[m].op == Op.MulO
+                ):
+                    let x = self.cx.fb.f.code[m]
+                    match self.const_of(x.b):
+                        case Some(c):
+                            if c == 2 or c == 4 or c == 8:
+                                size = c
+                                i = x.a
+                        case None:
+                            pass
+                p = self.cx.fb.elem(vs[0], i, size)
         if n.starts_with("load_"):
             return self.cx.fb.load(k, p, off)
         self.cx.fb.store(p, off, vs[2])
@@ -564,15 +597,20 @@ struct Lower:
 
     # The value of vreg v if the instruction that makes it is a constant.
     fn const_of(self, v: int) -> Option[int]:
+        let i = self.def_at(v)
+        if i >= 0 and self.cx.fb.f.code[i].op == Op.Const and not self.cx.fb.f.vk[v].is_wide():
+            return Some(self.cx.fb.f.code[i].n)
+        return None
+
+    # The last instruction so far that sets vreg v, or -1.
+    fn def_at(self, v: int) -> int:
         let code = self.cx.fb.f.code
         var i = len(code) - 1
         while i >= 0:
             if code[i].d == v:
-                if code[i].op == Op.Const and not self.cx.fb.f.vk[v].is_wide():
-                    return Some(code[i].n)
-                return None
+                return i
             i -= 1
-        return None
+        return -1
 
     # The IR parameters of brine function `id`: an sret pointer first for an
     # aggregate result, then the parameters, then `__loc` for prelude functions.

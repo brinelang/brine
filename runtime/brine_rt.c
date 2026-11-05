@@ -654,12 +654,14 @@ static bool br_leakcheck;
 /* What native code's inline allocation (runtime/rt.br) reads: a thread's
    heap is at its thread pointer plus th_off, or at the address stored there
    when th_ind; the heap's range; each chunk's size class. fast is 0 when
-   every allocation must go through the functions here. */
+   every allocation must go through the functions here; keep[c] is how many
+   free blocks of class c a thread keeps (BR_TOO_MANY). */
 typedef struct {
     int64_t th_off, th_ind;
     uintptr_t base, end;
     uint8_t *classes;
     int64_t fast;
+    int64_t keep[BR_NCLASS];
 } brine_heap_info_t;
 brine_heap_info_t brine_heap_info;
 static void br_heap_info_init(void) {
@@ -667,6 +669,7 @@ static void br_heap_info_init(void) {
     hi->base = br_heap_base;
     hi->end = br_heap_end;
     hi->classes = br_chunk_class;
+    for (int c = 0; c < BR_NCLASS; c++) hi->keep[c] = BR_SPARE / (int64_t)br_class_size(c);
     if (!br_heap_base || br_leakcheck) return;
 #if defined(_WIN32) && !defined(__clang__)
     if (br_th_key >= 64) return;
@@ -683,10 +686,12 @@ static void br_heap_info_init(void) {
     hi->fast = 1;
 }
 #define BR_LIVE(d) (BR_UNLIKELY(br_leakcheck) ? (void)__atomic_fetch_add(&br_live, (d), __ATOMIC_RELAXED) : (void)0)
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 void brine_str_free(brine_str *s) {
     BR_LIVE(-1);
     free(s);
 }
+#endif
 /* Freeing an object frees what it holds first, so a deep structure (a long
    enum list, a tree 100k levels deep) would recurse once per level and
    overflow the stack. `fn(p)` finishes freeing a dead object; past
@@ -730,6 +735,13 @@ static void br_arr_drop(void *p) {
     if (a->data) free(a->data);
     free(a);
 }
+#ifdef BRINE_RT_BR
+/* runtime/rt.br's brine_arr_free, for elements that need releasing */
+void brine_x_arr_drop(brine_arr *a) {
+    BR_LIVE(-1);
+    brine_drop(a, br_arr_drop);
+}
+#else
 void brine_arr_free(brine_arr *a) {
     BR_LIVE(-1);
     if (a->release) {
@@ -739,6 +751,7 @@ void brine_arr_free(brine_arr *a) {
     if (a->data) free(a->data);
     free(a);
 }
+#endif
 void *brine_box_new(int64_t size, int64_t tag) {
     brine_box *b = (brine_box *)brine_alloc(size);
     BR_LIVE(1);
@@ -768,6 +781,18 @@ static brine_str *br_str_alloc(int64_t n) {
 #ifdef BRINE_RT_BR
 /* what runtime/rt.br's strings still take from here */
 brine_str *brine_x_str_alloc(int64_t n) { return br_str_alloc(n); }
+void *brine_x_counted(int64_t n) {
+    BR_LIVE(1);
+    return brine_alloc(n);
+}
+void *brine_x_calloc(int64_t n) {
+    void *p = calloc(n > 0 ? (size_t)n : 1, 1);
+    if (!p) {
+        fprintf(stderr, "out of memory\n");
+        abort();
+    }
+    return p;
+}
 void *brine_x_realloc(void *p, int64_t n) {
     p = realloc(p, (size_t)n);
     if (!p) abort();
@@ -1799,6 +1824,7 @@ bool brine_try_parse_float(brine_str *s, bool f32, void *out) {
 }
 
 /* ============================================================ arrays */
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_fn rl, const char *loc) {
     if (len < 0) br_panicf(loc, "cannot create an array with negative length %lld", (long long)len);
     brine_arr *a = (brine_arr *)brine_alloc(sizeof(brine_arr));
@@ -2031,6 +2057,7 @@ brine_arr *brine_arr_slice(brine_arr *a, int64_t lo, int64_t hi, const char *loc
         for (int64_t i = 0; i < r->len; i++) r->retain(r->data + i * r->esz);
     return r;
 }
+#endif
 
 /* ============================================================ maps */
 void brine_rt_map(void *p) { brine_map_retain(*(brine_map **)p); }
