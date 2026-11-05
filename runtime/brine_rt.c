@@ -7243,6 +7243,8 @@ float brine_x_f_powf(float a, float b) { return brine_f_powf(a, b); }
 float brine_x_f_atan2f(float y, float x) { return brine_f_atan2f(y, x); }
 float brine_x_f_hypotf(float x, float y) { return brine_f_hypotf(x, y); }
 int64_t brine_x_popcnt_u64(uint64_t x) { return brine_popcnt_u64(x); }
+/* runtime/rt.br's `bswap` (x64.br has it inline) */
+uint64_t brine_x_bswap_u64(uint64_t x) { return __builtin_bswap64(x); }
 int64_t brine_x_clz_u64(uint64_t x) { return brine_clz_u64(x); }
 int64_t brine_x_ctz_u64(uint64_t x) { return brine_ctz_u64(x); }
 int64_t brine_x_popcnt_u128(const brine_u128 *x) { return brine_popcnt_u128(*x); }

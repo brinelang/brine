@@ -9,7 +9,7 @@ from ast import LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, stmt, pat
 from ast import children, stmt_exprs, stmt_blocks, local_of, lvalue_root, parse_fmt_spec
 from ast import Param, FnDecl, FieldDecl, StructDecl, EnumDecl, Module, Program, Import, module_name
 from info import StructInfo, VariantInfo, EnumInfo, ParamSig, FnSig, ConstVal, ConstInfo, ProgramInfo
-from info import TryKind, try_kind, new_info, mangle_module, PRELUDE
+from info import TryKind, try_kind, new_info, mangle_module, PRELUDE, RT, builtin_module
 import num
 
 # Upper bound on instances. Stops runaway recursion like `f[T]` calling `f[[T]]`.
@@ -148,6 +148,22 @@ fn reducer_by_name(n: str) -> Option[Reducer]:
             return Some(Reducer.First)
         case _:
             return None
+
+# The memory operations of the runtime module (runtime/rt.br), as
+# (parameters, result): `load_<t>(p, off)` reads the <t> at address p + off,
+# `store_<t>(p, off, v)` writes one, and `bswap(x)` reverses x's bytes.
+# (`call_bool(f, ...)`, which calls the function at f, is checked apart.)
+fn prim_sig(n: str) -> Option[([Ty], Ty)]:
+    let u64 = Ty.Int(IntTy.U64)
+    let ts = [("i64", int_ty()), ("u64", u64), ("u8", Ty.Int(IntTy.U8)), ("ptr", Ty.Ptr)]
+    for k, t in ts:
+        if n == "load_" + k:
+            return Some(([Ty.Ptr, int_ty()], t))
+        if n == "store_" + k:
+            return Some(([Ty.Ptr, int_ty(), t], Ty.Unit))
+    if n == "bswap":
+        return Some(([u64], u64))
+    return None
 
 fn builtin_by_name(n: str) -> Option[Builtin]:
     for name, b in builtins():
@@ -291,6 +307,10 @@ struct Checker:
 
     fn item(self, name: str) -> Option[Item]:
         return self.items[self.cur_mod].get(name)
+
+    # Checking the runtime module, which alone has `ptr` and its operations?
+    fn in_rt(self) -> bool:
+        return self.info.module_names[self.cur_mod] == RT
 
     fn has_item(self, name: str) -> bool:
         return name in self.items[self.cur_mod]
@@ -462,6 +482,8 @@ struct Checker:
                         match ps.ty:
                             case Ty.Int(_) | Ty.Float(_) | Ty.Bool | Ty.Str:
                                 ok = true
+                            case Ty.Ptr:
+                                ok = true
                             case _:
                                 pass
                         if not ok or p.by_ref or p.mutable:
@@ -480,7 +502,7 @@ struct Checker:
                             self.err(d)
                     var rok = false
                     match ret:
-                        case Ty.Int(_) | Ty.Float(_) | Ty.Bool | Ty.Unit:
+                        case Ty.Int(_) | Ty.Float(_) | Ty.Bool | Ty.Unit | Ty.Ptr:
                             rok = true
                         case _:
                             pass
@@ -850,6 +872,8 @@ struct Checker:
                     found = Some(self.tenv[path[0]])
                 elif len(path) == 1 and prim_type(name).is_some():
                     found = prim_type(name)
+                elif name == "ptr" and self.in_rt():
+                    found = Some(Ty.Ptr)
                 else:
                     match self.item_at(self.cur_mod, path):
                         case Some(Item.Struct(id)):
@@ -1163,7 +1187,7 @@ struct Checker:
     # In a typed project, a variable without a written type is an error.
     # `fix` offers to insert the inferred type after `span`.
     fn require_type(ref self, span: Span, names: str, label: str, fix: Option[str]):
-        if not self.typed or self.info.module_names[self.cur_mod] == PRELUDE or "?" in label:
+        if not self.typed or builtin_module(self.info.module_names[self.cur_mod]) or "?" in label:
             return
         if all(n == "_" for n in names.split(", ")):
             return
@@ -4584,6 +4608,9 @@ struct Checker:
                 # `"ab" * 3` is "ababab"
                 if op == BinOp.Mul and lt == Ty.Str and rt.is_int():
                     return Ty.Str
+                # the runtime's address arithmetic: `p + 8`, `p - n`
+                if (op == BinOp.Add or op == BinOp.Sub) and lt == Ty.Ptr and rt.is_int():
+                    return Ty.Ptr
                 if lt.is_numeric() and lt == rt:
                     return lt
                 var verb = "take the remainder of"
@@ -4965,6 +4992,30 @@ struct Checker:
                             return bt
             case None:
                 pass
+        if self.in_rt():
+            if name == "call_bool":
+                res = CallRes.Prim(name)
+                for i in 0..len(args):
+                    let t = self.check_expr(ref args[i].expr, Some(Ty.Ptr) if i == 0 else None)
+                    if i == 0:
+                        self.expect_ty(Ty.Ptr, args[i].expr)
+                    elif not t.is_int() and t != Ty.Ptr and t != Ty.Bool:
+                        self.expect_ty(Ty.Ptr, args[i].expr)
+                if len(args) == 0:
+                    self.nargs(name, ref args, 1, span)
+                return Ty.Bool
+            match prim_sig(name):
+                case Some(sig):
+                    res = CallRes.Prim(name)
+                    if self.nargs(name, ref args, len(sig.0), span):
+                        for i in 0..len(args):
+                            let t = self.check_expr(ref args[i].expr, Some(sig.0 [i]))
+                            # an offset may be any integer
+                            if i != 1 or name == "bswap" or not t.is_int():
+                                self.expect_ty(sig.0 [i], args[i].expr)
+                    return sig.1
+                case None:
+                    pass
         match builtin_by_name(name):
             case Some(b):
                 res = CallRes.Builtin(b)
@@ -7941,7 +7992,7 @@ fn orderable(info: ProgramInfo, t: Ty) -> bool:
 
 # The first part of `t` that can't be ordered, described, if any.
 fn unordered_part(info: ProgramInfo, t: Ty) -> Option[(str, Ty)]:
-    if t.is_numeric() or t == Ty.Str or t.is_error():
+    if t.is_numeric() or t == Ty.Str or t == Ty.Ptr or t.is_error():
         return None
     match t:
         case Ty.Enum(eid):

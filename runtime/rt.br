@@ -1,0 +1,181 @@
+# The runtime's fast paths, in brine. Native code calls these instead of the
+# C runtime's (brine_rt.h has the same functions, with the same parameters
+# and results) and inlines them; the slow paths stay in C for now.
+#
+# This module alone has `ptr`, a raw address, with `p + n` and `p - n`, and
+# the memory operations `load_<t>(p, off)`, `store_<t>(p, off, v)` (t is
+# i64, u64, u8 or ptr), `call_bool(f, ...)` and `bswap(x)`. Its arithmetic
+# wraps, and the prover doesn't look at it.
+
+# brine_str: a reference count (negative: immortal), the length, then the
+# bytes and a NUL. Every string can be read to the end of the 8-byte word
+# that holds its NUL, so short ones are handled a word at a time.
+const STR_RC = 0
+const STR_LEN = 8
+const STR_DATA = 16
+
+# brine_map
+const MAP_RC = 0
+const MAP_LEN = 8
+const MAP_NIDX = 32
+const MAP_KEYS = 48
+const MAP_VALS = 56
+const MAP_HASHES = 64
+const MAP_INDEX = 80
+
+# brine_app, the appender of a loop doing `s += t[i]`
+const APP_DATA = 0
+const APP_LEN = 8
+const APP_ROOM = 16
+const APP_LIM = 24
+const APP_W0 = 32
+
+const ONES: u64 = 0xffffffffffffffff
+
+extern fn brine_str_eq_long(a: ptr, b: ptr) -> bool
+
+extern fn brine_hash_long(p: ptr, n: u64) -> u64
+
+extern fn brine_map_at(m: ptr, k: ptr, loc: ptr) -> ptr
+
+extern fn brine_map_val_mut_slow(pm: ptr, e: int, k: ptr, loc: ptr) -> ptr
+
+extern fn brine_x_str_reset(ps: ptr, lit: ptr)
+
+extern fn brine_x_str_add_byte(ps: ptr, c: u8)
+
+extern fn brine_x_app_open(ps: ptr, ap: ptr)
+
+extern fn brine_x_app_byte(ps: ptr, ap: ptr, c: u8)
+
+# the low n bytes of a word, 0 <= n <= 8
+fn lowmask(n: u64) -> u64:
+    if n >= 8:
+        return ONES
+    return ~(ONES << (n * 8))
+
+# The longest string the block of a string of length n holds, for n <= 47
+# (brine_str_room).
+fn short_room(n: int) -> int:
+    return ((n + 32) & ~15) - 17
+
+fn str_eq(a: ptr, b: ptr) -> bool:
+    if a == b:
+        return true
+    let n = load_u64(a, STR_LEN)
+    if n != load_u64(b, STR_LEN):
+        return false
+    if n <= 8:
+        return ((load_u64(a, STR_DATA) ^ load_u64(b, STR_DATA)) & lowmask(n)) == 0
+    return brine_str_eq_long(a, b)
+
+# A string of up to 7 bytes hashes to its bytes and length, mixed one to
+# one, so equal hashes mean equal strings (brine_hash_str).
+fn hash_str(s: ptr) -> u64:
+    let n = load_u64(s, STR_LEN)
+    if n < 8:
+        let w = (load_u64(s, STR_DATA) & lowmask(n)) | n << 56
+        return bswap(w * 0x9e3779b97f4a7c15)
+    return brine_hash_long(s + STR_DATA, n)
+
+# The entry of key k (hash h) in map m, or -1. keq compares two keys of ksz
+# bytes; `exact`: equal hashes are equal keys.
+fn map_probe(m: ptr, k: ptr, h: u64, keq: ptr, ksz: int, exact: bool) -> int:
+    if load_i64(m, MAP_LEN) == 0:
+        return -1
+    let mask = load_u64(m, MAP_NIDX) - 1
+    let ix = load_ptr(m, MAP_INDEX)
+    let hs = load_ptr(m, MAP_HASHES)
+    var i = h & mask
+    while true:
+        let e = load_i64(ix, i * 8)
+        if e == -1:
+            return -1
+        if e >= 0 and load_u64(hs, e * 8) == h:
+            if exact or call_bool(keq, load_ptr(m, MAP_KEYS) + e * ksz, k):
+                return e
+        i = (i + 1) & mask
+    return -1
+
+# The value of entry e (from map_probe; -1 panics for the missing key k).
+fn map_val(m: ptr, e: int, k: ptr, vsz: int, loc: ptr) -> ptr:
+    if e < 0:
+        return brine_map_at(m, k, loc)
+    return load_ptr(m, MAP_VALS) + e * vsz
+
+# Same, after making the map unique so the value can be changed.
+fn map_val_mut(pm: ptr, e: int, k: ptr, vsz: int, loc: ptr) -> ptr:
+    let m = load_ptr(pm, 0)
+    if e >= 0 and load_i64(m, MAP_RC) == 1:
+        return load_ptr(m, MAP_VALS) + e * vsz
+    return brine_map_val_mut_slow(pm, e, k, loc)
+
+# `var s = lit` run again: keeps s's block when nothing else holds it. A
+# block always has room for 15 bytes, so a short literal is one word store.
+fn str_reset(ps: ptr, lit: ptr):
+    let a = load_ptr(ps, 0)
+    let n = load_u64(lit, STR_LEN)
+    if n < 8 and load_i64(a, STR_RC) == 1:
+        store_u64(a, STR_DATA, load_u64(lit, STR_DATA) & lowmask(n))
+        store_u64(a, STR_LEN, n)
+        return
+    brine_x_str_reset(ps, lit)
+
+# `s += t[i]`: one byte, in place when s is unshared and has room. Within
+# the first word the whole word is rewritten, so a later word load forwards
+# from one store.
+fn str_add_byte(ps: ptr, c: u8):
+    let a = load_ptr(ps, 0)
+    let la = load_i64(a, STR_LEN)
+    if la < 8 and load_i64(a, STR_RC) == 1:
+        let sh = la * 8
+        let w = load_u64(a, STR_DATA) & ~(ONES << sh)
+        store_u64(a, STR_DATA, w | u64(c) << sh)
+        if la == 7:
+            store_u8(a, STR_DATA + 8, 0)
+        store_i64(a, STR_LEN, la + 1)
+        return
+    brine_x_str_add_byte(ps, c)
+
+# The appender (brine_app_open): the length and the first word in it, the
+# bytes after those straight into s's block while it is unshared and has
+# room.
+fn app_open(ps: ptr, ap: ptr):
+    let a = load_ptr(ps, 0)
+    let n = load_i64(a, STR_LEN)
+    if n > 47:
+        brine_x_app_open(ps, ap)
+        return
+    var room = -1
+    if load_i64(a, STR_RC) == 1:
+        room = short_room(n)
+    store_ptr(ap, APP_DATA, a + STR_DATA)
+    store_i64(ap, APP_LEN, n)
+    store_i64(ap, APP_ROOM, room)
+    store_i64(ap, APP_LIM, room if room < 8 else 8)
+    store_u64(ap, APP_W0, load_u64(a, STR_DATA) & lowmask(load_u64(a, STR_LEN)))
+
+fn app_byte(ps: ptr, ap: ptr, c: u8):
+    let n = load_i64(ap, APP_LEN)
+    if n < load_i64(ap, APP_LIM):
+        store_u64(ap, APP_W0, load_u64(ap, APP_W0) | u64(c) << (n * 8))
+        store_i64(ap, APP_LEN, n + 1)
+        return
+    if n > 8 and n < load_i64(ap, APP_ROOM):
+        store_u8(load_ptr(ap, APP_DATA), n, c)
+        store_i64(ap, APP_LEN, n + 1)
+        return
+    brine_x_app_byte(ps, ap, c)
+
+fn app_close(ps: ptr, ap: ptr):
+    let a = load_ptr(ps, 0)
+    let n = load_i64(ap, APP_LEN)
+    if load_i64(a, STR_LEN) == n:
+        return
+    store_i64(a, STR_LEN, n)
+    # the bytes past n in w0 are 0: the NUL
+    let d = load_ptr(ap, APP_DATA)
+    if n <= 8:
+        store_u64(d, 0, load_u64(ap, APP_W0))
+    if n >= 8:
+        store_u8(d, n, 0)

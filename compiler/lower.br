@@ -19,7 +19,7 @@ from diag import Span, SourceMap
 from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, LocalKind, int_ty, NumM
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import FmtSpec, parse_fmt_spec, children, stmt_exprs, stmt_blocks, local_of, lvalue_root
-from info import ProgramInfo, ConstVal, TryKind, try_kind, mangle_module, PRELUDE
+from info import ProgramInfo, ConstVal, TryKind, try_kind, mangle_module, PRELUDE, RT
 from num import u128_bits
 from ir import K, Op, Func, Data, Reloc, Module, FB, KFunc, new_func, le_bytes, str_bytes, f64_bits, f32_bits
 from ir import DType, DField, DVar, DT_BASE, DT_STRUCT, DT_UNION, DT_ENUM, DT_PTR, DT_TYPEDEF, DT_ARRAY
@@ -49,6 +49,9 @@ struct Options:
     # ... made for the x86-64 backend (xkern.br), for Windows or System V
     nvec: bool
     win: bool
+    # for x64.br or a64.br: runtime helpers that runtime/rt.br has in brine
+    # are calls of those, which the native inliner can take
+    native: bool
 
 struct Temp:
     v: int
@@ -333,6 +336,7 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         clones=[],
         cloned={},
         nc_body=false,
+        rt_body=false,
         odecls={},
         own_clones=[],
         own_seen={},
@@ -385,6 +389,8 @@ struct Lower:
     cloned: {int: bool}
     # the body being lowered is such a clone
     nc_body: bool
+    # lowering a function of the runtime module: its arithmetic wraps
+    rt_body: bool
     # every brine function by id, the clones that own some by-value
     # parameters (`own_call`: id and a mask of parameters), and the mask of
     # the body being lowered
@@ -419,6 +425,8 @@ struct Lower:
                 if not f.is_extern:
                     self.odecls[f.id] = f
         for m in prog.modules:
+            if m.name == RT and not self.opts.native:
+                continue
             for f in m.fns:
                 if not f.is_extern:
                     self.gen_body(f, self.info.fns[f.id].c_name, false)
@@ -451,17 +459,81 @@ struct Lower:
         var externs: [Func] = []
         var seen: {str: bool} = {}
         for sig in self.info.fns:
+            # (the runtime module's are the C runtime's own functions)
+            if self.info.module_names[sig.module] == RT:
+                continue
             if sig.is_extern and not (sig.c_name in seen):
                 seen[sig.c_name] = true
                 let ks = [self.kind(p.ty) for p in sig.params]
                 let has = self.ret_has(sig.ret)
                 externs.push(new_func(sig.c_name, ks, has, self.kind(sig.ret) if has else K.I64))
         self.gpu_emit()
+        if self.opts.native:
+            self.route_rt()
         return Lowered(
             m=Module(funcs=self.funcs, data=self.data, dtypes=self.dtypes, kernels=self.nkernels),
             externs=externs,
             kernels=self.kernels
         )
+
+    # Runtime helper calls `brine_<n>` become calls of `n` in the runtime
+    # module, when it has one: ordinary brine functions, which native code
+    # inlines (same parameters and result as brine_rt.h's).
+    fn route_rt(ref self):
+        var to: {str: str} = {}
+        for sig in self.info.fns:
+            if not sig.is_extern and self.info.module_names[sig.module] == RT:
+                to["brine_" + sig.name] = sig.c_name
+        for fi in 0..len(self.funcs):
+            for xi in 0..len(self.funcs[fi].code):
+                let x = self.funcs[fi].code[xi]
+                if x.op == Op.Call and x.b == 1 and x.s in to:
+                    self.funcs[fi].code[xi].s = to[x.s]
+                    self.funcs[fi].code[xi].b = 0
+
+    # A memory operation of the runtime module (`prim_sig` in check.br).
+    fn prim(ref self, n: str, args: [Arg]) -> int:
+        var vs: [int] = []
+        for a in args:
+            vs.push(self.expr(a.expr))
+        if n == "call_bool":
+            return self.cx.fb.call_ind(true, K.Bool, vs[0], vs[1:])
+        if n == "bswap":
+            return self.cx.fb.rt(K.U64, "brine_bswap_u64", vs)
+        var k = K.Ptr
+        if n.ends_with("_i64"):
+            k = K.I64
+        elif n.ends_with("_u64"):
+            k = K.U64
+        elif n.ends_with("_u8"):
+            k = K.U8
+        # a constant offset goes in the load or store
+        var p = vs[0]
+        var off = 0
+        match self.const_of(vs[1]):
+            case Some(c):
+                off = c
+            case None:
+                var i = vs[1]
+                if self.cx.fb.f.vk[i] != K.I64:
+                    i = self.cx.fb.conv(K.I64, i)
+                p = self.cx.fb.elem(vs[0], i, 1)
+        if n.starts_with("load_"):
+            return self.cx.fb.load(k, p, off)
+        self.cx.fb.store(p, off, vs[2])
+        return self.unit()
+
+    # The value of vreg v if the instruction that makes it is a constant.
+    fn const_of(self, v: int) -> Option[int]:
+        let code = self.cx.fb.f.code
+        var i = len(code) - 1
+        while i >= 0:
+            if code[i].d == v:
+                if code[i].op == Op.Const and not self.cx.fb.f.vk[v].is_wide():
+                    return Some(code[i].n)
+                return None
+            i -= 1
+        return None
 
     # The IR parameters of brine function `id`: an sret pointer first for an
     # aggregate result, then the parameters, then `__loc` for prelude functions.
@@ -493,7 +565,9 @@ struct Lower:
         let rk = self.kind(ret) if has else K.I64
         self.fnd = Some(f)
         self.flocals = f.locals
+        self.rt_body = not is_test and self.info.module_names[self.info.fns[f.id].module] == RT
         self.cx = new_cx(new_func(name, ks, has, rk))
+        self.cx.fb.f.hot = self.rt_body
         self.cx.nc = self.nc_body
         self.cx.bret = self.br_body
         if self.opts.debug:
@@ -2520,11 +2594,13 @@ struct Lower:
         if not self.mark_done(name):
             return self.cx.fb.global(name)
         let s1 = self.start_helper("br_hk_" + m, [K.Ptr], true, K.U64)
+        self.cx.fb.f.hot = true
         let kx = self.ld(0, 0, k)
         let h = self.hash_code(kx, k)
         self.cx.fb.ret(h)
         self.finish_helper(s1)
         let s2 = self.start_helper("br_kq_" + m, [K.Ptr, K.Ptr], true, K.Bool)
+        self.cx.fb.f.hot = true
         let ka = self.ld(0, 0, k)
         let kb = self.ld(1, 0, k)
         let qk = self.eq_code(ka, kb, k)
@@ -3750,6 +3826,8 @@ struct Lower:
     # Is `op` on a `ty` checked, `checked` being what the source asks for? A
     # range-versioned copy drops the checks ranges.br showed can't fail.
     fn op_checked(self, op: Option[BinOp], ty: Ty, checked: bool) -> bool:
+        if self.rt_body:
+            return false
         if not checked or not self.cx.nc or ranges.handled(ty).is_none():
             return checked
         match op:
@@ -5042,6 +5120,8 @@ struct Lower:
                         return self.reduce(r, args[0].expr, e)
                     case CallRes.Convert(t):
                         return self.convert(t, args[0].expr, e)
+                    case CallRes.Prim(n):
+                        return self.prim(n, args)
                     case _:
                         return self.unit()
             case ExprKind.MethodCall(recv, _, _, args):
@@ -5318,7 +5398,8 @@ struct Lower:
             let zero = self.cx.fb.konst(K.Bool, 1 if fs.zero else 0)
             self.cx.fb.call_void("brine_sb_pad", [sb, start, w, left, zero])
 
-    fn arith(ref self, op: BinOp, a: int, b: int, ty: Ty, checked: bool, span: Span) -> int:
+    fn arith(ref self, op: BinOp, a: int, b: int, ty: Ty, checked0: bool, span: Span) -> int:
+        let checked = checked0 and not self.rt_body
         match ty:
             case Ty.Int(k):
                 let kk = int_kind(k)
@@ -5375,6 +5456,14 @@ struct Lower:
                     case _:
                         let fname = "brine_f_fmodf" if f == FloatTy.F32 else "brine_f_fmod"
                         return self.cx.fb.rt(fk, fname, [a, b])
+            case Ty.Ptr:
+                # the runtime module's `p + n` and `p - n`
+                var n = b
+                if self.cx.fb.f.vk[b] != K.I64:
+                    n = self.cx.fb.conv(K.I64, b)
+                if op == BinOp.Sub:
+                    n = self.cx.fb.un(Op.Neg, K.I64, n)
+                return self.cx.fb.elem(a, n, 1)
             case _:
                 return self.cx.fb.konst(K.I64, 0)
 
@@ -6344,7 +6433,8 @@ struct Lower:
                 if k == j:
                     return v
                 let kk = int_kind(k)
-                if widens(j, k):
+                # (the runtime module's conversions wrap, like C's)
+                if widens(j, k) or self.rt_body:
                     return self.cx.fb.conv(kk, v)
                 let loc = self.loc(e.span)
                 let ks = k.suffix()
