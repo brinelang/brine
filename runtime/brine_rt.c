@@ -7181,7 +7181,7 @@ brine_str *brine_x_str_byte(brine_str *s, int64_t i) { return brine_str_byte(s, 
 void brine_x_str_add(brine_str **ps, brine_str *b) { brine_str_add(ps, b); }
 void brine_x_str_add_byte(brine_str **ps, uint8_t c) { brine_str_add_byte(ps, c); }
 void brine_x_str_reset(brine_str **ps, brine_str *lit) { brine_str_reset(ps, lit); }
-void brine_x_app_open(brine_str **ps, void *ap) { brine_app_open(ps, ap); }
+int64_t brine_x_str_room(int64_t n) { return brine_str_room(n); }
 void brine_x_app_byte(brine_str **ps, void *ap, uint8_t c) { brine_app_byte(ps, ap, c); }
 void brine_x_app_close(brine_str **ps, void *ap) { brine_app_close(ps, ap); }
 bool brine_x_str_eq(brine_str *a, brine_str *b) { return brine_str_eq(a, b); }

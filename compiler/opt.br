@@ -3,9 +3,11 @@
 #
 # The lowering keeps every local variable in a stack slot and reads and writes
 # it through its address. `promote` moves the slots that are only read and
-# written whole (their address goes nowhere else) into vregs, so the register
-# allocator can keep them in registers, and then removes the copies that this
-# leaves behind.
+# written (their address goes nowhere else) into vregs, one per field, so the
+# register allocator can keep them in registers, and then removes the copies
+# that this leaves behind. A slot whose address is also passed to calls (the
+# appender of `s += t[i]`, to the runtime's slow paths) is in memory only
+# during those calls.
 
 from ir import K, Op, Inst, Func
 
@@ -28,6 +30,15 @@ fn slot_vregs(f: Func) -> [int]:
     for v in 0..nv:
         if ndef[v] != 1 or v < f.nparams:
             slot[v] = -1
+    # a copy of an address, made once (an inlined function's parameter)
+    var more = true
+    while more:
+        more = false
+        for x in f.code:
+            if x.op == Op.Mov and slot[x.d] < 0 and slot[x.a] >= 0:
+                if ndef[x.d] == 1 and x.d >= f.nparams:
+                    slot[x.d] = slot[x.a]
+                    more = true
     return slot
 
 fn same_slot(x: Inst, slot: [int]) -> bool:
@@ -56,41 +67,70 @@ fn reads(x: Inst, nv: int) -> [int]:
         r.extend(x.args)
     return r
 
-# Which slots can live in a vreg, and the kind they hold (K.I64 when not).
-fn promotable(f: Func, slot: [int]) -> ([bool], [K]):
+# The fields of the slots that can live in vregs: their offsets and kinds
+# (none: it can't), and whether calls are passed the slot's address.
+struct Fields:
+    off: [[int]]
+    kind: [[K]]
+    calls: [bool]
+
+fn field_of(fs: Fields, s: int, n: int) -> int:
+    for i, o in enumerate(fs.off[s]):
+        if o == n:
+            return i
+    return -1
+
+fn promotable(f: Func, slot: [int]) -> Fields:
     let ns = len(f.slots)
     let nv = len(f.vk)
     var ok = [true] * ns
-    var seen = [false] * ns
-    var kind = [K.I64] * ns
+    var fs = Fields(off=[[] for _ in 0..ns], kind=[[] for _ in 0..ns], calls=[false] * ns)
     for x in f.code:
-        if x.op == Op.SlotAddr or same_slot(x, slot):
+        if x.op == Op.SlotAddr:
+            # (an address in a vreg set more than once: not followed)
+            if slot[x.d] < 0:
+                ok[x.a] = false
             continue
-        # a slot address used as anything but the address of a whole load or store
+        if x.op == Op.Mov and slot[x.d] >= 0 and slot[x.a] == slot[x.d]:
+            continue
+        # a slot address used as anything but the address of a load or store
+        # or a call's argument
         var addr = -1
         var k = K.I64
-        if x.op == Op.Load and x.n == 0 and slot[x.a] >= 0:
+        if x.op == Op.Load and slot[x.a] >= 0:
             addr = x.a
             k = f.vk[x.d]
-        elif x.op == Op.Store and x.n == 0 and slot[x.a] >= 0 and slot[x.b] < 0:
+        elif x.op == Op.Store and slot[x.a] >= 0 and slot[x.b] < 0:
             addr = x.a
             k = f.vk[x.b]
+        elif x.op == Op.Call:
+            for v in x.args:
+                if slot[v] >= 0:
+                    fs.calls[slot[v]] = true
+            continue
         for v in reads(x, nv):
             if v != addr and slot[v] >= 0:
                 ok[slot[v]] = false
         if addr >= 0:
             let s = slot[addr]
-            if k.is_wide():
+            let i = field_of(fs, s, x.n)
+            if k.is_wide() or x.n < 0:
                 ok[s] = false
-            elif not seen[s]:
-                seen[s] = true
-                kind[s] = k
-            elif kind[s] != k:
+            elif i < 0:
+                fs.off[s].push(x.n)
+                fs.kind[s].push(k)
+            elif fs.kind[s][i] != k:
                 ok[s] = false
     for s in 0..ns:
-        if not seen[s]:
-            ok[s] = false
-    return (ok, kind)
+        # fields that overlap: no
+        for i, a in enumerate(fs.off[s]):
+            for j, b in enumerate(fs.off[s]):
+                if i != j and a <= b and b < a + fs.kind[s][i].size():
+                    ok[s] = false
+        if not ok[s] or len(fs.off[s]) == 0:
+            fs.off[s] = []
+            fs.kind[s] = []
+    return fs
 
 fn arith(op: Op) -> bool:
     match op:
@@ -106,25 +146,47 @@ fn mov(d: int, a: int) -> Inst:
 
 fn promote(f: Func) -> Func:
     let slot = slot_vregs(f)
-    let (ok, kind) = promotable(f, slot)
+    let fs = promotable(f, slot)
     var g = f
+    # the vreg of each field: home[s] + field
     var home = [-1] * len(f.slots)
     for s in 0..len(f.slots):
-        if ok[s]:
-            g.vk.push(kind[s])
-            home[s] = len(g.vk) - 1
+        home[s] = len(g.vk)
+        g.vk.extend(fs.kind[s])
     var code: [Inst] = []
     for x in f.code:
-        if x.op == Op.SlotAddr and slot[x.d] >= 0 and ok[x.a]:
+        # the address, when nothing needs it any more
+        if x.op == Op.SlotAddr or x.op == Op.Mov:
+            let t = slot[x.d] if x.d >= 0 else -1
+            if t >= 0 and (x.op == Op.SlotAddr or slot[x.a] == t):
+                if len(fs.off[t]) > 0 and not fs.calls[t]:
+                    continue
+        let s = slot[x.a] if (x.op == Op.Load or x.op == Op.Store) else -1
+        if s >= 0 and len(fs.off[s]) > 0:
+            let v = home[s] + field_of(fs, s, x.n)
+            if x.op == Op.Load:
+                code.push(mov(x.d, v))
+            else:
+                code.push(mov(v, x.b))
             continue
-        if same_slot(x, slot) and ok[slot[x.d]]:
-            continue
-        if x.op == Op.Load and x.n == 0 and slot[x.a] >= 0 and ok[slot[x.a]]:
-            code.push(mov(x.d, home[slot[x.a]]))
-        elif x.op == Op.Store and x.n == 0 and slot[x.a] >= 0 and ok[slot[x.a]]:
-            code.push(mov(home[slot[x.a]], x.b))
-        else:
+        if x.op != Op.Call:
             code.push(x)
+            continue
+        # the slots it is passed, in memory for the call
+        var ss: [int] = []
+        var at: [int] = []
+        for a in x.args:
+            let t = slot[a]
+            if t >= 0 and len(fs.off[t]) > 0 and t not in ss:
+                ss.push(t)
+                at.push(a)
+        for i, t in enumerate(ss):
+            for j, n in enumerate(fs.off[t]):
+                code.push(Inst(op=Op.Store, d=-1, a=at[i], b=home[t] + j, c=-1, n=n, s="", args=[]))
+        code.push(x)
+        for i, t in enumerate(ss):
+            for j, n in enumerate(fs.off[t]):
+                code.push(Inst(op=Op.Load, d=home[t] + j, a=at[i], b=-1, c=-1, n=n, s="", args=[]))
     g.code = code
     return forward(g)
 
