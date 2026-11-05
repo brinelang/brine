@@ -1051,6 +1051,9 @@ struct X:
                 self.fstore(fl_of(self.vk[v]), self.vm(v), self.freg[v])
             else:
                 self.mov_mr(self.vm(v), self.reg[v])
+        # (before the arguments: fp may be in one of their registers)
+        if sym < 0:
+            self.ld(R11, fp)
         var fls: [int] = []
         for a in args:
             fls.push(a.fl)
@@ -1076,8 +1079,8 @@ struct X:
                 elif a.how == A_VAL and self.fold[a.v] == F_NONE and self.reg[a.v] >= 0:
                     src[i] = self.reg[a.v]
         # an argument register is set once no argument left to set is in it
-        # (a slow path's arguments can be in any register: ra.br), in order
-        # when none is; a cycle goes through rax
+        # (they can be in any register: ra.br), in order when none is; a
+        # cycle goes through rax
         while len(todo) > 0:
             var at = -1
             for t, i in enumerate(todo):
@@ -1096,8 +1099,6 @@ struct X:
             let i = todo[at]
             self.arg_int(self.int_reg(locs[i]), regs[i])
             todo.pop(at)
-        if sym < 0:
-            self.ld(R11, fp)
         if sym >= 0:
             self.b(232)
             self.reloc(R_CALL, sym, -4)
@@ -1179,8 +1180,10 @@ struct X:
         let mt = self.sym_ref("brine_mt")
         var mm = mrip(mt, 0)
         if not self.direct(mt):
-            self.ld_sym(R11, mt)
-            mm = mreg(R11, 0)
+            # (p can be in r11: a call's arguments can be in any register)
+            let t = RCX if self.fold[p] == F_NONE and self.reg[p] == R11 else R11
+            self.ld_sym(t, mt)
+            mm = mreg(t, 0)
         self.rm(0, 0, 131, CMP, mm, 1)
         self.b(0)
         let shared = self.j8(CC_NE)
@@ -1232,9 +1235,44 @@ struct X:
             if x.s == "brine_bytes_copy":
                 self.bytes_copy(x)
                 return
+            if x.s == "brine_neg_i128":
+                # neg rax; adc rdx, 0; neg rdx. The runtime (to panic) when
+                # that overflows, and also for -(2^127 - n): rare, and right
+                let ma = self.vm(x.args[0])
+                self.mov_rm(RAX, ma)
+                self.mov_rm(RDX, moff(ma, 8))
+                self.rr(0, 1, 247, 3, RAX)
+                self.alu_ri(ADC, RDX, 0)
+                self.rr(0, 1, 247, 3, RDX)
+                let j = self.j32(CC_O)
+                self.st(RAX, x.d)
+                self.mov_mr(moff(self.vm(x.d), 8), RDX)
+                let e = self.jmp32()
+                self.here32(j)
+                self.call_rt(
+                    "brine_x_neg_i128",
+                    [
+                        CArg(how=A_ADDR, v=x.d, fl=0),
+                        CArg(how=A_ADDR, v=x.args[0], fl=0),
+                        CArg(how=A_VAL, v=x.args[1], fl=0)
+                    ]
+                )
+                self.here32(e)
+                return
             if x.s == "brine_bswap_u64":
                 self.ld(RAX, x.args[0])
                 self.bswap(RAX)
+                self.st(RAX, x.d)
+                return
+            if x.s == "brine_thread_ptr":
+                # mov rax, fs:[0] (Linux: the thread pointer) or gs:[0x30]
+                # (Windows: the thread's TEB)
+                self.b(0x65 if self.win else 0x64)
+                self.b(0x48)
+                self.b(0x8B)
+                self.b(0x04)
+                self.b(0x25)
+                self.b32(0x30 if self.win else 0)
                 self.st(RAX, x.d)
                 return
             if ra.int_div_rt(x.s) and not self.vk[x.d].is_wide():
@@ -2658,13 +2696,25 @@ struct X:
         self.fsaved = r.fsaved
         self.keep = r.keep
 
+    # An integer parameter can be in any register, an argument register too
+    # (ra.br), so the ones in registers are set last, in an order that reads
+    # each argument register before it is changed (a cycle goes through rax),
+    # and the ones passed on the stack after that.
     fn store_params(ref self, f: Func):
         let h = 1 if f.has_ret and f.ret.is_wide() else 0
         if h == 1:
             self.mov_mr(mrb(self.retp), self.int_reg(self.ploc[0]))
+        var todo: [int] = []
+        var src = [-1] * f.nparams
         for i in 0..f.nparams:
             let k = f.vk[i]
             let l = self.ploc[i + h]
+            if not k.is_wide() and l < L_XMM and self.reg[i] >= 0:
+                src[i] = self.int_reg(l)
+                self.norm(src[i], k)
+                if src[i] != self.reg[i]:
+                    todo.push(i)
+                continue
             if k.is_wide():
                 var r = R11
                 if l >= L_STACK:
@@ -2673,19 +2723,40 @@ struct X:
                     r = self.int_reg(l)
                 self.copy16(self.vm(i), mreg(r, 0))
             elif l >= L_STACK:
-                if self.reg[i] >= 0:
-                    self.load_k(self.reg[i], self.vm(i), k)
-                elif self.freg[i] >= 0:
-                    self.fload(fl_of(k), self.freg[i], self.vm(i))
-                elif k.size() < 8 and not k.is_float():
-                    self.load_k(RAX, self.vm(i), k)
-                    self.st(RAX, i)
+                pass
             elif l >= L_XMM:
                 self.fst(fl_of(k), i, l - L_XMM)
             else:
                 let r = self.int_reg(l)
                 self.norm(r, k)
                 self.st(r, i)
+        while len(todo) > 0:
+            var at = -1
+            for t, i in enumerate(todo):
+                if not any(j != i and src[j] == self.reg[i] for j in todo):
+                    at = t
+                    break
+            if at < 0:
+                let r = self.reg[todo[0]]
+                self.mov_rr(RAX, r)
+                for j in todo:
+                    if src[j] == r:
+                        src[j] = RAX
+                continue
+            let i = todo[at]
+            self.mov_rr(self.reg[i], src[i])
+            todo.pop(at)
+        for i in 0..f.nparams:
+            let k = f.vk[i]
+            if k.is_wide() or self.ploc[i + h] < L_STACK:
+                continue
+            if self.reg[i] >= 0:
+                self.load_k(self.reg[i], self.vm(i), k)
+            elif self.freg[i] >= 0:
+                self.fload(fl_of(k), self.freg[i], self.vm(i))
+            elif k.size() < 8 and not k.is_float():
+                self.load_k(RAX, self.vm(i), k)
+                self.st(RAX, i)
 
     # ------------------------------------------------------------ instructions
     # Compiles the instruction at i; returns the index of the next one.
@@ -3079,6 +3150,22 @@ struct X:
                 self.alu_rm(hi, RDX, moff(mb, 8))
                 self.st(RAX, x.d)
                 self.mov_mr(moff(self.vm(x.d), 8), RDX)
+            case Op.Mul:
+                # the low 128 bits (signed or not): a.lo * b.lo, plus the
+                # cross products in the high half
+                let ma = self.vm(x.a)
+                let mb = self.vm(x.b)
+                self.mov_rm(RCX, moff(ma, 8))
+                self.rm(0, 1, 4015, RCX, mb, 0)
+                self.mov_rm(RAX, moff(mb, 8))
+                self.rm(0, 1, 4015, RAX, ma, 0)
+                self.alu_rr(ADD, RCX, RAX)
+                self.mov_rm(RAX, ma)
+                # mul qword [b]
+                self.rm(0, 1, 247, 4, mb, 0)
+                self.alu_rr(ADD, RDX, RCX)
+                self.st(RAX, x.d)
+                self.mov_mr(moff(self.vm(x.d), 8), RDX)
             case Op.Shl | Op.Shr:
                 let nm = "shl" if x.op == Op.Shl else "shr"
                 self.call_rt(
@@ -3273,6 +3360,21 @@ struct X:
             kind = S_MUL
         if k.is_wide():
             let nm = ["add", "sub", "mul"][kind]
+            # add and subtract inline, calling the runtime (to panic) only
+            # when they overflow
+            var e = -1
+            if kind != S_MUL:
+                let ma = self.vm(x.a)
+                let mb = self.vm(x.b)
+                self.mov_rm(RAX, ma)
+                self.mov_rm(RDX, moff(ma, 8))
+                self.alu_rm(ADD if kind == S_ADD else SUB, RAX, mb)
+                self.alu_rm(ADC if kind == S_ADD else SBB, RDX, moff(mb, 8))
+                let j = self.j32(CC_O if k.is_signed() else CC_B)
+                self.st(RAX, x.d)
+                self.mov_mr(moff(self.vm(x.d), 8), RDX)
+                e = self.jmp32()
+                self.here32(j)
             self.call_rt(
                 f"brine_x_{nm}_{w128(k)}",
                 [
@@ -3282,6 +3384,8 @@ struct X:
                     CArg(how=A_VAL, v=x.c, fl=0)
                 ]
             )
+            if e >= 0:
+                self.here32(e)
             return
         let signed = k.is_signed()
         # in d's register, when that isn't b's or the panic's location's
@@ -3391,7 +3495,7 @@ struct X:
         self.st(RAX, x.d)
 
     fn copy_mem(ref self, dst: int, src: int, n: int):
-        if n > 64:
+        if n > 256:
             self.call_rt(
                 "memcpy",
                 [
@@ -3404,6 +3508,11 @@ struct X:
         let md = self.addr(dst, 0, R10)
         let ms = self.addr(src, 0, R11)
         var i = 0
+        # (a big one 16 bytes at a time, through xmm0: ra.br gives it no vreg)
+        while n > 64 and i + 16 <= n:
+            self.xrestore(0, moff(ms, i))
+            self.xsave(moff(md, i), 0)
+            i += 16
         while i + 8 <= n:
             self.mov_rm(RAX, moff(ms, i))
             self.mov_mr(moff(md, i), RAX)
@@ -3421,7 +3530,7 @@ struct X:
             self.store_sz(moff(md, i), RAX, 1)
 
     fn zero_mem(ref self, dst: int, n: int):
-        if n > 64:
+        if n > 256:
             self.call_rt(
                 "memset",
                 [
@@ -3434,6 +3543,11 @@ struct X:
         let md = self.addr(dst, 0, R10)
         self.rr(0, 0, 49, RAX, RAX)
         var i = 0
+        if n > 64:
+            self.xzero(0)
+        while n > 64 and i + 16 <= n:
+            self.xsave(moff(md, i), 0)
+            i += 16
         while i + 8 <= n:
             self.mov_mr(moff(md, i), RAX)
             i += 8
@@ -3937,13 +4051,14 @@ struct X:
                 self.norm(RAX, kd)
             self.st(RAX, x.d)
             return
-        # integer to integer
-        self.ld(RAX, x.a)
+        # integer to integer (in d's register, but for a bool)
+        let r = RAX if kd == K.Bool else self.dst(x.d)
+        self.ld(r, x.a)
         if kd == K.Bool:
             self.rr(0, 1, 133, RAX, RAX)
             self.setcc(CC_NE, RAX)
-        self.norm(RAX, kd)
-        self.st(RAX, x.d)
+        self.norm(r, kd)
+        self.st(r, x.d)
 
 # ================================================================ module
 

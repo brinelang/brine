@@ -625,12 +625,63 @@ static void br_heap_exit(void) {
 #define free(p) br_free(p)
 #define realloc(p, n) br_realloc(p, n)
 
+/* The thread's own block: what native code's `thread_ptr()` reads (fs:0 on
+   Linux x86-64, tpidr_el0 on AArch64, the TEB on Windows). */
+static void *br_thread_ptr(void) {
+#if defined(_WIN32)
+    return NtCurrentTeb();
+#elif defined(__linux__) && defined(__x86_64__)
+    void *p;
+    __asm__("mov %%fs:0, %0" : "=r"(p));
+    return p;
+#elif defined(__linux__) && defined(__aarch64__)
+    void *p;
+    __asm__("mrs %0, tpidr_el0" : "=r"(p));
+    return p;
+#else
+    return NULL;
+#endif
+}
+void *brine_x_thread_ptr(void) { return br_thread_ptr(); }
+
 void *brine_alloc(int64_t n) { return br_alloc(n > 0 ? (size_t)n : 1); }
 void brine_free(void *p) { br_free(p); }
 /* live string/array count, reported at exit when BRINE_LEAKCHECK is set */
 static int64_t br_live;
 /* counted only for BRINE_LEAKCHECK: a locked add on every allocation costs */
 static bool br_leakcheck;
+
+/* What native code's inline allocation (runtime/rt.br) reads: a thread's
+   heap is at its thread pointer plus th_off, or at the address stored there
+   when th_ind; the heap's range; each chunk's size class. fast is 0 when
+   every allocation must go through the functions here. */
+typedef struct {
+    int64_t th_off, th_ind;
+    uintptr_t base, end;
+    uint8_t *classes;
+    int64_t fast;
+} brine_heap_info_t;
+brine_heap_info_t brine_heap_info;
+static void br_heap_info_init(void) {
+    brine_heap_info_t *hi = &brine_heap_info;
+    hi->base = br_heap_base;
+    hi->end = br_heap_end;
+    hi->classes = br_chunk_class;
+    if (!br_heap_base || br_leakcheck) return;
+#if defined(_WIN32) && !defined(__clang__)
+    if (br_th_key >= 64) return;
+    TEB *t = (TEB *)NtCurrentTeb();
+    hi->th_off = (int64_t)((char *)&t->TlsSlots[br_th_key] - (char *)t);
+    hi->th_ind = 1;
+#elif defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
+    /* the executable's thread-locals are at the same offset in every thread */
+    hi->th_off = (int64_t)((char *)&br_th - (char *)br_thread_ptr());
+    hi->th_ind = 0;
+#else
+    return;
+#endif
+    hi->fast = 1;
+}
 #define BR_LIVE(d) (BR_UNLIKELY(br_leakcheck) ? (void)__atomic_fetch_add(&br_live, (d), __ATOMIC_RELAXED) : (void)0)
 void brine_str_free(brine_str *s) {
     BR_LIVE(-1);
@@ -5391,6 +5442,7 @@ void brine_rt_init(int argc, char **argv) {
 #endif
     br_leakcheck = getenv("BRINE_LEAKCHECK") != NULL;
     br_heap_init();
+    br_heap_info_init();
     br_argc = argc;
     br_argv = argv;
 #ifdef _WIN32

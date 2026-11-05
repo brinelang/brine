@@ -693,6 +693,17 @@ fn fold(x: Inst, vk: [K], st: [int], val: [int]) -> (int, int):
                 case _:
                     r = a >= b
             return (CONST, 1 if r else 0)
+        case Op.Call:
+            # the runtime's checked negation (`-B` for a constant B)
+            if x.b != 1 or not x.s.starts_with("brine_neg_") or len(x.args) != 2:
+                return (BOT, 0)
+            let v = x.args[0]
+            if vk[v] != k or st[v] != CONST:
+                return (st[v] if st[v] == TOP else BOT, 0)
+            let a = num(val[v], k)
+            if a == kmin(k):
+                return (BOT, 0)
+            return (CONST, wrapk(-a, k))
         case _:
             return (BOT, 0)
     # binary arithmetic of kind k (checks: a and b of kind k too)
@@ -1362,6 +1373,85 @@ fn empty_ifs(ref sf: SF) -> bool:
                 changed = true
                 break
     return changed
+
+# A block that only picks a bool and branches on it (the end of `a and b`, `a
+# or b`): a predecessor whose value for it is known (a constant, or the
+# condition it branched there on) goes straight to where that leads; one that
+# jumps there branches on its value itself, which native code fuses with the
+# comparison that made it. The bool is then never made. True if it changed
+# any.
+fn bool_ifs(ref sf: SF) -> bool:
+    let nv = len(sf.f.vk)
+    var nuse = [0] * nv
+    var cval = [-1] * nv
+    for b in sf.bs:
+        for x in b.code:
+            for u in uses(x):
+                nuse[u] += 1
+            if x.op == Op.Const and x.d >= 0 and (x.n == 0 or x.n == 1):
+                cval[x.d] = x.n
+    var changed = false
+    # (a block changed once waits for relink: its successors are stale)
+    var touched = [false] * len(sf.bs)
+    for b in 0..len(sf.bs):
+        if len(sf.bs[b].code) != 2:
+            continue
+        let ph = sf.bs[b].code[0]
+        let t = sf.bs[b].code[1]
+        let bl = sf.bs[b].label
+        if ph.op != Op.Phi or (t.op != Op.Br and t.op != Op.BrNot) or t.a != ph.d:
+            continue
+        if nuse[ph.d] != 1 or t.n == bl or t.c == bl:
+            continue
+        for p in sf.bs[b].pred:
+            if touched[p]:
+                continue
+            let pl = sf.bs[p].label
+            let v = phi_value(ph, pl)
+            let m = len(sf.bs[p].code)
+            let tp = sf.bs[p].code[m - 1]
+            # v's value on this edge: 1, 0, or -1 when not known
+            var known = cval[v]
+            if (tp.op == Op.Br or tp.op == Op.BrNot) and tp.a == v and tp.n != tp.c:
+                known = 1 if (tp.n == bl) == (tp.op == Op.Br) else 0
+            if known >= 0:
+                let dest = t.n if (known == 1) == (t.op == Op.Br) else t.c
+                if not edge_ok(sf, p, dest):
+                    continue
+                sf.bs[p].code[m - 1] = retarget(tp, bl, dest)
+                add_entries(ref sf, dest, pl, bl)
+                touched[p] = true
+                changed = true
+            elif tp.op == Op.Jmp:
+                if not edge_ok(sf, p, t.n) or not edge_ok(sf, p, t.c):
+                    continue
+                var y = t
+                y.a = v
+                sf.bs[p].code[m - 1] = y
+                add_entries(ref sf, t.n, pl, bl)
+                add_entries(ref sf, t.c, pl, bl)
+                touched[p] = true
+                changed = true
+    return changed
+
+# Can block p get an edge to label l? Not when it has one already and l's phis
+# would then need two values for p.
+fn edge_ok(sf: SF, p: int, l: int) -> bool:
+    let s = sf.lab[l]
+    if s not in sf.bs[p].succ:
+        return true
+    return len(sf.bs[s].code) == 0 or sf.bs[s].code[0].op != Op.Phi
+
+# The phis of label l take, on a new edge from label pl, what they take on
+# the edge from label bl.
+fn add_entries(ref sf: SF, l: int, pl: int, bl: int):
+    let s = sf.lab[l]
+    for j in 0..len(sf.bs[s].code):
+        let x = sf.bs[s].code[j]
+        if x.op != Op.Phi:
+            break
+        sf.bs[s].code[j].args.push(pl)
+        sf.bs[s].code[j].args.push(phi_value(x, bl))
 
 # Does the block do nothing but jump to label l?
 fn skips_to(b: Block, l: int) -> bool:
@@ -2981,5 +3071,7 @@ fn optimize(f: Func, vw: int) -> (Func, [KFunc]):
     if vw >= 4:
         ks.extend(lane_loops(ref sf, f"brl_{f.name}"))
     rev_first(ref sf)
+    while bool_ifs(ref sf):
+        relink(ref sf)
     dce(ref sf)
     return (from_ssa(sf), ks)

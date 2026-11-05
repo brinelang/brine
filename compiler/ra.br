@@ -80,8 +80,29 @@ fn inline_call(x: Inst) -> bool:
         or (n == "brine_bytes_rev" and x.d >= 0)
         or (n == "brine_bytes_rev0" and x.d >= 0)
         or (n == "brine_bswap_u64" and x.d >= 0)
+        or (n == "brine_thread_ptr" and x.d >= 0)
         or (int_div_rt(n) and len(x.args) == 2 and x.d >= 0)
     )
+
+# Does x64.br set x's arguments in parallel (do_call), so that its integer
+# arguments can be in any register? (Not the calls it writes out inline.)
+fn par_args(x: Inst) -> bool:
+    if x.op == Op.CallInd:
+        return true
+    if x.op != Op.Call or inline_call(x):
+        return false
+    if x.b == 1 and x.d >= 0:
+        let n = x.s
+        if (
+            n == "brine_bytes_rotl"
+            or n == "brine_bytes_copy"
+            or n == "brine_f_sqrt"
+            or n == "brine_f_sqrtf"
+        ):
+            return false
+        if int_div_rt(n):
+            return false
+    return true
 
 # Does the code for x call anything (and so change the caller-saved registers)?
 fn callish(x: Inst, vk: [K]) -> bool:
@@ -90,7 +111,7 @@ fn callish(x: Inst, vk: [K]) -> bool:
     if x.op == Op.CallInd or x.op == Op.Unreachable:
         return true
     if x.op == Op.Copy or x.op == Op.Zero:
-        return x.n > 64
+        return x.n > 256
     if x.d >= 0 and (vk[x.d].is_wide() or (x.op == Op.Rem and vk[x.d].is_float())):
         return true
     for v in reads(x, len(vk)):
@@ -331,9 +352,11 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool, cold: {str: bo
                 if two_address(x, f.vk) and ci[x.b] >= 0 and isf[ci[x.b]] == isf[cd]:
                     add_edge(ref mat, ref adj, wn, cd, ci[x.b])
             let rs = reads_x(x, nv, ea, eb)
-            # a slow path's integer arguments can be in any register (x64.br
-            # sets them in an order that reads each before it is changed)
+            # a call's integer arguments can be in any register (x64.br sets
+            # them in an order that reads each before it is changed), r10 and
+            # r11 too unless it calls through r11
             let slow = x.op == Op.Call and x.s in cold
+            let pa = par_args(x)
             if not keeps_r10(x, f.vk):
                 for k in 0..wn:
                     var wd = live[k]
@@ -344,7 +367,7 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool, cold: {str: bo
                 if cd >= 0:
                     nor10[cd] = true
                 for u in rs:
-                    if ci[u] >= 0 and (not slow or isf[ci[u]]):
+                    if ci[u] >= 0 and (not pa or x.op != Op.Call or isf[ci[u]]):
                         nor10[ci[u]] = true
             if callish(x, f.vk):
                 var fl: [int] = []
@@ -367,7 +390,7 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool, cold: {str: bo
                     fcalls.push(i)
                     flive.push(fl)
                 for u in rs:
-                    if ci[u] >= 0 and (not slow or isf[ci[u]]):
+                    if ci[u] >= 0 and (not pa or isf[ci[u]]):
                         noarg[ci[u]] = true
             for u in rs:
                 let j = ci[u]
@@ -375,13 +398,14 @@ fn allocate(f: Func, ok: [bool], ea: [int], eb: [int], win: bool, cold: {str: bo
                     live[j >> 6] |= 1 << (j & 63)
             i -= 1
         if b == 0:
-            # the parameters are all set on entry
+            # the parameters are all set on entry (an integer one in any
+            # register: x64.br sets them in parallel)
             for p in 0..f.nparams:
                 let cp = ci[p]
                 if cp < 0:
                     continue
-                noarg[cp] = true
-                nor10[cp] = true
+                if isf[cp]:
+                    noarg[cp] = true
                 live[cp >> 6] |= 1 << (cp & 63)
             for p in 0..f.nparams:
                 let cp = ci[p]
