@@ -1235,6 +1235,30 @@ struct X:
             if x.s == "brine_bytes_copy":
                 self.bytes_copy(x)
                 return
+            if x.s == "brine_neg_i128":
+                # neg rax; adc rdx, 0; neg rdx. The runtime (to panic) when
+                # that overflows, and also for -(2^127 - n): rare, and right
+                let ma = self.vm(x.args[0])
+                self.mov_rm(RAX, ma)
+                self.mov_rm(RDX, moff(ma, 8))
+                self.rr(0, 1, 247, 3, RAX)
+                self.alu_ri(ADC, RDX, 0)
+                self.rr(0, 1, 247, 3, RDX)
+                let j = self.j32(CC_O)
+                self.st(RAX, x.d)
+                self.mov_mr(moff(self.vm(x.d), 8), RDX)
+                let e = self.jmp32()
+                self.here32(j)
+                self.call_rt(
+                    "brine_x_neg_i128",
+                    [
+                        CArg(how=A_ADDR, v=x.d, fl=0),
+                        CArg(how=A_ADDR, v=x.args[0], fl=0),
+                        CArg(how=A_VAL, v=x.args[1], fl=0)
+                    ]
+                )
+                self.here32(e)
+                return
             if x.s == "brine_bswap_u64":
                 self.ld(RAX, x.args[0])
                 self.bswap(RAX)
@@ -3309,6 +3333,21 @@ struct X:
             kind = S_MUL
         if k.is_wide():
             let nm = ["add", "sub", "mul"][kind]
+            # add and subtract inline, calling the runtime (to panic) only
+            # when they overflow
+            var e = -1
+            if kind != S_MUL:
+                let ma = self.vm(x.a)
+                let mb = self.vm(x.b)
+                self.mov_rm(RAX, ma)
+                self.mov_rm(RDX, moff(ma, 8))
+                self.alu_rm(ADD if kind == S_ADD else SUB, RAX, mb)
+                self.alu_rm(ADC if kind == S_ADD else SBB, RDX, moff(mb, 8))
+                let j = self.j32(CC_O if k.is_signed() else CC_B)
+                self.st(RAX, x.d)
+                self.mov_mr(moff(self.vm(x.d), 8), RDX)
+                e = self.jmp32()
+                self.here32(j)
             self.call_rt(
                 f"brine_x_{nm}_{w128(k)}",
                 [
@@ -3318,6 +3357,8 @@ struct X:
                     CArg(how=A_VAL, v=x.c, fl=0)
                 ]
             )
+            if e >= 0:
+                self.here32(e)
             return
         let signed = k.is_signed()
         # in d's register, when that isn't b's or the panic's location's
