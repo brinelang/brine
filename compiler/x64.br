@@ -24,6 +24,7 @@ from ir import KO_MOV, KO_LD, KO_LDP, KO_LDH, KO_ST, KO_STH, KO_OP, KO_SQRT, KO_
 from ir import KO_CONST, KO_CONST2, KO_SPILL, KO_FILL, KO_ARG, KO_CHK, PFX_PD, PFX_SD
 from ir import KPath, KV_BCF, KV_BCI, KV_J, KV_JINC, KV_LD, KV_ST, KV_MOV, KV_FOP, KV_IOP, KV_SHI
 from ir import KV_CVT, KV_RLD, KV_RED, KV_RST
+from ir import KL_LD, KL_ST, KL_MOV, KL_OP, KL_CMP, KL_SEL, KL_NOT, KL_ANY
 from opt import promote, reads, switches, inline_small
 import ssa
 import ra
@@ -1782,7 +1783,7 @@ struct X:
             self.fsave_at.push(-off)
         let slots = off
         off += 16 * k.nslots
-        if k.loop:
+        if k.loop or k.lanes:
             # rbx, rcx and rdx around cpuid, then 128 bytes that hold 64
             # aligned ones for the lanes of sums
             off += 32 + 128
@@ -1811,6 +1812,8 @@ struct X:
             self.xsave(mrb(self.fsave_at[i]), x)
         if k.loop:
             self.kernel_loop(k, gp, slots)
+        elif k.lanes:
+            self.kernel_lanes(k, gp[0], slots)
         else:
             for o in k.ops:
                 self.kop(o, gp, slots)
@@ -1963,6 +1966,68 @@ struct X:
                         self.rm(PFX_SD, 0, 3840 + o.n, o.a, mreg(R11, 8 * i), 0)
                     else:
                         self.vex_m(1, 3, 0, o.n, o.a, o.a, mreg(R11, 8 * i))
+
+    # A lane loop kernel (vlane.br), with AVX2; p holds the block.
+    fn kernel_lanes(ref self, k: KFunc, p: int, slots: int):
+        let t = k.paths[0]
+        self.cpu_level(slots)
+        self.alu_ri(CMP, RAX, 3)
+        let none = self.j32(CC_B)
+        for o in t.pre:
+            self.kl(o, p)
+        let top = self.pos()
+        var outs: [int] = []
+        for o in t.body:
+            if o.op == KL_ANY:
+                # vmovmskpd eax, a; test eax, eax; jz out
+                self.vex_r(1, 1, 1, 80, RAX, 0, o.a)
+                self.rr(0, 0, 133, RAX, RAX)
+                outs.push(self.j32(CC_E))
+            else:
+                self.kl(o, p)
+        # jmp top
+        self.b(233)
+        self.b32(top - (self.pos() + 4))
+        for at in outs:
+            self.here32(at)
+        for o in t.post:
+            self.kl(o, p)
+        # vzeroupper
+        self.b(197)
+        self.b(248)
+        self.b(119)
+        self.here32(none)
+
+    # One operation of a lane loop kernel: 256-bit VEX, 66 prefix.
+    fn kl(ref self, o: KOp, p: int):
+        match o.op:
+            case KL_LD | KL_ST:
+                # vmovupd
+                self.vex_m(1, 1, 1, 16 if o.op == KL_LD else 17, o.a, 0, mreg(p, 8 * o.n))
+            case KL_MOV:
+                # vmovapd
+                self.vex_r(1, 1, 1, 40, o.a, 0, o.b)
+            case KL_NOT:
+                # vpxor with all ones
+                self.vex_m(1, 1, 1, 239, o.a, o.b, mrip(self.zconst_sym(-1, 0), 0))
+            case KL_OP:
+                self.vex_rm(o.n >> 8, o.n & 255, o.a, o.b, o.m, p)
+            case KL_CMP:
+                # vcmppd a, b, m, n
+                self.vex_rm(1, 194, o.a, o.b, o.m, p)
+                self.b(o.n)
+            case _:
+                # KL_SEL: vblendvpd a, b, m, n
+                self.vex_rm(3, 75, o.a, o.b, o.m, p)
+                self.b(o.n << 4)
+
+    # VEX.256.66 op a, b, m, with m a ymm register, or 16 + the word of the
+    # block at p it is
+    fn vex_rm(ref self, map: int, op: int, a: int, b: int, m: int, p: int):
+        if m >= 16:
+            self.vex_m(map, 1, 1, op, a, b, mreg(p, 8 * (m - 16)))
+        else:
+            self.vex_r(map, 1, 1, op, a, b, m)
 
     # rax = the CPU level (see cpu_sym), found with cpuid the first time.
     # rbx, rcx and rdx are kept in the 24 bytes below `slots`.

@@ -1,0 +1,386 @@
+# Lane loops for the x86-64 backend. Release builds interleave independent
+# iterations of a loop (jam.br): four copies of its work run in lockstep,
+# each with a mask that says whether its iteration is still going, and each
+# of its updates in a branch of its own that the mask decides. ssa.br finds
+# such innermost loops where the four copies do the same operations, each on
+# its own values, and gives them a kernel, called before the loop, that runs
+# the four as one AVX2 vector: the updates become blends, and the loop goes
+# on while any lane's mask is set. Every lane does the operations the loop
+# would, so the results are the same bits. When the kernel is done, the loop
+# tests once more that nothing is left and goes on after it. The x86-64
+# backend interleaves 8 iterations, two vectors, so that two chains of
+# dependent operations overlap.
+#
+# The kernel's one parameter points at a block of 8-byte words: 4 for each of
+# the loop's variables (their values before, and the kernel writes the values
+# it stopped at) and 4 for each value from outside the loop it reads.
+# Booleans are -1 (true) or 0 there. Without AVX2 the kernel does nothing.
+
+from ir import KOp, KFunc, KPath, KL_LD, KL_ST, KL_MOV, KL_OP, KL_CMP, KL_SEL, KL_NOT, KL_ANY
+
+# The operations (VOp.op). d = a op b, on doubles:
+const V_FADD = 0
+const V_FSUB = 1
+const V_FMUL = 2
+const V_FDIV = 3
+# on 64-bit integers and on booleans:
+const V_IADD = 4
+const V_ISUB = 5
+const V_AND = 6
+const V_OR = 7
+const V_XOR = 8
+# d = not a
+const V_NOT = 9
+# d = a compared with b: doubles with the vcmppd predicate p; signed integers
+# a > b and a == b, then not that if p is 1
+const V_FCMP = 10
+const V_IGT = 11
+const V_IEQ = 12
+# d = b in the lanes where a is set, else c
+const V_SEL = 13
+
+struct VOp:
+    op: int
+    p: int
+    d: int
+    a: int
+    b: int
+    c: int
+
+# Values are numbered: the loop's variables 0..nvar - 1 (their values at the
+# top of an iteration), then ninv values from outside the loop, then what the
+# operations make. Value v is at word 4v of the block.
+struct Lanes:
+    nvar: int
+    ninv: int
+    # the operations up to the loop's test, the value it tests, the rest
+    head: [VOp]
+    test: int
+    body: [VOp]
+    # each variable's value for the next iteration
+    next: [int]
+
+fn nwords(l: Lanes) -> int:
+    return 4 * (l.nvar + l.ninv)
+
+fn no_kernel() -> (bool, KFunc):
+    return (
+        false,
+        KFunc(
+            name="",
+            narr=0,
+            nflt=0,
+            has_ret=false,
+            nslots=0,
+            regs=[],
+            ops=[],
+            loop=false,
+            paths=[],
+            lanes=false
+        )
+    )
+
+# The registers: the variables keep theirs, ymm0 up, but those `spilled`,
+# which stay in the block; other values get one from where they are made to
+# their last read.
+struct RA:
+    nvar: int
+    ninv: int
+    spilled: [bool]
+    reg: [int]
+    last: [int]
+    # the variable whose register a value takes (it is that variable's next
+    # value, made after its last read), else -1
+    into: [int]
+    free: [bool]
+    used: [bool]
+    out: [KOp]
+    ok: bool
+
+fn kop(op: int, a: int, b: int, n: int, m: int) -> KOp:
+    return KOp(op=op, a=a, b=b, n=n, m=m)
+
+# whether v is read from the block
+fn in_mem(ra: RA, v: int) -> bool:
+    if v < ra.nvar:
+        return ra.spilled[v]
+    return v < ra.nvar + ra.ninv
+
+fn take(ref ra: RA) -> int:
+    for r in 0..16:
+        if ra.free[r]:
+            ra.free[r] = false
+            ra.used[r] = true
+            return r
+    ra.ok = false
+    return 0
+
+# v as an operand that can be in memory
+fn src(ra: RA, v: int) -> int:
+    if in_mem(ra, v):
+        return 16 + 4 * v
+    return ra.reg[v]
+
+# v in a register: values in the block are loaded into one, freed after
+# the operation (in `tmps`)
+fn in_reg(ref ra: RA, v: int, ref tmps: [int]) -> int:
+    if in_mem(ra, v):
+        let t = take(ref ra)
+        ra.out.push(kop(KL_LD, t, 0, 4 * v, 0))
+        tmps.push(t)
+        return t
+    return ra.reg[v]
+
+# Frees the registers of operands last read at position at, then gives d one.
+fn result(ref ra: RA, o: VOp, at: int, tmps: [int]) -> int:
+    for t in tmps:
+        ra.free[t] = true
+    for v in [o.a, o.b, o.c]:
+        if v >= ra.nvar + ra.ninv and ra.last[v] == at and ra.reg[v] >= 0:
+            ra.free[ra.reg[v]] = true
+            ra.reg[v] = -1
+    if ra.into[o.d] >= 0:
+        ra.reg[o.d] = ra.reg[ra.into[o.d]]
+        return ra.reg[o.d]
+    let r = take(ref ra)
+    ra.reg[o.d] = r
+    if ra.last[o.d] < 0:
+        ra.free[r] = true
+    return r
+
+# The opcode, plus 256 times its map (1: 0F, 2: 0F38).
+fn opcode(op: int) -> int:
+    match op:
+        case V_FADD:
+            # vaddpd
+            return 256 + 88
+        case V_FSUB:
+            return 256 + 92
+        case V_FMUL:
+            return 256 + 89
+        case V_FDIV:
+            return 256 + 94
+        case V_IADD:
+            # vpaddq
+            return 256 + 212
+        case V_ISUB:
+            return 256 + 251
+        case V_AND:
+            return 256 + 219
+        case V_OR:
+            return 256 + 235
+        case V_XOR:
+            return 256 + 239
+        case V_IGT:
+            # vpcmpgtq
+            return 512 + 55
+        case _:
+            # vpcmpeqq
+            return 512 + 41
+
+fn commutes(op: int) -> bool:
+    return (
+        op == V_FADD
+        or op == V_FMUL
+        or op == V_IADD
+        or op == V_AND
+        or op == V_OR
+        or op == V_XOR
+        or op == V_IEQ
+    )
+
+fn step(ref ra: RA, o: VOp, at: int):
+    var tmps: [int] = []
+    match o.op:
+        case V_NOT:
+            let a = in_reg(ref ra, o.a, ref tmps)
+            let d = result(ref ra, o, at, tmps)
+            ra.out.push(kop(KL_NOT, d, a, 0, 0))
+        case V_SEL:
+            let mask = in_reg(ref ra, o.a, ref tmps)
+            let e = in_reg(ref ra, o.c, ref tmps)
+            let t = src(ra, o.b)
+            let d = result(ref ra, o, at, tmps)
+            ra.out.push(kop(KL_SEL, d, e, mask, t))
+        case V_FCMP:
+            let a = in_reg(ref ra, o.a, ref tmps)
+            let b = src(ra, o.b)
+            let d = result(ref ra, o, at, tmps)
+            ra.out.push(kop(KL_CMP, d, a, o.p, b))
+        case _:
+            var x = o.a
+            var y = o.b
+            if commutes(o.op) and in_mem(ra, x) and not in_mem(ra, y):
+                x = o.b
+                y = o.a
+            let a = in_reg(ref ra, x, ref tmps)
+            let b = a if y == x else src(ra, y)
+            let d = result(ref ra, o, at, tmps)
+            ra.out.push(kop(KL_OP, d, a, opcode(o.op), b))
+            if (o.op == V_IGT or o.op == V_IEQ) and o.p == 1:
+                ra.out.push(kop(KL_NOT, d, d, 0, 0))
+
+# The kernel, or ok false when the loop needs more than 16 registers even
+# with its variables in the block. Those first in the block are the ones the
+# test doesn't depend on, read least.
+fn compile(l: Lanes, name: str) -> (bool, KFunc):
+    var reads = [0] * l.nvar
+    var in_head = [false] * l.nvar
+    for i, o in enumerate(l.head):
+        for v in [o.a, o.b, o.c]:
+            if v >= 0 and v < l.nvar:
+                in_head[v] = true
+    if l.test < l.nvar:
+        in_head[l.test] = true
+    for o in l.body:
+        for v in [o.a, o.b, o.c]:
+            if v >= 0 and v < l.nvar:
+                reads[v] += 1
+    var order: [int] = []
+    for pass_head in [false, true]:
+        var left: [int] = []
+        for g in 0..l.nvar:
+            if in_head[g] == pass_head:
+                left.push(g)
+        while len(left) > 0:
+            var best = 0
+            for i, g in enumerate(left):
+                if reads[g] < reads[left[best]]:
+                    best = i
+            order.push(left[best])
+            var rest: [int] = []
+            for i, g in enumerate(left):
+                if i != best:
+                    rest.push(g)
+            left = rest
+    for n in 0..l.nvar + 1:
+        var sp = [false] * l.nvar
+        for i in 0..n:
+            sp[order[i]] = true
+        let (ok, k) = attempt(l, name, sp)
+        if ok:
+            return (true, k)
+    return no_kernel()
+
+fn attempt(l: Lanes, name: str, spilled: [bool]) -> (bool, KFunc):
+    var ops: [VOp] = []
+    for o in l.head:
+        ops.push(o)
+    for o in l.body:
+        ops.push(o)
+    let base = l.nvar + l.ninv
+    let nval = base + len(ops)
+    let end = 2 * len(ops)
+    var last = [-1] * nval
+    for i, o in enumerate(ops):
+        if o.d != base + i:
+            return no_kernel()
+        for v in [o.a, o.b, o.c]:
+            if v >= 0:
+                last[v] = 2 * i
+    if len(l.body) == 0 or (l.test < base and l.test >= l.nvar):
+        return no_kernel()
+    last[l.test] = max(last[l.test], 2 * len(l.head) - 1)
+    for v in l.next:
+        last[v] = end
+    # where each variable is last read, and how often each value is a next one
+    var gl = [-1] * l.nvar
+    for i, o in enumerate(ops):
+        for v in [o.a, o.b, o.c]:
+            if v >= 0 and v < l.nvar:
+                gl[v] = 2 * i
+    if l.test < l.nvar:
+        gl[l.test] = max(gl[l.test], 2 * len(l.head) - 1)
+    var nexts = [0] * nval
+    for v in l.next:
+        nexts[v] += 1
+    # only body values: a header value would replace the variable before the
+    # test, and the scalar loop resumes from the variables when it fails
+    var into = [-1] * nval
+    for g, v in enumerate(l.next):
+        if (
+            v >= base + len(l.head)
+            and not spilled[g]
+            and nexts[v] == 1
+            and nexts[g] == 0
+            and gl[g] <= 2 * (v - base)
+        ):
+            into[v] = g
+    var ra = RA(
+        nvar=l.nvar,
+        ninv=l.ninv,
+        spilled=spilled,
+        reg=[-1] * nval,
+        last=last,
+        into=into,
+        free=[true] * 16,
+        used=[false] * 16,
+        out=[],
+        ok=true
+    )
+    var pre: [KOp] = []
+    var post: [KOp] = []
+    for g in 0..l.nvar:
+        if not spilled[g]:
+            let r = take(ref ra)
+            ra.reg[g] = r
+            pre.push(kop(KL_LD, r, 0, 4 * g, 0))
+            post.push(kop(KL_ST, r, 0, 4 * g, 0))
+    for i, o in enumerate(ops):
+        if i == len(l.head):
+            var tmps: [int] = []
+            let t = in_reg(ref ra, l.test, ref tmps)
+            ra.out.push(kop(KL_ANY, t, 0, 0, 0))
+            for r in tmps:
+                ra.free[r] = true
+            if l.test >= base and last[l.test] == 2 * i - 1:
+                ra.free[ra.reg[l.test]] = true
+        step(ref ra, o, 2 * i)
+    # the next values: copies of other variables first, so no variable is
+    # written before it's read
+    var copy = [-1] * l.nvar
+    for g, v in enumerate(l.next):
+        if v != g and v < l.nvar:
+            copy[g] = take(ref ra)
+            if spilled[v]:
+                ra.out.push(kop(KL_LD, copy[g], 0, 4 * v, 0))
+            else:
+                ra.out.push(kop(KL_MOV, copy[g], ra.reg[v], 0, 0))
+    for g, v in enumerate(l.next):
+        if v == g:
+            continue
+        var r = -1
+        if v < l.nvar:
+            r = copy[g]
+        elif v < base:
+            r = take(ref ra)
+            ra.out.push(kop(KL_LD, r, 0, 4 * v, 0))
+            ra.free[r] = true
+        else:
+            r = ra.reg[v]
+        if spilled[g]:
+            ra.out.push(kop(KL_ST, r, 0, 4 * g, 0))
+        elif r != ra.reg[g]:
+            ra.out.push(kop(KL_MOV, ra.reg[g], r, 0, 0))
+    if not ra.ok:
+        return no_kernel()
+    var regs: [int] = []
+    for r in 0..16:
+        if ra.used[r]:
+            regs.push(r)
+    let p = KPath(w=4, pre=pre, body=ra.out, post=post)
+    return (
+        true,
+        KFunc(
+            name=name,
+            narr=0,
+            nflt=0,
+            has_ret=false,
+            nslots=0,
+            regs=regs,
+            ops=[],
+            loop=false,
+            paths=[p],
+            lanes=true
+        )
+    )
