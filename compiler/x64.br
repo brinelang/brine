@@ -85,6 +85,9 @@ const F_NONE = 0
 const F_CONST = 1
 const F_SLOT = 2
 const F_GLOBAL = 3
+# an element address used only by loads and stores just after it, which
+# address [a + b * n] themselves (fval: the Elem's index in the code)
+const F_ELEM = 4
 
 # call argument sources
 const A_VAL = 0
@@ -787,6 +790,11 @@ struct X:
     # The memory at pointer vreg p plus n; may load p into r.
     fn addr(ref self, p: int, n: int, r: int) -> Mem:
         let f = self.fold[p]
+        if f == F_ELEM:
+            let e = self.code[self.fval[p]]
+            let base = self.use(r, e.a)
+            let ix = self.use(R11, e.b)
+            return Mem(base=base, index=ix, scale=e.n, disp=n, sym=-1)
         if f == F_SLOT:
             return self.smem(self.fval[p], n)
         if f == F_GLOBAL and self.direct(self.fval[p]):
@@ -1099,6 +1107,8 @@ struct X:
                 elif x.op == Op.Global:
                     self.fold[v] = F_GLOBAL
                     self.fval[v] = self.sym_ref(x.s)
+        if not self.dbg:
+            self.fold_elems(f, ndef)
         # (after the folding: it tells which indirect calls return 128 bits)
         var nstack = 0
         for x in f.code:
@@ -1538,6 +1548,54 @@ struct X:
 
     # Keeps the most used integer vregs (uses in loops count more) in
     # callee-saved registers for the whole function.
+    # Elems that become F_ELEM: scale 1, 2, 4 or 8, every use the address of
+    # a load or store in the same block soon after, with no write to the
+    # Elem's operands in between.
+    fn fold_elems(ref self, f: Func, ndef: [int]):
+        let ncode = len(f.code)
+        let nv = len(f.vk)
+        for i in 0..ncode:
+            let x = f.code[i]
+            if x.op != Op.Elem or x.d < 0 or ndef[x.d] != 1 or self.fold[x.d] != F_NONE:
+                continue
+            if not (x.n == 1 or x.n == 2 or x.n == 4 or x.n == 8):
+                continue
+            if self.fold[x.a] != F_NONE or self.fold[x.b] != F_NONE or self.vk[x.b].is_wide():
+                continue
+            var need = self.nuse[x.d]
+            var ok = need > 0
+            var j = i + 1
+            while ok and need > 0:
+                if j >= ncode or j > i + 64:
+                    ok = false
+                    break
+                let y = f.code[j]
+                for u in reads(y, nv):
+                    if u != x.d:
+                        continue
+                    if (y.op == Op.Load or y.op == Op.Store) and y.a == x.d and y.b != x.d:
+                        need -= 1
+                    else:
+                        ok = false
+                if need > 0 and (
+                    y.op == Op.Label
+                    or y.op == Op.Jmp
+                    or y.op == Op.Br
+                    or y.op == Op.BrNot
+                    or y.op == Op.Switch
+                    or y.op == Op.Ret
+                    or y.d == x.a
+                    or y.d == x.b
+                ):
+                    ok = false
+                j += 1
+            if ok:
+                self.fold[x.d] = F_ELEM
+                self.fval[x.d] = i
+                # read again at each use
+                self.once[x.a] = false
+                self.once[x.b] = false
+
     fn alloc(ref self, f: Func, ndef: [int]):
         let nv = len(f.vk)
         var ok = [false] * nv
@@ -1566,7 +1624,15 @@ struct X:
                 )
             ):
                 ok[x.d] = false
-        let r = ra.allocate(f, ok, self.win)
+        # reads of an F_ELEM vreg read its Elem's operands
+        var ea = [-1] * nv
+        var eb = [-1] * nv
+        for v in 0..nv:
+            if self.fold[v] == F_ELEM:
+                let e = f.code[self.fval[v]]
+                ea[v] = e.a
+                eb[v] = e.b
+        let r = ra.allocate(f, ok, ea, eb, self.win)
         self.reg = r.reg
         self.freg = r.freg
         self.saved = r.saved

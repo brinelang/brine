@@ -1430,6 +1430,10 @@ fn speculatable(x: Inst, sf: SF, def_b: [int], def_i: [int]) -> bool:
         case _:
             return false
 
+# Is u the same on every iteration of the loop (made outside it, or hoisted)?
+fn inv(u: int, def_b: [int], inb: [bool], moved: [bool]) -> bool:
+    return not (def_b[u] >= 0 and inb[def_b[u]] and not moved[u])
+
 fn licm(ref sf: SF):
     preheaders(ref sf)
     var loops = find_loops(sf)
@@ -1482,8 +1486,16 @@ fn licm(ref sf: SF):
                         calls = true
                     case _:
                         pass
+        # 64-bit adds in the loop, to split element indexes (below)
+        var add_a = [-1] * len(sf.f.vk)
+        var add_b = [-1] * len(sf.f.vk)
+        for b in lp.body:
+            for x in sf.bs[b].code:
+                if x.op == Op.Add and sf.f.vk[x.d].size() == 8 and not sf.f.vk[x.d].is_float():
+                    add_a[x.d] = x.a
+                    add_b[x.d] = x.b
         var hoisted: [Inst] = []
-        var moved = [false] * nv
+        var moved = [false] * len(sf.f.vk)
         # in the loop's own order: an operand set earlier in it may move first
         let po = postorder(sf.bs)
         var j = len(po) - 1
@@ -1524,10 +1536,25 @@ fn licm(ref sf: SF):
                 if go:
                     hoisted.push(x)
                     moved[x.d] = true
-                else:
-                    if effect(x) and x.op != Op.Phi:
-                        blocked = true
-                    keep.push(x)
+                    continue
+                if effect(x) and x.op != Op.Phi:
+                    blocked = true
+                # `elem a + (x + y) * n` with a and x invariant is
+                # `elem (elem a + x * n) + y * n`, and the inner one moves out
+                if x.op == Op.Elem and x.n != 0 and add_a[x.b] >= 0 and inv(x.a, def_b, inb, moved):
+                    let p = add_a[x.b]
+                    let q = add_b[x.b]
+                    let ip = inv(p, def_b, inb, moved)
+                    if ip != inv(q, def_b, inb, moved):
+                        let t = len(sf.f.vk)
+                        sf.f.vk.push(sf.f.vk[x.d])
+                        moved.push(true)
+                        def_b.push(-1)
+                        def_i.push(-1)
+                        hoisted.push(mk(Op.Elem, t, x.a, p if ip else q, -1, x.n))
+                        keep.push(mk(Op.Elem, x.d, t, q if ip else p, -1, x.n))
+                        continue
+                keep.push(x)
             sf.bs[b].code = keep
         if len(hoisted) > 0:
             var pc = sf.bs[pre].code
