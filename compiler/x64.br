@@ -592,6 +592,12 @@ struct X:
             self.rr(0, 0, 3880, r, x)
 
     # an SSE instruction `op xmm x, v` (pfx: its mandatory prefix)
+    # xorps x, x: cvtsi2sd, cvtss2sd and sqrtsd keep x's upper bits, so without
+    # it each one waits for whatever last wrote x (a dependency across loop
+    # iterations)
+    fn xzero(ref self, x: int):
+        self.rr(0, 0, 3927, x, x)
+
     fn fop(ref self, pfx: int, op: int, x: int, v: int):
         let r = self.freg[v]
         if r < 0:
@@ -999,9 +1005,21 @@ struct X:
             # sqrtsd / sqrtss, into d's own register if it has one
             let fl = fl_of(self.vk[x.d])
             let r = max(self.freg[x.d], 0)
+            if self.freg[x.args[0]] != r:
+                self.xzero(r)
             self.fop(242 if fl == 1 else 243, 3921, r, x.args[0])
             self.fst(fl, x.d, r)
             return
+        if x.op == Op.Call and x.b == 1 and x.d >= 0:
+            if x.s == "brine_bytes_rev":
+                self.bytes_rev(x)
+                return
+            if x.s == "brine_bytes_rotl":
+                self.bytes_rotl(x)
+                return
+            if x.s == "brine_bytes_copy":
+                self.bytes_copy(x)
+                return
         var args: [CArg] = []
         let ind = x.op == Op.CallInd
         var name = x.s
@@ -2310,6 +2328,205 @@ struct X:
         if i < n:
             self.store_sz(moff(md, i), RAX, 1)
 
+    # ------------------------------------------------------------ byte idioms
+    # The loop idioms on arrays kept as bytes, as brine_rt.h does them: 16
+    # bytes in two registers, stored 8 at a time so that the loads after get
+    # the stores forwarded. Byte arrays have 16 spare bytes at the end.
+
+    fn jmp32(ref self) -> int:
+        self.b(233)
+        self.b32(0)
+        return self.pos() - 4
+
+    fn bswap(ref self, r: int):
+        self.b(72 | (r >> 3))
+        self.b(15)
+        self.b(200 + (r & 7))
+
+    fn not_r(ref self, r: int):
+        self.rr(0, 1, 247, 2, r)
+
+    # op [m], r (op: an ALU extension)
+    fn alu_mr(ref self, op: int, m: Mem, r: int):
+        self.rm(0, 1, (op << 3) | 1, r, m, 0)
+
+    # brine_bytes_rev(d, n, i, j): bytes i..j reversed when they're in bounds
+    # and at most 16; true then, or when i >= j. Without branches on k (it
+    # varies from call to call), in the scratch registers alone.
+    fn bytes_rev(ref self, x: Inst):
+        self.ld(RCX, x.args[2])
+        self.ld(RDX, x.args[3])
+        self.ld(R10, x.args[0])
+        self.ld(R11, x.args[1])
+        self.alu_rr(CMP, RCX, RDX)
+        let done = self.j32(CC_GE)
+        self.rr(0, 1, 133, RCX, RCX)
+        let f1 = self.j32(CC_S)
+        self.alu_rr(CMP, RDX, R11)
+        let f2 = self.j32(CC_GE)
+        # k = j - i, p = d + i
+        self.alu_rr(SUB, RDX, RCX)
+        self.alu_ri(CMP, RDX, 16)
+        let f3 = self.j32(CC_GE)
+        self.alu_rr(ADD, R10, RCX)
+        # the 16 bytes byte-swapped, shifted down cl = 8 * (15 - k) bits, are
+        # the new bytes 0..k
+        self.mov_ri(RCX, 15)
+        self.alu_rr(SUB, RCX, RDX)
+        self.shift_i(SHL, RCX, 3)
+        self.mov_rm(RAX, mreg(R10, 8))
+        self.bswap(RAX)
+        self.mov_rm(RDX, mreg(R10, 0))
+        self.bswap(RDX)
+        # Below 64, z = shrd(rax, rdx, cl) is the whole low half and
+        # y = (rdx >> cl) | (x_hi & ~(ones >> cl)) the high half; from 64 on,
+        # y (with x_lo) is the low half and the high half stays.
+        # shrd rax, rdx, cl
+        self.rr(0, 1, 4013, RDX, RAX)
+        self.shift_cl(SHR, RDX)
+        self.mov_ri(R11, -1)
+        self.shift_cl(SHR, R11)
+        self.not_r(R11)
+        self.test_cl64()
+        self.mov_rm(RCX, mreg(R10, 8))
+        # cmovne rcx, [p]
+        self.rm(0, 1, 3909, RCX, mreg(R10, 0), 0)
+        self.alu_rr(AND, R11, RCX)
+        self.alu_rr(OR, R11, RDX)
+        # from 64 on is k < 8 (k again, from i and j)
+        self.ld(RCX, x.args[3])
+        self.ld(RDX, x.args[2])
+        self.alu_rr(SUB, RCX, RDX)
+        self.alu_ri(CMP, RCX, 8)
+        self.cmov(CC_L, RAX, R11)
+        # cmovl r11, [p + 8]
+        self.rm(0, 1, 3916, R11, mreg(R10, 8), 0)
+        self.mov_mr(mreg(R10, 0), RAX)
+        self.mov_mr(mreg(R10, 8), R11)
+        self.idiom_end(x, [done], [f1, f2, f3])
+
+    # test cl, 64: is a 128-bit shift by cl one of 64 or more?
+    fn test_cl64(ref self):
+        self.b(246)
+        self.b(193)
+        self.b(64)
+
+    fn cmov(ref self, cc: int, d: int, s: int):
+        self.rr(0, 1, 3904 + cc, d, s)
+
+    # d = 1 after the (rel32) jumps in `ok`, 0 after those in `fail`
+    fn idiom_end(ref self, x: Inst, ok: [int], fail: [int]):
+        for j in ok:
+            self.here32(j)
+        self.mov_ri(RAX, 1)
+        let e = self.jmp8()
+        for j in fail:
+            self.here32(j)
+        self.mov_ri(RAX, 0)
+        self.here8(e)
+        self.st(RAX, x.d)
+
+    # the runtime's version, for what the inline code doesn't do
+    fn idiom_call(ref self, x: Inst):
+        var args: [CArg] = []
+        for v in x.args:
+            args.push(CArg(how=A_VAL, v=v, fl=0))
+        self.call_rt("brine_x_" + x.s[6:], args)
+        self.store_ret(x.d)
+
+    # brine_bytes_rotl(d, n, lo, hi): t = d[lo]; d[lo..hi] = d[lo + 1..=hi];
+    # d[hi] = t. Also a call to ra.br.
+    fn bytes_rotl(ref self, x: Inst):
+        self.ld(R10, x.args[0])
+        self.ld(R11, x.args[1])
+        self.ld(RAX, x.args[2])
+        self.ld(RDX, x.args[3])
+        self.alu_rr(CMP, RAX, RDX)
+        let f1 = self.j32(CC_G)
+        self.rr(0, 1, 133, RAX, RAX)
+        let f2 = self.j32(CC_S)
+        self.alu_rr(CMP, RDX, R11)
+        let f3 = self.j32(CC_GE)
+        # k = hi - lo, p = d + lo
+        self.alu_rr(SUB, RDX, RAX)
+        self.alu_ri(CMP, RDX, 16)
+        let slow = self.j32(CC_GE)
+        self.alu_rr(ADD, R10, RAX)
+        self.mov_rr(RCX, RDX)
+        # rdx:rax = the 16 bytes; r9:r8 = them ^ them shifted down a byte
+        self.mov_rm(RAX, mreg(R10, 0))
+        self.mov_rm(RDX, mreg(R10, 8))
+        self.mov_rr(R8, RAX)
+        # shrd r8, rdx, 8
+        self.rr(0, 1, 4012, RDX, R8)
+        self.b(8)
+        self.alu_rr(XOR, R8, RAX)
+        self.mov_rr(R9, RDX)
+        self.shift_i(SHR, R9, 8)
+        self.alu_rr(XOR, R9, RDX)
+        # rax = (p[k] ^ p[0]) << (cl = 8k), what turns byte k into p[0]
+        self.rm(0, 0, 4022, RAX, Mem(base=R10, index=RCX, scale=1, disp=0, sym=-1), 0)
+        self.rm(0, 0, 4022, RDX, mreg(R10, 0), 0)
+        self.alu_rr(XOR, RAX, RDX)
+        self.shift_i(SHL, RCX, 3)
+        self.shift_cl(SHL, RAX)
+        # r11 = the mask of bytes below k in its half
+        self.mov_ri(R11, 1)
+        self.shift_cl(SHL, R11)
+        self.alu_ri(SUB, R11, 1)
+        # k >= 8: the low half changes by r8, the high by r9 & r11 | rax;
+        # else the low by r8 & r11 | rax, the high not at all
+        self.alu_rr(AND, R9, R11)
+        self.alu_rr(OR, R9, RAX)
+        self.alu_rr(AND, R11, R8)
+        self.alu_rr(OR, R11, RAX)
+        self.rr(0, 0, 49, RDX, RDX)
+        self.test_cl64()
+        self.cmov(CC_E, R8, R11)
+        self.cmov(CC_E, R9, RDX)
+        self.alu_mr(XOR, mreg(R10, 0), R8)
+        self.alu_mr(XOR, mreg(R10, 8), R9)
+        self.idiom_end(x, [], [f1, f2, f3])
+        let e = self.jmp32()
+        self.here32(slow)
+        self.idiom_call(x)
+        self.here32(e)
+
+    # brine_bytes_copy(db, nb, da, na, lo, hi): b[lo..hi] = a[lo..hi], inline
+    # when that runs to b's end and is at most 16 bytes
+    fn bytes_copy(ref self, x: Inst):
+        self.ld(RAX, x.args[4])
+        self.ld(RDX, x.args[5])
+        self.alu_rr(CMP, RAX, RDX)
+        let done = self.j32(CC_GE)
+        self.rr(0, 1, 133, RAX, RAX)
+        let f1 = self.j32(CC_S)
+        self.ld(R11, x.args[3])
+        self.alu_rr(CMP, RDX, R11)
+        let f2 = self.j32(CC_G)
+        self.ld(R11, x.args[1])
+        self.alu_rr(CMP, RDX, R11)
+        let f3 = self.j32(CC_G)
+        let s1 = self.j32(CC_NE)
+        self.mov_rr(RCX, RDX)
+        self.alu_rr(SUB, RCX, RAX)
+        self.alu_ri(CMP, RCX, 16)
+        let s2 = self.j32(CC_G)
+        self.ld(R10, x.args[2])
+        self.ld(R11, x.args[0])
+        let ma = Mem(base=R10, index=RAX, scale=1, disp=0, sym=-1)
+        let mb = Mem(base=R11, index=RAX, scale=1, disp=0, sym=-1)
+        self.mov_rm(RCX, ma)
+        self.mov_mr(mb, RCX)
+        self.mov_rm(RCX, moff(ma, 8))
+        self.mov_mr(moff(mb, 8), RCX)
+        self.idiom_end(x, [done], [f1, f2, f3])
+        let e = self.jmp32()
+        self.here32(s1)
+        self.here32(s2)
+        self.idiom_call(x)
+        self.here32(e)
+
     # ------------------------------------------------------------ conversions
     fn conv(ref self, x: Inst):
         let ks = self.vk[x.a]
@@ -2322,6 +2539,7 @@ struct X:
             return
         if ks.is_float() and kd.is_float():
             # cvtss2sd / cvtsd2ss
+            self.xzero(0)
             self.fop(243 if ks == K.F32 else 242, 3930, 0, x.a)
             self.fst(fl_of(kd), x.d, 0)
             return
@@ -2358,6 +2576,7 @@ struct X:
             return
         if kd.is_float():
             let pfx = 242 if kd == K.F64 else 243
+            self.xzero(0)
             if ks == K.U64 or ks == K.Ptr:
                 # u64 to float: halve (keeping the low bit) when the top bit is set
                 self.ld(RAX, x.a)

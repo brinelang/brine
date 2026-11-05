@@ -496,8 +496,8 @@ static inline void br_st128(char *p, br_u128x x) {
 /* while i < j: a[i], a[j] = a[j], a[i]; i += 1; j -= 1. Only 16 bytes at
    most: longer ones gain little over the loop, and a loop around this one
    then holds nothing else, so the C compiler can keep the bytes in registers. */
-static inline bool brine_bytes_rev(char *d, int64_t n, int64_t *pi, int64_t *pj) {
-    int64_t i = *pi, j = *pj;
+/* bytes i..j reversed in place; the caller moves i and j to the middle */
+static inline bool brine_bytes_rev(char *d, int64_t n, int64_t i, int64_t j) {
     if (i >= j) return true;
     if (i < 0 || j >= n || j - i >= 16) return false;
     /* bytes i..j reversed in place, the rest of the 16 kept */
@@ -505,8 +505,6 @@ static inline bool brine_bytes_rev(char *d, int64_t n, int64_t *pi, int64_t *pj)
     br_u128x x = br_ld128(d + i);
     br_u128x m = br_low_bytes(k + 1);
     br_st128(d + i, ((br_bswap128(x) >> (8 * (15 - k))) & m) | (x & ~m));
-    *pi = i + (k + 1) / 2;
-    *pj = j - (k + 1) / 2;
     return true;
 }
 /* x = a[lo]; for i in lo..hi: a[i] = a[i + 1]; a[hi] = x */

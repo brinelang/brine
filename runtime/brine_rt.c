@@ -7189,7 +7189,7 @@ uint64_t brine_x_hash_str(brine_str *s) { return brine_hash_str(s); }
 bool brine_x_map_has(brine_map *m, const void *k) { return brine_map_has(m, k); }
 bool brine_x_arr_shl(brine_arr **pa, int64_t lo, int64_t hi) { return brine_arr_shl(pa, lo, hi); }
 bool brine_x_arr_copy(brine_arr **pb, brine_arr *a, int64_t lo, int64_t hi) { return brine_arr_copy(pb, a, lo, hi); }
-bool brine_x_bytes_rev(char *d, int64_t n, int64_t *pi, int64_t *pj) { return brine_bytes_rev(d, n, pi, pj); }
+bool brine_x_bytes_rev(char *d, int64_t n, int64_t i, int64_t j) { return brine_bytes_rev(d, n, i, j); }
 bool brine_x_bytes_shl(char *d, int64_t n, int64_t lo, int64_t hi) { return brine_bytes_shl(d, n, lo, hi); }
 bool brine_x_bytes_rotl(char *d, int64_t n, int64_t lo, int64_t hi) { return brine_bytes_rotl(d, n, lo, hi); }
 bool brine_x_arr_rotl(brine_arr **pa, int64_t lo, int64_t hi) { return brine_arr_rotl(pa, lo, hi); }
