@@ -743,6 +743,10 @@ fn sb_base(sb: ptr, u: u64, bits: u64):
     var n = 1
     while n < most and u >> (u64(n) * bits) != 0:
         n += 1
+    sb_base_n(sb, u, bits, n)
+
+# u in exactly n digits of base 2^bits
+fn sb_base_n(sb: ptr, u: u64, bits: u64, n: int):
     let d = sb_room(sb, n)
     let t = ptr_of(HEX) + STR_DATA
     let mask = (u64(1) << bits) - 1
@@ -833,6 +837,241 @@ fn brine_sb_finish(sb: ptr) -> ptr:
     blk_free(p)
     store_u64(sb, SB_P, 0)
     return s
+
+# ------------------------------------------------------------ integers
+
+fn int_blank(c: u8) -> bool:
+    return c == 32 or c == 10 or c == 13 or c == 9
+
+# Integer text as `int()` reads it: blanks around it, a sign, decimal
+# digits, and `_` between two digits, as in literals (`1_000`). The value
+# goes to the u128 at out (low word first); the result is 1 if there was a
+# minus sign, 0 if not, and -1 if it isn't an integer or doesn't fit in 128
+# bits.
+fn parse_128(s: ptr, out: ptr) -> int:
+    let d = s + STR_DATA
+    var i = 0
+    var e = load_i64(s, STR_LEN)
+    while i < e and int_blank(load_u8(d, i)):
+        i += 1
+    while e > i and int_blank(load_u8(d, e - 1)):
+        e -= 1
+    var neg = 0
+    if i < e and (load_u8(d, i) == 43 or load_u8(d, i) == 45):
+        if load_u8(d, i) == 45:
+            neg = 1
+        i += 1
+    if i == e:
+        return -1
+    let first = i
+    var v: u64 = 0
+    while i < e:
+        let c = load_u8(d, i)
+        if c == 95 and i > first and i + 1 < e and is_digit(load_u8(d, i + 1)):
+            i += 1
+            continue
+        if not is_digit(c):
+            return -1
+        # past here the next digit could overflow 64 bits
+        if v > 1844674407370955160:
+            return parse_128_cold(d, i, e, v, out, neg)
+        v = v * 10 + u64(c - 48)
+        i += 1
+    store_u64(out, 0, v)
+    store_u64(out, 8, 0)
+    return neg
+
+fn parse_128_cold(d: ptr, i0: int, e: int, v: u64, out: ptr, neg: int) -> int:
+    let max = u128(0) - u128(1)
+    var w = u128(v)
+    var i = i0
+    while i < e:
+        let c = load_u8(d, i)
+        if c == 95 and i + 1 < e and is_digit(load_u8(d, i + 1)):
+            i += 1
+            continue
+        if not is_digit(c):
+            return -1
+        let g = u128(c - 48)
+        if w > (max - g) / 10:
+            return -1
+        w = w * 10 + g
+        i += 1
+    store_u64(out, 0, u64(w))
+    store_u64(out, 8, u64(w >> 64))
+    return neg
+
+fn bad_int_cold(s: ptr, loc: ptr):
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    sb_lit(sb, "invalid integer: \"")
+    brine_sb_cat(sb, s + STR_DATA, load_i64(s, STR_LEN))
+    sb_byte(sb, 34)
+    brine_panic_at(loc, str_of(brine_sb_finish(sb)))
+
+# The smallest int: no result of short_int
+const NOT_INT = -9223372036854775807 - 1
+
+# s as int() reads it when s is an optional minus and 1 to 18 digits (too
+# few to overflow), the common case; NOT_INT for anything else
+fn short_int(s: ptr) -> int:
+    let d = s + STR_DATA
+    let n = load_i64(s, STR_LEN)
+    var i = 0
+    if n > 0 and load_u8(d, 0) == 45:
+        i = 1
+    if n - i <= 0 or n - i > 18:
+        return NOT_INT
+    var v = 0
+    while i < n:
+        let g = u64(load_u8(d, i)) - 48
+        if g >= 10:
+            return NOT_INT
+        v = v * 10 + int(g)
+        i += 1
+    return -v if load_u8(d, 0) == 45 else v
+
+fn parse_i64(s: ptr, loc: ptr) -> int:
+    let v = short_int(s)
+    if v != NOT_INT:
+        return v
+    return parse_i64_cold(s, loc)
+
+fn parse_i64_cold(s: ptr, loc: ptr) -> int:
+    let o = stack_mem(16)
+    let neg = parse_128(s, o)
+    let u = load_u64(o, 0)
+    if neg < 0 or load_u64(o, 8) != 0 or u > u64(9223372036854775807) + u64(neg):
+        bad_int_cold(s, loc)
+    return int(u64(0) - u) if neg == 1 else int(u)
+
+fn parse_i128(s: ptr, loc: ptr) -> i128:
+    let v = short_int(s)
+    if v != NOT_INT:
+        return i128(v)
+    return parse_i128_cold(s, loc)
+
+fn parse_i128_cold(s: ptr, loc: ptr) -> i128:
+    let o = stack_mem(16)
+    let neg = parse_128(s, o)
+    let u = (u128(load_u64(o, 8)) << 64) | u128(load_u64(o, 0))
+    if neg < 0 or u > (u128(1) << 127) - 1 + u128(neg):
+        bad_int_cold(s, loc)
+    return i128(u128(0) - u) if neg == 1 else i128(u)
+
+fn parse_u128(s: ptr, loc: ptr) -> u128:
+    let o = stack_mem(16)
+    let neg = parse_128(s, o)
+    let u = (u128(load_u64(o, 8)) << 64) | u128(load_u64(o, 0))
+    if neg < 0 or (neg == 1 and u != 0):
+        bad_int_cold(s, loc)
+    return u
+
+# `int(s, bits, signed)` as an Option: the value goes to out, in `bits` bits
+fn try_parse_int(s: ptr, bits: int, sgn: bool, out: ptr) -> bool:
+    let v = short_int(s)
+    if v == NOT_INT or (v < 0 and not sgn):
+        return try_parse_int_cold(s, bits, sgn, out)
+    if bits < 64:
+        let top = 1 << (bits - 1 if sgn else bits)
+        if v >= top or v < -top:
+            return false
+    if bits == 8:
+        store_u8(out, 0, u8(v))
+    elif bits == 16:
+        store_u16(out, 0, u16(v))
+    elif bits == 32:
+        store_u32(out, 0, u32(v))
+    else:
+        store_i64(out, 0, v)
+        if bits == 128:
+            store_i64(out, 8, v >> 63)
+    return true
+
+fn try_parse_int_cold(s: ptr, bits: int, sgn: bool, out: ptr) -> bool:
+    let o = stack_mem(16)
+    let neg = parse_128(s, o)
+    if neg < 0:
+        return false
+    let u = (u128(load_u64(o, 8)) << 64) | u128(load_u64(o, 0))
+    var max = u128(0) - u128(1)
+    if bits < 128:
+        max = (u128(1) << u128(bits)) - 1
+    if sgn:
+        max = max >> 1
+    if neg == 1:
+        if sgn and u > max + 1:
+            return false
+        if not sgn and u != 0:
+            return false
+    elif u > max:
+        return false
+    let v = u128(0) - u if neg == 1 else u
+    if bits == 8:
+        store_u8(out, 0, u8(v))
+    elif bits == 16:
+        store_u16(out, 0, u16(v))
+    elif bits == 32:
+        store_u32(out, 0, u32(v))
+    elif bits == 64:
+        store_u64(out, 0, u64(v))
+    else:
+        store_u64(out, 0, u64(v))
+        store_u64(out, 8, u64(v >> 64))
+    return true
+
+# v in decimal: 19 digits at a time
+fn sb_u128(sb: ptr, v: u128):
+    if v >> 64 == 0:
+        brine_sb_u64(sb, u64(v))
+        return
+    let p = u128(10000000000000000000)
+    let a = v / p
+    if a >> 64 == 0:
+        brine_sb_u64(sb, u64(a))
+    else:
+        brine_sb_u64(sb, u64(a / p))
+        sb_dec19(sb, u64(a % p))
+    sb_dec19(sb, u64(v % p))
+
+# u in exactly 19 decimal digits
+fn sb_dec19(sb: ptr, u: u64):
+    let d = sb_room(sb, 19)
+    memset(d, 48, 19)
+    put_dec(d, 19, u)
+    store_i64(sb, SB_LEN, load_i64(sb, SB_LEN) + 19)
+
+fn sb_i128(sb: ptr, v: i128):
+    if v < 0:
+        sb_byte(sb, 45)
+    sb_u128(sb, u128(0) - u128(v) if v < 0 else u128(v))
+
+# u in base 2^bits (hex: 4, binary: 1)
+fn sb_base128(sb: ptr, u: u128, bits: u64):
+    let hi = u64(u >> 64)
+    if hi == 0:
+        sb_base(sb, u64(u), bits)
+        return
+    sb_base(sb, hi, bits)
+    sb_base_n(sb, u64(u), bits, int(64 / bits))
+
+fn sb_fmt_u128(sb: ptr, v: u128, kind: int):
+    if kind == 120 or kind == 98:
+        sb_base128(sb, v, 4 if kind == 120 else 1)
+    elif kind == 102 or kind == 101 or kind == 103:
+        brine_sb_fmt_f64(sb, float(v), -1, i32(kind))
+    else:
+        sb_u128(sb, v)
+
+fn sb_fmt_i128(sb: ptr, v: i128, kind: int):
+    if kind == 120 or kind == 98:
+        if v < 0:
+            sb_byte(sb, 45)
+        sb_base128(sb, u128(0) - u128(v) if v < 0 else u128(v), 4 if kind == 120 else 1)
+    elif kind == 102 or kind == 101 or kind == 103:
+        brine_sb_fmt_f64(sb, float(v), -1, i32(kind))
+    else:
+        sb_i128(sb, v)
 
 # ------------------------------------------------------------ unicode
 # Unicode 16.0.0 tables, from the Unicode Character Database (as Python's
