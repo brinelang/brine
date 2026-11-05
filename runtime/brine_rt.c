@@ -2628,6 +2628,7 @@ brine_arr *brine_args(void) {
 }
 
 /* ============================================================ thread pool */
+#ifndef BRINE_RT_BR /* runtime/rt.br has the pool */
 typedef struct br_job {
     brine_chunk_fn fn;
     void *ctx;
@@ -2652,6 +2653,7 @@ static struct {
     int active;
     int main_waits;
 } br_pool;
+#endif
 
 /* whether this thread runs a parallel region (a field of the per-thread heap
    struct: MinGW gcc would emulate a _Thread_local with libwinpthread) */
@@ -2660,9 +2662,21 @@ static int br_in_par_get(void) {
     return h ? h->in_par : 0;
 }
 static void br_in_par_set(int v) { br_th_get()->in_par = v; }
-static int64_t br_task_budget = 0;
 /* see brine_rt.h */
-int brine_mt = 0;
+int64_t brine_mt = 0;
+#ifdef BRINE_RT_BR
+int64_t brine_x_in_par_get(void) { return br_in_par_get(); }
+void brine_x_in_par_set(int64_t v) { br_in_par_set((int)v); }
+void brine_x_thread_enter(void) { br_stack_enter(); }
+void brine_x_thread_leave(void) {
+    br_heap_exit();
+    br_stack_leave();
+}
+int64_t brine_x_threads(void);
+void brine_x_pool_init(void);
+static int br_threads(void) { return (int)brine_x_threads(); }
+#else
+static int64_t br_task_budget = 0;
 
 static int br_threads(void) {
     if (br_pool.nthreads == 0) {
@@ -2678,6 +2692,7 @@ static int br_threads(void) {
     }
     return br_pool.nthreads;
 }
+#endif
 
 /* Waking a sleeping thread takes tens of microseconds, longer than many
    parallel regions run, so threads busy-wait a little before they sleep. */
@@ -2689,6 +2704,7 @@ static int br_threads(void) {
 #define BR_RELAX() ((void)0)
 #endif
 #define BR_SPINS 20000
+#ifndef BRINE_RT_BR
 static void br_spin_while_eq(uint64_t *p, uint64_t v) {
     for (int i = 0; i < BR_SPINS && __atomic_load_n(p, __ATOMIC_ACQUIRE) == v; i++) BR_RELAX();
 }
@@ -2771,6 +2787,7 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
     __atomic_sub_fetch(&brine_mt, 1, __ATOMIC_SEQ_CST);
     br_unlock(&br_pool.job_lock);
 }
+#endif
 
 int64_t brine_par_chunks(int64_t n) { return brine_par_plan(n); }
 
@@ -2786,6 +2803,7 @@ void brine_first_found(int64_t *stop, int64_t chunk) {
 }
 #endif
 
+#ifndef BRINE_RT_BR
 typedef struct {
     brine_task_fn fn;
     void *ctx;
@@ -2832,6 +2850,7 @@ void brine_par_tasks(int64_t k, brine_task_fn fn, void *ctx) {
     free(ths);
     free(spawned);
 }
+#endif
 
 /* ============================================================ reductions */
 /* `par sum(...)` and the other reductions combine in one fixed order that
@@ -5533,10 +5552,14 @@ void brine_rt_init(int argc, char **argv) {
     SetConsoleOutputCP(CP_UTF8);
 #endif
     br_mutex_init(&br_io_mu);
+#ifdef BRINE_RT_BR
+    brine_x_pool_init();
+#else
     br_mutex_init(&br_pool.mu);
     br_mutex_init(&br_pool.job_lock);
     br_cond_init(&br_pool.cv_work);
     br_cond_init(&br_pool.cv_done);
+#endif
     br_gpu_setup();
     static char outbuf[1 << 16];
     setvbuf(stdout, outbuf, _IOFBF, sizeof outbuf);

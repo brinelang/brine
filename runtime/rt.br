@@ -8386,3 +8386,384 @@ fn first_found(stop: ptr, chunk: int):
         if seen == cur:
             return
         cur = seen
+
+# ---------------------------------------------------------------- threads
+
+# Locks and condition variables take 64 bytes each, enough everywhere
+# (pthread_mutex_t is 40 bytes on Linux x86-64, 48 on AArch64, 64 on macOS;
+# pthread_cond_t 48). On Windows they are an SRW lock and a
+# CONDITION_VARIABLE, ready when zeroed.
+const LOCK_SIZE = 64
+
+# every thread brine code runs on, `main` included, gets a stack this big
+# (reserved, not committed)
+const THREAD_STACK = 67108864
+
+extern fn AcquireSRWLockExclusive(m: ptr)
+
+extern fn ReleaseSRWLockExclusive(m: ptr)
+
+extern fn TryAcquireSRWLockExclusive(m: ptr) -> u8
+
+extern fn SleepConditionVariableSRW(c: ptr, m: ptr, ms: u32, flags: u32) -> i32
+
+extern fn WakeAllConditionVariable(c: ptr)
+
+extern fn CreateThread(attr: ptr, stack: u64, f: ptr, arg: ptr, flags: u32, id: ptr) -> ptr
+
+extern fn WaitForSingleObject(h: ptr, ms: u32) -> u32
+
+extern fn CloseHandle(h: ptr) -> i32
+
+extern fn GetSystemInfo(si: ptr)
+
+extern fn pthread_mutex_init(m: ptr, attr: ptr) -> i32
+
+extern fn pthread_mutex_lock(m: ptr) -> i32
+
+extern fn pthread_mutex_unlock(m: ptr) -> i32
+
+extern fn pthread_mutex_trylock(m: ptr) -> i32
+
+extern fn pthread_cond_init(c: ptr, attr: ptr) -> i32
+
+extern fn pthread_cond_wait(c: ptr, m: ptr) -> i32
+
+extern fn pthread_cond_broadcast(c: ptr) -> i32
+
+extern fn pthread_attr_init(a: ptr) -> i32
+
+extern fn pthread_attr_setstacksize(a: ptr, n: u64) -> i32
+
+extern fn pthread_attr_destroy(a: ptr) -> i32
+
+extern fn pthread_create(th: ptr, attr: ptr, f: ptr, arg: ptr) -> i32
+
+extern fn pthread_join(th: u64, ret: ptr) -> i32
+
+extern fn sysconf(name: i32) -> int
+
+extern fn malloc(n: u64) -> ptr
+
+extern fn free(p: ptr)
+
+extern fn getenv(name: ptr) -> ptr
+
+# (brine_rt.c, until stacks and heaps move here: a new thread sets up its
+# stack overflow report first and gives its heap back last)
+extern fn brine_x_thread_enter()
+
+extern fn brine_x_thread_leave()
+
+fn lock_init(m: ptr):
+    if os_is("windows"):
+        store_i64(m, 0, 0)
+    else:
+        pthread_mutex_init(m, null_ptr())
+
+fn lock(m: ptr):
+    if os_is("windows"):
+        AcquireSRWLockExclusive(m)
+    else:
+        pthread_mutex_lock(m)
+
+fn unlock(m: ptr):
+    if os_is("windows"):
+        ReleaseSRWLockExclusive(m)
+    else:
+        pthread_mutex_unlock(m)
+
+fn try_lock(m: ptr) -> bool:
+    if os_is("windows"):
+        return TryAcquireSRWLockExclusive(m) != 0
+    else:
+        return pthread_mutex_trylock(m) == 0
+
+fn cond_init(c: ptr):
+    if os_is("windows"):
+        store_i64(c, 0, 0)
+    else:
+        pthread_cond_init(c, null_ptr())
+
+fn cond_wait(c: ptr, m: ptr):
+    if os_is("windows"):
+        # (INFINITE)
+        SleepConditionVariableSRW(c, m, u32(4294967295), u32(0))
+    else:
+        pthread_cond_wait(c, m)
+
+fn cond_broadcast(c: ptr):
+    if os_is("windows"):
+        WakeAllConditionVariable(c)
+    else:
+        pthread_cond_broadcast(c)
+
+# Starts the C function `void f(void *)` on arg in a new thread; the
+# thread's handle goes in the 8 bytes at th.
+fn thread_start(f: ptr, arg: ptr, th: ptr) -> bool:
+    let t = malloc(16)
+    store_ptr(t, 0, f)
+    store_ptr(t, 8, arg)
+    if os_is("windows"):
+        # (STACK_SIZE_PARAM_IS_A_RESERVATION)
+        let flags = u32(65536)
+        let h = CreateThread(
+            null_ptr(),
+            u64(THREAD_STACK),
+            symbol("brine_x_thread_main"),
+            t,
+            flags,
+            null_ptr()
+        )
+        store_ptr(th, 0, h)
+        return addr(h) != 0
+    else:
+        let at = stack_mem(64)
+        pthread_attr_init(at)
+        pthread_attr_setstacksize(at, u64(THREAD_STACK))
+        let ok = pthread_create(th, at, symbol("brine_x_thread_main"), t) == 0
+        pthread_attr_destroy(at)
+        return ok
+
+fn brine_x_thread_main(t: ptr) -> ptr:
+    let f = load_ptr(t, 0)
+    let arg = load_ptr(t, 8)
+    free(t)
+    brine_x_thread_enter()
+    call_void(f, arg)
+    brine_x_thread_leave()
+    return null_ptr()
+
+fn thread_join(th: u64):
+    if os_is("windows"):
+        let h = null_ptr() + int(th)
+        WaitForSingleObject(h, u32(4294967295))
+        CloseHandle(h)
+    else:
+        pthread_join(th, null_ptr())
+
+fn ncpu() -> int:
+    if os_is("windows"):
+        # SYSTEM_INFO.dwNumberOfProcessors
+        let si = stack_mem(48)
+        GetSystemInfo(si)
+        return int(load_u32(si, 32))
+    else:
+        # (_SC_NPROCESSORS_ONLN)
+        let n = sysconf(i32(58) if os_is("macos") else i32(84))
+        return n if n > 0 else 1
+
+# C's atoi: blanks, a sign, then digits
+fn atoi(p: ptr) -> int:
+    var i = 0
+    while true:
+        let c = load_u8(p, i)
+        if c != 32 and (c < 9 or c > 13):
+            break
+        i += 1
+    let s = load_u8(p, i)
+    let neg = s == 45
+    if s == 45 or s == 43:
+        i += 1
+    var n = 0
+    while true:
+        let c = load_u8(p, i)
+        if c < 48 or c > 57:
+            break
+        n = n * 10 + int(c - 48)
+        i += 1
+    return -n if neg else n
+
+# ---------------------------------------------------------------- thread pool
+
+# The running job is published in `cur` (and its number in `ids`); a worker
+# counts itself in `active` before it reads `cur`, and the thread that
+# posted the job clears `cur` and waits for `active` to drain before the job
+# (in its frame) goes away. Joining and leaving take no lock; `mu` is only
+# for sleeping. `budget` is how many more threads `par` tasks may start.
+const PL_MU = 0
+const PL_CV_WORK = 64
+const PL_CV_DONE = 128
+const PL_JOB_LOCK = 192
+const PL_NTHREADS = 256
+const PL_STARTED = 264
+const PL_CUR = 272
+const PL_IDS = 280
+const PL_ACTIVE = 288
+const PL_MAIN_WAITS = 296
+const PL_BUDGET = 304
+
+# a job: `fn(ctx, chunk, lo, hi)` for each of k chunks of the n items from lo
+const JB_FN = 0
+const JB_CTX = 8
+const JB_LO = 16
+const JB_N = 24
+const JB_K = 32
+const JB_NEXT = 40
+const JB_ID = 48
+
+# Waking a sleeping thread takes tens of microseconds, longer than many
+# parallel regions run, so threads busy-wait a little before they sleep.
+const SPINS = 20000
+
+# (brine_rt.c: a field of the per-thread heap)
+extern fn brine_x_in_par_get() -> int
+
+extern fn brine_x_in_par_set(v: int)
+
+fn pool() -> ptr:
+    return global_mem("pool", 320)
+
+# (brine_rt_init, once)
+fn brine_x_pool_init():
+    let pl = pool()
+    lock_init(pl + PL_MU)
+    lock_init(pl + PL_JOB_LOCK)
+    cond_init(pl + PL_CV_WORK)
+    cond_init(pl + PL_CV_DONE)
+
+fn brine_x_threads() -> int:
+    let pl = pool()
+    if load_i64(pl, PL_NTHREADS) == 0:
+        let e = getenv(ptr_of("BRINE_THREADS") + STR_DATA)
+        var n = 0 if addr(e) == 0 else atoi(e)
+        if n <= 0:
+            n = ncpu()
+        if n > 1024:
+            n = 1024
+        store_i64(pl, PL_NTHREADS, n)
+        atomic_store(pl + PL_BUDGET, n - 1)
+    return load_i64(pl, PL_NTHREADS)
+
+fn spin_while_eq(p: ptr, v: int):
+    for _ in 0..SPINS:
+        if atomic_load(p) != v:
+            return
+        cpu_relax()
+
+fn run_chunks(j: ptr):
+    let n = load_i64(j, JB_N)
+    let k = load_i64(j, JB_K)
+    let base = n / k
+    let rem = n % k
+    let lo = load_i64(j, JB_LO)
+    while true:
+        let c = atomic_add(j + JB_NEXT, 1)
+        if c >= k:
+            break
+        let a = c * base + (c if c < rem else rem)
+        let b = a + base + (1 if c < rem else 0)
+        call_void(load_ptr(j, JB_FN), load_ptr(j, JB_CTX), c, lo + a, lo + b)
+
+fn brine_x_pool_worker(arg: ptr):
+    let pl = pool()
+    brine_x_in_par_set(1)
+    var seen = 0
+    while true:
+        spin_while_eq(pl + PL_IDS, seen)
+        if atomic_load(pl + PL_IDS) == seen:
+            lock(pl + PL_MU)
+            while atomic_load(pl + PL_IDS) == seen:
+                cond_wait(pl + PL_CV_WORK, pl + PL_MU)
+            unlock(pl + PL_MU)
+        seen = atomic_load(pl + PL_IDS)
+        atomic_add(pl + PL_ACTIVE, 1)
+        let j = atomic_load(pl + PL_CUR)
+        if j != 0:
+            run_chunks(null_ptr() + j)
+        # (the last one out wakes the poster if it sleeps)
+        if atomic_add(pl + PL_ACTIVE, -1) == 1 and atomic_load(pl + PL_MAIN_WAITS) != 0:
+            lock(pl + PL_MU)
+            cond_broadcast(pl + PL_CV_DONE)
+            unlock(pl + PL_MU)
+
+fn brine_par_run(lo: int, hi: int, nchunks: int, f: ptr, ctx: ptr):
+    if hi <= lo or nchunks <= 0:
+        return
+    let pl = pool()
+    let job = stack_mem(56)
+    store_ptr(job, JB_FN, f)
+    store_ptr(job, JB_CTX, ctx)
+    store_i64(job, JB_LO, lo)
+    store_i64(job, JB_N, hi - lo)
+    store_i64(job, JB_K, nchunks)
+    store_i64(job, JB_NEXT, 0)
+    if (
+        nchunks == 1
+        or brine_x_in_par_get() != 0
+        or brine_x_threads() <= 1
+        or not try_lock(pl + PL_JOB_LOCK)
+    ):
+        run_chunks(job)
+        return
+    let mt = symbol("brine_mt")
+    # (before the workers can see the job, after they are done below)
+    atomic_add(mt, 1)
+    if load_i64(pl, PL_STARTED) == 0:
+        store_i64(pl, PL_STARTED, 1)
+        let th = stack_mem(8)
+        for _ in 0..load_i64(pl, PL_NTHREADS) - 1:
+            thread_start(symbol("brine_x_pool_worker"), null_ptr(), th)
+    lock(pl + PL_MU)
+    let id = load_i64(pl, PL_IDS) + 1
+    store_i64(job, JB_ID, id)
+    atomic_store(pl + PL_CUR, addr(job))
+    atomic_store(pl + PL_IDS, id)
+    cond_broadcast(pl + PL_CV_WORK)
+    unlock(pl + PL_MU)
+    brine_x_in_par_set(1)
+    run_chunks(job)
+    brine_x_in_par_set(0)
+    atomic_store(pl + PL_CUR, 0)
+    for _ in 0..SPINS:
+        if atomic_load(pl + PL_ACTIVE) <= 0:
+            break
+        cpu_relax()
+    if atomic_load(pl + PL_ACTIVE) > 0:
+        lock(pl + PL_MU)
+        atomic_store(pl + PL_MAIN_WAITS, 1)
+        while atomic_load(pl + PL_ACTIVE) > 0:
+            cond_wait(pl + PL_CV_DONE, pl + PL_MU)
+        atomic_store(pl + PL_MAIN_WAITS, 0)
+        unlock(pl + PL_MU)
+    atomic_add(mt, -1)
+    unlock(pl + PL_JOB_LOCK)
+
+# `par` tasks: a thread for each but the last while the budget lasts; the
+# rest run here
+fn brine_par_tasks(k: int, f: ptr, ctx: ptr):
+    let pl = pool()
+    brine_x_threads()
+    let tasks = brine_alloc(k * 24)
+    let ths = brine_alloc(k * 8)
+    let spawned = brine_alloc(k)
+    for i in 0..k:
+        store_ptr(tasks, i * 24, f)
+        store_ptr(tasks, i * 24 + 8, ctx)
+        store_i64(tasks, i * 24 + 16, i)
+        store_u8(spawned, i, u8(0))
+    let mt = symbol("brine_mt")
+    atomic_add(mt, 1)
+    for i in 0..k - 1:
+        # (the budget was at least 1)
+        if (
+            atomic_add(pl + PL_BUDGET, -1) >= 1
+            and thread_start(symbol("brine_x_task_main"), tasks + i * 24, ths + i * 8)
+        ):
+            store_u8(spawned, i, u8(1))
+        else:
+            atomic_add(pl + PL_BUDGET, 1)
+    for i in 0..k:
+        if load_u8(spawned, i) == 0:
+            call_void(f, ctx, i)
+    for i in 0..k:
+        if load_u8(spawned, i) != 0:
+            thread_join(load_u64(ths, i * 8))
+            atomic_add(pl + PL_BUDGET, 1)
+    atomic_add(mt, -1)
+    brine_free(tasks)
+    brine_free(ths)
+    brine_free(spawned)
+
+fn brine_x_task_main(t: ptr):
+    call_void(load_ptr(t, 0), load_ptr(t, 8), load_i64(t, 16))

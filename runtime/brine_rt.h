@@ -142,7 +142,7 @@ void brine_arr_free(brine_arr *a);
    values (a `par` region or task group is running): only then do reference
    counts need locked instructions. The thread that starts the others raises
    it before they start and lowers it once they are done with every value. */
-extern int brine_mt;
+extern int64_t brine_mt;
 #define BR_ONE_THREAD() __builtin_expect(__atomic_load_n(&brine_mt, __ATOMIC_RELAXED) == 0, 1)
 static inline void br_rc_inc(int64_t *rc) {
     if (BR_ONE_THREAD())
