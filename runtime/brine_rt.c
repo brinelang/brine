@@ -1019,6 +1019,7 @@ brine_arr *brine_s_split(brine_str *s, brine_str *sep, const char *loc) {
 }
 #endif
 /* ============================================================ unicode */
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 typedef struct {
     uint32_t lo, hi;
     int32_t delta;
@@ -1637,6 +1638,7 @@ int brine_str_cmp(brine_str *a, brine_str *b) {
     if (c) return c;
     return a->len < b->len ? -1 : (a->len > b->len ? 1 : 0);
 }
+#endif
 /* Integer text as `int()` reads it: blanks around it, a sign, decimal digits,
  * and `_` between two digits, as in literals (`1_000`). By hand: the C
  * library stops at 64 bits and knows no `_`. False if it isn't one or
