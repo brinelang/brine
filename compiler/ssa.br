@@ -1256,6 +1256,91 @@ fn find(ref repl: [int], v: int) -> int:
         w = nx
     return r
 
+# Float arithmetic on constants (F64) done now: IEEE results are the same on
+# every machine, except NaNs (their bits differ between x86-64 and AArch64),
+# which stay. (It also keeps hoisted code from computing, say, an underflow
+# on every call: a slow microcode assist on x86-64.)
+fn ffold(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var known = [false] * nv
+    var bits: [u64] = [0] * nv
+    var changed = true
+    while changed:
+        changed = false
+        for b in 0..len(sf.bs):
+            for i in 0..len(sf.bs[b].code):
+                let x = sf.bs[b].code[i]
+                if x.d < 0 or known[x.d] or sf.f.vk[x.d] != K.F64:
+                    continue
+                if x.op == Op.FConst:
+                    known[x.d] = true
+                    bits[x.d] = int_u64(x.n)
+                    changed = true
+                    continue
+                if not (x.op == Op.Add or x.op == Op.Sub or x.op == Op.Mul or x.op == Op.Div):
+                    continue
+                if not known[x.a] or not known[x.b]:
+                    continue
+                let a = float.from_bits(bits[x.a])
+                let c = float.from_bits(bits[x.b])
+                var r = 0.0
+                match x.op:
+                    case Op.Add:
+                        r = a + c
+                    case Op.Sub:
+                        r = a - c
+                    case Op.Mul:
+                        r = a * c
+                    case _:
+                        r = a / c
+                if r != r:
+                    continue
+                known[x.d] = true
+                bits[x.d] = r.to_bits()
+                sf.bs[b].code[i] = mk(Op.FConst, x.d, -1, -1, -1, u64_to_int(bits[x.d]))
+                changed = true
+
+fn int_u64(n: int) -> u64:
+    if n < 0:
+        return u64(i128(n) + 18446744073709551616)
+    return u64(n)
+
+# A load read only as the bits of another kind (`float.from_bits(t[i])`) loads
+# that kind instead, and a store of such bits stores the value they came from:
+# no move between an integer and an xmm register.
+fn bit_loads(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var nuse = [0] * nv
+    var def_b = [-1] * nv
+    var def_i = [-1] * nv
+    for b in 0..len(sf.bs):
+        for i, x in enumerate(sf.bs[b].code):
+            if x.d >= 0:
+                def_b[x.d] = b
+                def_i[x.d] = i
+            for u in uses(x):
+                nuse[u] += 1
+    var gone = [false] * nv
+    for b in 0..len(sf.bs):
+        for i in 0..len(sf.bs[b].code):
+            let x = sf.bs[b].code[i]
+            if x.op == Op.Bits and nuse[x.a] == 1 and def_b[x.a] >= 0:
+                let lb = def_b[x.a]
+                let li = def_i[x.a]
+                if sf.bs[lb].code[li].op == Op.Load:
+                    sf.bs[lb].code[li].d = x.d
+                    gone[x.d] = true
+            elif x.op == Op.Store and def_b[x.b] >= 0:
+                let y = sf.bs[def_b[x.b]].code[def_i[x.b]]
+                if y.op == Op.Bits:
+                    sf.bs[b].code[i].b = y.a
+    for b in 0..len(sf.bs):
+        var code: [Inst] = []
+        for x in sf.bs[b].code:
+            if not (x.op == Op.Bits and gone[x.d]):
+                code.push(x)
+        sf.bs[b].code = code
+
 # ================================================================ memory
 
 # The slots whose address only ever serves as the address of a load, a store,
@@ -1312,7 +1397,7 @@ fn gvn_key(x: Inst, vk: [K]) -> str:
             return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{a}|{b}"
         case Op.Sub | Op.Div | Op.Rem | Op.Shl | Op.Shr | Op.Lt | Op.Le | Op.Gt | Op.Ge:
             return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{x.a}|{x.b}"
-        case Op.Neg | Op.Not | Op.Conv:
+        case Op.Neg | Op.Not | Op.Conv | Op.Bits:
             return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{x.a}"
         case Op.Elem:
             return f"elem|{x.a}|{x.b}|{x.n}"
@@ -1715,10 +1800,10 @@ fn speculatable(x: Inst, sf: SF, def_b: [int], def_i: [int]) -> bool:
             return true
         case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
             return true
-        case Op.Neg | Op.Not | Op.Conv:
+        case Op.Neg | Op.Not | Op.Conv | Op.Bits:
             return true
-        case Op.Eq | Op.Ne | Op.Lt | Op.Le | Op.Gt | Op.Ge:
-            return true
+        # (not comparisons: a branch on one compares in place, and a hoisted
+        # one is a byte kept in a register or spilled across the loop)
         case Op.Div | Op.Rem:
             if sf.f.vk[x.d].is_float():
                 return true
@@ -3154,6 +3239,7 @@ fn optimize(f: Func, vw: int) -> (Func, [KFunc]):
     copies(ref sf)
     sccp(ref sf)
     simplify(ref sf)
+    ffold(ref sf)
     rewrites(ref sf)
     copies(ref sf)
     addressing(ref sf)
@@ -3162,6 +3248,7 @@ fn optimize(f: Func, vw: int) -> (Func, [KFunc]):
     licm(ref sf)
     gvn(ref sf)
     copies(ref sf)
+    bit_loads(ref sf)
     # dead phis (of inlined calls' results) would hide loops' shapes
     dce(ref sf)
     var ks = vector_loops(ref sf, f"brv_{f.name}", vw)

@@ -27,7 +27,7 @@ from ir import KV_CVT, KV_RLD, KV_RED, KV_RST
 from ir import KL_LD, KL_ST, KL_MOV, KL_OP, KL_CMP, KL_SEL, KL_NOT, KL_ANY
 from ir import KW_LD, KW_LDH, KW_LDD, KW_LDP, KW_LDV, KW_INS, KW_BC, KW_BCA, KW_OP, KW_SQRT
 from ir import KW_PERM, KW_LDK, KW_ALIGN, KW_ST, KW_STH, KW_SPILL, KW_FILL, KW_MOV, KW_ARG
-from opt import promote, reads, switches, inline_small
+from opt import promote, reads, switches, inline_small, const_arrs, arr_data
 import ssa
 import ra
 from dwarf import Dwarf, DFn, DRow, DLocal, new_dwarf, loc_breg, loc_deref, write_dwarf
@@ -109,6 +109,8 @@ const A_REG = 5
 # argument locations: integer register i, xmm register 100 + i, stack 1000 + i
 const L_XMM = 100
 const L_STACK = 1000
+# (par_fmoves: an argument saved in rax to break a cycle of moves)
+const F_IN_RAX = -2
 
 # panic stubs
 const S_ADD = 0
@@ -1068,13 +1070,18 @@ struct X:
         var todo: [int] = []
         var src: [int] = []
         var regs: [CArg] = args
+        var ftodo: [int] = []
+        var fsrc: [int] = []
         for i, a in enumerate(args):
             let l = locs[i]
             src.push(-1)
+            fsrc.push(-1)
             if l >= L_STACK:
                 pass
             elif l >= L_XMM:
-                self.fld(a.fl, l - L_XMM, a.v)
+                ftodo.push(i)
+                if a.how == A_VAL and self.fold[a.v] == F_NONE and self.freg[a.v] >= 0:
+                    fsrc[i] = self.freg[a.v]
             else:
                 todo.push(i)
                 if a.how == A_REG:
@@ -1083,7 +1090,8 @@ struct X:
                     src[i] = self.reg[a.v]
         # an argument register is set once no argument left to set is in it
         # (they can be in any register: ra.br), in order when none is; a
-        # cycle goes through rax
+        # cycle goes through rax. Float ones first, then integer ones.
+        self.par_fmoves(ftodo, locs, fsrc, args)
         while len(todo) > 0:
             var at = -1
             for t, i in enumerate(todo):
@@ -1113,6 +1121,39 @@ struct X:
                 self.fload(fl_of(self.vk[v]), self.freg[v], self.vm(v))
             else:
                 self.mov_rm(self.reg[v], self.vm(v))
+
+    # xmm argument registers locs[i] = args[i] for i in todo, fsrc[i] the xmm
+    # register args[i] is in (-1: memory or a constant), in an order that
+    # reads each register before it is changed; a cycle goes through rax
+    fn par_fmoves(ref self, todo0: [int], locs: [int], fsrc0: [int], args: [CArg]):
+        var todo = todo0
+        var fsrc = fsrc0
+        while len(todo) > 0:
+            var at = -1
+            for t, i in enumerate(todo):
+                let r = locs[i] - L_XMM
+                if not any(j != i and fsrc[j] == r for j in todo):
+                    at = t
+                    break
+            if at < 0:
+                let r = locs[todo[0]] - L_XMM
+                # movq rax, xmm r
+                self.rr(102, 1, 3966, r, RAX)
+                for j in todo:
+                    if fsrc[j] == r:
+                        fsrc[j] = F_IN_RAX
+                continue
+            let i = todo[at]
+            let d = locs[i] - L_XMM
+            if fsrc[i] == F_IN_RAX:
+                # movq xmm d, rax
+                self.rr(102, 1, 3950, d, RAX)
+            elif fsrc[i] >= 0:
+                if fsrc[i] != d:
+                    self.rr(0, 0, 3880, d, fsrc[i])
+            else:
+                self.fld(args[i].fl, d, args[i].v)
+            todo.pop(at)
 
     fn call_rt(ref self, name: str, args: [CArg]):
         let s = self.sym_ref(name)
@@ -2852,6 +2893,7 @@ struct X:
         if h == 1:
             self.mov_mr(mrb(self.retp), self.int_reg(self.ploc[0]))
         var todo: [int] = []
+        var ftodo: [int] = []
         var src = [-1] * f.nparams
         for i in 0..f.nparams:
             let k = f.vk[i]
@@ -2872,11 +2914,40 @@ struct X:
             elif l >= L_STACK:
                 pass
             elif l >= L_XMM:
-                self.fst(fl_of(k), i, l - L_XMM)
+                if self.freg[i] >= 0:
+                    ftodo.push(i)
+                else:
+                    self.fst(fl_of(k), i, l - L_XMM)
             else:
                 let r = self.int_reg(l)
                 self.norm(r, k)
                 self.st(r, i)
+        # a float parameter can be in another's argument register (ra.br): the
+        # same as the integer ones, with movaps
+        var fsrc = [-1] * f.nparams
+        for i in ftodo:
+            fsrc[i] = self.ploc[i + h] - L_XMM
+        while len(ftodo) > 0:
+            var at = -1
+            for t, i in enumerate(ftodo):
+                if not any(j != i and fsrc[j] == self.freg[i] for j in ftodo):
+                    at = t
+                    break
+            if at < 0:
+                let r = self.freg[ftodo[0]]
+                # movq rax, xmm r
+                self.rr(102, 1, 3966, r, RAX)
+                for j in ftodo:
+                    if fsrc[j] == r:
+                        fsrc[j] = F_IN_RAX
+                continue
+            let i = ftodo[at]
+            if fsrc[i] == F_IN_RAX:
+                # movq xmm, rax
+                self.rr(102, 1, 3950, self.freg[i], RAX)
+            elif self.freg[i] != fsrc[i]:
+                self.rr(0, 0, 3880, self.freg[i], fsrc[i])
+            ftodo.pop(at)
         while len(todo) > 0:
             var at = -1
             for t, i in enumerate(todo):
@@ -2984,6 +3055,15 @@ struct X:
                 return self.compare(i, x)
             case Op.Conv:
                 self.conv(x)
+            case Op.Bits:
+                # movq between an xmm register and a general one
+                if self.vk[x.d].is_float():
+                    self.st(self.use(RAX, x.a), x.d)
+                else:
+                    let r = self.dst(x.d)
+                    self.ld(r, x.a)
+                    self.norm(r, self.vk[x.d])
+                    self.st(r, x.d)
             case Op.AddO | Op.SubO | Op.MulO:
                 self.checked(x)
             case Op.IdxChk:
@@ -4304,8 +4384,9 @@ fn optimized(m: Module, release: bool) -> Module:
     let on = use_ssa(release)
     out.funcs = []
     let vw = vloop_width()
+    let arrs = const_arrs(m)
     for f in inline_small(m.funcs):
-        let (g, ks) = opt_func(f, on, vw)
+        let (g, ks) = opt_func(f, arrs, on, vw)
         out.funcs.push(g)
         out.kernels.extend(ks)
     return out
@@ -4331,7 +4412,8 @@ fn vloop_width() -> int:
         case None:
             return 8
 
-fn opt_func(f: Func, on: bool, vw: int) -> (Func, [KFunc]):
+fn opt_func(f0: Func, arrs: {str: bool}, on: bool, vw: int) -> (Func, [KFunc]):
+    let f = arr_data(f0, arrs)
     if on:
         let (g, ks) = ssa.optimize(promote(f), vw)
         return (switches(g), ks)
@@ -4456,7 +4538,8 @@ fn emit(
     else:
         # each function is optimized on its own, so all at once
         let fs = inline_small(m.funcs)
-        let done = par [opt_func(f, on, vw) for f in fs]
+        let arrs = const_arrs(m)
+        let done = par [opt_func(f, arrs, on, vw) for f in fs]
         for (g, fks) in done:
             x.func(g)
             ks.extend(fks)
