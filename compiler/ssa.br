@@ -1673,17 +1673,58 @@ fn from_ssa(sf0: SF) -> Func:
             pc.push(t)
             sf.bs[p].code = pc
         sf.bs[s].code = sf.bs[s].code[np:]
+    # A jump to a block that only jumps on goes straight to where that goes.
+    var fwd = [-1] * n
+    for b in 1..n:
+        if len(sf.bs[b].code) == 1 and sf.bs[b].code[0].op == Op.Jmp:
+            fwd[b] = sf.bs[b].code[0].n
+    for b in 0..n:
+        let m = len(sf.bs[b].code)
+        var t = sf.bs[b].code[m - 1]
+        for l in targets(t):
+            var to = l
+            var hops = 0
+            while fwd[sf.lab[to]] >= 0 and hops < n:
+                to = fwd[sf.lab[to]]
+                hops += 1
+            if to != l:
+                t = retarget(t, l, to)
+        if (t.op == Op.Br or t.op == Op.BrNot) and t.n == t.c:
+            t = mk(Op.Jmp, -1, -1, -1, -1, t.n)
+        sf.bs[b].code[m - 1] = t
+    # Depth first from the entry: what is reachable, and the back edges (to
+    # a block still on the path), whose jumps make a loop's latch.
+    var reach = [false] * n
+    var on_path = [false] * n
+    var latch = [-1] * n
+    var path = [0]
+    var next_succ = [0]
+    reach[0] = true
+    on_path[0] = true
+    while len(path) > 0:
+        let b = path[len(path) - 1]
+        let t = sf.bs[b].code[len(sf.bs[b].code) - 1]
+        let ts = targets(t)
+        let k = next_succ[len(path) - 1]
+        if k >= len(ts):
+            on_path[b] = false
+            path.pop()
+            next_succ.pop()
+            continue
+        next_succ[len(path) - 1] = k + 1
+        let s = sf.lab[ts[k]]
+        if on_path[s]:
+            if t.op == Op.Jmp and s > 0:
+                latch[s] = b if latch[s] == -1 else -2
+        elif not reach[s]:
+            reach[s] = true
+            on_path[s] = true
+            path.push(s)
+            next_succ.push(0)
     # Flat code, in block order, except that a loop header ending in a branch
     # goes right after its latch (the one block jumping back to it): then an
     # iteration ends in one conditional branch instead of a jump and a branch.
     var order: [int] = [i for i in 0..n]
-    var latch = [-1] * n
-    for l in 0..n:
-        let t = sf.bs[l].code[len(sf.bs[l].code) - 1]
-        if t.op == Op.Jmp:
-            let h = sf.lab[t.n]
-            if h > 0 and h < l:
-                latch[h] = l if latch[h] == -1 else -2
     for h in 1..n:
         let t = sf.bs[h].code[len(sf.bs[h].code) - 1]
         if latch[h] >= 0 and (t.op == Op.Br or t.op == Op.BrNot):
@@ -1695,15 +1736,37 @@ fn from_ssa(sf0: SF) -> Func:
             while order[at] != latch[h]:
                 at += 1
             order.insert(at + 1, h)
+    # Then chains: a block is followed by where it jumps, or by the block a
+    # branch falls through to, if not placed yet, so the copies on an edge
+    # (split blocks, made last) sit on the way instead of out of line. A
+    # rotated loop header comes only after its latch.
+    var placed = [false] * n
+    var chained: [int] = []
+    for start in order:
+        var b = start
+        while b >= 0 and reach[b] and not placed[b]:
+            placed[b] = true
+            chained.push(b)
+            let t = sf.bs[b].code[len(sf.bs[b].code) - 1]
+            var nb = -1
+            if t.op == Op.Jmp:
+                nb = sf.lab[t.n]
+            elif t.op == Op.Br or t.op == Op.BrNot:
+                nb = sf.lab[t.c]
+            if nb >= 0 and latch[nb] >= 0 and latch[nb] != b:
+                nb = -1
+            b = nb
+    order = chained
+    let n2 = len(order)
     var code: [Inst] = []
-    for oi in 0..n:
+    for oi in 0..n2:
         let b = sf.bs[order[oi]]
         code.push(mk(Op.Label, -1, -1, -1, -1, b.label))
         let m = len(b.code)
         for j in 0..m - 1:
             code.push(b.code[j])
         let t = b.code[m - 1]
-        let next = sf.bs[order[oi + 1]].label if oi + 1 < n else -1
+        let next = sf.bs[order[oi + 1]].label if oi + 1 < n2 else -1
         match t.op:
             case Op.Jmp:
                 if t.n != next:
