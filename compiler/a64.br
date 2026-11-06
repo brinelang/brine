@@ -1008,21 +1008,33 @@ struct A:
             if skip >= 0:
                 self.here(skip, B14)
             return true
-        # ldar x9, [b]
-        self.w(0xC8DFFC00 | (b << 5) | T0)
         var done: [int] = []
+        var frees: [int] = []
+        # one thread: a plain load, and no acquire (ldar) to wait for
+        let shared = self.if_mt()
+        self.ldst(M_LDRX, T0, b, 0)
         if immortal:
             done.push(self.fwd(0xB7F80000 | T0))
-        var last = -1
+        # subs x9, x9, #1
+        self.w(0xF1000400 | (T0 << 5) | T0)
+        if n == "brine_map_release":
+            # (a map is freed with its count stored as 0)
+            self.ldst(M_STRX, T0, b, 0)
+            done.push(self.fwd(0x54000000 | C_NE))
+            frees.push(self.fwd(0x14000000))
+        else:
+            frees.push(self.fwd(0x54000000 | C_EQ))
+            self.ldst(M_STRX, T0, b, 0)
+            done.push(self.fwd(0x14000000))
+        self.here(shared, B19)
+        # ldar x9, [b]
+        self.w(0xC8DFFC00 | (b << 5) | T0)
+        if immortal:
+            done.push(self.fwd(0xB7F80000 | T0))
         if n != "brine_map_release":
             # the only reference: no other thread can change the count
             self.cmp_ri(T0, 1)
-            last = self.fwd(0x54000000 | C_EQ)
-        let shared = self.if_mt()
-        self.w(0xD1000400 | (T0 << 5) | T0)
-        self.ldst(M_STRX, T0, b, 0)
-        let e = self.fwd(0x14000000)
-        self.here(shared, B19)
+            frees.push(self.fwd(0x54000000 | C_EQ))
         let ll = self.if_no_lse()
         # mov x9, #-1; ldaddal x9, x9, [b]; sub x9, x9, #1
         self.mov_ri(T0, -1)
@@ -1036,17 +1048,16 @@ struct A:
         self.w(0xD1000400 | (T0 << 5) | T0)
         self.w(0xC800FC00 | (T2 << 16) | (b << 5) | T0)
         self.w(0x35000000 | ((((top - self.pos()) / 4) & 0x7FFFF) << 5) | T2)
-        self.here(e, B26)
         self.here(e2, B26)
         # cbnz x9, done
         done.push(self.fwd(0xB5000000 | T0))
-        if last >= 0:
-            self.here(last, B19)
+        for at in frees:
+            self.here(at, B26 if self.get32(at) >> 26 == 5 else B19)
         if n == "brine_box_dec":
             self.mov_ri(T0, 1)
             let over = self.fwd(0x14000000)
             for at in done:
-                self.here(at, B14 if self.get32(at) >> 24 == 0xB7 else B19)
+                self.here(at, done_kind(self.get32(at)))
             self.mov_ri(T0, 0)
             self.here(over, B26)
             if x.d >= 0:
@@ -1054,7 +1065,7 @@ struct A:
             return true
         self.call_rt(free, [CArg(how=A_VAL, v=p, fl=0)])
         for at in done:
-            self.here(at, B14 if self.get32(at) >> 24 == 0xB7 else B19)
+            self.here(at, done_kind(self.get32(at)))
         return true
 
     fn ir_call(ref self, x: Inst):
@@ -3164,6 +3175,15 @@ fn hi_dead(ops: [KOp]) -> [bool]:
                 live[a] = true
         i -= 1
     return dead
+
+# The kind of branch to patch at a release's exits: tbnz (B14), b (B26), or
+# b.cond / cbnz (B19).
+fn done_kind(ins: int) -> int:
+    if ins >> 24 == 0xB7:
+        return B14
+    if ins >> 26 == 5:
+        return B26
+    return B19
 
 # Is operand j (0: a, 1: b) of x one a64.br needs in a register even when it
 # is a constant (it has no immediate form there)?
