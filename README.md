@@ -145,14 +145,13 @@ Hello, brine!
 
 ### Build from source
 
-The compiler is written in brine, so the first build starts from its own
-generated C, the bootstrap seed (see [bootstrap/README.md](bootstrap/README.md)):
+The compiler is written in brine, so the first build starts from a released
+brine (see [bootstrap/README.md](bootstrap/README.md)):
 
 ```sh
 git clone https://github.com/brinelang/brine && cd brine
-# Windows: brine.exe and -lws2_32 -lshell32 instead of -lm -lpthread -ldl
-cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread -ldl
-./brine build compiler/main.br -o brine    # brine rebuilding itself
+sh scripts/dist.sh bootstrap               # downloads the release in bootstrap/VERSION
+./brine build compiler/main.br -o brine    # after a change: brine rebuilds itself
 ```
 
 ## A quick tour

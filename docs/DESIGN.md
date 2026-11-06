@@ -315,8 +315,8 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
       ─► native binary
 ```
 
-* **Written in brine** (`compiler/`). It builds itself; `bootstrap/brinec.c` (its own
-  generated C) builds it from scratch with only a C compiler.
+* **Written in brine** (`compiler/`). It builds itself; a fresh checkout starts from
+  the release named in `bootstrap/VERSION` (`sh scripts/dist.sh bootstrap`).
 * **Runtime** (`runtime/rt.br` for native code, `runtime/brine_rt.h` +
   `runtime/brine_rt.c` for C) is embedded in the compiler binary: refcounted copy-on-write strings/arrays, checked arithmetic,
   thread pool, deterministic reductions, TCP world transport. Win32 and POSIX code
@@ -380,8 +380,7 @@ reads it:
   `BRINE_DUMP_PTX=file` writes the module (PTX or MSL) when building.
 * **C** (`ir_c.br`): one statement per IR instruction. gcc/clang at `-O2`/`-O3`
   make it as fast as hand-written C, so it serves `--release` on AArch64 and every
-  platform without a native backend (with `#line` for `--debug` there). It's also the bootstrap
-  seed (`bootstrap/brinec.c`).
+  platform without a native backend (with `#line` for `--debug` there).
 
 Rules that keep this working:
 * Nothing above the IR may depend on a backend: no C-only semantics leak into the
@@ -505,5 +504,5 @@ so only weaker ones need approval, rules about `world` protocols and traces.
 The compiler was first written in Rust, then ported to brine module by module, with
 every stage cross-checked against the Rust compiler (identical diagnostics, prover
 reports and generated C on every file, plus mutation fuzzing). The brine compiler
-builds itself to a fixed point and the Rust compiler has been retired. Its own
-generated C (`bootstrap/brinec.c`) is the seed that builds it from scratch.
+builds itself to a fixed point and the Rust compiler has been retired. A
+released brine (`bootstrap/VERSION`) builds it from scratch.

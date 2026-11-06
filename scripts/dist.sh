@@ -1,11 +1,14 @@
 #!/bin/sh
-# Builds brine from the bootstrap seed and packages it for this machine. CI and
+# Builds brine from a released brine and packages it for this machine. CI and
 # releases run it from the repository root; it works the same by hand.
 #
-#   sh scripts/dist.sh bootstrap   seed -> target/boot/brine0 -> ./brine (the compiler under test)
+#   sh scripts/dist.sh bootstrap   stage 0 -> target/boot/brine1 -> ./brine (the compiler under test)
 #   sh scripts/dist.sh package     ./brine -> target/dist/brine-<os>-<arch>.tar.gz (.zip on Windows)
 #
-# Needs a C compiler: $CC, or cc (gcc on Windows, from MSYS2 or MinGW).
+# Stage 0 is the release named in bootstrap/VERSION, downloaded and checked
+# against bootstrap/SHA256SUMS, or $BRINE0 (a brine executable) when set. Needs
+# curl and sha256sum or shasum, and a C compiler only if stage 0 needs one
+# (0.8.0 links through cc: $CC, cc, gcc or clang).
 set -eu
 
 case "$(uname -s)" in
@@ -22,26 +25,53 @@ esac
 name="brine-$os-$arch"
 
 exe=""
-cc="${CC:-cc}"
-cflags="-std=c11 -O2 -fno-strict-aliasing -w -Iruntime"
-case "$os" in
-    linux) libs="-lm -lpthread -ldl" ;;
-    # the oldest macOS that runs on Apple silicon
-    macos) libs="-lm -lpthread"; cflags="$cflags -mmacosx-version-min=11.0" ;;
-    # static, so the binary doesn't need MinGW's DLLs (libwinpthread)
-    windows) libs="-static -lws2_32 -lshell32"; exe=".exe"; cc="${CC:-gcc}" ;;
-esac
+ext="tar.gz"
+if [ "$os" = windows ]; then exe=".exe"; ext="zip"; fi
+
+# The released brine that builds this one, downloaded once into target/boot.
+stage0() {
+    if [ -n "${BRINE0:-}" ]; then
+        echo "$BRINE0"
+        return
+    fi
+    v="$(cat bootstrap/VERSION)"
+    d="target/boot/brine-$v"
+    if [ ! -x "$d/$name/brine$exe" ]; then
+        rm -rf "$d"
+        mkdir -p "$d"
+        echo "downloading brine $v ($name.$ext)" >&2
+        curl -fsSL --retry 3 -o "$d/$name.$ext" "https://github.com/brinelang/brine/releases/download/v$v/$name.$ext"
+        want="$(awk -v f="$name.$ext" '$2 == f { print $1 }' bootstrap/SHA256SUMS)"
+        if command -v sha256sum > /dev/null; then
+            got="$(sha256sum "$d/$name.$ext" | awk '{ print $1 }')"
+        else
+            got="$(shasum -a 256 "$d/$name.$ext" | awk '{ print $1 }')"
+        fi
+        if [ -z "$want" ] || [ "$got" != "$want" ]; then
+            echo "dist.sh: $name.$ext doesn't match bootstrap/SHA256SUMS (expected '$want', got $got)" >&2
+            exit 1
+        fi
+        if [ "$ext" = zip ]; then
+            if command -v unzip > /dev/null; then
+                (cd "$d" && unzip -q "$name.zip")
+            else
+                (cd "$d" && powershell.exe -NoProfile -Command "Expand-Archive -Path '$name.zip' -DestinationPath .")
+            fi
+        else
+            tar -xzf "$d/$name.tar.gz" -C "$d"
+        fi
+    fi
+    echo "$d/$name/brine$exe"
+}
 
 bootstrap() {
-    mkdir -p target/boot
-    echo "building the seed with $cc"
-    # brine0 only builds ./brine once, and the seed is one big C file: -O1
-    # compiles it in about half the time of -O2 and runs just as fast here
-    # shellcheck disable=SC2086
-    "$cc" $cflags -O1 bootstrap/brinec.c runtime/brine_rt.c -o "target/boot/brine0$exe" $libs
-    # brine0 carries the seed's copy of the runtime, which may predate fixes in
-    # runtime/; build with the C compiler that just built it, which handles it.
-    BRINE_CC="$cc" "target/boot/brine0$exe" build compiler/main.br -o "brine$exe"
+    b0="$(stage0)"
+    "$b0" --version
+    if [ -n "${CC:-}" ]; then export BRINE_CC="$CC"; fi
+    # stage 1 carries stage 0's runtime and code generation; it rebuilds itself
+    # so that the compiler under test has this checkout's
+    "$b0" build compiler/main.br -o "target/boot/brine1$exe"
+    "target/boot/brine1$exe" build compiler/main.br -o "brine$exe"
     "./brine$exe" --version
 }
 
@@ -50,17 +80,17 @@ package() {
     out="target/dist/$name"
     rm -rf target/dist
     mkdir -p "$out"
-    # A release build through C, with flags that suit a binary for other machines.
-    "./brine$exe" emit-c --release compiler/main.br -o target/dist/brine.c
-    # shellcheck disable=SC2086
-    "$cc" $cflags target/dist/brine.c runtime/brine_rt.c -o "$out/brine$exe" $libs
+    # (built outside $out: a build leaves its cache stamp next to the executable)
+    "./brine$exe" build --release compiler/main.br -o "target/boot/brine-release$exe"
+    cp "target/boot/brine-release$exe" "$out/brine$exe"
     cp LICENSE README.md "$out/"
 
-    # The packaged compiler must work on its own, outside the repository.
+    # The packaged compiler must work on its own, outside the repository, and
+    # without a C compiler (BRINE_CC points at none).
     smoke="$(mktemp -d)"
     cp "$out/brine$exe" "$smoke/"
     printf 'fn main():\n    print("hello from", par sum(i for i in 0..10))\n' > "$smoke/hello.br"
-    (cd "$smoke" && "./brine$exe" --version && "./brine$exe" run hello.br -q) > "$smoke/log" 2>&1 || {
+    (cd "$smoke" && export BRINE_CC=/no/cc && "./brine$exe" --version && "./brine$exe" run hello.br -q) > "$smoke/log" 2>&1 || {
         cat "$smoke/log" >&2
         exit 1
     }

@@ -1,25 +1,26 @@
-# Bootstrap seed
+# Bootstrap
 
-`brinec.c` is the C that the brine compiler (`compiler/`, written in brine)
-generates for itself. It lets you build the compiler with only a C11 compiler:
+The compiler is written in brine, so building it takes a brine. `VERSION`
+names the release that builds this one (stage 0), and `SHA256SUMS` is that
+release's checksum list, so a download that doesn't match is refused.
 
 ```sh
-# Linux / macOS
-cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread -ldl
-
-# Windows (MinGW gcc or clang)
-gcc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine.exe -lws2_32 -lshell32
+sh scripts/dist.sh bootstrap
 ```
 
-Run these from the repository root. The result is the full `brine` tool
-(`brine run`, `build`, `check`, `test`, `fmt`, ...).
+downloads stage 0 for this machine into `target/boot/`, builds the compiler
+with it (`target/boot/brine1`), and has that one rebuild itself as `./brine`,
+with this checkout's runtime and code generation. Set `BRINE0` to a brine
+executable to use it as stage 0 instead of downloading one.
 
-After changing the compiler, rebuild it with itself and refresh the seed:
+Then, after changing the compiler:
 
 ```sh
-./brine build --release compiler/main.br -o brine
-./brine emit-c --release compiler/main.br -o bootstrap/brinec.c
+./brine build compiler/main.br -o brine
 ```
 
 A correct compiler reaches a fixed point: rebuilding `brine` with itself again
-gives the same `brinec.c`.
+gives the same compiler (`tests/integration.br` checks this).
+
+Stage 0 is 0.8.0, which links through the system C compiler (`cc`, `gcc` or
+`clang`; MinGW on Windows). Releases from 0.9.0 on need none.

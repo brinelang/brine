@@ -10,8 +10,8 @@ The rules for commits and versions themselves are in [AGENTS.md](../AGENTS.md).
 1. Work on a branch (`feat/...`, `fix/...`, `ci/...`), in Conventional Commits,
    one logical change per commit, each one passing the tests.
 2. Open a pull request. CI (`.github/workflows/ci.yml`) builds brine from the
-   bootstrap seed, checks formatting, runs `tests/integration.br` and packages a
-   release archive on each platform (linux-x64, linux-arm64, macos-arm64, macos-x64,
+   release in `bootstrap/VERSION`, checks formatting, runs `tests/integration.br`
+   and packages a release archive on each platform (linux-x64, linux-arm64, macos-arm64, macos-x64,
    windows-x64). The archives are attached to the run as artifacts.
 3. Merge when CI is green and review is done, with a **merge commit**. The
    commits keep their messages, which become the changelog, and each one passes
@@ -35,14 +35,8 @@ built or uploaded by hand.
      Fixed, Security, in plain sentences; breaking changes say how to migrate.
      Leave an empty `## [Unreleased]` above it and add the compare link at the
      bottom;
-   - rebuild the compiler with itself and refresh the seed:
-     ```sh
-     ./brine build compiler/main.br -o brine
-     ./brine emit-c --release compiler/main.br -o bootstrap/brinec.c
-     ```
    - check that `sh scripts/release-notes.sh X.Y.Z` prints the notes.
 3. **Open a pull request** for it and merge it (merge commit) when CI is green.
-   CI builds from the new seed, so this also proves the seed works.
 4. **Tag the merge commit** on `main` and push the tag:
    ```sh
    git switch main && git pull --ff-only
@@ -63,6 +57,10 @@ built or uploaded by hand.
    then move the tag: `git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`,
    tag the new commit and push it again. Never move a tag after its release is
    published; make a patch release instead.
+6. **Stage 0** may then move to the new release, in a `build(bootstrap)` pull
+   request: its version in `bootstrap/VERSION` and its `SHA256SUMS` copied into
+   `bootstrap/`. That's required before `compiler/` uses a feature the old stage
+   0 can't compile.
 
 ## Installing
 
