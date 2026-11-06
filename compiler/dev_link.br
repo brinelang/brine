@@ -3,7 +3,7 @@
 #
 #     brine test compiler/dev_link.br
 
-from obj import ObjFile, OSym, ORel, new_obj, SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, R_PC32, R_CALL, R_ABS64, R_GOT
+from obj import ObjFile, OSym, ORel, new_obj, SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, R_PC32, R_CALL, R_ABS64, R_GOT, R_A64_CALL26, R_A64_PAGE, R_A64_LO12, R_A64_GOT_PAGE, R_A64_GOT_LO12, ARCH_A64, put32
 from link import link_pe, link_elf, PE_DLLS, ELF_LIBS
 from ir import str_bytes
 
@@ -19,6 +19,12 @@ fn ins(ref o: ObjFile, bytes: [u8], s: int, kind: int):
     o.text.extend(bytes)
     if s >= 0:
         o.trel.push(ORel(off=len(o.text) - 4, sym=s, kind=kind, add=-4))
+
+# Appends an AArch64 instruction, relocated against `s` (none if `s` < 0).
+fn w(ref o: ObjFile, word: int, s: int, kind: int):
+    if s >= 0:
+        o.trel.push(ORel(off=len(o.text), sym=s, kind=kind, add=0))
+    put32(ref o.text, word)
 
 const MSG = "hello from brine's linker"
 
@@ -141,6 +147,49 @@ test "a Linux executable starts through libc and calls it":
     match link_elf(o, "main", ELF_LIBS):
         case Ok(b):
             let r = run_exe(write_exe(b, "t1"))
+            assert r.code == 7, f"exit code {r.code}: {r.out}"
+            assert r.out == WANT, r.out
+        case Err(e):
+            panic(e)
+
+# (linked everywhere, so its machine code can be inspected; run on AArch64)
+test "an AArch64 Linux executable starts through libc and calls it":
+    var (o, msg, msg2, ptr, fp, puts) = base_obj()
+    o.arch = ARCH_A64
+    sym(ref o, "main", SEC_TEXT, 0, true)
+    # stp x29, x30, [sp, #-16]!; mov x29, sp
+    w(ref o, 0xA9BF7BFD, -1, 0)
+    w(ref o, 0x910003FD, -1, 0)
+    # x0 = msg; bl puts
+    w(ref o, 0x90000000, msg, R_A64_PAGE)
+    w(ref o, 0x91000000, msg, R_A64_LO12)
+    w(ref o, 0x94000000, puts, R_A64_CALL26)
+    # x0 = *ptr; bl puts
+    w(ref o, 0x90000000, ptr, R_A64_PAGE)
+    w(ref o, 0x91000000, ptr, R_A64_LO12)
+    w(ref o, 0xF9400000, -1, 0)
+    w(ref o, 0x94000000, puts, R_A64_CALL26)
+    # x0 = msg; x1 = *fp; blr x1
+    w(ref o, 0x90000000, msg, R_A64_PAGE)
+    w(ref o, 0x91000000, msg, R_A64_LO12)
+    w(ref o, 0x90000001, fp, R_A64_PAGE)
+    w(ref o, 0x91000021, fp, R_A64_LO12)
+    w(ref o, 0xF9400021, -1, 0)
+    w(ref o, 0xD63F0020, -1, 0)
+    # x2 = puts from the GOT (not called: checks it links)
+    w(ref o, 0x90000002, puts, R_A64_GOT_PAGE)
+    w(ref o, 0xF9400042, puts, R_A64_GOT_LO12)
+    # return 7
+    w(ref o, 0x528000E0, -1, 0)
+    w(ref o, 0xA8C17BFD, -1, 0)
+    w(ref o, 0xD65F03C0, -1, 0)
+    assert msg2 >= 0
+    match link_elf(o, "main", ELF_LIBS):
+        case Ok(b):
+            let path = write_exe(b, "t2")
+            if os.name() != "linux" or os.arch() != "aarch64":
+                return
+            let r = run_exe(path)
             assert r.code == 7, f"exit code {r.code}: {r.out}"
             assert r.out == WANT, r.out
         case Err(e):

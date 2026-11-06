@@ -1,10 +1,10 @@
 # brine's own linker: turns the native backends' object (obj.br) into an
 # executable, so building a program needs no C toolchain.
 #   Windows: a PE image that imports what it calls from the system's DLLs.
-#   Linux (x86-64): a position-independent ELF executable that glibc's
-#   dynamic loader starts, through a `_start` of our own.
+#   Linux (x86-64, AArch64): a position-independent ELF executable that
+#   glibc's dynamic loader starts, through a `_start` of our own.
 
-from obj import ObjFile, OSym, ORel, SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, SEC_UNWIND, SEC_PDATA, R_PC32, R_CALL, R_ABS64, R_GOT, R_RVA32, R_SECREL, ARCH_X64, put16, put32, put64, set32, set64, pad_to, put_name8
+from obj import ObjFile, OSym, ORel, SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, SEC_UNWIND, SEC_PDATA, R_PC32, R_CALL, R_ABS64, R_GOT, R_RVA32, R_SECREL, R_A64_CALL26, R_A64_PAGE, R_A64_LO12, R_A64_GOT_PAGE, R_A64_GOT_LO12, ARCH_X64, ARCH_A64, put16, put32, put64, set32, set64, pad_to, put_name8
 from ir import str_bytes
 
 fn get16(b: [u8], at: int) -> int:
@@ -406,8 +406,11 @@ fn link_pe(o0: ObjFile, entry: str, dlls: [str]) -> Result[[u8], str]:
 
 # ================================================================ ELF (Linux)
 
-const ELF_INTERP = "/lib64/ld-linux-x86-64.so.2"
 const ELF_LIBS = ["libc.so.6", "libm.so.6"]
+
+# Segments are this far apart in memory (but not in the file), so each gets
+# pages of its own on kernels with pages up to 64 KB (some AArch64 ones).
+const SEG = 65536
 
 # glibc's start: __libc_start_main(main, argc, argv, init, fini, rtld_fini,
 # stack_end) runs `main` and exits with what it returns. The `lea` of main and
@@ -417,33 +420,98 @@ const START_X64: [u8] = [
     141, 61, 0, 0, 0, 0, 255, 21, 0, 0, 0, 0, 244
 ]
 
-# A dynamic relocation: R_X86_64_* `typ` at `off`.
+# The same for AArch64: x0 = main (adrp/add, words 6-7), x1 = argc, x2 = argv,
+# x5 = rtld_fini, x6 = the stack; the call goes through the GOT (words 10-11).
+const START_A64 = [
+    0xD280001D, 0xD280001E, 0xAA0003E5, 0xF94003E1, 0x910023E2, 0x910003E6, 0x90000000, 0x91000000,
+    0xD2800003, 0xD2800004, 0x90000010, 0xF9400210, 0xD63F0200, 0xD4200000
+]
+
+# What differs between the two Linux targets.
+struct ElfArch:
+    a64: bool
+    interp: str
+    machine: int
+    # an import's stub: a jump through its GOT entry
+    stub: int
+    # R_*_RELATIVE, R_*_64 (ABS64), R_*_GLOB_DAT
+    r_rel: int
+    r_abs: int
+    r_glob: int
+
+fn elf_arch(arch: int) -> ElfArch:
+    if arch == ARCH_A64:
+        return ElfArch(
+            a64=true,
+            interp="/lib/ld-linux-aarch64.so.1",
+            machine=183,
+            stub=16,
+            r_rel=1027,
+            r_abs=257,
+            r_glob=1025
+        )
+    return ElfArch(
+        a64=false,
+        interp="/lib64/ld-linux-x86-64.so.2",
+        machine=62,
+        stub=8,
+        r_rel=8,
+        r_abs=1,
+        r_glob=6
+    )
+
+# A dynamic relocation: R_* `typ` at `off`.
 struct Rela:
     off: int
     typ: int
     sym: int
     add: int
 
-struct ElfSec:
-    typ: int
-    flags: int
-    addr: int
-    off: int
-    size: int
-    link: int
-    info: int
-    align: int
-    entsize: int
-
-fn put_phdr(ref out: [u8], typ: int, flags: int, off: int, size: int, align: int):
+fn put_phdr(ref out: [u8], typ: int, flags: int, off: int, addr: int, size: int, align: int):
     put32(ref out, typ)
     put32(ref out, flags)
     put64(ref out, off)
-    put64(ref out, off)
-    put64(ref out, off)
+    put64(ref out, addr)
+    put64(ref out, addr)
     put64(ref out, size)
     put64(ref out, size)
     put64(ref out, align)
+
+fn put_shdr(
+    ref out: [u8],
+    name: int,
+    typ: int,
+    flags: int,
+    addr: int,
+    off: int,
+    size: int,
+    link: int,
+    info: int,
+    align: int,
+    entsize: int
+):
+    put32(ref out, name)
+    put32(ref out, typ)
+    put64(ref out, flags)
+    put64(ref out, addr)
+    put64(ref out, off)
+    put64(ref out, size)
+    put32(ref out, link)
+    put32(ref out, info)
+    put64(ref out, align)
+    put64(ref out, entsize)
+
+# AArch64 instruction fields: `adrp` to the page of t (from p), the low 12
+# bits of t in an `add`, and in a 64-bit `ldr` (scaled by 8)
+fn a64_page(ref b: [u8], at: int, t: int, p: int):
+    let d = (t >> 12) - (p >> 12)
+    set32(ref b, at, get32(b, at) | ((d & 3) << 29) | (((d >> 2) & 524287) << 5))
+
+fn a64_lo12(ref b: [u8], at: int, t: int):
+    set32(ref b, at, get32(b, at) | ((t & 4095) << 10))
+
+fn a64_ldr12(ref b: [u8], at: int, t: int):
+    set32(ref b, at, get32(b, at) | (((t & 4095) >> 3) << 10))
 
 # Patches `b` (a section at `base`) with final addresses. `addr` is each
 # symbol's address (-1 outside the image), `got` its GOT entry's (-1 if none),
@@ -455,41 +523,57 @@ fn elf_apply(
     addr: [int],
     got: [int],
     dyn: [int],
+    ea: ElfArch,
     ref relas: [Rela]
 ) -> Result[(), str]:
     for r in rels:
         let p = base + r.off
-        if r.kind == R_SECREL:
+        let k = r.kind
+        if k == R_SECREL:
             continue
-        if r.kind == R_GOT:
+        if k == R_GOT:
             set32(ref b, r.off, got[r.sym] + r.add - p)
+            continue
+        if k == R_A64_GOT_PAGE:
+            a64_page(ref b, r.off, got[r.sym], p)
+            continue
+        if k == R_A64_GOT_LO12:
+            a64_ldr12(ref b, r.off, got[r.sym])
             continue
         let s = addr[r.sym]
         if s < 0:
             return Err("a relocation refers to a section the executable doesn't have")
-        if r.kind == R_PC32 or r.kind == R_CALL:
+        if k == R_PC32 or k == R_CALL:
             let v = s + r.add - p
             if not fits32(v):
                 return Err("a relocation is out of range")
             set32(ref b, r.off, v)
-        elif r.kind == R_ABS64:
+        elif k == R_A64_CALL26:
+            let v = s + r.add - p
+            if v < -134217728 or v >= 134217728:
+                return Err("a call is out of range")
+            set32(ref b, r.off, (get32(b, r.off) & 4227858432) | ((v >> 2) & 67108863))
+        elif k == R_A64_PAGE:
+            a64_page(ref b, r.off, s + r.add, p)
+        elif k == R_A64_LO12:
+            a64_lo12(ref b, r.off, s + r.add)
+        elif k == R_ABS64:
             if dyn[r.sym] > 0:
-                # R_X86_64_64: a libc address (a function passed as a value)
+                # a libc address (a function passed as a value)
                 set64(ref b, r.off, 0)
-                relas.push(Rela(off=p, typ=1, sym=dyn[r.sym], add=r.add))
+                relas.push(Rela(off=p, typ=ea.r_abs, sym=dyn[r.sym], add=r.add))
             else:
-                # R_X86_64_RELATIVE: moved with the executable
+                # moved with the executable
                 set64(ref b, r.off, s + r.add)
-                relas.push(Rela(off=p, typ=8, sym=0, add=s + r.add))
+                relas.push(Rela(off=p, typ=ea.r_rel, sym=0, add=s + r.add))
         else:
-            return Err(f"relocation kind {r.kind} is not supported in a Linux executable")
+            return Err(f"relocation kind {k} is not supported in a Linux executable")
     return Ok(())
 
 # `main` is a C-style main(argc, argv, envp) that returns the exit code.
 fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     var o = o0
-    if o.arch != ARCH_X64:
-        return Err("linking AArch64 executables is not supported yet")
+    let ea = elf_arch(o.arch)
     if any(r.kind == R_ABS64 for r in o.rrel):
         return Err("read-only data with addresses in it (it belongs in .data)")
     let m = find_sym(o, main)?
@@ -504,16 +588,16 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     for nm in imps:
         got_of[nm] = len(got_of)
     var got_local: [int] = []
-    for rs in [o.trel, o.drel, o.urel]:
-        for r in rs:
-            let s = o.syms[r.sym]
-            if r.kind == R_GOT and s.sec != SEC_UNDEF and s.name not in got_of:
-                got_of[s.name] = len(got_of)
-                got_local.push(r.sym)
     var nabs = 0
     for rs in [o.trel, o.drel, o.urel]:
         for r in rs:
-            if r.kind == R_ABS64:
+            let s = o.syms[r.sym]
+            let k = r.kind
+            if k == R_GOT or k == R_A64_GOT_PAGE or k == R_A64_GOT_LO12:
+                if s.sec != SEC_UNDEF and s.name not in got_of:
+                    got_of[s.name] = len(got_of)
+                    got_local.push(r.sym)
+            if k == R_ABS64:
                 nabs += 1
     let nrela = nabs + len(got_of)
     # dynamic strings: libraries, then imports
@@ -542,36 +626,36 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     put32(ref hash, nsym - 1)
     for i in 0..nsym:
         put32(ref hash, max(i - 1, 0))
-    # the read-only segment: headers, interpreter, dynamic linking tables, data
+    # File offsets. The read-only segment: headers, interpreter, dynamic
+    # linking tables, read-only data, unwind tables.
     let nph = 7
+    let interp_len = len(ea.interp.bytes()) + 1
     var pos = 64 + 56 * nph
     let interp_at = pos
-    pos += len(ELF_INTERP.bytes()) + 1
-    pos = align_up(pos, 8)
+    pos = align_up(pos + interp_len, 8)
     let dynsym_at = pos
     pos += len(dynsym)
     let dynstr_at = pos
-    pos += len(dynstr)
-    pos = align_up(pos, 8)
+    pos = align_up(pos + len(dynstr), 8)
     let hash_at = pos
-    pos += len(hash)
-    pos = align_up(pos, 8)
+    pos = align_up(pos + len(hash), 8)
     let rela_at = pos
-    pos += 24 * nrela
-    pos = align_up(pos, max(o.rodata_align, 8))
+    pos = align_up(pos + 24 * nrela, max(o.rodata_align, 8))
     let rodata_at = pos
-    pos += len(o.rodata)
-    pos = align_up(pos, 8)
+    pos = align_up(pos + len(o.rodata), 8)
     let eh_at = pos
     pos += len(o.unwind)
     let r_end = pos
-    # code: the program's, the import stubs, _start
-    let text_at = align_up(r_end, PAGE)
+    # code: the program's, the import stubs, _start (one SEG up in memory)
+    let text_off = align_up(r_end, 16)
+    let text_at = text_off + SEG
     let stubs_at = text_at + align_up(len(o.text), 16)
-    let start_at = stubs_at + 8 * len(imps)
-    let x_end = start_at + len(START_X64)
-    # data: the program's, the GOT, the dynamic section
-    let data_at = align_up(x_end, PAGE)
+    let start_at = stubs_at + ea.stub * len(imps)
+    let start_len = 4 * len(START_A64) if ea.a64 else len(START_X64)
+    let x_end = start_at + start_len
+    # data: the program's, the GOT, the dynamic section (two SEGs up)
+    let data_off = align_up(x_end - SEG, max(o.data_align, 16))
+    let data_at = data_off + 2 * SEG
     let got_at = align_up(data_at + len(o.data), 8)
     let dynamic_at = got_at + 8 * len(got_of)
     let ndyn = len(libs) + 12
@@ -589,26 +673,54 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
         elif s.sec == SEC_UNWIND:
             addr[i] = eh_at + s.off
         elif s.sec == SEC_UNDEF and s.name in imp_of:
-            addr[i] = stubs_at + 8 * imp_of[s.name]
+            addr[i] = stubs_at + ea.stub * imp_of[s.name]
             dyn[i] = imp_of[s.name] + 1
         if s.name in got_of:
             got[i] = got_at + 8 * got_of[s.name]
     var relas: [Rela] = []
-    elf_apply(ref o.text, o.trel, text_at, addr, got, dyn, ref relas)?
-    elf_apply(ref o.data, o.drel, data_at, addr, got, dyn, ref relas)?
-    elf_apply(ref o.unwind, o.urel, eh_at, addr, got, dyn, ref relas)?
+    elf_apply(ref o.text, o.trel, text_at, addr, got, dyn, ea, ref relas)?
+    elf_apply(ref o.data, o.drel, data_at, addr, got, dyn, ea, ref relas)?
+    elf_apply(ref o.unwind, o.urel, eh_at, addr, got, dyn, ea, ref relas)?
     for i, nm in enumerate(imps):
-        # R_X86_64_GLOB_DAT
-        relas.push(Rela(off=got_at + 8 * got_of[nm], typ=6, sym=i + 1, add=0))
+        relas.push(Rela(off=got_at + 8 * got_of[nm], typ=ea.r_glob, sym=i + 1, add=0))
     for si in got_local:
-        relas.push(Rela(off=got[si], typ=8, sym=0, add=addr[si]))
+        relas.push(Rela(off=got[si], typ=ea.r_rel, sym=0, add=addr[si]))
+    # the stubs and _start
+    var code: [u8] = []
+    let lsm = got_at + 8 * got_of["__libc_start_main"]
+    if ea.a64:
+        for nm in imps:
+            # adrp x16, slot; ldr x17, [x16, lo12]; br x17; nop
+            let at = len(code)
+            let g = got_at + 8 * got_of[nm]
+            for w in [0x90000010, 0xF9400211, 0xD61F0220, 0xD503201F]:
+                put32(ref code, w)
+            a64_page(ref code, at, g, stubs_at + at)
+            a64_ldr12(ref code, at + 4, g)
+        let at = len(code)
+        for w in START_A64:
+            put32(ref code, w)
+        a64_page(ref code, at + 24, addr[m], stubs_at + at + 24)
+        a64_lo12(ref code, at + 28, addr[m])
+        a64_page(ref code, at + 40, lsm, stubs_at + at + 40)
+        a64_ldr12(ref code, at + 44, lsm)
+    else:
+        for nm in imps:
+            # jmp [rip + slot]
+            let at = stubs_at + len(code)
+            code.extend([255, 37])
+            put32(ref code, got_at + 8 * got_of[nm] - (at + 6))
+            code.extend([204, 204])
+        var st: [u8] = START_X64
+        set32(ref st, 23, addr[m] - (start_at + 27))
+        set32(ref st, 29, lsm - (start_at + 33))
+        code.extend(st)
     var out: [u8] = []
-    # ELF header
+    # ELF header: 64-bit, little endian, ET_DYN (position independent)
     out.extend([127, 69, 76, 70, 2, 1, 1, 0])
     pad_with(ref out, 16, 0)
-    # ET_DYN (position independent), x86-64
     put16(ref out, 3)
-    put16(ref out, 62)
+    put16(ref out, ea.machine)
     put32(ref out, 1)
     put64(ref out, start_at)
     put64(ref out, 64)
@@ -622,15 +734,16 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     let shnum_at = len(out)
     put16(ref out, 0)
     put16(ref out, 0)
-    # program headers: PT_PHDR, PT_INTERP, PT_LOAD r / r-x / rw-, PT_DYNAMIC, PT_GNU_STACK
-    put_phdr(ref out, 6, 4, 64, 56 * nph, 8)
-    put_phdr(ref out, 3, 4, interp_at, len(ELF_INTERP.bytes()) + 1, 1)
-    put_phdr(ref out, 1, 4, 0, r_end, PAGE)
-    put_phdr(ref out, 1, 5, text_at, x_end - text_at, PAGE)
-    put_phdr(ref out, 1, 6, data_at, w_end - data_at, PAGE)
-    put_phdr(ref out, 2, 6, dynamic_at, 16 * ndyn, 8)
-    put_phdr(ref out, 1685382481, 6, 0, 0, 16)
-    str_bytes(ref out, ELF_INTERP)
+    # PT_PHDR, PT_INTERP, PT_LOAD r / r-x / rw-, PT_DYNAMIC, PT_GNU_STACK
+    let dynamic_off = dynamic_at - 2 * SEG
+    put_phdr(ref out, 6, 4, 64, 64, 56 * nph, 8)
+    put_phdr(ref out, 3, 4, interp_at, interp_at, interp_len, 1)
+    put_phdr(ref out, 1, 4, 0, 0, r_end, SEG)
+    put_phdr(ref out, 1, 5, text_off, text_at, x_end - text_at, SEG)
+    put_phdr(ref out, 1, 6, data_off, data_at, w_end - data_at, SEG)
+    put_phdr(ref out, 2, 6, dynamic_off, dynamic_at, 16 * ndyn, 8)
+    put_phdr(ref out, 1685382481, 6, 0, 0, 0, 16)
+    str_bytes(ref out, ea.interp)
     out.push(0)
     pad_with(ref out, dynsym_at, 0)
     out.extend(dynsym)
@@ -646,23 +759,14 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     out.extend(o.rodata)
     pad_with(ref out, eh_at, 0)
     out.extend(o.unwind)
-    pad_with(ref out, text_at, 0)
+    pad_with(ref out, text_off, 0)
     out.extend(o.text)
-    pad_with(ref out, stubs_at, 204)
-    for nm in imps:
-        # jmp [rip + GOT entry]
-        let at = len(out)
-        out.extend([255, 37])
-        put32(ref out, got_at + 8 * got_of[nm] - (at + 6))
-        out.extend([204, 204])
-    var st: [u8] = START_X64
-    set32(ref st, 23, addr[m] - (start_at + 27))
-    set32(ref st, 29, got_at + 8 * got_of["__libc_start_main"] - (start_at + 33))
-    out.extend(st)
-    pad_with(ref out, data_at, 0)
+    pad_with(ref out, stubs_at - SEG, 0)
+    out.extend(code)
+    pad_with(ref out, data_off, 0)
     out.extend(o.data)
     # the GOT starts zeroed; the loader fills it in
-    pad_with(ref out, dynamic_at, 0)
+    pad_with(ref out, dynamic_off, 0)
     for at in lib_at:
         # DT_NEEDED
         put64(ref out, 1)
@@ -704,7 +808,9 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
         put16(ref symtab, 3)
         put64(ref symtab, text_at + off)
         put64(ref symtab, end - off)
-    let names = [
+    var shstr: [u8] = []
+    var name_at: [int] = []
+    for nm in [
         "",
         ".dynsym",
         ".dynstr",
@@ -716,10 +822,7 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
         ".symtab",
         ".strtab",
         ".shstrtab"
-    ]
-    var shstr: [u8] = []
-    var name_at: [int] = []
-    for nm in names:
+    ]:
         name_at.push(len(shstr))
         str_bytes(ref shstr, nm)
         shstr.push(0)
@@ -732,130 +835,31 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     out.extend(shstr)
     pad_to(ref out, 8)
     let shoff = len(out)
-    let secs = [
-        ElfSec(typ=0, flags=0, addr=0, off=0, size=0, link=0, info=0, align=0, entsize=0),
-        ElfSec(
-            typ=11,
-            flags=2,
-            addr=dynsym_at,
-            off=dynsym_at,
-            size=len(dynsym),
-            link=2,
-            info=1,
-            align=8,
-            entsize=24
-        ),
-        ElfSec(
-            typ=3,
-            flags=2,
-            addr=dynstr_at,
-            off=dynstr_at,
-            size=len(dynstr),
-            link=0,
-            info=0,
-            align=1,
-            entsize=0
-        ),
-        ElfSec(
-            typ=1,
-            flags=6,
-            addr=text_at,
-            off=text_at,
-            size=x_end - text_at,
-            link=0,
-            info=0,
-            align=16,
-            entsize=0
-        ),
-        ElfSec(
-            typ=1,
-            flags=2,
-            addr=rodata_at,
-            off=rodata_at,
-            size=len(o.rodata),
-            link=0,
-            info=0,
-            align=max(o.rodata_align, 1),
-            entsize=0
-        ),
-        ElfSec(
-            typ=1,
-            flags=2,
-            addr=eh_at,
-            off=eh_at,
-            size=len(o.unwind),
-            link=0,
-            info=0,
-            align=8,
-            entsize=0
-        ),
-        ElfSec(
-            typ=1,
-            flags=3,
-            addr=data_at,
-            off=data_at,
-            size=dynamic_at - data_at,
-            link=0,
-            info=0,
-            align=max(o.data_align, 8),
-            entsize=0
-        ),
-        ElfSec(
-            typ=6,
-            flags=3,
-            addr=dynamic_at,
-            off=dynamic_at,
-            size=w_end - dynamic_at,
-            link=2,
-            info=0,
-            align=8,
-            entsize=16
-        ),
-        ElfSec(
-            typ=2,
-            flags=0,
-            addr=0,
-            off=symtab_at,
-            size=len(symtab),
-            link=9,
-            info=len(funcs) + 1,
-            align=8,
-            entsize=24
-        ),
-        ElfSec(
-            typ=3,
-            flags=0,
-            addr=0,
-            off=strtab_at,
-            size=len(strtab),
-            link=0,
-            info=0,
-            align=1,
-            entsize=0
-        ),
-        ElfSec(
-            typ=3,
-            flags=0,
-            addr=0,
-            off=shstr_at,
-            size=len(shstr),
-            link=0,
-            info=0,
-            align=1,
-            entsize=0
-        )
-    ]
-    for i, s in enumerate(secs):
-        put32(ref out, name_at[i])
-        put32(ref out, s.typ)
-        put64(ref out, s.flags)
-        put64(ref out, s.addr)
-        put64(ref out, s.off)
-        put64(ref out, s.size)
-        put32(ref out, s.link)
-        put32(ref out, s.info)
-        put64(ref out, s.align)
-        put64(ref out, s.entsize)
+    let n = name_at
+    # SHT_* 1 PROGBITS, 2 SYMTAB, 3 STRTAB, 6 DYNAMIC, 11 DYNSYM; SHF_* 1 W, 2 A, 4 X
+    put_shdr(ref out, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    put_shdr(ref out, n[1], 11, 2, dynsym_at, dynsym_at, len(dynsym), 2, 1, 8, 24)
+    put_shdr(ref out, n[2], 3, 2, dynstr_at, dynstr_at, len(dynstr), 0, 0, 1, 0)
+    put_shdr(ref out, n[3], 1, 6, text_at, text_off, x_end - text_at, 0, 0, 16, 0)
+    put_shdr(
+        ref out,
+        n[4],
+        1,
+        2,
+        rodata_at,
+        rodata_at,
+        len(o.rodata),
+        0,
+        0,
+        max(o.rodata_align, 1),
+        0
+    )
+    put_shdr(ref out, n[5], 1, 2, eh_at, eh_at, len(o.unwind), 0, 0, 8, 0)
+    put_shdr(ref out, n[6], 1, 3, data_at, data_off, dynamic_at - data_at, 0, 0, 16, 0)
+    put_shdr(ref out, n[7], 6, 3, dynamic_at, dynamic_off, w_end - dynamic_at, 2, 0, 8, 16)
+    put_shdr(ref out, n[8], 2, 0, 0, symtab_at, len(symtab), 9, len(funcs) + 1, 8, 24)
+    put_shdr(ref out, n[9], 3, 0, 0, strtab_at, len(strtab), 0, 0, 1, 0)
+    put_shdr(ref out, n[10], 3, 0, 0, shstr_at, len(shstr), 0, 0, 1, 0)
     set64(ref out, shoff_at, shoff)
-    set32(ref out, shnum_at, len(secs) | (10 << 16))
+    set32(ref out, shnum_at, 11 | (10 << 16))
     return Ok(out)
