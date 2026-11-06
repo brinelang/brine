@@ -75,6 +75,12 @@ const F_MUL = 7
 # `a >> k` read only by the `& (2^n - 1)` right after it, which is then a
 # ubfx (fval: the shift's position)
 const F_SHR = 8
+# `a << k` or `a >> k` read only by the `+` or `-` right after it, which then
+# takes it as a shifted register (fval: the shift's position)
+const F_SHIFT = 9
+# `a + 1` read only by an `a * (a + 1)` right after it, which is then
+# `madd a, a, a` (fval: a)
+const F_INC = 10
 
 # call argument sources
 const A_VAL = 0
@@ -1598,6 +1604,44 @@ struct A:
                 continue
             self.fold[y.d] = F_SHR
             self.fval[y.d] = i - 1
+        for i in 1..ncode:
+            let x = f.code[i]
+            let y = f.code[i - 1]
+            let shifted = (
+                (x.op == Op.Add or x.op == Op.Sub)
+                and (y.op == Op.Shl or y.op == Op.Shr)
+                and self.imm(y.b)
+                and x.a != x.b
+                and (y.d == x.b or (x.op == Op.Add and y.d == x.a))
+            )
+            let inc = (
+                x.op == Op.Mul
+                and y.op == Op.Add
+                and self.imm(y.b)
+                and self.fval[y.b] == 1
+                and ((x.a == y.a and x.b == y.d) or (x.b == y.a and x.a == y.d))
+            )
+            if not shifted and not inc:
+                continue
+            let k = f.vk[x.d]
+            if (
+                (k != K.I64 and k != K.U64)
+                or f.vk[y.d] != k
+                or self.nuse[y.d] != 1
+                or ndef[y.d] != 1
+                or self.fold[y.d] != F_NONE
+                or y.a == y.d
+            ):
+                continue
+            if shifted:
+                let sh = self.fval[y.b]
+                if sh <= 0 or sh >= 64:
+                    continue
+                self.fold[y.d] = F_SHIFT
+                self.fval[y.d] = i - 1
+            else:
+                self.fold[y.d] = F_INC
+                self.fval[y.d] = y.a
         var out_bytes = 0
         for x in f.code:
             if x.op == Op.Call or x.op == Op.CallInd:
@@ -2642,6 +2686,34 @@ struct A:
         self.epilogue()
 
     fn int_bin(ref self, x0: Inst):
+        if (
+            (x0.op == Op.Add or x0.op == Op.Sub)
+            and (self.fold[x0.b] == F_SHIFT or (x0.op == Op.Add and self.fold[x0.a] == F_SHIFT))
+        ):
+            let s = x0.b if self.fold[x0.b] == F_SHIFT else x0.a
+            let y = self.code[self.fval[s]]
+            let r = self.dst(x0.d)
+            let p = self.use(T0, x0.a if s == x0.b else x0.b)
+            let q = self.use(T1, y.a)
+            let ty = 0 if y.op == Op.Shl else (2 if self.vk[y.d].is_signed() else 1)
+            # add / sub r, p, q, lsl / lsr / asr #k
+            self.w(
+                (0x8B000000 if x0.op == Op.Add else 0xCB000000)
+                | (ty << 22)
+                | (q << 16)
+                | (self.fval[y.b] << 10)
+                | (p << 5)
+                | r
+            )
+            self.st(r, x0.d)
+            return
+        if x0.op == Op.Mul and (self.fold[x0.a] == F_INC or self.fold[x0.b] == F_INC):
+            let r = self.dst(x0.d)
+            let p = self.use(T0, self.fval[x0.a if self.fold[x0.a] == F_INC else x0.b])
+            # madd r, p, p, p: p * (p + 1)
+            self.w(0x9B000000 | (p << 16) | (p << 10) | (p << 5) | r)
+            self.st(r, x0.d)
+            return
         if x0.op == Op.Add and (self.fold[x0.a] == F_MUL or self.fold[x0.b] == F_MUL):
             let m = x0.a if self.fold[x0.a] == F_MUL else x0.b
             let y = self.code[self.fval[m]]
