@@ -60,18 +60,6 @@ const SMALL = 256
 
 const ONES: u64 = 0xffffffffffffffff
 
-extern fn brine_x_str_reset(ps: ptr, lit: ptr)
-
-extern fn brine_x_str_add_byte(ps: ptr, c: u8)
-
-extern fn brine_x_str_add(ps: ptr, b: ptr)
-
-extern fn brine_x_str_at(s: ptr, i: int, loc: ptr) -> ptr
-
-extern fn brine_x_str_room(n: int) -> int
-
-extern fn brine_x_app_byte(ps: ptr, ap: ptr, c: u8)
-
 # the low n bytes of a word, 0 <= n <= 8
 fn lowmask(n: u64) -> u64:
     if n >= 8:
@@ -81,7 +69,7 @@ fn lowmask(n: u64) -> u64:
 # The longest string the block of a string of length n holds (brine_str_room).
 fn str_room(n: int) -> int:
     if n > 47:
-        return brine_x_str_room(n)
+        return str_block(n) - 17
     return ((n + 32) & ~15) - 17
 
 fn str_eq(a: ptr, b: ptr) -> bool:
@@ -157,7 +145,18 @@ fn str_reset(ps: ptr, lit: ptr):
         store_u64(a, STR_DATA, load_u64(lit, STR_DATA) & lowmask(n))
         store_u64(a, STR_LEN, n)
         return
-    brine_x_str_reset(ps, lit)
+    str_reset_cold(ps, lit)
+
+fn str_reset_cold(ps: ptr, lit: ptr):
+    let a = load_ptr(ps, 0)
+    let n = load_i64(lit, STR_LEN)
+    if load_i64(a, STR_RC) == 1 and n <= str_room(load_i64(a, STR_LEN)):
+        copy_bytes(a + STR_DATA, lit + STR_DATA, n)
+        store_u8(a, STR_DATA + n, 0)
+        store_i64(a, STR_LEN, n)
+        return
+    release_str(a)
+    store_ptr(ps, 0, lit)
 
 # `s[i]` (i in bounds): the byte as a one-character string, from the table
 # of immortal ones (brine_bytes: brine_str1, 24 bytes each)
@@ -166,7 +165,7 @@ fn str_byte(s: ptr, i: int) -> ptr:
 
 fn str_at(s: ptr, i: int, loc: ptr) -> ptr:
     if u64(i) >= load_u64(s, STR_LEN):
-        return brine_x_str_at(s, i, loc)
+        brine_panic_idx(i, load_i64(s, STR_LEN), loc)
     return str_byte(s, i)
 
 # `s += t`, in place when s is unshared, t is at most a word and the word
@@ -182,7 +181,18 @@ fn str_add(ps: ptr, b: ptr):
             store_u8(a, STR_DATA + la + 8, 0)
         store_i64(a, STR_LEN, la + lb)
         return
-    brine_x_str_add(ps, b)
+    str_add_cold(ps, b)
+
+fn str_add_cold(ps: ptr, b: ptr):
+    let a = load_ptr(ps, 0)
+    let la = load_i64(a, STR_LEN)
+    let n = la + load_i64(b, STR_LEN)
+    if load_i64(a, STR_RC) == 1 and n <= str_room(la):
+        copy_bytes(a + STR_DATA + la, b + STR_DATA, n - la)
+        store_u8(a, STR_DATA + n, 0)
+        store_i64(a, STR_LEN, n)
+        return
+    brine_str_append(ps, b)
 
 # `s += t[i]`: one byte, in place when s is unshared and has room. Within
 # the first word the whole word is rewritten, so a later word load forwards
@@ -198,7 +208,17 @@ fn str_add_byte(ps: ptr, c: u8):
             store_u8(a, STR_DATA + 8, 0)
         store_i64(a, STR_LEN, la + 1)
         return
-    brine_x_str_add_byte(ps, c)
+    str_add_byte_cold(ps, c)
+
+fn str_add_byte_cold(ps: ptr, c: u8):
+    let a = load_ptr(ps, 0)
+    let la = load_i64(a, STR_LEN)
+    if load_i64(a, STR_RC) == 1 and la < str_room(la):
+        store_u8(a, STR_DATA + la, c)
+        store_u8(a, STR_DATA + la + 1, 0)
+        store_i64(a, STR_LEN, la + 1)
+        return
+    brine_str_add_byte_slow(ps, c)
 
 # The appender (brine_app_open): the length and the first word in it, the
 # bytes after those straight into s's block while it is unshared and has
@@ -225,7 +245,36 @@ fn app_byte(ps: ptr, ap: ptr, c: u8):
         store_u8(load_ptr(ap, APP_DATA), n, c)
         store_i64(ap, APP_LEN, n + 1)
         return
-    brine_x_app_byte(ps, ap, c)
+    app_more_cold(ps, ap, c)
+
+# app_byte past its fast paths: the 9th byte, a shared string or a full block
+fn app_more_cold(ps: ptr, ap: ptr, c: u8):
+    let n = load_i64(ap, APP_LEN)
+    let room = load_i64(ap, APP_ROOM)
+    if n == 8 and n < room:
+        let d = load_ptr(ap, APP_DATA)
+        store_u64(d, 0, load_u64(ap, APP_W0))
+        store_u8(d, 8, c)
+        store_i64(ap, APP_LEN, 9)
+        store_i64(ap, APP_LIM, 0)
+        store_u64(ap, APP_W0, 0)
+        return
+    if room >= 0:
+        # unshared: write the appender back first
+        let a = load_ptr(ps, 0)
+        if n <= 8:
+            store_u64(a, STR_DATA, load_u64(ap, APP_W0))
+        store_i64(a, STR_LEN, n)
+        store_u8(a, STR_DATA + n, 0)
+    brine_str_add_byte_slow(ps, c)
+    let s = load_ptr(ps, 0)
+    let m = n + 1
+    let r = str_room(m)
+    store_ptr(ap, APP_DATA, s + STR_DATA)
+    store_i64(ap, APP_LEN, m)
+    store_i64(ap, APP_ROOM, r)
+    store_i64(ap, APP_LIM, 8 if m < 8 and r >= 8 else 0)
+    store_u64(ap, APP_W0, load_u64(s, STR_DATA) & lowmask(u64(m)))
 
 fn app_close(ps: ptr, ap: ptr):
     let a = load_ptr(ps, 0)
@@ -433,7 +482,9 @@ fn brine_rt_str(p: ptr):
         rc_inc(s)
 
 fn brine_rl_str(p: ptr):
-    let s = load_ptr(p, 0)
+    release_str(load_ptr(p, 0))
+
+fn release_str(s: ptr):
     let rc = load_i64(s, STR_RC)
     if rc >= 0 and (rc == 1 or rc_dec(s, rc)):
         brine_str_free(s)
