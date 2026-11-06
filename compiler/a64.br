@@ -89,6 +89,12 @@ const S_ADD = 0
 const S_SUB = 1
 const S_MUL = 2
 const S_IDX = 3
+# the atomic half of an inline retain or release (inline_rc)
+const S_RC = 4
+# S_RC flags
+const RC_RETAIN = 1
+const RC_IMMORTAL = 2
+const RC_MAP = 4
 
 # branch fields to patch: imm26 (b, bl), imm19 (b.cond, cbz), imm14 (tbz);
 # W32: a jump table word, the byte offset from itself
@@ -274,6 +280,9 @@ struct Stub:
     a: int
     b: int
     c: int
+    # S_RC: where its "done" exit goes, a position or (if >= 0) a label
+    d: int
+    e: int
 
 # Where (offsets in .text) a function's prologue steps end, for .eh_frame.
 struct Unw:
@@ -742,7 +751,7 @@ struct A:
         self.st_end = -1
 
     fn bcc_stub(ref self, cc: int, kind: int, a: int, b: int, c: int):
-        self.stubs.push(Stub(at=self.pos(), kind=kind, a=a, b=b, c=c))
+        self.stubs.push(Stub(at=self.pos(), kind=kind, a=a, b=b, c=c, d=-1, e=-1))
         self.w(0x54000000 | cc)
 
     # ------------------------------------------------------------ vregs
@@ -1029,6 +1038,13 @@ struct A:
             or n == "brine_box_retain"
             or n == "brine_box_dec"
         )
+        var flags = 0
+        if immortal:
+            flags = flags | RC_IMMORTAL
+        if n == "brine_map_release":
+            flags = flags | RC_MAP
+        # Only the one-thread path is inline: the atomic one is a cold stub
+        # (rc_stub), which keeps hot code small.
         if retain:
             var skip = -1
             self.ldst(M_LDRX, T0, b, 0)
@@ -1036,27 +1052,14 @@ struct A:
                 # tbnz x9, #63
                 skip = self.fwd(0xB7F80000 | T0)
             let shared = self.if_mt()
-            # a plain add unless other threads may hold the value
             self.w(0x91000400 | (T0 << 5) | T0)
             self.ldst(M_STRX, T0, b, 0)
-            let e = self.fwd(0x14000000)
-            self.here(shared, B19)
-            let ll = self.if_no_lse_mt()
-            # mov x9, #1; stadd x9, [b]
-            self.mov_ri(T0, 1)
-            self.w(0xF820001F | (T0 << 16) | (b << 5))
-            let e2 = self.fwd(0x14000000)
-            self.here(ll, B14)
-            let top = self.pos()
-            # ldxr x9, [b]; add x9, x9, #1; stxr w11, x9, [b]; cbnz w11, top
-            self.w(0xC85F7C00 | (b << 5) | T0)
-            self.w(0x91000400 | (T0 << 5) | T0)
-            self.w(0xC8007C00 | (T2 << 16) | (b << 5) | T0)
-            self.w(0x35000000 | ((((top - self.pos()) / 4) & 0x7FFFF) << 5) | T2)
-            self.here(e, B26)
-            self.here(e2, B26)
             if skip >= 0:
                 self.here(skip, B14)
+            let back = self.pos()
+            self.stubs.push(
+                Stub(at=shared, kind=S_RC, a=flags | RC_RETAIN, b=b, c=back, d=back, e=-1)
+            )
             return true
         var done: [int] = []
         var frees: [int] = []
@@ -1071,46 +1074,25 @@ struct A:
             # (a map is freed with its count stored as 0)
             self.ldst(M_STRX, T0, b, 0)
             done.push(self.fwd(0x54000000 | C_NE))
-            frees.push(self.fwd(0x14000000))
         else:
             frees.push(self.fwd(0x54000000 | C_EQ))
             self.ldst(M_STRX, T0, b, 0)
             done.push(self.fwd(0x14000000))
-        self.here(shared, B19)
-        # ldar x9, [b]
-        self.w(0xC8DFFC00 | (b << 5) | T0)
-        if immortal:
-            done.push(self.fwd(0xB7F80000 | T0))
-        if n != "brine_map_release":
-            # the only reference: no other thread can change the count
-            self.cmp_ri(T0, 1)
-            frees.push(self.fwd(0x54000000 | C_EQ))
-        let ll = self.if_no_lse_mt()
-        # mov x9, #-1; ldaddal x9, x9, [b]; cmp x9, #1 (the count before)
-        self.mov_ri(T0, -1)
-        self.w(0xF8E00000 | (T0 << 16) | (b << 5) | T0)
-        self.cmp_ri(T0, 1)
-        done.push(self.fwd(0x54000000 | C_NE))
-        frees.push(self.fwd(0x14000000))
-        self.here(ll, B14)
-        let top = self.pos()
-        # ldaxr x9, [b]; sub x9, x9, #1; stlxr w11, x9, [b]; cbnz w11, top
-        self.w(0xC85FFC00 | (b << 5) | T0)
-        self.w(0xD1000400 | (T0 << 5) | T0)
-        self.w(0xC800FC00 | (T2 << 16) | (b << 5) | T0)
-        self.w(0x35000000 | ((((top - self.pos()) / 4) & 0x7FFFF) << 5) | T2)
-        # cbnz x9, done
-        done.push(self.fwd(0xB5000000 | T0))
         for at in frees:
-            self.here(at, B26 if self.get32(at) >> 26 == 5 else B19)
+            self.here(at, B19)
+        let free_at = self.pos()
+        var done_at = -1
+        var done_label = -1
         if n == "brine_box_dec" and self.dec_br >= 0:
             let br = self.code[self.dec_br]
             if br.op == Op.Br:
                 self.jmp_label(br.n)
                 for at in done:
                     self.here(at, done_kind(self.get32(at)))
+                done_at = self.pos()
             else:
                 # (straight to the label, but a tbnz reaches only 32 KiB)
+                done_label = br.n
                 var near: [int] = []
                 for at in done:
                     let k = done_kind(self.get32(at))
@@ -1124,21 +1106,82 @@ struct A:
                         self.here(at, B14)
                     self.jmp_label(br.n)
                     self.here(over, B26)
-            return true
-        if n == "brine_box_dec":
+        elif n == "brine_box_dec":
             self.mov_ri(T0, 1)
             let over = self.fwd(0x14000000)
             for at in done:
                 self.here(at, done_kind(self.get32(at)))
+            done_at = self.pos()
             self.mov_ri(T0, 0)
             self.here(over, B26)
             if x.d >= 0:
                 self.st(T0, x.d)
-            return true
-        self.call_rt(free, [CArg(how=A_VAL, v=p, fl=0)])
-        for at in done:
-            self.here(at, done_kind(self.get32(at)))
+        else:
+            self.call_rt(free, [CArg(how=A_VAL, v=p, fl=0)])
+            for at in done:
+                self.here(at, done_kind(self.get32(at)))
+            done_at = self.pos()
+        self.stubs.push(
+            Stub(at=shared, kind=S_RC, a=flags, b=b, c=free_at, d=done_at, e=done_label)
+        )
         return true
+
+    # A branch from a cold stub back into the body: to position `to`, or to
+    # label l when l >= 0.
+    fn stub_br(ref self, ins: int, kind: int, to: int, l: int):
+        let at = self.fwd(ins)
+        if l >= 0:
+            self.to_label(at, kind, l)
+        else:
+            self.patch(at, to, kind)
+
+    # The atomic half of inline_rc, for when other threads may hold the value:
+    # x12 is still brine_mt, b the pointer. A retain goes back to s.c; a
+    # release to s.c to free, or to its done exit (s.d / s.e).
+    fn rc_stub(ref self, s: Stub):
+        let b = s.b
+        if s.a & RC_RETAIN != 0:
+            let ll = self.if_no_lse_mt()
+            # mov x9, #1; stadd x9, [b]
+            self.mov_ri(T0, 1)
+            self.w(0xF820001F | (T0 << 16) | (b << 5))
+            self.stub_br(0x14000000, B26, s.c, -1)
+            self.here(ll, B14)
+            let top = self.pos()
+            # ldxr x9, [b]; add x9, x9, #1; stxr w11, x9, [b]; cbnz w11, top
+            self.w(0xC85F7C00 | (b << 5) | T0)
+            self.w(0x91000400 | (T0 << 5) | T0)
+            self.w(0xC8007C00 | (T2 << 16) | (b << 5) | T0)
+            self.w(0x35000000 | ((((top - self.pos()) / 4) & 0x7FFFF) << 5) | T2)
+            self.stub_br(0x14000000, B26, s.c, -1)
+            return
+        # ldar x9, [b]
+        self.w(0xC8DFFC00 | (b << 5) | T0)
+        if s.a & RC_IMMORTAL != 0:
+            # tbz x9, #63, +8; b done (a tbnz reaches only 32 KiB)
+            self.w(0xB6F80040 | T0)
+            self.stub_br(0x14000000, B26, s.d, s.e)
+        if s.a & RC_MAP == 0:
+            # the only reference: no other thread can change the count
+            self.cmp_ri(T0, 1)
+            self.stub_br(0x54000000 | C_EQ, B19, s.c, -1)
+        let ll = self.if_no_lse_mt()
+        # mov x9, #-1; ldaddal x9, x9, [b]; cmp x9, #1 (the count before)
+        self.mov_ri(T0, -1)
+        self.w(0xF8E00000 | (T0 << 16) | (b << 5) | T0)
+        self.cmp_ri(T0, 1)
+        self.stub_br(0x54000000 | C_NE, B19, s.d, s.e)
+        self.stub_br(0x14000000, B26, s.c, -1)
+        self.here(ll, B14)
+        let top = self.pos()
+        # ldaxr x9, [b]; sub x9, x9, #1; stlxr w11, x9, [b]; cbnz w11, top
+        self.w(0xC85FFC00 | (b << 5) | T0)
+        self.w(0xD1000400 | (T0 << 5) | T0)
+        self.w(0xC800FC00 | (T2 << 16) | (b << 5) | T0)
+        self.w(0x35000000 | ((((top - self.pos()) / 4) & 0x7FFFF) << 5) | T2)
+        # cbnz x9, done
+        self.stub_br(0xB5000000 | T0, B19, s.d, s.e)
+        self.stub_br(0x14000000, B26, s.c, -1)
 
     fn ir_call(ref self, x: Inst):
         if x.op == Op.Call and x.b == 1 and self.inline_rc(x):
@@ -1641,7 +1684,9 @@ struct A:
         # cold stubs
         for s in self.stubs:
             self.here(s.at, B19)
-            if s.kind == S_IDX:
+            if s.kind == S_RC:
+                self.rc_stub(s)
+            elif s.kind == S_IDX:
                 self.call_rt(
                     "brine_panic_idx",
                     [
