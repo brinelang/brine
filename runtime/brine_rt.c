@@ -5995,6 +5995,7 @@ static void br_quote_arg(brine_sb *sb, const char *a) {
 #endif
 
 /* Run a program and wait for it. false (with *err set) if it couldn't be started. */
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_run(brine_arr *argv, int64_t *code, brine_str **err) {
     *code = 0;
     /* the child writes to the same stdout: what we printed comes first */
@@ -6070,6 +6071,7 @@ bool brine_run(brine_arr *argv, int64_t *code, brine_str **err) {
     free(cv);
     return ok;
 }
+#endif
 
 /* ============================================================ the os module */
 #ifndef _WIN32
@@ -6154,6 +6156,7 @@ static brine_str *br_lossy(const unsigned char *p, size_t n) {
 
 static int br_cmp_strp(const void *a, const void *b) { return brine_str_cmp(*(brine_str *const *)a, *(brine_str *const *)b); }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_list_dir(brine_str *path, brine_arr **out, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
@@ -6210,6 +6213,7 @@ bool brine_os_list_dir(brine_str *path, brine_arr **out, brine_str **err) {
     *out = a;
     return true;
 }
+#endif
 
 /* 0: missing, 1: regular file, 2: directory, 3: something else. Follows links. */
 static int br_kind(const char *p) {
@@ -6236,6 +6240,7 @@ static int br_kind(const char *p) {
 #endif
 }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_is_dir(brine_str *path) {
     char *p = br_cstr(path);
     if (!p) return false;
@@ -6243,7 +6248,9 @@ bool brine_os_is_dir(brine_str *path) {
     free(p);
     return k == 2;
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_is_file(brine_str *path) {
     char *p = br_cstr(path);
     if (!p) return false;
@@ -6251,6 +6258,7 @@ bool brine_os_is_file(brine_str *path) {
     free(p);
     return k == 1;
 }
+#endif
 
 static int br_is_sep(char c) {
 #ifdef _WIN32
@@ -6317,6 +6325,7 @@ static int br_mkdir_all(const char *p) {
     return !e || br_kind(p) == 2 ? 0 : e;
 }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_make_dir(brine_str *path, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
@@ -6329,7 +6338,9 @@ bool brine_os_make_dir(brine_str *path, brine_str **err) {
     else if (e) *err = br_os_err(e);
     return e == 0;
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_remove_file(brine_str *path, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
@@ -6347,7 +6358,9 @@ bool brine_os_remove_file(brine_str *path, brine_str **err) {
     if (e) *err = br_os_err(e);
     return e == 0;
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_rename(brine_str *src, brine_str *dst, brine_str **err) {
     char *a = br_cstr(src), *b = br_cstr(dst);
     if (!a || !b) {
@@ -6369,7 +6382,9 @@ bool brine_os_rename(brine_str *src, brine_str *dst, brine_str **err) {
     if (e) *err = br_os_err(e);
     return e == 0;
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_os_cwd(void) {
 #ifdef _WIN32
     DWORD n = GetCurrentDirectoryW(0, NULL);
@@ -6393,7 +6408,9 @@ brine_str *brine_os_cwd(void) {
     }
 #endif
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_set_cwd(brine_str *path, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
@@ -6411,11 +6428,13 @@ bool brine_os_set_cwd(brine_str *path, brine_str **err) {
     if (e) *err = br_os_err(e);
     return e == 0;
 }
+#endif
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
 /* the absolute path of the running executable */
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_os_exe_path(void) {
 #ifdef _WIN32
     for (DWORD cap = 260; cap < (1u << 20); cap *= 2) {
@@ -6457,7 +6476,9 @@ brine_str *brine_os_exe_path(void) {
     const char *a0 = br_argv && br_argv[0] ? br_argv[0] : "";
     return brine_str_new(a0, (int64_t)strlen(a0));
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_os_temp_dir(void) {
     brine_str *s;
 #ifdef _WIN32
@@ -6486,7 +6507,9 @@ brine_str *brine_os_temp_dir(void) {
     }
     return s;
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_abs_path(brine_str *path, brine_str **out, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
@@ -6529,8 +6552,10 @@ bool brine_os_abs_path(brine_str *path, brine_str **out, brine_str **err) {
     return true;
 #endif
 }
+#endif
 
 /* the names Rust uses in std::env::consts */
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_os_name(void) {
 #if defined(_WIN32)
     const char *n = "windows";
@@ -6557,7 +6582,9 @@ brine_str *brine_os_name(void) {
 #endif
     return brine_str_new(n, (int64_t)strlen(n));
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_os_arch(void) {
 #if defined(__wasm32__)
     const char *n = "wasm32";
@@ -6582,6 +6609,7 @@ brine_str *brine_os_arch(void) {
 #endif
     return brine_str_new(n, (int64_t)strlen(n));
 }
+#endif
 
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 int64_t brine_os_pid(void) {
@@ -6595,10 +6623,12 @@ int64_t brine_os_pid(void) {
 }
 #endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 int64_t brine_os_cpu_count(void) {
     int n = br_ncpu();
     return n > 0 ? n : 1;
 }
+#endif
 int64_t brine_os_thread_count(void) { return br_threads(); }
 
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
@@ -6650,6 +6680,7 @@ static int br_msys_tty(HANDLE h) {
 }
 #endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_is_terminal(int64_t fd) {
     if (fd < 0 || fd > 2) return false;
 #ifdef _WIN32
@@ -6663,7 +6694,9 @@ bool brine_os_is_terminal(int64_t fd) {
     return isatty((int)fd) == 1;
 #endif
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 void brine_os_enable_ansi(void) {
 #ifdef _WIN32
     DWORD which[2] = {STD_OUTPUT_HANDLE, STD_ERROR_HANDLE};
@@ -6674,6 +6707,7 @@ void brine_os_enable_ansi(void) {
     }
 #endif
 }
+#endif
 
 bool brine_os_free_ports(int64_t n, brine_arr **out, brine_str **err) {
 #ifdef BR_WASM

@@ -8372,8 +8372,8 @@ fn brine_os_sleep(seconds: float):
         while nanosleep(ts, ts) != 0:
             pass
 
-# ------------------------------------------------------------ files and stdin
-# brine_rt.c's "files and processes" (the files part) and "stdin". Messages
+# ------------------------------------------- files, stdin and the os module
+# brine_rt.c's "files and processes", "stdin" and "the os module". Messages
 # read as the C ones did: the C library's strerror, Windows' FormatMessageW.
 
 extern fn strlen(p: ptr) -> u64
@@ -8928,3 +8928,868 @@ fn brine_read_stdin(out: ptr) -> bool:
         return false
     store_ptr(out, 0, brine_str_new(p, n))
     return true
+
+# ---- run
+extern fn posix_spawnp(pid: ptr, file: ptr, fa: ptr, attr: ptr, argv: ptr, envp: ptr) -> i32
+
+extern fn waitpid(pid: i32, status: ptr, flags: i32) -> i32
+
+extern fn _NSGetEnviron() -> ptr
+
+extern fn CreateProcessW(
+    app: ptr,
+    line: ptr,
+    pa: ptr,
+    ta: ptr,
+    inherit: i32,
+    flags: u32,
+    env: ptr,
+    dir: ptr,
+    si: ptr,
+    pi: ptr
+) -> i32
+
+extern fn WaitForSingleObject(h: ptr, ms: u32) -> u32
+
+extern fn GetExitCodeProcess(h: ptr, code: ptr) -> i32
+
+extern fn CloseHandle(h: ptr) -> i32
+
+# STARTUPINFOW: cb, dwFlags, hStdInput, hStdOutput, hStdError
+const SI_SIZE = 104
+const SI_FLAGS = 60
+const SI_IN = 80
+const SI_OUT = 88
+const SI_ERR = 96
+
+# PROCESS_INFORMATION: hProcess, hThread
+const PI_PROC = 0
+const PI_THREAD = 8
+
+const INFINITE: u32 = 0xffffffff
+
+# The environment (the C library's `environ`).
+fn os_environ() -> ptr:
+    if os_is("macos"):
+        return load_ptr(_NSGetEnviron(), 0)
+    else:
+        return load_ptr(symbol("environ"), 0)
+
+# Is byte c one of the bytes of `set`?
+fn os_in_set(c: u8, set: str) -> bool:
+    let p = ptr_of(set)
+    for i in 0..load_i64(p, STR_LEN):
+        if load_u8(p, STR_DATA + i) == c:
+            return true
+    return false
+
+# Does C string a hold a byte of `set`? (strpbrk)
+fn os_has_any(a: ptr, set: str) -> bool:
+    var i = 0
+    while load_u8(a, i) != 0:
+        if os_in_set(load_u8(a, i), set):
+            return true
+        i += 1
+    return false
+
+fn os_backslashes(sb: ptr, n: int):
+    for i in 0..n:
+        sb_byte(sb, 92)
+
+# One argument of a command line (C string a), quoted so the child's argv
+# parser gets it back unchanged.
+fn os_quote_arg(sb: ptr, a: ptr):
+    if load_u8(a, 0) != 0 and not os_has_any(a, " \t\n\u{b}\""):
+        brine_sb_cat(sb, a, int(strlen(a)))
+        return
+    sb_byte(sb, 34)
+    var i = 0
+    while true:
+        var slashes = 0
+        while load_u8(a, i) == 92:
+            slashes += 1
+            i += 1
+        let c = load_u8(a, i)
+        if c == 0:
+            os_backslashes(sb, slashes * 2)
+            break
+        os_backslashes(sb, slashes * 2 + 1 if c == 34 else slashes)
+        sb_byte(sb, c)
+        i += 1
+    sb_byte(sb, 34)
+
+# A wait status as run() reports it: the exit code, 128 + the signal, or -1.
+fn os_run_code(st: int) -> int:
+    let sig = st & 0x7f
+    if sig == 0:
+        return (st >> 8) & 0xff
+    if sig != 0x7f:
+        return 128 + sig
+    return -1
+
+# Runs a program and waits for it. False (with *err set) if it couldn't be
+# started.
+fn brine_run(argv: ptr, code: ptr, err: ptr) -> bool:
+    store_i64(code, 0, 0)
+    # the child writes to the same stdout: what we printed comes first
+    brine_flush()
+    let n = load_i64(argv, ARR_LEN)
+    if n == 0:
+        store_ptr(err, 0, os_msg("run() needs a program name, but the command list is empty"))
+        return false
+    let d = load_ptr(argv, ARR_DATA)
+    let cv = blk_alloc(8 * (n + 1))
+    var ok = true
+    for i in 0..n:
+        let c = os_cstr(load_ptr(d, i * 8))
+        store_ptr(cv, i * 8, c)
+        if addr(c) == 0 and ok:
+            store_ptr(err, 0, os_msg(f"run(): argument {i} contains a NUL byte"))
+            ok = false
+    store_ptr(cv, n * 8, null_ptr())
+    fflush(os_stdio(1))
+    fflush(os_stdio(2))
+    let c0 = str_of(load_ptr(d, 0))
+    if ok:
+        if os_is("windows"):
+            let sb = stack_mem(24)
+            brine_sb_init(sb)
+            for i in 0..n:
+                if i != 0:
+                    sb_byte(sb, 32)
+                os_quote_arg(sb, load_ptr(cv, i * 8))
+            let line = brine_sb_finish(sb)
+            let wl = os_wide(line + STR_DATA)
+            str_release(line)
+            let si = stack_mem(SI_SIZE)
+            memset(si, 0, u64(SI_SIZE))
+            store_u32(si, 0, u32(SI_SIZE))
+            let pi = stack_mem(24)
+            if (
+                CreateProcessW(
+                    null_ptr(),
+                    wl,
+                    null_ptr(),
+                    null_ptr(),
+                    1,
+                    0,
+                    null_ptr(),
+                    null_ptr(),
+                    si,
+                    pi
+                )
+                == 0
+            ):
+                let e = GetLastError()
+                if e == 2 or e == 3:
+                    store_ptr(err, 0, os_msg(f"cannot run {c0}: program not found"))
+                else:
+                    store_ptr(err, 0, os_msg(f"cannot run {c0}: error {e}"))
+                ok = false
+            else:
+                let h = load_ptr(pi, PI_PROC)
+                WaitForSingleObject(h, INFINITE)
+                let c = stack_mem(8)
+                store_u32(c, 0, 0)
+                GetExitCodeProcess(h, c)
+                CloseHandle(h)
+                CloseHandle(load_ptr(pi, PI_THREAD))
+                store_i64(code, 0, int(load_i32(c, 0)))
+            blk_free(wl)
+        else:
+            let pid = stack_mem(8)
+            store_i64(pid, 0, 0)
+            let r = int(
+                posix_spawnp(pid, load_ptr(cv, 0), null_ptr(), null_ptr(), cv, os_environ())
+            )
+            if r != 0:
+                if r == 2:
+                    store_ptr(err, 0, os_msg(f"cannot run {c0}: program not found"))
+                else:
+                    let m = os_strerror(r)
+                    store_ptr(err, 0, os_msg(f"cannot run {c0}: {str_of(m)}"))
+                    str_release(m)
+                ok = false
+            else:
+                let st = stack_mem(8)
+                store_i64(st, 0, 0)
+                while waitpid(load_i32(pid, 0), st, 0) < 0 and os_errno() == EINTR:
+                    pass
+                store_i64(code, 0, os_run_code(int(load_i32(st, 0))))
+    blk_free(cv)
+    return ok
+
+# ---- the os module
+extern fn FormatMessageW(
+    flags: u32,
+    src: ptr,
+    id: u32,
+    lang: u32,
+    buf: ptr,
+    n: u32,
+    args: ptr
+) -> u32
+
+extern fn FindFirstFileExW(pat: ptr, level: i32, fd: ptr, op: i32, filter: ptr, flags: u32) -> ptr
+
+extern fn FindNextFileW(h: ptr, fd: ptr) -> i32
+
+extern fn FindClose(h: ptr) -> i32
+
+extern fn CreateFileW(
+    path: ptr,
+    access: u32,
+    share: u32,
+    sa: ptr,
+    disp: u32,
+    flags: u32,
+    tmpl: ptr
+) -> ptr
+
+extern fn GetFileInformationByHandle(h: ptr, info: ptr) -> i32
+
+extern fn CreateDirectoryW(path: ptr, sa: ptr) -> i32
+
+extern fn DeleteFileW(path: ptr) -> i32
+
+extern fn MoveFileExW(a: ptr, b: ptr, flags: u32) -> i32
+
+extern fn GetCurrentDirectoryW(n: u32, buf: ptr) -> u32
+
+extern fn SetCurrentDirectoryW(path: ptr) -> i32
+
+extern fn GetModuleFileNameW(m: ptr, buf: ptr, n: u32) -> u32
+
+extern fn GetModuleHandleW(name: ptr) -> ptr
+
+extern fn GetProcAddress(m: ptr, name: ptr) -> ptr
+
+extern fn GetTempPathW(n: u32, buf: ptr) -> u32
+
+extern fn GetFinalPathNameByHandleW(h: ptr, buf: ptr, n: u32, flags: u32) -> u32
+
+extern fn GetSystemInfo(si: ptr)
+
+extern fn GetFileType(h: ptr) -> u32
+
+extern fn GetFileInformationByHandleEx(h: ptr, class: i32, buf: ptr, n: u32) -> i32
+
+extern fn opendir(path: ptr) -> ptr
+
+extern fn readdir(d: ptr) -> ptr
+
+extern fn closedir(d: ptr) -> i32
+
+extern fn mkdir(path: ptr, mode: u32) -> i32
+
+extern fn unlink(path: ptr) -> i32
+
+extern fn rename(a: ptr, b: ptr) -> i32
+
+extern fn getcwd(buf: ptr, n: u64) -> ptr
+
+extern fn chdir(path: ptr) -> i32
+
+extern fn readlink(path: ptr, buf: ptr, n: u64) -> int
+
+extern fn _NSGetExecutablePath(buf: ptr, n: ptr) -> i32
+
+extern fn realpath(path: ptr, out: ptr) -> ptr
+
+extern fn sysconf(name: i32) -> int
+
+extern fn isatty(fd: i32) -> i32
+
+extern fn brine_arg(i: int) -> ptr
+
+# WIN32_FIND_DATAW: cFileName, MAX_PATH UTF-16 units
+const FD_SIZE = 592
+const FD_NAME = 44
+
+# struct dirent: d_name (glibc, on every processor; macOS)
+const DIRENT_NAME = 19
+const MAC_DIRENT_NAME = 21
+
+# SYSTEM_INFO: dwNumberOfProcessors
+const SYSI_NCPU = 32
+
+const ATTR_DIR: u32 = 0x10
+const ATTR_LINK: u32 = 0x400
+
+# FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+const SHARE_ALL: u32 = 7
+const OPEN_EXISTING: u32 = 3
+const BACKUP_SEMANTICS: u32 = 0x02000000
+
+# INVALID_HANDLE_VALUE
+fn os_bad_handle() -> ptr:
+    return null_ptr() - 1
+
+# The C int of a 32-bit code (an error number from a DWORD).
+fn os_c_int(code: int) -> int:
+    let c = code & 0xffffffff
+    return c - 0x100000000 if c >= 0x80000000 else c
+
+# The text Rust's io::Error prints for an OS error code.
+fn os_err(code: int) -> ptr:
+    let c = os_c_int(code)
+    if os_is("windows"):
+        let buf = stack_mem(4096)
+        # FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS
+        var n = int(FormatMessageW(0x1200, null_ptr(), u32(code), 0, buf, 2048, null_ptr()))
+        if n == 0:
+            let e = GetLastError()
+            return os_msg(f"OS Error {c} (FormatMessageW() returned error {e}) (os error {c})")
+        while n > 0:
+            let ch = load_u16(buf, (n - 1) * 2)
+            if ch != 13 and ch != 10 and ch != 32 and ch != 9:
+                break
+            n -= 1
+        let m = os_from_wide(buf, n)
+        let s = brine_str_concat(m, ptr_of(f" (os error {c})"))
+        str_release(m)
+        return s
+    else:
+        let m = os_strerror(code)
+        let s = os_msg(f"{str_of(m)} (os error {c})")
+        str_release(m)
+        return s
+
+fn os_nul_err() -> ptr:
+    return os_msg("file name contained an unexpected NUL byte")
+
+# Bytes as a string, invalid UTF-8 replaced as Rust's
+# String::from_utf8_lossy does.
+fn os_lossy(p: ptr, n: int) -> ptr:
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    var i = 0
+    # the start of the valid bytes not copied yet
+    var run = 0
+    while i < n:
+        let b = load_u8(p, i)
+        if b < 0x80:
+            i += 1
+            continue
+        var w = 0
+        if b >= 0xc2 and b <= 0xdf:
+            w = 2
+        elif b >= 0xe0 and b <= 0xef:
+            w = 3
+        elif b >= 0xf0 and b <= 0xf4:
+            w = 4
+        var j = i + 1
+        if w != 0:
+            var lo: u8 = 0x80
+            var hi: u8 = 0xbf
+            if b == 0xe0:
+                lo = 0xa0
+            elif b == 0xed:
+                hi = 0x9f
+            elif b == 0xf0:
+                lo = 0x90
+            elif b == 0xf4:
+                hi = 0x8f
+            if j < n and load_u8(p, j) >= lo and load_u8(p, j) <= hi:
+                j += 1
+                while j - i < w and j < n and load_u8(p, j) >= 0x80 and load_u8(p, j) <= 0xbf:
+                    j += 1
+                if j - i == w:
+                    i = j
+                    continue
+        brine_sb_cat(sb, p + run, i - run)
+        sb_lit(sb, "\u{fffd}")
+        i = j
+        run = i
+    brine_sb_cat(sb, p + run, n - run)
+    return brine_sb_finish(sb)
+
+# Compares two strings by their slots (for brine_arr_sort).
+fn brine_x_os_cmp_strp(a: ptr, b: ptr) -> i32:
+    return brine_str_cmp(load_ptr(a, 0), load_ptr(b, 0))
+
+# Is the UTF-16 name at w "." or ".."?
+fn os_dots_w(w: ptr) -> bool:
+    if load_u16(w, 0) != 46:
+        return false
+    let c = load_u16(w, 2)
+    return c == 0 or (c == 46 and load_u16(w, 4) == 0)
+
+fn os_dots(p: ptr) -> bool:
+    if load_u8(p, 0) != 46:
+        return false
+    let c = load_u8(p, 1)
+    return c == 0 or (c == 46 and load_u8(p, 2) == 0)
+
+fn brine_os_list_dir(path: ptr, out: ptr, err: ptr) -> bool:
+    let p = os_cstr(path)
+    if addr(p) == 0:
+        store_ptr(err, 0, os_nul_err())
+        return false
+    let pa = stack_mem(8)
+    store_ptr(pa, 0, new_strs())
+    if os_is("windows"):
+        var n = load_i64(path, STR_LEN)
+        let pat = blk_alloc(n + 3)
+        memcpy(pat, p, u64(n))
+        if n > 0 and load_u8(p, n - 1) != 92 and load_u8(p, n - 1) != 47:
+            store_u8(pat, n, 92)
+            n += 1
+        store_u8(pat, n, 42)
+        store_u8(pat, n + 1, 0)
+        let w = os_wide(pat)
+        blk_free(pat)
+        let fd = stack_mem(FD_SIZE)
+        # FindExInfoBasic, FindExSearchNameMatch
+        let h = FindFirstFileExW(w, 1, fd, 0, null_ptr(), 0)
+        blk_free(w)
+        if h == os_bad_handle():
+            let e = GetLastError()
+            # only an empty root directory has no entries at all
+            if e != 2:
+                arr_release(load_ptr(pa, 0))
+                store_ptr(err, 0, os_err(int(e)))
+                return false
+        else:
+            while true:
+                if not os_dots_w(fd + FD_NAME):
+                    push_str(pa, os_from_wide(fd + FD_NAME, -1))
+                if FindNextFileW(h, fd) == 0:
+                    break
+            FindClose(h)
+    else:
+        let dir = opendir(p)
+        if addr(dir) == 0:
+            let e = os_errno()
+            arr_release(load_ptr(pa, 0))
+            store_ptr(err, 0, os_err(e))
+            return false
+        let off = MAC_DIRENT_NAME if os_is("macos") else DIRENT_NAME
+        while true:
+            let ent = readdir(dir)
+            if addr(ent) == 0:
+                break
+            if not os_dots(ent + off):
+                push_str(pa, os_text(ent + off))
+        closedir(dir)
+    brine_arr_sort(pa, symbol("brine_x_os_cmp_strp"))
+    store_ptr(out, 0, load_ptr(pa, 0))
+    return true
+
+# 0: missing, 1: a file, 2: a directory, 3: something else. Follows links.
+fn os_kind(p: ptr) -> int:
+    if os_is("windows"):
+        let w = os_wide(p)
+        let a = GetFileAttributesW(w)
+        var k = 0
+        if a != NO_ATTRS:
+            k = 2 if a & ATTR_DIR != 0 else 1
+        if k != 0 and a & ATTR_LINK != 0:
+            # a link: look at its target
+            let h = CreateFileW(
+                w,
+                0,
+                SHARE_ALL,
+                null_ptr(),
+                OPEN_EXISTING,
+                BACKUP_SEMANTICS,
+                null_ptr()
+            )
+            if h == os_bad_handle():
+                k = 0
+            else:
+                let info = stack_mem(56)
+                if GetFileInformationByHandle(h, info) != 0:
+                    k = 2 if load_u32(info, 0) & ATTR_DIR != 0 else 1
+                else:
+                    k = 0
+                CloseHandle(h)
+        blk_free(w)
+        return k
+    else:
+        let mode = stack_mem(8)
+        if not os_stat(p, mode):
+            return 0
+        let t = load_u32(mode, 0) & 0xf000
+        if t == 0x4000:
+            return 2
+        return 1 if t == 0x8000 else 3
+
+fn brine_os_is_dir(path: ptr) -> bool:
+    let p = os_cstr(path)
+    return addr(p) != 0 and os_kind(p) == 2
+
+fn brine_os_is_file(path: ptr) -> bool:
+    let p = os_cstr(path)
+    return addr(p) != 0 and os_kind(p) == 1
+
+fn os_is_sep(c: u8) -> bool:
+    if os_is("windows"):
+        return c == 47 or c == 92
+    else:
+        return c == 47
+
+# The length of C string p's root: "/" or, on Windows, "C:", "C:\" or "\".
+fn os_root_len(p: ptr) -> int:
+    if os_is("windows"):
+        let c = load_u8(p, 0) | 32
+        if c >= 97 and c <= 122 and load_u8(p, 1) == 58:
+            return 3 if os_is_sep(load_u8(p, 2)) else 2
+    return 1 if os_is_sep(load_u8(p, 0)) else 0
+
+# Rust's Path::parent of C string p, as a new C string: 0 when there is
+# none (a root); "" for a bare name.
+fn os_parent(p: ptr) -> ptr:
+    let root = os_root_len(p)
+    var n = int(strlen(p))
+    while n > root and os_is_sep(load_u8(p, n - 1)):
+        n -= 1
+    if n <= root:
+        return null_ptr()
+    var i = n
+    while i > root and not os_is_sep(load_u8(p, i - 1)):
+        i -= 1
+    while i > root and os_is_sep(load_u8(p, i - 1)):
+        i -= 1
+    let q = blk_alloc(i + 1)
+    memcpy(q, p, u64(i))
+    store_u8(q, i, 0)
+    return q
+
+# 0 on success, else the OS error code.
+fn os_mkdir1(p: ptr) -> int:
+    if os_is("windows"):
+        let w = os_wide(p)
+        let e = 0 if CreateDirectoryW(w, null_ptr()) != 0 else int(GetLastError())
+        blk_free(w)
+        return e
+    else:
+        return 0 if mkdir(p, 511) == 0 else os_errno()
+
+fn os_not_found(e: int) -> bool:
+    if os_is("windows"):
+        return e == 2 or e == 3
+    else:
+        return e == 2
+
+# Rust's fs::create_dir_all; -1 when the tree can't be made at all.
+fn os_mkdir_all(p: ptr) -> int:
+    if load_u8(p, 0) == 0:
+        return 0
+    var e = os_mkdir1(p)
+    if e == 0:
+        return 0
+    if not os_not_found(e):
+        return 0 if os_kind(p) == 2 else e
+    let parent = os_parent(p)
+    if addr(parent) == 0:
+        return -1
+    let pe = os_mkdir_all(parent)
+    blk_free(parent)
+    if pe != 0:
+        return pe
+    e = os_mkdir1(p)
+    return 0 if e == 0 or os_kind(p) == 2 else e
+
+fn brine_os_make_dir(path: ptr, err: ptr) -> bool:
+    let p = os_cstr(path)
+    if addr(p) == 0:
+        store_ptr(err, 0, os_nul_err())
+        return false
+    let e = os_mkdir_all(p)
+    if e == -1:
+        store_ptr(err, 0, os_msg("failed to create whole tree"))
+    elif e != 0:
+        store_ptr(err, 0, os_err(e))
+    return e == 0
+
+fn brine_os_remove_file(path: ptr, err: ptr) -> bool:
+    let p = os_cstr(path)
+    if addr(p) == 0:
+        store_ptr(err, 0, os_nul_err())
+        return false
+    var e = 0
+    if os_is("windows"):
+        let w = os_wide(p)
+        e = 0 if DeleteFileW(w) != 0 else int(GetLastError())
+        blk_free(w)
+    else:
+        e = 0 if unlink(p) == 0 else os_errno()
+    if e != 0:
+        store_ptr(err, 0, os_err(e))
+    return e == 0
+
+fn brine_os_rename(src: ptr, dst: ptr, err: ptr) -> bool:
+    let a = os_cstr(src)
+    let b = os_cstr(dst)
+    if addr(a) == 0 or addr(b) == 0:
+        store_ptr(err, 0, os_nul_err())
+        return false
+    var e = 0
+    if os_is("windows"):
+        let wa = os_wide(a)
+        let wb = os_wide(b)
+        # MOVEFILE_REPLACE_EXISTING
+        e = 0 if MoveFileExW(wa, wb, 1) != 0 else int(GetLastError())
+        blk_free(wa)
+        blk_free(wb)
+    else:
+        e = 0 if rename(a, b) == 0 else os_errno()
+    if e != 0:
+        store_ptr(err, 0, os_err(e))
+    return e == 0
+
+fn brine_os_cwd() -> ptr:
+    if os_is("windows"):
+        let n = GetCurrentDirectoryW(0, null_ptr())
+        let w = blk_alloc(2 * (int(n) + 1))
+        let got = GetCurrentDirectoryW(n + 1, w)
+        let s = os_from_wide(w, int(got))
+        blk_free(w)
+        return s
+    else:
+        var cap = 256
+        while true:
+            let buf = blk_alloc(cap)
+            if addr(getcwd(buf, u64(cap))) != 0:
+                let s = os_text(buf)
+                blk_free(buf)
+                return s
+            blk_free(buf)
+            # ERANGE
+            if os_errno() != 34:
+                return os_lit(".")
+            cap *= 2
+    return new_str(0)
+
+fn brine_os_set_cwd(path: ptr, err: ptr) -> bool:
+    let p = os_cstr(path)
+    if addr(p) == 0:
+        store_ptr(err, 0, os_nul_err())
+        return false
+    var e = 0
+    if os_is("windows"):
+        let w = os_wide(p)
+        e = 0 if SetCurrentDirectoryW(w) != 0 else int(GetLastError())
+        blk_free(w)
+    else:
+        e = 0 if chdir(p) == 0 else os_errno()
+    if e != 0:
+        store_ptr(err, 0, os_err(e))
+    return e == 0
+
+# The absolute path of the running executable.
+fn brine_os_exe_path() -> ptr:
+    if os_is("windows"):
+        var cap = 260
+        while cap < (1 << 20):
+            let w = blk_alloc(2 * cap)
+            let n = int(GetModuleFileNameW(null_ptr(), w, u32(cap)))
+            if n > 0 and n < cap:
+                let s = os_from_wide(w, n)
+                blk_free(w)
+                return s
+            blk_free(w)
+            if n == 0:
+                break
+            cap *= 2
+    elif os_is("macos"):
+        let size = stack_mem(8)
+        store_u32(size, 0, 0)
+        _NSGetExecutablePath(null_ptr(), size)
+        let buf = blk_alloc(int(load_u32(size, 0)) + 1)
+        if _NSGetExecutablePath(buf, size) == 0:
+            let r = realpath(buf, null_ptr())
+            let s = os_text(buf if addr(r) == 0 else r)
+            free(r)
+            blk_free(buf)
+            return s
+        blk_free(buf)
+    elif os_is("linux"):
+        var cap = 256
+        while cap < (1 << 20):
+            let buf = blk_alloc(cap)
+            let n = readlink(ptr_of("/proc/self/exe") + STR_DATA, buf, u64(cap))
+            if n > 0 and n < cap:
+                let s = brine_str_new(buf, n)
+                blk_free(buf)
+                return s
+            blk_free(buf)
+            if n <= 0:
+                break
+            cap *= 2
+    let a0 = brine_arg(0)
+    if addr(a0) == 0:
+        return new_str(0)
+    return os_text(a0)
+
+fn brine_os_temp_dir() -> ptr:
+    var s = null_ptr()
+    if os_is("windows"):
+        let k32 = os_wide(ptr_of("kernel32.dll") + STR_DATA)
+        let f = GetProcAddress(GetModuleHandleW(k32), ptr_of("GetTempPath2W") + STR_DATA)
+        blk_free(k32)
+        # MAX_PATH + 2 units
+        let w = stack_mem(528)
+        var n = 0
+        if addr(f) != 0:
+            n = int(call_u32(f, u32(261), w))
+        else:
+            n = int(GetTempPathW(261, w))
+        if n > 261:
+            n = 0
+        s = os_from_wide(w, n)
+    else:
+        let t = getenv(ptr_of("TMPDIR") + STR_DATA)
+        s = os_text(ptr_of("/tmp") + STR_DATA if addr(t) == 0 else t)
+    # no trailing separator, unless the whole path is a root
+    let c = os_cstr(s)
+    let root = 0 if addr(c) == 0 else os_root_len(c)
+    let len = load_i64(s, STR_LEN)
+    var n2 = len
+    while n2 > root and os_is_sep(load_u8(s, STR_DATA + n2 - 1)):
+        n2 -= 1
+    if n2 != len:
+        let t2 = brine_str_new(s + STR_DATA, n2)
+        str_release(s)
+        s = t2
+    return s
+
+fn brine_os_abs_path(path: ptr, out: ptr, err: ptr) -> bool:
+    let p = os_cstr(path)
+    if addr(p) == 0:
+        store_ptr(err, 0, os_nul_err())
+        return false
+    if os_is("windows"):
+        # what Rust's fs::canonicalize does: the final path of an open
+        # handle, `\\?\C:\...`
+        let w = os_wide(p)
+        let h = CreateFileW(
+            w,
+            0,
+            SHARE_ALL,
+            null_ptr(),
+            OPEN_EXISTING,
+            BACKUP_SEMANTICS,
+            null_ptr()
+        )
+        blk_free(w)
+        if h == os_bad_handle():
+            store_ptr(err, 0, os_err(int(GetLastError())))
+            return false
+        # VOLUME_NAME_DOS
+        let need = GetFinalPathNameByHandleW(h, null_ptr(), 0, 0)
+        let buf = blk_alloc(2 * (int(need) + 1))
+        var got: u32 = 0
+        if need != 0:
+            got = GetFinalPathNameByHandleW(h, buf, need + 1, 0)
+        let e = int(GetLastError()) if got == 0 or got > need else 0
+        CloseHandle(h)
+        if e != 0 or got == 0:
+            blk_free(buf)
+            # ERROR_INVALID_DATA
+            store_ptr(err, 0, os_err(e if e != 0 else 13))
+            return false
+        store_ptr(out, 0, os_from_wide(buf, int(got)))
+        blk_free(buf)
+        return true
+    else:
+        let r = realpath(p, null_ptr())
+        let e = os_errno()
+        if addr(r) == 0:
+            store_ptr(err, 0, os_err(e))
+            return false
+        store_ptr(out, 0, os_text(r))
+        free(r)
+        return true
+
+# A new string of literal s.
+fn os_lit(s: str) -> ptr:
+    let p = ptr_of(s)
+    return brine_str_new(p + STR_DATA, load_i64(p, STR_LEN))
+
+# the names Rust uses in std::env::consts
+fn brine_os_name() -> ptr:
+    if os_is("windows"):
+        return os_lit("windows")
+    elif os_is("macos"):
+        return os_lit("macos")
+    elif os_is("linux"):
+        return os_lit("linux")
+    return os_lit("unknown")
+
+fn brine_os_arch() -> ptr:
+    if os_is("x86_64"):
+        return os_lit("x86_64")
+    elif os_is("aarch64"):
+        return os_lit("aarch64")
+    return os_lit("unknown")
+
+fn brine_os_cpu_count() -> int:
+    var n = 0
+    if os_is("windows"):
+        let si = stack_mem(48)
+        GetSystemInfo(si)
+        n = int(load_i32(si, SYSI_NCPU))
+    else:
+        # _SC_NPROCESSORS_ONLN
+        let m = sysconf(i32(58) if os_is("macos") else i32(84))
+        n = int(i32(m)) if m > 0 else 1
+    return n if n > 0 else 1
+
+# An MSYS/Cygwin terminal is a named pipe called like
+# `msys-...-pty0-to-master` (the same test as Rust's).
+fn os_msys_tty(h: ptr) -> bool:
+    # FILE_TYPE_PIPE
+    if GetFileType(h) != 3:
+        return false
+    # FILE_NAME_INFO: the name's length in bytes, then MAX_PATH units
+    let info = stack_mem(528)
+    memset(info, 0, 524)
+    # FileNameInfo
+    if GetFileInformationByHandleEx(h, 2, info, 524) == 0:
+        return false
+    var n = int(load_u32(info, 0)) / 2
+    if n > 260:
+        n = 260
+    let s = os_from_wide(info + 4, n)
+    let len = load_i64(s, STR_LEN)
+    var start = 0
+    for i in 0..len:
+        if load_u8(s, STR_DATA + i) == 92:
+            start = i + 1
+    let b = brine_str_new(s + STR_DATA + start, len - start)
+    str_release(s)
+    let none = null_ptr()
+    let pre = (
+        brine_s_starts_with(b, ptr_of("msys-"), none)
+        or brine_s_starts_with(b, ptr_of("cygwin-"), none)
+    )
+    let r = pre and find_from(b, ptr_of("-pty"), 0) >= 0
+    str_release(b)
+    return r
+
+fn brine_os_is_terminal(fd: int) -> bool:
+    if fd < 0 or fd > 2:
+        return false
+    if os_is("windows"):
+        let which = STD_INPUT if fd == 0 else (STD_OUTPUT if fd == 1 else STD_ERROR)
+        let h = GetStdHandle(which)
+        if addr(h) == 0 or h == os_bad_handle():
+            return false
+        let mode = stack_mem(8)
+        if GetConsoleMode(h, mode) != 0:
+            return true
+        return os_msys_tty(h)
+    else:
+        return isatty(i32(fd)) == 1
+
+fn brine_os_enable_ansi():
+    if os_is("windows"):
+        for i in 0..2:
+            let h = GetStdHandle(STD_OUTPUT if i == 0 else STD_ERROR)
+            let m = stack_mem(8)
+            store_u32(m, 0, 0)
+            if GetConsoleMode(h, m) != 0:
+                # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                SetConsoleMode(h, load_u32(m, 0) | 4)
