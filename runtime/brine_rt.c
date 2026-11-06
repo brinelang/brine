@@ -691,7 +691,9 @@ static void *br_thread_ptr(void) {
     return NULL;
 #endif
 }
+#ifndef BRINE_RT_BR /* the backends do it inline */
 void *brine_x_thread_ptr(void) { return br_thread_ptr(); }
+#endif
 
 #ifndef BRINE_RT_BR
 void *brine_alloc(int64_t n) { return br_alloc(n > 0 ? (size_t)n : 1); }
@@ -900,6 +902,7 @@ void brine_str_add_byte_slow(brine_str **ps, uint8_t c) {
     *ps = s;
 }
 #endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it (app_byte) */
 /* brine_app_byte past the appender's fast paths: the 9th byte, a shared
    string, or a full block */
 brine_app_st brine_app_more(brine_str *a, int64_t n, int64_t room, uint64_t w0, uint8_t c) {
@@ -928,6 +931,7 @@ brine_app_st brine_app_more(brine_str *a, int64_t n, int64_t room, uint64_t w0, 
     x.w0 = brine_ld8(a->data) & brine_lowmask((uint64_t)n);
     return x;
 }
+#endif
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
 bool brine_str_eq_long(brine_str *a, brine_str *b) { return memcmp(a->data, b->data, (size_t)a->len) == 0; }
 bool brine_str_contains(brine_str *s, brine_str *sub) {
@@ -2821,7 +2825,9 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
 }
 #endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 int64_t brine_par_chunks(int64_t n) { return brine_par_plan(n); }
+#endif
 
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
 bool brine_first_stopped(const int64_t *stop, int64_t chunk) {
@@ -6653,7 +6659,9 @@ int64_t brine_os_cpu_count(void) {
     return n > 0 ? n : 1;
 }
 #endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 int64_t brine_os_thread_count(void) { return br_threads(); }
+#endif
 
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 void brine_os_sleep(double seconds) {
@@ -7380,6 +7388,7 @@ static void br_procs_free(void) { brine_x_os_procs_free(); }
  * pointer to it, and an i128/u128 result is written through an extra first
  * argument. The `brine_x_i128_*` / `brine_x_u128_*` functions are the plain
  * (wrapping) 128-bit operations the native backend doesn't do inline. */
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_x_str_retain(brine_str *s) { brine_str_retain(s); }
 void brine_x_str_release(brine_str *s) { brine_str_release(s); }
 void brine_x_arr_retain(brine_arr *a) { brine_arr_retain(a); }
@@ -7388,10 +7397,8 @@ void brine_x_box_retain(void *p) { brine_box_retain(p); }
 bool brine_x_box_dec(void *p) { return brine_box_dec(p); }
 void brine_x_map_retain(brine_map *m) { brine_map_retain(m); }
 void brine_x_map_release(brine_map *m) { brine_map_release(m); }
-#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_x_arr_push_in(brine_arr **pa, const void *elem, int64_t esz) { brine_arr_push_in(pa, elem, esz); }
 void brine_x_arr_pop_in(brine_arr **pa, void *out, int64_t esz, const char *loc) { brine_arr_pop_in(pa, out, esz, loc); }
-#endif
 void brine_x_arr_clear_in(brine_arr **pa) { brine_arr_clear_in(pa); }
 brine_str *brine_x_str_at(brine_str *s, int64_t i, const char *loc) { return brine_str_at(s, i, loc); }
 brine_str *brine_x_str_byte(brine_str *s, int64_t i) { return brine_str_byte(s, i); }
@@ -7427,6 +7434,7 @@ uint64_t brine_x_hash_mix(uint64_t h, uint64_t x) { return brine_hash_mix(h, x);
 uint64_t brine_x_hash_u128(const brine_u128 *x) { return brine_hash_u128(*x); }
 int64_t brine_x_idx(int64_t i, int64_t len, const char *loc) { return brine_idx(i, len, loc); }
 int64_t brine_x_par_plan(int64_t n) { return brine_par_plan(n); }
+#endif
 
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
 #define BR_X_MATH1(name) \

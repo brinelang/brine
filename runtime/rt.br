@@ -15713,3 +15713,117 @@ fn arr_pop_in(pa: ptr, out: ptr, esz: int, loc: ptr):
         copy_bytes(out, load_ptr(a, ARR_DATA) + (n - 1) * esz, esz)
         return
     brine_arr_pop(pa, out, loc)
+
+fn arr_clear_in(pa: ptr):
+    let a = load_ptr(pa, 0)
+    if addr(load_ptr(a, ARR_RL)) == 0 and load_i64(a, ARR_RC) == 1:
+        store_i64(a, ARR_LEN, 0)
+        return
+    brine_arr_clear(pa)
+
+# ------------------------------------------------------------ loop idioms
+# Loops the compiler recognizes, done in one step when every element they
+# touch is in bounds. False, having changed nothing, when the loop must run
+# as written (so a panic happens where it would have).
+
+fn arr_mine(pa: ptr):
+    if load_i64(load_ptr(pa, 0), ARR_RC) != 1:
+        brine_arr_unique(pa)
+
+# for i in lo..hi: a[i] = a[i + 1]
+fn arr_shl(pa: ptr, lo: int, hi: int) -> bool:
+    if lo >= hi:
+        return true
+    let a0 = load_ptr(pa, 0)
+    let e = load_i64(a0, ARR_ESZ)
+    if lo < 0 or hi >= load_i64(a0, ARR_LEN) or e == 0:
+        return false
+    arr_mine(pa)
+    let d = load_ptr(load_ptr(pa, 0), ARR_DATA)
+    memmove(d + lo * e, d + (lo + 1) * e, u64((hi - lo) * e))
+    return true
+
+# for i in lo..hi: b[i] = a[i], b and a different variables
+fn arr_copy(pb: ptr, a: ptr, lo: int, hi: int) -> bool:
+    if lo >= hi:
+        return true
+    let b0 = load_ptr(pb, 0)
+    let e = load_i64(a, ARR_ESZ)
+    if (
+        lo < 0
+        or hi > load_i64(a, ARR_LEN)
+        or hi > load_i64(b0, ARR_LEN)
+        or e != load_i64(b0, ARR_ESZ)
+        or e == 0
+    ):
+        return false
+    arr_mine(pb)
+    memcpy(
+        load_ptr(load_ptr(pb, 0), ARR_DATA) + lo * e,
+        load_ptr(a, ARR_DATA) + lo * e,
+        u64((hi - lo) * e)
+    )
+    return true
+
+# x = a[lo]; for i in lo..hi: a[i] = a[i + 1]; a[hi] = x
+fn arr_rotl(pa: ptr, lo: int, hi: int) -> bool:
+    let a0 = load_ptr(pa, 0)
+    let e = load_i64(a0, ARR_ESZ)
+    if lo > hi or lo < 0 or hi >= load_i64(a0, ARR_LEN) or e == 0 or e > 64:
+        return false
+    arr_mine(pa)
+    let d = load_ptr(load_ptr(pa, 0), ARR_DATA)
+    let x = stack_mem(64)
+    copy_bytes(x, d + lo * e, e)
+    memmove(d + lo * e, d + (lo + 1) * e, u64((hi - lo) * e))
+    copy_bytes(d + hi * e, x, e)
+    return true
+
+# The same on byte arrays: data d, length n, never shared.
+fn bytes_shl(d: ptr, n: int, lo: int, hi: int) -> bool:
+    if lo >= hi:
+        return true
+    if lo < 0 or hi >= n:
+        return false
+    memmove(d + lo, d + lo + 1, u64(hi - lo))
+    return true
+
+# (the brine_x_ names: x86-64 does these inline and calls these for the rest)
+fn brine_x_bytes_rev(d: ptr, n: int, i0: int, j0: int) -> bool:
+    if i0 >= j0:
+        return true
+    if i0 < 0 or j0 >= n or j0 - i0 >= 16:
+        return false
+    var i = i0
+    var j = j0
+    while i < j:
+        let t = load_u8(d, i)
+        store_u8(d, i, load_u8(d, j))
+        store_u8(d, j, t)
+        i += 1
+        j -= 1
+    return true
+
+fn brine_x_bytes_rotl(d: ptr, n: int, lo: int, hi: int) -> bool:
+    if lo > hi or lo < 0 or hi >= n:
+        return false
+    let x = load_u8(d, lo)
+    memmove(d + lo, d + lo + 1, u64(hi - lo))
+    store_u8(d, hi, x)
+    return true
+
+fn brine_x_bytes_copy(db: ptr, nb: int, da: ptr, na: int, lo: int, hi: int) -> bool:
+    if lo >= hi:
+        return true
+    if lo < 0 or hi > na or hi > nb:
+        return false
+    copy_bytes(db + lo, da + lo, hi - lo)
+    return true
+
+# ------------------------------------------------------------ threads
+fn os_thread_count() -> int:
+    return brine_x_threads()
+
+# how many chunks a parallel loop of n splits into
+fn par_chunks(n: int) -> int:
+    return par_plan(n)
