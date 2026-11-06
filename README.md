@@ -58,7 +58,7 @@ fn main():
 <tr><td>⚡ <b>Natively parallel</b></td><td><code>par</code> loops, maps, reductions and fork-join, data-race free by construction. Deterministic reductions. Automatic GPU offload (CUDA, Metal). MPI-style multi-process with the <code>world</code> module.</td></tr>
 <tr><td>🔒 <b>Rules can't be broken</b></td><td><code>requires</code>, <code>ensures</code>, <code>invariant</code> and <code>prove</code> are checked at compile time. Overflow, bad indexes and division by zero always stop the program with a clear message, unless the compiler proved they can't happen; then the check is removed. There is no <code>unsafe</code> and no flag to turn checks off.</td></tr>
 <tr><td>📜 <b>Rules the agent can't break</b></td><td><code>RULES.br</code> says what the program must do, in rules its owner writes and approves. Every build proves every rule, or nothing is built, and the code a rule covers can't crash. An approved rule that changes stops the build until its owner agrees.</td></tr>
-<tr><td>🚀 <b>Fast</b></td><td>Native code, no garbage collector, no VM. Values are copy-on-write and memory is freed deterministically. On x86-64 Linux and Windows every build goes straight to optimized machine code, linked by brine itself: no C compiler needed.</td></tr>
+<tr><td>🚀 <b>Fast</b></td><td>Native code, no garbage collector, no VM. Values are copy-on-write and memory is freed deterministically. On x86-64 (Linux, Windows, macOS) every build goes straight to optimized machine code, linked by brine itself: no C compiler needed.</td></tr>
 <tr><td>🐍 <b>Easy to read</b></td><td>Python-like syntax, static types with local inference, structs, enums with <code>match</code>, generics, <code>Option</code>/<code>Result</code> with <code>?</code>. One obvious way to write things.</td></tr>
 <tr><td>🤖 <b>Made for humans and agents</b></td><td>One CLI. Every error has a code, a precise span, the reason and a fix. <code>--json</code> output for tools, <code>brine explain &lt;code&gt;</code>, and <code>brine guide</code> prints the whole language on one page.</td></tr>
 <tr><td>🛠️ <b>Self-hosted</b></td><td>The compiler is written in brine and builds itself.</td></tr>
@@ -94,9 +94,10 @@ To uninstall, delete `~/.brine` and the `PATH` line the installer added.
 
 ### Requirements
 
-On x86-64 Linux and Windows, brine needs nothing else: it writes and links
-executables itself. On macOS, and for `--release` builds on ARM64 Linux, it
-still uses a C compiler (`clang` or `gcc`). Check your setup with:
+On x86-64 (Linux, Windows, macOS), brine needs nothing else: it writes and
+links executables itself. On ARM64 (Apple silicon, Linux) it does too, except
+for `--release` builds, which still use a C compiler (`clang` or `gcc`). Check
+your setup with:
 
 ```sh
 brine doctor

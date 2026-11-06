@@ -4,7 +4,7 @@
 #   Linux (x86-64, AArch64): a position-independent ELF executable that
 #   glibc's dynamic loader starts, through a `_start` of our own.
 
-from obj import ObjFile, OSym, ORel, SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, SEC_UNWIND, SEC_PDATA, R_PC32, R_CALL, R_ABS64, R_GOT, R_RVA32, R_SECREL, R_A64_CALL26, R_A64_PAGE, R_A64_LO12, R_A64_GOT_PAGE, R_A64_GOT_LO12, ARCH_X64, ARCH_A64, put16, put32, put64, set32, set64, pad_to, put_name8
+from obj import ObjFile, OSym, ORel, SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, SEC_UNWIND, SEC_PDATA, R_PC32, R_CALL, R_ABS64, R_GOT, R_RVA32, R_SECREL, R_A64_CALL26, R_A64_PAGE, R_A64_LO12, R_A64_GOT_PAGE, R_A64_GOT_LO12, ARCH_X64, ARCH_A64, put16, put32, put64, set32, set64, pad_to, put_name8, uleb, sleb, log2
 from ir import str_bytes
 
 fn get16(b: [u8], at: int) -> int:
@@ -1134,3 +1134,551 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     set64(ref out, shoff_at, shoff)
     set32(ref out, shnum_at, nsh | (10 << 16))
     return Ok(out)
+
+# ================================================================ Mach-O (macOS)
+
+# Where the image goes (above __PAGEZERO, which catches null pointers), and
+# the page size segments are aligned to (16 KB on Apple silicon).
+const MACHO_BASE = 4294967296
+const MACHO_PAGE = 16384
+const MACHO_DYLINKER = "/usr/lib/dyld"
+const MACHO_LIBSYSTEM = "/usr/lib/libSystem.B.dylib"
+
+# libSystem names some functions differently from C: the ones taking the
+# 64-bit-inode struct stat (only the x86-64 default is the old one), and the
+# ones with the current (UNIX03) behavior.
+const MACHO_INODE64 = ["stat", "fstat", "lstat", "fstatat", "opendir", "readdir"]
+const MACHO_EXTSN = ["fopen", "realpath"]
+
+fn macho_name(nm: str, a64: bool) -> str:
+    if nm in MACHO_EXTSN:
+        return "_" + nm + "$DARWIN_EXTSN"
+    if not a64 and nm in MACHO_INODE64:
+        return "_" + nm + "$INODE64"
+    return "_" + nm
+
+fn put_name16(ref out: [u8], s: str):
+    let bs = s.bytes()
+    for i in 0..16:
+        out.push(u8(bs[i]) if i < len(bs) else u8(0))
+
+fn put32be(ref out: [u8], v: int):
+    out.push(u8((v >> 24) & 255))
+    out.push(u8((v >> 16) & 255))
+    out.push(u8((v >> 8) & 255))
+    out.push(u8(v & 255))
+
+fn put64be(ref out: [u8], v: int):
+    put32be(ref out, (v >> 32) & 4294967295)
+    put32be(ref out, v & 4294967295)
+
+fn put_seg(
+    ref out: [u8],
+    name: str,
+    nsects: int,
+    addr: int,
+    vmsize: int,
+    off: int,
+    size: int,
+    prot: int
+):
+    # LC_SEGMENT_64
+    put32(ref out, 25)
+    put32(ref out, 72 + 80 * nsects)
+    put_name16(ref out, name)
+    put64(ref out, addr)
+    put64(ref out, vmsize)
+    put64(ref out, off)
+    put64(ref out, size)
+    put32(ref out, prot)
+    put32(ref out, prot)
+    put32(ref out, nsects)
+    put32(ref out, 0)
+
+fn put_sect(
+    ref out: [u8],
+    name: str,
+    seg: str,
+    off: int,
+    size: int,
+    align: int,
+    flags: int,
+    r1: int,
+    r2: int
+):
+    put_name16(ref out, name)
+    put_name16(ref out, seg)
+    put64(ref out, MACHO_BASE + off)
+    put64(ref out, size)
+    put32(ref out, off)
+    put32(ref out, log2(align))
+    put32(ref out, 0)
+    put32(ref out, 0)
+    put32(ref out, flags)
+    put32(ref out, r1)
+    put32(ref out, r2)
+    put32(ref out, 0)
+
+# A position-independent executable that dyld starts at `main`
+# (main(argc, argv, envp), exiting with what it returns), ad-hoc signed as
+# Apple silicon requires. Imports bind to libSystem. A file offset is the
+# address less MACHO_BASE, in every segment.
+fn link_macho(o0: ObjFile, main: str, ident: str) -> Result[[u8], str]:
+    var o = o0
+    let a64 = o.arch == ARCH_A64
+    let ea = elf_arch(o.arch)
+    if any(r.kind == R_ABS64 for r in o.rrel) or any(r.kind == R_ABS64 for r in o.urel):
+        return Err("read-only data with addresses in it (it belongs in .data)")
+    let m = find_sym(o, main)?
+    var imps = undefined(o)
+    imps.sort()
+    var imp_of: {str: int} = {}
+    for i, nm in enumerate(imps):
+        imp_of[nm] = i
+    # GOT entries: one per import, then one per defined symbol a GOT load reads
+    var got_of: {str: int} = {}
+    for nm in imps:
+        got_of[nm] = len(got_of)
+    var got_local: [int] = []
+    for rs in [o.trel, o.drel, o.urel]:
+        for r in rs:
+            let s = o.syms[r.sym]
+            let k = r.kind
+            if k == R_GOT or k == R_A64_GOT_PAGE or k == R_A64_GOT_LO12:
+                if s.sec != SEC_UNDEF and s.name not in got_of:
+                    got_of[s.name] = len(got_of)
+                    got_local.push(r.sym)
+    let nimp = len(imps)
+    # __TEXT: the headers, code, import stubs, read-only data, unwind tables
+    let ndw = len(o.dsecs)
+    let ncmds = 13 + (1 if ndw > 0 else 0)
+    let cmds_size = 1096 + (72 + 80 * ndw if ndw > 0 else 0)
+    let stub = 16 if a64 else 8
+    let text_off = align_up(32 + cmds_size, max(o.text_align, 16))
+    let stubs_off = align_up(text_off + len(o.text), 16)
+    let const_off = align_up(stubs_off + stub * nimp, max(o.rodata_align, 8))
+    let eh_off = align_up(const_off + len(o.rodata), 8)
+    let text_size = align_up(eh_off + len(o.unwind), MACHO_PAGE)
+    # __DATA: the program's data, the GOT
+    let data_off = text_size
+    let got_off = align_up(data_off + len(o.data), 8)
+    let data_size = align_up(got_off + 8 * len(got_of) - data_off, MACHO_PAGE)
+    # __DWARF: a debug build's debug info, which debuggers read from the
+    # executable (as Go's linker leaves it: no dsymutil needed)
+    let dw_off = data_off + data_size
+    var dw_at: [int] = []
+    var dw_end = dw_off
+    for d in o.dsecs:
+        dw_at.push(dw_end)
+        dw_end += len(d.bytes)
+    let dw_size = align_up(dw_end - dw_off, MACHO_PAGE)
+    let le_off = dw_off + dw_size
+    var addr = [-1] * len(o.syms)
+    var dyn = [0] * len(o.syms)
+    var got = [-1] * len(o.syms)
+    for i, s in enumerate(o.syms):
+        if s.sec == SEC_TEXT:
+            addr[i] = MACHO_BASE + text_off + s.off
+        elif s.sec == SEC_DATA:
+            addr[i] = MACHO_BASE + data_off + s.off
+        elif s.sec == SEC_RODATA:
+            addr[i] = MACHO_BASE + const_off + s.off
+        elif s.sec == SEC_UNWIND:
+            addr[i] = MACHO_BASE + eh_off + s.off
+        elif s.sec == SEC_UNDEF and s.name in imp_of:
+            addr[i] = MACHO_BASE + stubs_off + stub * imp_of[s.name]
+            dyn[i] = imp_of[s.name] + 1
+        if s.name in got_of:
+            got[i] = MACHO_BASE + got_off + 8 * got_of[s.name]
+    # 8-byte addresses: in the ELF linker's terms, dyld slides (rebases) the
+    # R_*_RELATIVE ones and binds the R_*_64 ones to an import
+    var relas: [Rela] = []
+    elf_apply(ref o.text, o.trel, MACHO_BASE + text_off, addr, got, dyn, ea, ref relas)?
+    elf_apply(ref o.rodata, o.rrel, MACHO_BASE + const_off, addr, got, dyn, ea, ref relas)?
+    elf_apply(ref o.unwind, o.urel, MACHO_BASE + eh_off, addr, got, dyn, ea, ref relas)?
+    if len(relas) > 0:
+        return Err("code with addresses in it (they belong in data)")
+    elf_apply(ref o.data, o.drel, MACHO_BASE + data_off, addr, got, dyn, ea, ref relas)?
+    let dbg = debug_secs(o, addr, 0)?
+    var gotb = [u8(0)] * (8 * len(got_of))
+    for si in got_local:
+        set64(ref gotb, got[si] - MACHO_BASE - got_off, addr[si])
+        relas.push(Rela(off=got[si], typ=ea.r_rel, sym=0, add=0))
+    for i, nm in enumerate(imps):
+        relas.push(Rela(off=MACHO_BASE + got_off + 8 * got_of[nm], typ=ea.r_abs, sym=i + 1, add=0))
+    # the dyld opcodes: rebases, then binds (all to libSystem, ordinal 1), in
+    # segment 2 (__DATA)
+    var rb: [int] = []
+    for r in relas:
+        if r.typ == ea.r_rel:
+            rb.push(r.off - MACHO_BASE - data_off)
+    rb.sort()
+    var rebase: [u8] = []
+    if len(rb) > 0:
+        # REBASE_OPCODE_SET_TYPE_IMM pointer
+        rebase.push(17)
+        for off in rb:
+            # SET_SEGMENT_AND_OFFSET_ULEB 2, DO_REBASE_IMM_TIMES 1
+            rebase.push(34)
+            uleb(ref rebase, off)
+            rebase.push(81)
+    rebase.push(0)
+    pad_to(ref rebase, 8)
+    # BIND_OPCODE_SET_DYLIB_ORDINAL_IMM 1, SET_TYPE_IMM pointer
+    var bind: [u8] = [17, 81]
+    var add = 0
+    for r in relas:
+        if r.typ != ea.r_abs:
+            continue
+        # SET_SYMBOL_TRAILING_FLAGS_IMM 0
+        bind.push(64)
+        str_bytes(ref bind, macho_name(imps[r.sym - 1], a64))
+        bind.push(0)
+        if r.add != add:
+            # SET_ADDEND_SLEB
+            bind.push(96)
+            sleb(ref bind, r.add)
+            add = r.add
+        # SET_SEGMENT_AND_OFFSET_ULEB 2, DO_BIND
+        bind.push(114)
+        uleb(ref bind, r.off - MACHO_BASE - data_off)
+        bind.push(144)
+    bind.push(0)
+    pad_to(ref bind, 8)
+    # the export trie: only __mh_execute_header, at offset 0
+    var exports: [u8] = [0, 1]
+    str_bytes(ref exports, "__mh_execute_header")
+    exports.push(0)
+    exports.extend([23, 2, 0, 0, 0])
+    pad_to(ref exports, 8)
+    # the symbol table: the functions (local), __mh_execute_header, the imports
+    var funcs: [(int, str)] = []
+    for s in o.syms:
+        if s.sec == SEC_TEXT and s.func:
+            funcs.push((s.off, s.name))
+    funcs.sort()
+    var syms: [u8] = []
+    var strs: [u8] = [32, 0]
+    for f in funcs:
+        put32(ref syms, len(strs))
+        str_bytes(ref strs, "_" + f.1)
+        strs.push(0)
+        # N_SECT in section 1 (__text)
+        syms.extend([14, 1])
+        put16(ref syms, 0)
+        put64(ref syms, MACHO_BASE + text_off + f.0)
+    put32(ref syms, len(strs))
+    str_bytes(ref strs, "__mh_execute_header")
+    strs.push(0)
+    # N_SECT | N_EXT, REFERENCED_DYNAMICALLY
+    syms.extend([15, 1])
+    put16(ref syms, 16)
+    put64(ref syms, MACHO_BASE)
+    for nm in imps:
+        put32(ref syms, len(strs))
+        str_bytes(ref strs, macho_name(nm, a64))
+        strs.push(0)
+        # N_UNDF | N_EXT, from library 1
+        syms.extend([1, 0])
+        put16(ref syms, 256)
+        put64(ref syms, 0)
+    pad_to(ref strs, 8)
+    let nloc = len(funcs)
+    # indirect symbols: the stubs', then the GOT's (INDIRECT_SYMBOL_LOCAL for
+    # defined symbols)
+    var ind: [u8] = []
+    for _ in 0..2:
+        for i in 0..nimp:
+            put32(ref ind, nloc + 1 + i)
+    for _ in got_local:
+        put32(ref ind, 2147483648)
+    let nind = len(ind) / 4
+    pad_to(ref ind, 8)
+    let rebase_at = le_off
+    let bind_at = rebase_at + len(rebase)
+    let export_at = bind_at + len(bind)
+    let sym_at = export_at + len(exports)
+    let ind_at = sym_at + len(syms)
+    let str_at = ind_at + len(ind)
+    let sig_at = align_up(str_at + len(strs), 16)
+    let id = ident if ident != "" else "a.out"
+    let sig_size = sig_len(sig_at, id)
+    let le_size = sig_at + sig_size - le_off
+    # the stubs: jumps through the GOT
+    var code: [u8] = []
+    for nm in imps:
+        let at = MACHO_BASE + stubs_off + len(code)
+        let g = MACHO_BASE + got_off + 8 * got_of[nm]
+        if a64:
+            # adrp x16, slot; ldr x17, [x16, lo12]; br x17; nop
+            let c = len(code)
+            for wd in [0x90000010, 0xF9400211, 0xD61F0220, 0xD503201F]:
+                put32(ref code, wd)
+            a64_page(ref code, c, g, at)
+            a64_ldr12(ref code, c + 4, g)
+        else:
+            # jmp [rip + slot]
+            code.extend([255, 37])
+            put32(ref code, g - (at + 6))
+            code.extend([204, 204])
+    var out: [u8] = []
+    # mach_header_64: MH_EXECUTE; MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
+    put32(ref out, 0xFEEDFACF)
+    put32(ref out, 0x0100000C if a64 else 0x01000007)
+    put32(ref out, 0 if a64 else 3)
+    put32(ref out, 2)
+    put32(ref out, ncmds)
+    put32(ref out, cmds_size)
+    put32(ref out, 0x200085)
+    put32(ref out, 0)
+    put_seg(ref out, "__PAGEZERO", 0, 0, MACHO_BASE, 0, 0, 0)
+    # r-x
+    put_seg(ref out, "__TEXT", 4, MACHO_BASE, text_size, 0, text_size, 5)
+    put_sect(
+        ref out,
+        "__text",
+        "__TEXT",
+        text_off,
+        len(o.text),
+        max(o.text_align, 16),
+        0x80000400,
+        0,
+        0
+    )
+    # S_SYMBOL_STUBS
+    put_sect(ref out, "__stubs", "__TEXT", stubs_off, stub * nimp, 16, 0x80000408, 0, stub)
+    put_sect(
+        ref out,
+        "__const",
+        "__TEXT",
+        const_off,
+        len(o.rodata),
+        max(o.rodata_align, 8),
+        0,
+        0,
+        0
+    )
+    put_sect(ref out, "__eh_frame", "__TEXT", eh_off, len(o.unwind), 8, 0x6800000B, 0, 0)
+    # rw-
+    put_seg(ref out, "__DATA", 2, MACHO_BASE + data_off, data_size, data_off, data_size, 3)
+    put_sect(ref out, "__data", "__DATA", data_off, len(o.data), max(o.data_align, 16), 0, 0, 0)
+    # S_NON_LAZY_SYMBOL_POINTERS
+    put_sect(ref out, "__got", "__DATA", got_off, 8 * len(got_of), 8, 6, nimp, 0)
+    if ndw > 0:
+        # r--
+        put_seg(ref out, "__DWARF", ndw, MACHO_BASE + dw_off, dw_size, dw_off, dw_size, 1)
+        for i, d in enumerate(o.dsecs):
+            # .debug_info -> __debug_info; S_ATTR_DEBUG
+            let nm = "__" + d.name[1:len(d.name)]
+            put_sect(ref out, nm, "__DWARF", dw_at[i], len(d.bytes), 1, 0x02000000, 0, 0)
+    # r--
+    put_seg(
+        ref out,
+        "__LINKEDIT",
+        0,
+        MACHO_BASE + le_off,
+        align_up(le_size, MACHO_PAGE),
+        le_off,
+        le_size,
+        1
+    )
+    # LC_DYLD_INFO_ONLY
+    put32(ref out, 0x80000022)
+    put32(ref out, 48)
+    for v in [rebase_at, len(rebase), bind_at, len(bind), 0, 0, 0, 0, export_at, len(exports)]:
+        put32(ref out, v)
+    # LC_SYMTAB
+    put32(ref out, 2)
+    put32(ref out, 24)
+    for v in [sym_at, nloc + 1 + nimp, str_at, len(strs)]:
+        put32(ref out, v)
+    # LC_DYSYMTAB: locals, defined externals, undefined, indirect symbols
+    put32(ref out, 11)
+    put32(ref out, 80)
+    for v in [0, nloc, nloc, 1, nloc + 1, nimp, 0, 0, 0, 0, 0, 0, ind_at, nind, 0, 0, 0, 0]:
+        put32(ref out, v)
+    # LC_LOAD_DYLINKER
+    let dl_at = len(out)
+    put32(ref out, 14)
+    put32(ref out, 32)
+    put32(ref out, 12)
+    str_bytes(ref out, MACHO_DYLINKER)
+    pad_with(ref out, dl_at + 32, 0)
+    # LC_UUID (filled in below)
+    put32(ref out, 27)
+    put32(ref out, 24)
+    let uuid_at = len(out)
+    pad_with(ref out, uuid_at + 16, 0)
+    # LC_BUILD_VERSION: macOS, 11.0 or later, SDK 15.0, no tools
+    put32(ref out, 50)
+    put32(ref out, 24)
+    for v in [1, 0x000B0000, 0x000F0000, 0]:
+        put32(ref out, v)
+    # LC_MAIN: main's file offset, the default stack
+    put32(ref out, 0x80000028)
+    put32(ref out, 24)
+    put64(ref out, addr[m] - MACHO_BASE)
+    put64(ref out, 0)
+    # LC_LOAD_DYLIB: the name, a timestamp, version 1351.0.0, compatible with 1.0.0
+    let ld_at = len(out)
+    put32(ref out, 12)
+    put32(ref out, 56)
+    for v in [24, 2, 0x05470000, 0x00010000]:
+        put32(ref out, v)
+    str_bytes(ref out, MACHO_LIBSYSTEM)
+    pad_with(ref out, ld_at + 56, 0)
+    # LC_CODE_SIGNATURE
+    put32(ref out, 29)
+    put32(ref out, 16)
+    put32(ref out, sig_at)
+    put32(ref out, sig_size)
+    if len(out) != 32 + cmds_size:
+        return Err(f"internal error: Mach-O load commands are {len(out) - 32} bytes")
+    pad_with(ref out, text_off, 0)
+    out.extend(o.text)
+    pad_with(ref out, stubs_off, 0)
+    out.extend(code)
+    pad_with(ref out, const_off, 0)
+    out.extend(o.rodata)
+    pad_with(ref out, eh_off, 0)
+    out.extend(o.unwind)
+    pad_with(ref out, data_off, 0)
+    out.extend(o.data)
+    pad_with(ref out, got_off, 0)
+    out.extend(gotb)
+    for i, b in enumerate(dbg):
+        pad_with(ref out, dw_at[i], 0)
+        out.extend(b)
+    pad_with(ref out, le_off, 0)
+    out.extend(rebase)
+    out.extend(bind)
+    out.extend(exports)
+    out.extend(syms)
+    out.extend(ind)
+    out.extend(strs)
+    pad_with(ref out, sig_at, 0)
+    # the UUID: from the contents, so the same program links the same
+    let h = sha256(out)
+    for i in 0..16:
+        out[uuid_at + i] = h[i]
+    out.extend(code_signature(out, id, text_size))
+    return Ok(out)
+
+fn sig_len(n: int, id: str) -> int:
+    return 20 + 88 + len(id.bytes()) + 1 + 32 * ((n + 4095) / 4096)
+
+# An ad-hoc signature, as a C linker makes: no certificate, a SHA-256 hash
+# of each 4 KB page. arm64 macOS runs nothing without one. Big endian.
+fn code_signature(file: [u8], id: str, text_size: int) -> [u8]:
+    let n = len(file)
+    let id_len = len(id.bytes()) + 1
+    let cd_size = sig_len(n, id) - 20
+    var out: [u8] = []
+    # SuperBlob: one blob, the CodeDirectory
+    for v in [0xFADE0CC0, 20 + cd_size, 1, 0, 20]:
+        put32be(ref out, v)
+    # CodeDirectory 0x20400, adhoc | linker-signed: the hashes after the id
+    # (at 88), the page count, the bytes they cover
+    for v in [0xFADE0C02, cd_size, 0x20400, 0x20002, 88 + id_len, 88, 0, (n + 4095) / 4096, n]:
+        put32be(ref out, v)
+    # 32-byte SHA-256 hashes, 4 KB pages
+    out.extend([32, 2, 0, 12])
+    for _ in 0..4:
+        put32be(ref out, 0)
+    put64be(ref out, 0)
+    # the executable segment (__TEXT) of a main executable
+    put64be(ref out, 0)
+    put64be(ref out, text_size)
+    put64be(ref out, 1)
+    str_bytes(ref out, id)
+    out.push(0)
+    var at = 0
+    while at < n:
+        let e = min(at + 4096, n)
+        out.extend(sha256(file[at:e]))
+        at = e
+    return out
+
+# ---------------------------------------------------------------- SHA-256
+
+const SHA_K = [
+    0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
+    0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174,
+    0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA,
+    0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7, 0xC6E00BF3, 0xD5A79147, 0x06CA6351, 0x14292967,
+    0x27B70A85, 0x2E1B2138, 0x4D2C6DFC, 0x53380D13, 0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85,
+    0xA2BFE8A1, 0xA81A664B, 0xC24B8B70, 0xC76C51A3, 0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070,
+    0x19A4C116, 0x1E376C08, 0x2748774C, 0x34B0BCB5, 0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3,
+    0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2
+]
+
+fn rotr32(x: int, n: int) -> int:
+    return ((x >> n) | (x << (32 - n))) & 4294967295
+
+fn sha256(msg: [u8]) -> [u8]:
+    var h = [
+        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+    ]
+    let n = len(msg)
+    let full = n / 64
+    # the last part block, a 1 bit, zeros and the length in bits
+    var tail: [u8] = msg[full * 64:n]
+    tail.push(128)
+    while len(tail) % 64 != 56:
+        tail.push(0)
+    put64be(ref tail, n * 8)
+    var w = [0] * 64
+    for blk in 0..full + len(tail) / 64:
+        let last = blk >= full
+        let base = (blk - full) * 64 if last else blk * 64
+        for t in 0..16:
+            let p = base + 4 * t
+            if last:
+                w[t] = (
+                    (int(tail[p]) << 24)
+                    | (int(tail[p + 1]) << 16)
+                    | (int(tail[p + 2]) << 8)
+                    | int(tail[p + 3])
+                )
+            else:
+                w[t] = (
+                    (int(msg[p]) << 24)
+                    | (int(msg[p + 1]) << 16)
+                    | (int(msg[p + 2]) << 8)
+                    | int(msg[p + 3])
+                )
+        for t in 16..64:
+            let x = w[t - 15]
+            let y = w[t - 2]
+            let s0 = rotr32(x, 7) ^ rotr32(x, 18) ^ (x >> 3)
+            let s1 = rotr32(y, 17) ^ rotr32(y, 19) ^ (y >> 10)
+            w[t] = (w[t - 16] + s0 + w[t - 7] + s1) & 4294967295
+        var a = h[0]
+        var b = h[1]
+        var c = h[2]
+        var d = h[3]
+        var e = h[4]
+        var f = h[5]
+        var g = h[6]
+        var hh = h[7]
+        for t in 0..64:
+            let s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+            let ch = (e & f) ^ ((e ^ 4294967295) & g)
+            let t1 = (hh + s1 + ch + SHA_K[t] + w[t]) & 4294967295
+            let s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+            let mj = (a & b) ^ (a & c) ^ (b & c)
+            hh = g
+            g = f
+            f = e
+            e = (d + t1) & 4294967295
+            d = c
+            c = b
+            b = a
+            a = (t1 + s0 + mj) & 4294967295
+        let v = [a, b, c, d, e, f, g, hh]
+        for i in 0..8:
+            h[i] = (h[i] + v[i]) & 4294967295
+    var out: [u8] = []
+    for x in h:
+        put32be(ref out, x)
+    return out

@@ -4,7 +4,7 @@
 #     brine test compiler/dev_link.br
 
 from obj import ObjFile, OSym, ORel, new_obj, SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, R_PC32, R_CALL, R_ABS64, R_GOT, R_A64_CALL26, R_A64_PAGE, R_A64_LO12, R_A64_GOT_PAGE, R_A64_GOT_LO12, ARCH_A64, put32
-from link import link_pe, link_elf, PE_DLLS, ELF_LIBS
+from link import link_pe, link_elf, link_macho, sha256, PE_DLLS, ELF_LIBS
 from ir import str_bytes
 
 const DIR = "target/link"
@@ -123,9 +123,8 @@ test "a missing import is an error":
         case Err(e):
             assert "no_such_function_anywhere" in e, e
 
-test "a Linux executable starts through libc and calls it":
-    if os.name() != "linux" or os.arch() != "x86_64":
-        return
+# A SysV x86-64 main that prints WANT through `puts` and returns 7.
+fn x64_main() -> ObjFile:
     var (o, msg, msg2, ptr, fp, puts) = base_obj()
     sym(ref o, "main", SEC_TEXT, 0, true)
     # push rbx
@@ -144,7 +143,12 @@ test "a Linux executable starts through libc and calls it":
     # mov eax, 7; pop rbx; ret
     ins(ref o, [184, 7, 0, 0, 0, 91, 195], -1, 0)
     assert msg2 >= 0
-    match link_elf(o, "main", ELF_LIBS):
+    return o
+
+test "a Linux executable starts through libc and calls it":
+    if os.name() != "linux" or os.arch() != "x86_64":
+        return
+    match link_elf(x64_main(), "main", ELF_LIBS):
         case Ok(b):
             let r = run_exe(write_exe(b, "t1"))
             assert r.code == 7, f"exit code {r.code}: {r.out}"
@@ -152,8 +156,8 @@ test "a Linux executable starts through libc and calls it":
         case Err(e):
             panic(e)
 
-# (linked everywhere, so its machine code can be inspected; run on AArch64)
-test "an AArch64 Linux executable starts through libc and calls it":
+# The same for AArch64.
+fn a64_main() -> ObjFile:
     var (o, msg, msg2, ptr, fp, puts) = base_obj()
     o.arch = ARCH_A64
     sym(ref o, "main", SEC_TEXT, 0, true)
@@ -184,7 +188,11 @@ test "an AArch64 Linux executable starts through libc and calls it":
     w(ref o, 0xA8C17BFD, -1, 0)
     w(ref o, 0xD65F03C0, -1, 0)
     assert msg2 >= 0
-    match link_elf(o, "main", ELF_LIBS):
+    return o
+
+# (linked everywhere, so its machine code can be inspected; run on AArch64)
+test "an AArch64 Linux executable starts through libc and calls it":
+    match link_elf(a64_main(), "main", ELF_LIBS):
         case Ok(b):
             let path = write_exe(b, "t2")
             if os.name() != "linux" or os.arch() != "aarch64":
@@ -194,3 +202,35 @@ test "an AArch64 Linux executable starts through libc and calls it":
             assert r.out == WANT, r.out
         case Err(e):
             panic(e)
+
+fn hex(b: [u8]) -> str:
+    var s = ""
+    for x in b:
+        s += f"{int(x):02x}"
+    return s
+
+test "SHA-256 of the standard test messages":
+    var abc: [u8] = []
+    str_bytes(ref abc, "abc")
+    assert hex(sha256(abc)) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    assert hex(sha256([])) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    var two: [u8] = []
+    str_bytes(ref two, "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+    assert hex(sha256(two)) == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+    var mil = [u8(97)] * 1000000
+    assert hex(sha256(mil)) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+
+# (linked everywhere; run on macOS)
+test "a macOS executable starts through dyld and calls libSystem":
+    for a64 in [false, true]:
+        let o = a64_main() if a64 else x64_main()
+        match link_macho(o, "main", "t3"):
+            case Ok(b):
+                let path = write_exe(b, "t3-a64" if a64 else "t3-x64")
+                if os.name() != "macos" or (os.arch() == "aarch64") != a64:
+                    continue
+                let r = run_exe(path)
+                assert r.code == 7, f"exit code {r.code}: {r.out}"
+                assert r.out == WANT, r.out
+            case Err(e):
+                panic(e)
