@@ -8767,3 +8767,1251 @@ fn brine_par_tasks(k: int, f: ptr, ctx: ptr):
 
 fn brine_x_task_main(t: ptr):
     call_void(load_ptr(t, 0), load_ptr(t, 8), load_i64(t, 16))
+
+# ---------------------------------------------------------------- world
+
+# One process per rank, connected to each other by TCP (BRINE_RANK,
+# BRINE_WORLD_SIZE and BRINE_PEERS, set by `brine run --ranks`). A
+# receiver thread per peer reads its messages into a queue; collectives
+# run on the main thread and take them from the queues.
+
+# the world: rank, size, how many lower ranks share this machine (GPUs go
+# one per rank), the call this rank is in (operation, how many calls so
+# far, call site), the peers, and whether the end was reached
+const WD_RANK = 0
+const WD_SIZE = 8
+const WD_LOCAL = 16
+const WD_OP = 24
+const WD_SEQ = 32
+const WD_SITE = 40
+const WD_PEERS = 48
+const WD_DONE = 56
+
+# a peer: its locks and the queue's condition, its socket, the queue, set
+# when the connection closed, and the receiver's read buffer
+const PR_MU = 0
+const PR_SEND_MU = 64
+const PR_CV = 128
+const PR_SOCK = 192
+const PR_HEAD = 200
+const PR_TAIL = 208
+const PR_CLOSED = 216
+const PR_RBUF = 224
+const PR_RPOS = 232
+const PR_REND = 240
+const PR_SIZE = 256
+
+# a message: the next in the queue, then the header as it travels (kind,
+# length, the sender's call: operation, number, site length), the payload
+# and the site
+const MS_NEXT = 0
+const MS_KIND = 8
+const MS_LEN = 16
+const MS_OP = 24
+const MS_SEQ = 32
+const MS_SLEN = 40
+const MS_DATA = 48
+const HDR = 40
+
+const K_EMPTY = 0
+const K_I64 = 1
+const K_F64 = 2
+const K_MSG = 7
+
+# Which collective a message belongs to. Every rank makes the same calls in
+# the same order (the compiler checks this), so each message carries its
+# call and the receiver checks that it is in the same one: a mismatch is a
+# clear panic instead of a hang or a silently wrong result.
+const OP_BARRIER = 1
+const OP_SHIFT = 2
+const OP_EXCHANGE = 3
+const OP_BCAST = 4
+const OP_GATHER = 5
+const OP_SUM = 6
+const OP_MIN = 7
+const OP_MAX = 8
+const OP_ANY = 9
+const OP_ALL = 10
+const OP_FINISH = 11
+
+# The receiver reads through a buffer: one `recv` usually brings in several
+# small messages, or one whole.
+const RBUF = 65536
+
+# struct addrinfo: ai_family, ai_socktype, ai_protocol, ai_addrlen, then
+# ai_addr (at 24 on Linux, after ai_canonname at 32 on Windows and macOS)
+const AI_FAMILY = 4
+const AI_SOCKTYPE = 8
+const AI_PROTOCOL = 12
+const AI_ADDRLEN = 16
+
+# Winsock, from ws2_32.dll once a program needs it: importing it would load
+# it, and the DLLs it needs, into every program. Its functions' addresses:
+const WS_STARTUP = 0
+const WS_SOCKET = 8
+const WS_SETSOCKOPT = 16
+const WS_BIND = 24
+const WS_LISTEN = 32
+const WS_ACCEPT = 40
+const WS_CONNECT = 48
+const WS_GETADDRINFO = 56
+const WS_FREEADDRINFO = 64
+const WS_CLOSESOCKET = 72
+const WS_SEND = 80
+const WS_RECV = 88
+
+extern fn LoadLibraryA(name: ptr) -> ptr
+
+extern fn GetProcAddress(h: ptr, name: ptr) -> ptr
+
+extern fn SetEnvironmentVariableA(name: ptr, v: ptr) -> i32
+
+extern fn _putenv(s: ptr) -> i32
+
+extern fn __acrt_iob_func(i: u32) -> ptr
+
+extern fn _errno() -> ptr
+
+extern fn __errno_location() -> ptr
+
+extern fn __error() -> ptr
+
+extern fn socket(fam: i32, ty: i32, proto: i32) -> i32
+
+extern fn setsockopt(s: i32, level: i32, name: i32, v: ptr, n: u32) -> i32
+
+extern fn bind(s: i32, a: ptr, n: u32) -> i32
+
+extern fn listen(s: i32, n: i32) -> i32
+
+extern fn accept(s: i32, a: ptr, n: ptr) -> i32
+
+extern fn connect(s: i32, a: ptr, n: u32) -> i32
+
+extern fn getaddrinfo(host: ptr, port: ptr, hints: ptr, res: ptr) -> i32
+
+extern fn freeaddrinfo(a: ptr)
+
+extern fn close(fd: i32) -> i32
+
+extern fn send(s: i32, p: ptr, n: u64, flags: i32) -> int
+
+extern fn recv(s: i32, p: ptr, n: u64, flags: i32) -> int
+
+extern fn unsetenv(name: ptr) -> i32
+
+extern fn signal(sig: i32, f: ptr) -> ptr
+
+extern fn setvbuf(f: ptr, buf: ptr, mode: i32, n: u64) -> i32
+
+extern fn fflush(f: ptr) -> i32
+
+extern fn fwrite(p: ptr, size: u64, n: u64, f: ptr) -> u64
+
+extern fn exit(code: i32)
+
+extern fn strlen(s: ptr) -> u64
+
+extern fn brine_flush()
+
+fn wd() -> ptr:
+    return global_mem("world", 64)
+
+fn brine_world_rank() -> int:
+    return load_i64(wd(), WD_RANK)
+
+fn brine_world_size() -> int:
+    return load_i64(wd(), WD_SIZE)
+
+fn brine_x_world_local_rank() -> int:
+    return load_i64(wd(), WD_LOCAL)
+
+fn peer(r: int) -> ptr:
+    return load_ptr(wd(), WD_PEERS) + r * PR_SIZE
+
+# a string literal as a C string
+fn lit(s: str) -> ptr:
+    return ptr_of(s) + STR_DATA
+
+fn c_stderr() -> ptr:
+    if os_is("windows"):
+        return __acrt_iob_func(u32(2))
+    elif os_is("macos"):
+        return load_ptr(symbol("__stderrp"), 0)
+    else:
+        return load_ptr(symbol("stderr"), 0)
+
+fn errno_val() -> int:
+    if os_is("windows"):
+        return int(load_i32(_errno(), 0))
+    elif os_is("macos"):
+        return int(load_i32(__error(), 0))
+    else:
+        return int(load_i32(__errno_location(), 0))
+
+fn sleep_ms(ms: int):
+    if os_is("windows"):
+        Sleep(u32(ms))
+    else:
+        let ts = stack_mem(16)
+        store_i64(ts, 0, ms / 1000)
+        store_i64(ts, 8, (ms % 1000) * 1000000)
+        nanosleep(ts, null_ptr())
+
+# The C string at p as a new brine string.
+fn c_str(p: ptr) -> str:
+    return str_of(brine_str_new(p, int(strlen(p))))
+
+fn err_out(s: str):
+    let p = ptr_of(s)
+    fwrite(p + STR_DATA, u64(1), load_u64(p, STR_LEN), c_stderr())
+
+# a failure while starting: the message, then exit code 2
+fn world_fail(s: str):
+    err_out(s)
+    exit(i32(2))
+
+fn kind_name(k: int) -> str:
+    if k == K_EMPTY:
+        return "nothing"
+    elif k == K_I64:
+        return "int"
+    elif k == K_F64:
+        return "float"
+    elif k == K_MSG:
+        return "message"
+    return "(internal)"
+
+fn op_name(op: int) -> str:
+    if op == OP_BARRIER:
+        return "`world.barrier`"
+    elif op == OP_SHIFT:
+        return "`world.shift`"
+    elif op == OP_EXCHANGE:
+        return "`world.exchange`"
+    elif op == OP_BCAST:
+        return "`world.broadcast`"
+    elif op == OP_GATHER:
+        return "`world.gather_all`"
+    elif op == OP_SUM:
+        return "`world.sum`"
+    elif op == OP_MIN:
+        return "`world.min`"
+    elif op == OP_MAX:
+        return "`world.max`"
+    elif op == OP_ANY:
+        return "`world.any`"
+    elif op == OP_ALL:
+        return "`world.all`"
+    elif op == OP_FINISH:
+        return "the end of the program"
+    return "(internal)"
+
+# A panic, its message cut to 1023 bytes as the C runtime's buffer cuts it.
+fn world_panic(loc: ptr, msg: str):
+    let p = ptr_of(msg)
+    if load_i64(p, STR_LEN) > 1023:
+        brine_panic_at(loc, str_of(brine_str_new(p + STR_DATA, 1023)))
+    brine_panic_at(loc, msg)
+
+# the call this rank is in (collectives only run on the main thread)
+fn coll(op: int, loc: ptr):
+    let w = wd()
+    store_i64(w, WD_OP, op)
+    store_ptr(w, WD_SITE, loc)
+    store_i64(w, WD_SEQ, load_i64(w, WD_SEQ) + 1)
+
+fn cur_site() -> ptr:
+    let s = load_ptr(wd(), WD_SITE)
+    return lit("") if addr(s) == 0 else s
+
+# ---- sockets: a SOCKET on Windows, a file descriptor elsewhere; -1 is none
+
+fn ws(f: int) -> ptr:
+    return load_ptr(global_mem("world_ws", 96), f)
+
+fn ws_start():
+    let t = global_mem("world_ws", 96)
+    let h = LoadLibraryA(lit("ws2_32.dll"))
+    if addr(h) == 0:
+        world_fail("brine: could not load ws2_32.dll\n")
+    store_ptr(t, WS_STARTUP, GetProcAddress(h, lit("WSAStartup")))
+    store_ptr(t, WS_SOCKET, GetProcAddress(h, lit("socket")))
+    store_ptr(t, WS_SETSOCKOPT, GetProcAddress(h, lit("setsockopt")))
+    store_ptr(t, WS_BIND, GetProcAddress(h, lit("bind")))
+    store_ptr(t, WS_LISTEN, GetProcAddress(h, lit("listen")))
+    store_ptr(t, WS_ACCEPT, GetProcAddress(h, lit("accept")))
+    store_ptr(t, WS_CONNECT, GetProcAddress(h, lit("connect")))
+    store_ptr(t, WS_GETADDRINFO, GetProcAddress(h, lit("getaddrinfo")))
+    store_ptr(t, WS_FREEADDRINFO, GetProcAddress(h, lit("freeaddrinfo")))
+    store_ptr(t, WS_CLOSESOCKET, GetProcAddress(h, lit("closesocket")))
+    store_ptr(t, WS_SEND, GetProcAddress(h, lit("send")))
+    store_ptr(t, WS_RECV, GetProcAddress(h, lit("recv")))
+    # version 2.2 (WSADATA takes 408 bytes)
+    let wsa = stack_mem(512)
+    call_i32(ws(WS_STARTUP), u16(514), wsa)
+
+fn sk_socket(fam: i32, ty: i32, proto: i32) -> int:
+    if os_is("windows"):
+        return int(call_u64(ws(WS_SOCKET), fam, ty, proto))
+    else:
+        return int(socket(fam, ty, proto))
+
+fn sk_close(s: int):
+    if os_is("windows"):
+        call_i32(ws(WS_CLOSESOCKET), u64(s))
+    else:
+        close(i32(s))
+
+fn sk_setopt(s: int, level: i32, name: i32, v: int):
+    let p = stack_mem(8)
+    store_i32(p, 0, i32(v))
+    if os_is("windows"):
+        call_i32(ws(WS_SETSOCKOPT), u64(s), level, name, p, i32(4))
+    else:
+        setsockopt(i32(s), level, name, p, u32(4))
+
+fn sk_bind(s: int, a: ptr, n: int) -> bool:
+    if os_is("windows"):
+        return call_i32(ws(WS_BIND), u64(s), a, i32(n)) == 0
+    else:
+        return bind(i32(s), a, u32(n)) == 0
+
+fn sk_listen(s: int, n: int) -> bool:
+    if os_is("windows"):
+        return call_i32(ws(WS_LISTEN), u64(s), i32(n)) == 0
+    else:
+        return listen(i32(s), i32(n)) == 0
+
+fn sk_accept(s: int) -> int:
+    if os_is("windows"):
+        return int(call_u64(ws(WS_ACCEPT), u64(s), null_ptr(), null_ptr()))
+    else:
+        return int(accept(i32(s), null_ptr(), null_ptr()))
+
+fn sk_connect(s: int, a: ptr, n: int) -> bool:
+    if os_is("windows"):
+        return call_i32(ws(WS_CONNECT), u64(s), a, i32(n)) == 0
+    else:
+        return connect(i32(s), a, u32(n)) == 0
+
+fn sk_getaddrinfo(host: ptr, port: ptr, hints: ptr, res: ptr) -> bool:
+    if os_is("windows"):
+        return call_i32(ws(WS_GETADDRINFO), host, port, hints, res) == 0
+    else:
+        return getaddrinfo(host, port, hints, res) == 0
+
+fn sk_freeaddrinfo(a: ptr):
+    if os_is("windows"):
+        call_void(ws(WS_FREEADDRINFO), a)
+    else:
+        freeaddrinfo(a)
+
+# n <= 2^30 bytes: how many went, or <= 0
+fn sk_send(s: int, p: ptr, n: int) -> int:
+    if os_is("windows"):
+        return int(call_i32(ws(WS_SEND), u64(s), p, i32(n), i32(0)))
+    elif os_is("linux"):
+        # (MSG_NOSIGNAL: a closed peer is an error, not SIGPIPE)
+        return send(i32(s), p, u64(n), i32(16384))
+    else:
+        return send(i32(s), p, u64(n), i32(0))
+
+fn sk_recv(s: int, p: ptr, n: int) -> int:
+    if os_is("windows"):
+        return int(call_i32(ws(WS_RECV), u64(s), p, i32(n), i32(0)))
+    else:
+        return recv(i32(s), p, u64(n), i32(0))
+
+# a call a signal interrupted (EINTR): try again
+fn interrupted(r: int) -> bool:
+    if os_is("windows"):
+        return false
+    else:
+        return r < 0 and errno_val() == 4
+
+fn write_all(s: int, p0: ptr, n0: int) -> bool:
+    var p = p0
+    var n = n0
+    while n > 0:
+        let w = sk_send(s, p, 1073741824 if n > 1073741824 else n)
+        if w <= 0:
+            if interrupted(w):
+                continue
+            return false
+        p = p + w
+        n -= w
+    return true
+
+fn read_all(s: int, p0: ptr, n0: int) -> bool:
+    var p = p0
+    var n = n0
+    while n > 0:
+        let r = sk_recv(s, p, 1073741824 if n > 1073741824 else n)
+        if r <= 0:
+            if interrupted(r):
+                continue
+            return false
+        p = p + r
+        n -= r
+    return true
+
+# what has arrived, at least one byte: 0 when the connection is closed
+fn read_some(s: int, p: ptr, n: int) -> int:
+    while true:
+        let r = sk_recv(s, p, 1073741824 if n > 1073741824 else n)
+        if interrupted(r):
+            continue
+        return r if r > 0 else 0
+    return 0
+
+# ---- the queues
+
+fn enqueue(pr: ptr, m: ptr):
+    store_ptr(m, MS_NEXT, null_ptr())
+    lock(pr + PR_MU)
+    let t = load_ptr(pr, PR_TAIL)
+    if addr(t) != 0:
+        store_ptr(t, MS_NEXT, m)
+    else:
+        store_ptr(pr, PR_HEAD, m)
+    store_ptr(pr, PR_TAIL, m)
+    cond_broadcast(pr + PR_CV)
+    unlock(pr + PR_MU)
+
+fn rd(pr: ptr, dst: ptr, n0: int) -> bool:
+    var d = dst
+    var n = n0
+    let buf = load_ptr(pr, PR_RBUF)
+    while n > 0:
+        var pos = load_i64(pr, PR_RPOS)
+        var end = load_i64(pr, PR_REND)
+        if pos == end:
+            if n >= RBUF:
+                return read_all(load_i64(pr, PR_SOCK), d, n)
+            let r = read_some(load_i64(pr, PR_SOCK), buf, RBUF)
+            if r <= 0:
+                return false
+            pos = 0
+            end = r
+            store_i64(pr, PR_REND, r)
+        let k = end - pos if end - pos < n else n
+        copy_bytes(d, buf + pos, k)
+        store_i64(pr, PR_RPOS, pos + k)
+        d = d + k
+        n -= k
+    return true
+
+fn brine_x_world_receiver(pr: ptr):
+    store_ptr(pr, PR_RBUF, brine_alloc(RBUF))
+    let hdr = stack_mem(40)
+    while true:
+        if not rd(pr, hdr, HDR):
+            break
+        let len = load_i64(hdr, 8)
+        let slen = load_i64(hdr, 32)
+        if len < 0 or slen < 0 or slen > 4096:
+            break
+        let m = blk_alloc(MS_DATA + len + slen)
+        copy_bytes(m + MS_KIND, hdr, HDR)
+        if len + slen != 0 and not rd(pr, m + MS_DATA, len + slen):
+            blk_free(m)
+            break
+        enqueue(pr, m)
+    lock(pr + PR_MU)
+    atomic_store(pr + PR_CLOSED, 1)
+    cond_broadcast(pr + PR_CV)
+    unlock(pr + PR_MU)
+
+fn check_rank(r: int, what: str, loc: ptr):
+    let n = brine_world_size()
+    if r < 0 or r >= n:
+        world_panic(loc, f"{what} rank {r} is out of range (world size is {n})")
+
+# A peer is gone. Usually it failed and printed why: give `brine run` time to
+# stop this rank quietly, so that message is the one people see.
+fn peer_lost(r: int, loc: ptr):
+    brine_flush()
+    sleep_ms(1000)
+    let op = op_name(load_i64(wd(), WD_OP))
+    world_panic(
+        loc,
+        f"rank {r} stopped before taking part in {op} (it finished or failed: see its messages)"
+    )
+
+fn world_send(dest: int, kind: int, data: ptr, len: int, loc: ptr):
+    # what this rank printed so far comes out before anything another rank
+    # prints after hearing from it (ranks share stdout, each with its own
+    # buffer)
+    brine_flush()
+    let w = wd()
+    let pr = peer(dest)
+    let site = cur_site()
+    var slen = int(strlen(site))
+    if slen > 4096:
+        slen = 4096
+    if dest == load_i64(w, WD_RANK):
+        let m = blk_alloc(MS_DATA + len + slen)
+        store_i64(m, MS_KIND, kind)
+        store_i64(m, MS_LEN, len)
+        store_i64(m, MS_OP, load_i64(w, WD_OP))
+        store_i64(m, MS_SEQ, load_i64(w, WD_SEQ))
+        store_i64(m, MS_SLEN, slen)
+        copy_bytes(m + MS_DATA, data, len)
+        copy_bytes(m + MS_DATA + len, site, slen)
+        enqueue(pr, m)
+        return
+    let s = load_i64(pr, PR_SOCK)
+    var ok = false
+    if len <= RBUF:
+        # one `send`: each one costs a system call and often a packet
+        let b = blk_alloc(HDR + len + slen)
+        store_i64(b, 0, kind)
+        store_i64(b, 8, len)
+        store_i64(b, 16, load_i64(w, WD_OP))
+        store_i64(b, 24, load_i64(w, WD_SEQ))
+        store_i64(b, 32, slen)
+        copy_bytes(b + HDR, data, len)
+        copy_bytes(b + HDR + len, site, slen)
+        lock(pr + PR_SEND_MU)
+        ok = write_all(s, b, HDR + len + slen)
+        unlock(pr + PR_SEND_MU)
+        blk_free(b)
+    else:
+        let h = stack_mem(40)
+        store_i64(h, 0, kind)
+        store_i64(h, 8, len)
+        store_i64(h, 16, load_i64(w, WD_OP))
+        store_i64(h, 24, load_i64(w, WD_SEQ))
+        store_i64(h, 32, slen)
+        lock(pr + PR_SEND_MU)
+        ok = (
+            write_all(s, h, HDR)
+            and write_all(s, data, len)
+            and (slen == 0 or write_all(s, site, slen))
+        )
+        unlock(pr + PR_SEND_MU)
+    if not ok:
+        peer_lost(dest, loc)
+
+# The other rank is in a different call than this one.
+fn mismatch(src: int, m: ptr, loc: ptr):
+    let w = wd()
+    let cur = load_i64(w, WD_OP)
+    let op = load_i64(m, MS_OP)
+    let sl = load_i64(m, MS_SLEN)
+    let sp = m + MS_DATA + load_i64(m, MS_LEN)
+    let site = str_of(brine_str_new(sp, sl))
+    if op == OP_FINISH:
+        world_panic(
+            loc,
+            f"rank {src} has already finished ({site}), but this rank is in {op_name(cur)}"
+        )
+    if cur == OP_FINISH:
+        world_panic(
+            loc,
+            f"this rank has finished, but rank {src} is still communicating: {op_name(op)} at {site}"
+        )
+    let here = cur_site()
+    if op == cur and int(strlen(here)) == sl and memcmp(sp, here, u64(sl)) == 0:
+        let theirs = load_i64(m, MS_SEQ)
+        let ours = load_i64(w, WD_SEQ)
+        world_panic(
+            loc,
+            f"mismatched communication: rank {src} is in a different call of {op_name(op)} here (its communication #{theirs}, this rank's #{ours})"
+        )
+    world_panic(
+        loc,
+        f"mismatched communication: this rank is in {op_name(cur)}, but rank {src} is in {op_name(op)} at {site}"
+    )
+
+fn world_recv(src: int, kind: int, loc: ptr) -> ptr:
+    let pr = peer(src)
+    # the message usually comes within microseconds: wait for it awake, as
+    # waking a sleeping thread takes longer
+    for _ in 0..SPINS:
+        if atomic_load(pr + PR_HEAD) != 0 or atomic_load(pr + PR_CLOSED) != 0:
+            break
+        cpu_relax()
+    lock(pr + PR_MU)
+    while addr(load_ptr(pr, PR_HEAD)) == 0:
+        if load_i64(pr, PR_CLOSED) != 0:
+            unlock(pr + PR_MU)
+            peer_lost(src, loc)
+        cond_wait(pr + PR_CV, pr + PR_MU)
+    let m = load_ptr(pr, PR_HEAD)
+    store_ptr(pr, PR_HEAD, load_ptr(m, MS_NEXT))
+    if load_ptr(pr, PR_TAIL) == m:
+        store_ptr(pr, PR_TAIL, null_ptr())
+    unlock(pr + PR_MU)
+    let w = wd()
+    let cur = load_i64(w, WD_OP)
+    let op = load_i64(m, MS_OP)
+    # returning from `main` and `exit` are the same call
+    var same = cur == OP_FINISH
+    if op != OP_FINISH:
+        let here = cur_site()
+        let sl = load_i64(m, MS_SLEN)
+        same = (
+            op == cur
+            and load_i64(m, MS_SEQ) == load_i64(w, WD_SEQ)
+            and sl == int(strlen(here))
+            and memcmp(m + MS_DATA + load_i64(m, MS_LEN), here, u64(sl)) == 0
+        )
+    if not same:
+        mismatch(src, m, loc)
+    let mk = load_i64(m, MS_KIND)
+    if mk != kind:
+        world_panic(
+            loc,
+            f"type mismatch: rank {src} sent {kind_name(mk)}, but this rank expects {kind_name(kind)}"
+        )
+    return m
+
+# ---- starting
+
+fn sock_connect(host: ptr, port: ptr) -> int:
+    let hints = stack_mem(48)
+    memset(hints, i32(0), u64(48))
+    # AF_INET, SOCK_STREAM
+    store_i32(hints, AI_FAMILY, i32(2))
+    store_i32(hints, AI_SOCKTYPE, i32(1))
+    let res = stack_mem(8)
+    store_ptr(res, 0, null_ptr())
+    if not sk_getaddrinfo(host, port, hints, res) or addr(load_ptr(res, 0)) == 0:
+        return -1
+    let ai = load_ptr(res, 0)
+    let s = sk_socket(load_i32(ai, AI_FAMILY), load_i32(ai, AI_SOCKTYPE), load_i32(ai, AI_PROTOCOL))
+    if s == -1:
+        sk_freeaddrinfo(ai)
+        return -1
+    let sa = load_ptr(ai, 24 if os_is("linux") else 32)
+    if not sk_connect(s, sa, int(load_u32(ai, AI_ADDRLEN))):
+        sk_close(s)
+        sk_freeaddrinfo(ai)
+        return -1
+    sk_freeaddrinfo(ai)
+    return s
+
+# SOL_SOCKET and its options SO_REUSEADDR, SO_SNDBUF, SO_RCVBUF
+fn sol_socket() -> i32:
+    return i32(1) if os_is("linux") else i32(65535)
+
+fn so_reuseaddr() -> i32:
+    return i32(2) if os_is("linux") else i32(4)
+
+fn sk_nodelay(s: int):
+    # IPPROTO_TCP, TCP_NODELAY
+    sk_setopt(s, i32(6), i32(1), 1)
+    sk_setopt(s, sol_socket(), i32(7) if os_is("linux") else i32(4097), 4194304)
+    sk_setopt(s, sol_socket(), i32(8) if os_is("linux") else i32(4098), 4194304)
+
+fn c_starts(s: ptr, pre: str) -> bool:
+    let p = ptr_of(pre)
+    for i in 0..load_i64(p, STR_LEN):
+        if load_u8(s, i) != load_u8(p, STR_DATA + i):
+            return false
+    return true
+
+fn c_eq(a: ptr, b: ptr) -> bool:
+    var i = 0
+    while true:
+        let c = load_u8(a, i)
+        if c != load_u8(b, i):
+            return false
+        if c == 0:
+            return true
+        i += 1
+    return true
+
+fn loopback(h: ptr) -> bool:
+    return c_starts(h, "127.") or c_eq(h, lit("localhost"))
+
+fn same_host(a: ptr, b: ptr) -> bool:
+    return c_eq(a, b) or (loopback(a) and loopback(b))
+
+# Processes this rank starts (`run`, `os.spawn`) are not part of its world.
+fn world_unsetenv(name: str, assign: str):
+    if os_is("windows"):
+        _putenv(lit(assign))
+        SetEnvironmentVariableA(lit(name), null_ptr())
+    else:
+        unsetenv(lit(name))
+
+# stderr is buffered with several ranks: what `abort` would lose
+fn brine_x_world_abort_flush(sig: i32):
+    fflush(c_stderr())
+
+fn brine_x_world_init():
+    let w = wd()
+    store_i64(w, WD_SIZE, 1)
+    let er = getenv(lit("BRINE_RANK"))
+    let es = getenv(lit("BRINE_WORLD_SIZE"))
+    let ep = getenv(lit("BRINE_PEERS"))
+    if addr(er) == 0 or addr(es) == 0 or addr(ep) == 0:
+        return
+    let rank = atoi(er)
+    let size = atoi(es)
+    let ln = int(strlen(ep))
+    let list = malloc(u64(ln + 1))
+    memcpy(list, ep, u64(ln + 1))
+    world_unsetenv("BRINE_RANK", "BRINE_RANK=")
+    world_unsetenv("BRINE_WORLD_SIZE", "BRINE_WORLD_SIZE=")
+    world_unsetenv("BRINE_PEERS", "BRINE_PEERS=")
+    if size <= 1:
+        free(list)
+        return
+    store_i64(w, WD_RANK, rank)
+    store_i64(w, WD_SIZE, size)
+    # ranks share stderr: write each message whole (panics and `eprint`
+    # flush); (_IOFBF)
+    setvbuf(c_stderr(), global_mem("world_errbuf", 16384), i32(0), u64(16384))
+    # (SIGABRT)
+    signal(i32(22) if os_is("windows") else i32(6), symbol("brine_x_world_abort_flush"))
+    if os_is("windows"):
+        ws_start()
+    else:
+        # (SIGPIPE, SIG_IGN)
+        signal(i32(13), null_ptr() + 1)
+    store_ptr(w, WD_PEERS, brine_x_calloc(size * PR_SIZE))
+    let hosts = brine_x_calloc(size * 8)
+    let ports = brine_x_calloc(size * 8)
+    var p = list
+    for i in 0..size:
+        # an entry ends at a comma; the port is after its last colon
+        var n = 0
+        while load_u8(p, n) != 0 and load_u8(p, n) != 44:
+            n += 1
+        let more = load_u8(p, n) == 44
+        store_u8(p, n, u8(0))
+        var colon = n - 1
+        while colon >= 0 and load_u8(p, colon) != 58:
+            colon -= 1
+        if colon < 0:
+            world_fail(f"brine: invalid BRINE_PEERS entry '{c_str(p)}'\n")
+        store_u8(p, colon, u8(0))
+        store_ptr(hosts, i * 8, p)
+        store_ptr(ports, i * 8, p + colon + 1)
+        p = p + (n + 1 if more else n)
+    let me = load_ptr(hosts, rank * 8)
+    var local = 0
+    for i in 0..rank:
+        if same_host(load_ptr(hosts, i * 8), me):
+            local += 1
+    store_i64(w, WD_LOCAL, local)
+    for i in 0..size:
+        let pr = peer(i)
+        lock_init(pr + PR_MU)
+        lock_init(pr + PR_SEND_MU)
+        cond_init(pr + PR_CV)
+        store_i64(pr, PR_SOCK, -1)
+    # listen on our own port
+    let ls = sk_socket(i32(2), i32(1), i32(0))
+    sk_setopt(ls, sol_socket(), so_reuseaddr(), 1)
+    # when every rank is on this machine, listen on loopback only: nothing
+    # outside can reach it, and firewalls don't ask about it
+    var all_local = true
+    for i in 0..size:
+        if not loopback(load_ptr(hosts, i * 8)):
+            all_local = false
+    let myport = load_ptr(ports, rank * 8)
+    let port = atoi(myport) & 65535
+    # struct sockaddr_in: the family (after sin_len on macOS), then the port
+    # and the address, in network byte order
+    let sa = stack_mem(16)
+    memset(sa, i32(0), u64(16))
+    if os_is("macos"):
+        store_u8(sa, 1, u8(2))
+    else:
+        store_u16(sa, 0, u16(2))
+    store_u8(sa, 2, u8(port >> 8))
+    store_u8(sa, 3, u8(port & 255))
+    if all_local:
+        store_u8(sa, 4, u8(127))
+        store_u8(sa, 7, u8(1))
+    if not sk_bind(ls, sa, 16) or not sk_listen(ls, size + 4):
+        world_fail(f"brine: rank {rank} could not listen on port {c_str(myport)}\n")
+    # connect to lower ranks
+    let word = stack_mem(8)
+    for r in 0..rank:
+        let host = load_ptr(hosts, r * 8)
+        let rport = load_ptr(ports, r * 8)
+        var s = -1
+        var attempt = 0
+        while attempt < 600 and s == -1:
+            s = sock_connect(host, rport)
+            if s == -1:
+                sleep_ms(50)
+            attempt += 1
+        if s == -1:
+            world_fail(
+                f"brine: rank {rank} could not connect to rank {r} at {c_str(host)}:{c_str(rport)}\n"
+            )
+        sk_nodelay(s)
+        store_i64(word, 0, rank)
+        write_all(s, word, 8)
+        store_i64(peer(r), PR_SOCK, s)
+    # accept higher ranks
+    for _ in rank + 1..size:
+        let s = sk_accept(ls)
+        if s == -1:
+            world_fail(f"brine: accept failed on rank {rank}\n")
+        sk_nodelay(s)
+        store_i64(word, 0, -1)
+        read_all(s, word, 8)
+        let who = load_i64(word, 0)
+        if who <= rank or who >= size:
+            world_fail(f"brine: bad handshake on rank {rank}\n")
+        store_i64(peer(who), PR_SOCK, s)
+    sk_close(ls)
+    let th = stack_mem(8)
+    for r in 0..size:
+        if r != rank:
+            thread_start(symbol("brine_x_world_receiver"), peer(r), th)
+    free(hosts)
+    free(ports)
+
+# ---- collectives
+
+# Dissemination barrier: log2(size) rounds, no rank in the middle.
+fn barrier(loc: ptr):
+    let rank = brine_world_rank()
+    let size = brine_world_size()
+    var k = 1
+    while k < size:
+        world_send((rank + k) % size, K_EMPTY, null_ptr(), 0, loc)
+        blk_free(world_recv((rank - k + size) % size, K_EMPTY, loc))
+        k <<= 1
+
+fn brine_world_barrier(loc: ptr):
+    if brine_world_size() <= 1:
+        return
+    coll(OP_BARRIER, loc)
+    barrier(loc)
+
+# The end of the program (returning from `main`, or `exit`): wait until
+# every rank gets there, so no rank leaves while others still talk to it.
+fn brine_x_world_finish(how: ptr):
+    let w = wd()
+    if load_i64(w, WD_SIZE) <= 1 or load_i64(w, WD_DONE) != 0:
+        return
+    store_i64(w, WD_DONE, 1)
+    coll(OP_FINISH, how)
+    barrier(lit("<end of the program>"))
+
+# Messages are encoded from a type description string, which the compiler
+# derives from the static type: i = 64-bit int, 1/2/4/h = 8/16/32/128-bit
+# int, f = float, g = f32, b = bool, s = str, a<T> = array of <T>. Every
+# rank reaches the same collective call (the compiler checks this), so both
+# sides always agree on the description.
+
+# bytes per element in memory
+fn desc_size(d: ptr) -> int:
+    let c = load_u8(d, 0)
+    # b, 1
+    if c == 98 or c == 49:
+        return 1
+    elif c == 50:
+        return 2
+    # 4, g
+    elif c == 52 or c == 103:
+        return 4
+    # h
+    elif c == 104:
+        return 16
+    return 8
+
+# a string or an array
+fn desc_ref(d: ptr) -> bool:
+    let c = load_u8(d, 0)
+    return c == 115 or c == 97
+
+# plain data, sent as it is
+fn desc_plain(d: ptr) -> bool:
+    let c = load_u8(d, 0)
+    return c != 115 and c != 97 and c != 98
+
+# the element functions of an array of d
+fn desc_rt(d: ptr) -> ptr:
+    let c = load_u8(d, 0)
+    if c == 115:
+        return symbol("brine_rt_str")
+    elif c == 97:
+        return symbol("brine_rt_arr")
+    return null_ptr()
+
+fn desc_rl(d: ptr) -> ptr:
+    let c = load_u8(d, 0)
+    if c == 115:
+        return symbol("brine_rl_str")
+    elif c == 97:
+        return symbol("brine_rl_arr")
+    return null_ptr()
+
+fn sb_word(sb: ptr, x: int):
+    store_i64(sb_room(sb, 8), 0, x)
+    store_i64(sb, SB_LEN, load_i64(sb, SB_LEN) + 8)
+
+fn encode(sb: ptr, d: ptr, v: ptr):
+    let c = load_u8(d, 0)
+    if c == 98:
+        sb_byte(sb, u8(1) if load_u8(v, 0) != 0 else u8(0))
+    elif c == 115:
+        let s = load_ptr(v, 0)
+        let n = load_i64(s, STR_LEN)
+        sb_word(sb, n)
+        brine_sb_cat(sb, s + STR_DATA, n)
+    elif c == 97:
+        let a = load_ptr(v, 0)
+        let n = load_i64(a, ARR_LEN)
+        sb_word(sb, n)
+        let e = d + 1
+        let data = load_ptr(a, ARR_DATA)
+        if desc_plain(e):
+            brine_sb_cat(sb, data, n * desc_size(e))
+        else:
+            let esz = load_i64(a, ARR_ESZ)
+            for i in 0..n:
+                encode(sb, e, data + i * esz)
+    else:
+        brine_sb_cat(sb, v, desc_size(d))
+
+# Decodes one value at p into `out` (an owned reference for strings and
+# arrays); where the next one starts.
+fn decode(p: ptr, d: ptr, out: ptr, loc: ptr) -> ptr:
+    let c = load_u8(d, 0)
+    if c == 98:
+        store_u8(out, 0, u8(1) if load_u8(p, 0) != 0 else u8(0))
+        return p + 1
+    elif c == 115:
+        let n = load_i64(p, 0)
+        store_ptr(out, 0, brine_str_new(p + 8, n))
+        return p + 8 + n
+    elif c == 97:
+        let n = load_i64(p, 0)
+        let e = d + 1
+        let a = brine_arr_new(n, desc_size(e), desc_rt(e), desc_rl(e), loc)
+        let data = load_ptr(a, ARR_DATA)
+        var q = p + 8
+        if desc_plain(e):
+            copy_bytes(data, q, n * desc_size(e))
+            q = q + n * desc_size(e)
+        else:
+            let esz = load_i64(a, ARR_ESZ)
+            for i in 0..n:
+                q = decode(q, e, data + i * esz, loc)
+        store_ptr(out, 0, a)
+        return q
+    let n = desc_size(d)
+    copy_bytes(out, p, n)
+    return p + n
+
+# a copy of the value at v in `out`, taking a new reference
+fn copy_val(d: ptr, v: ptr, out: ptr):
+    copy_bytes(out, v, desc_size(d))
+    let c = load_u8(d, 0)
+    if c == 115:
+        str_retain(load_ptr(out, 0))
+    elif c == 97:
+        arr_retain(load_ptr(out, 0))
+
+fn put(dest: int, d: ptr, v: ptr, loc: ptr):
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    encode(sb, d, v)
+    world_send(dest, K_MSG, load_ptr(sb, SB_P), load_i64(sb, SB_LEN), loc)
+    blk_free(load_ptr(sb, SB_P))
+
+fn take(src: int, d: ptr, out: ptr, loc: ptr):
+    let m = world_recv(src, K_MSG, loc)
+    decode(m + MS_DATA, d, out, loc)
+    blk_free(m)
+
+fn brine_world_shift(d: ptr, v: ptr, out: ptr, by: int, loc: ptr):
+    let size = brine_world_size()
+    if size <= 1:
+        copy_val(d, v, out)
+        return
+    coll(OP_SHIFT, loc)
+    # (`%` takes the divisor's sign)
+    let k = by % size
+    if k == 0:
+        copy_val(d, v, out)
+        return
+    let rank = brine_world_rank()
+    put((rank + k) % size, d, v, loc)
+    take((rank - k + size) % size, d, out, loc)
+
+# `world.shift(v, by, edge)`: no wrapping around; a rank with no rank `by`
+# before it (rank - by is outside the world) gets `edge`.
+fn brine_world_shift_edge(d: ptr, v: ptr, out: ptr, by: int, edge: ptr, loc: ptr):
+    let size = brine_world_size()
+    if size > 1:
+        coll(OP_SHIFT, loc)
+    if by == 0:
+        copy_val(d, v, out)
+        return
+    if by >= size or by <= -size:
+        copy_val(d, edge, out)
+        return
+    let rank = brine_world_rank()
+    let to = rank + by
+    let from = rank - by
+    if to >= 0 and to < size:
+        put(to, d, v, loc)
+    if from >= 0 and from < size:
+        take(from, d, out, loc)
+    else:
+        copy_val(d, edge, out)
+
+fn brine_world_exchange(ed: ptr, xs: ptr, loc: ptr) -> ptr:
+    let size = brine_world_size()
+    let n = load_i64(xs, ARR_LEN)
+    if n != size:
+        world_panic(
+            loc,
+            f"world.exchange needs one element per rank: got {n} elements, but the world size is {size}"
+        )
+    let res = brine_arr_new(size, desc_size(ed), desc_rt(ed), desc_rl(ed), loc)
+    if size > 1:
+        coll(OP_EXCHANGE, loc)
+    let rank = brine_world_rank()
+    let xd = load_ptr(xs, ARR_DATA)
+    let xe = load_i64(xs, ARR_ESZ)
+    let rdata = load_ptr(res, ARR_DATA)
+    let re = load_i64(res, ARR_ESZ)
+    # everyone sends to a different rank at each step
+    for k in 1..size:
+        let j = (rank + k) % size
+        put(j, ed, xd + j * xe, loc)
+    copy_val(ed, xd + rank * xe, rdata + rank * re)
+    for k in 1..size:
+        let j = (rank - k + size) % size
+        take(j, ed, rdata + j * re, loc)
+    return res
+
+# Binomial tree from `root`: log2(size) rounds; the encoded bytes are
+# forwarded as they are.
+fn brine_world_bcast(d: ptr, v: ptr, out: ptr, root: int, loc: ptr):
+    check_rank(root, "root", loc)
+    let size = brine_world_size()
+    if size <= 1:
+        copy_val(d, v, out)
+        return
+    coll(OP_BCAST, loc)
+    let rank = brine_world_rank()
+    let sb = stack_mem(24)
+    var data = null_ptr()
+    var len = 0
+    var got = null_ptr()
+    if rank == root:
+        brine_sb_init(sb)
+        encode(sb, d, v)
+        data = load_ptr(sb, SB_P)
+        len = load_i64(sb, SB_LEN)
+    let vr = (rank - root + size) % size
+    var mask = 1
+    while mask < size:
+        if (vr & mask) != 0:
+            got = world_recv((rank - mask + size) % size, K_MSG, loc)
+            data = got + MS_DATA
+            len = load_i64(got, MS_LEN)
+            break
+        mask <<= 1
+    mask >>= 1
+    while mask > 0:
+        if vr + mask < size:
+            world_send((rank + mask) % size, K_MSG, data, len, loc)
+        mask >>= 1
+    if rank == root:
+        copy_val(d, v, out)
+        blk_free(data)
+    else:
+        decode(data, d, out, loc)
+        blk_free(got)
+
+# Every rank gets [v from rank 0, v from rank 1, ...]. Each rank encodes
+# its value once. Strings and arrays (which can be large) go straight to
+# every other rank, staggered so no rank is sent to by all at once: the
+# data moves over all connections at the same time. Fixed-size values,
+# where the number of messages matters more, use Bruck's algorithm: in
+# round k each rank sends all it has (up to 2^k values) to the rank 2^k
+# below and gets as much from the rank 2^k above, so log2(size) rounds.
+# The choice depends on the type only, so every rank makes the same one.
+fn brine_world_gather(ed: ptr, v: ptr, loc: ptr) -> ptr:
+    let size = brine_world_size()
+    let res = brine_arr_new(size, desc_size(ed), desc_rt(ed), desc_rl(ed), loc)
+    let rdata = load_ptr(res, ARR_DATA)
+    let re = load_i64(res, ARR_ESZ)
+    if size <= 1:
+        copy_val(ed, v, rdata)
+        return res
+    coll(OP_GATHER, loc)
+    let rank = brine_world_rank()
+    let b = stack_mem(24)
+    brine_sb_init(b)
+    encode(b, ed, v)
+    if desc_ref(ed):
+        copy_val(ed, v, rdata + rank * re)
+        for k in 1..size:
+            world_send((rank + k) % size, K_MSG, load_ptr(b, SB_P), load_i64(b, SB_LEN), loc)
+        blk_free(load_ptr(b, SB_P))
+        for k in 1..size:
+            let j = (rank - k + size) % size
+            take(j, ed, rdata + j * re, loc)
+        return res
+    # Bruck: rank r collects the values of ranks r, r+1, ... (mod size);
+    # offs holds where each collected value starts in b, offs[n] the end
+    let offs = brine_alloc((size + 1) * 8)
+    store_i64(offs, 0, 0)
+    store_i64(offs, 8, load_i64(b, SB_LEN))
+    var n = 1
+    let out = stack_mem(24)
+    var d = 1
+    while d < size:
+        let c = d if d < size - d else size - d
+        # the first c values: their lengths, then their bytes
+        brine_sb_init(out)
+        for i in 0..c:
+            sb_word(out, load_i64(offs, (i + 1) * 8) - load_i64(offs, i * 8))
+        brine_sb_cat(out, load_ptr(b, SB_P), load_i64(offs, c * 8))
+        let to = (rank - d + size) % size
+        world_send(to, K_MSG, load_ptr(out, SB_P), load_i64(out, SB_LEN), loc)
+        blk_free(load_ptr(out, SB_P))
+        let from = (rank + d) % size
+        let m = world_recv(from, K_MSG, loc)
+        let ml = load_i64(m, MS_LEN)
+        var got = ml - c * 8
+        var i = 0
+        while i < c and got >= 0:
+            let l = load_i64(m, MS_DATA + i * 8)
+            got -= l
+            store_i64(offs, (n + i + 1) * 8, load_i64(offs, (n + i) * 8) + l)
+            i += 1
+        if got != 0:
+            world_panic(loc, f"`world.gather_all`: malformed message from rank {from}")
+        brine_sb_cat(b, m + MS_DATA + c * 8, ml - c * 8)
+        blk_free(m)
+        n += c
+        d <<= 1
+    let bp = load_ptr(b, SB_P)
+    for i in 0..size:
+        decode(bp + load_i64(offs, i * 8), ed, rdata + ((rank + i) % size) * re, loc)
+    brine_free(offs)
+    blk_free(bp)
+    return res
+
+# ---- reductions
+# Recursive doubling: in each round, partners combine (lower ranks' part,
+# upper ranks' part) in that order, so every rank computes exactly the same
+# operations and ends with bit-identical results. With a world size that
+# isn't a power of two, the ranks above it first hand their value to a
+# partner below and get the result back at the end.
+
+# op: 0 sum, 1 min, 2 max, 3 any, 4 all (on 0/1)
+fn red_op(op: i32) -> int:
+    if op >= 0 and op < 5:
+        return OP_SUM + int(op)
+    return OP_SUM
+
+# out[i] = lo[i] (op) hi[i]; `fl`: floats, else ints
+fn combine(op: i32, fl: bool, lo: ptr, hi: ptr, out: ptr, n: int, loc: ptr):
+    for i in 0..n:
+        if fl:
+            let a = load_f64(lo, i * 8)
+            let b = load_f64(hi, i * 8)
+            var r = 0.0
+            if op == 0:
+                r = a + b
+            elif op == 1:
+                r = b if b < a else a
+            else:
+                r = b if b > a else a
+            store_f64(out, i * 8, r)
+        else:
+            let a = load_i64(lo, i * 8)
+            let b = load_i64(hi, i * 8)
+            var r = 0
+            if op == 0:
+                r = brine_x_add_i64(a, b, loc)
+            elif op == 1 or op == 4:
+                r = b if b < a else a
+            else:
+                r = b if b > a else a
+            store_i64(out, i * 8, r)
+
+# the partner's part, into tmp
+fn red_take(src: int, kind: int, tmp: ptr, n: int, loc: ptr):
+    let m = world_recv(src, kind, loc)
+    let ml = load_i64(m, MS_LEN)
+    if ml != n * 8:
+        let op = op_name(load_i64(wd(), WD_OP))
+        world_panic(
+            loc,
+            f"{op}: rank {src} has {ml / 8} elements, but this rank has {n} (arrays must be the same length on every rank)"
+        )
+    copy_bytes(tmp, m + MS_DATA, ml)
+    blk_free(m)
+
+# combines the n elements at acc across all ranks, in place
+fn allreduce(acc: ptr, n: int, fl: bool, op: i32, loc: ptr):
+    let rank = brine_world_rank()
+    let size = brine_world_size()
+    let kind = K_F64 if fl else K_I64
+    let bytes = n * 8
+    var p2 = 1
+    while p2 * 2 <= size:
+        p2 *= 2
+    let extra = size - p2
+    let tmp = blk_alloc(bytes if bytes > 0 else 1)
+    if rank >= p2:
+        world_send(rank - p2, kind, acc, bytes, loc)
+        red_take(rank - p2, kind, tmp, n, loc)
+        copy_bytes(acc, tmp, bytes)
+        blk_free(tmp)
+        return
+    if rank < extra:
+        red_take(rank + p2, kind, tmp, n, loc)
+        combine(op, fl, acc, tmp, acc, n, loc)
+    var mask = 1
+    while mask < p2:
+        let partner = rank ^ mask
+        world_send(partner, kind, acc, bytes, loc)
+        red_take(partner, kind, tmp, n, loc)
+        if rank < partner:
+            combine(op, fl, acc, tmp, acc, n, loc)
+        else:
+            combine(op, fl, tmp, acc, acc, n, loc)
+        mask <<= 1
+    if rank < extra:
+        world_send(rank + p2, kind, acc, bytes, loc)
+    blk_free(tmp)
+
+fn brine_world_reduce_i64(v: int, op: i32, loc: ptr) -> int:
+    if brine_world_size() <= 1:
+        return v
+    coll(red_op(op), loc)
+    let acc = stack_mem(8)
+    store_i64(acc, 0, v)
+    allreduce(acc, 1, false, op, loc)
+    return load_i64(acc, 0)
+
+fn brine_world_reduce_f64(v: float, op: i32, loc: ptr) -> float:
+    if brine_world_size() <= 1:
+        return v
+    coll(red_op(op), loc)
+    let acc = stack_mem(8)
+    store_f64(acc, 0, v)
+    allreduce(acc, 1, true, op, loc)
+    return load_f64(acc, 0)
+
+# element by element over `[int]` (ed "i") or `[float]` (ed "f"); a new array
+fn brine_world_reduce_arr(ed: ptr, xs: ptr, op: i32, loc: ptr) -> ptr:
+    let n = load_i64(xs, ARR_LEN)
+    let res = brine_arr_new(n, 8, null_ptr(), null_ptr(), loc)
+    copy_bytes(load_ptr(res, ARR_DATA), load_ptr(xs, ARR_DATA), n * 8)
+    if brine_world_size() <= 1:
+        return res
+    coll(red_op(op), loc)
+    allreduce(load_ptr(res, ARR_DATA), n, load_u8(ed, 0) == 102, op, loc)
+    return res

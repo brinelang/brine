@@ -224,9 +224,21 @@ static void br_sock_close(br_sock s) { close(s); }
 static br_mutex br_io_mu;
 static int br_argc;
 static char **br_argv;
+#ifdef BRINE_RT_BR
+/* the world is runtime/rt.br's; the rest reads it from there */
+int64_t brine_x_world_local_rank(void);
+void brine_x_world_init(void);
+void brine_x_world_finish(const char *how);
+#define br_rank brine_world_rank()
+#define br_size brine_world_size()
+#define br_local_rank brine_x_world_local_rank()
+#define br_world_init brine_x_world_init
+#define br_world_finish brine_x_world_finish
+#else
 static int64_t br_rank = 0, br_size = 1;
 /* how many lower ranks run on this rank's machine (GPUs go one per rank) */
 static int64_t br_local_rank = 0;
+#endif
 
 /* ============================================================ panics */
 static void br_flush(void) { fflush(stdout); }
@@ -353,7 +365,9 @@ static void br_stack_leave(void) {
 }
 #endif
 
+#ifndef BRINE_RT_BR
 static void br_world_finish(const char *how);
+#endif
 void brine_exit(int64_t code) {
     br_flush();
     br_gpu_settle();
@@ -4507,6 +4521,7 @@ void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, brine_leaf_f
     if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt);
 }
 
+#ifndef BRINE_RT_BR
 /* ============================================================ world: transport */
 enum { BR_K_EMPTY = 0, BR_K_I64 = 1, BR_K_F64 = 2, BR_K_MSG = 7 };
 static const char *br_kind_name(int64_t k) {
@@ -5423,6 +5438,7 @@ brine_arr *brine_world_reduce_arr(const char *ed, brine_arr *xs, int op, const c
     br_allreduce(res->data, xs->len, *ed == 'f', op, loc);
     return res;
 }
+#endif /* BRINE_RT_BR */
 
 /* ============================================================ init / shutdown */
 #ifdef _WIN32
