@@ -43,7 +43,7 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/brinelang/brine/main/install.ps1 | iex
 \`\`\`
 
-brine needs a C compiler (\`gcc\` or \`clang\`; MinGW on Windows): run \`brine doctor\` to check.
+brine needs no C compiler: it writes and links executables itself on x86-64 and ARM64. Run \`brine doctor\` to check your setup.
 To install this version rather than the latest, set \`BRINE_VERSION=$ver\` first. The
 archives below are checked against \`SHA256SUMS\` by the installers, and each has a
 [build provenance attestation]($repo/attestations) (\`gh attestation verify <file> -R brinelang/brine\`).
