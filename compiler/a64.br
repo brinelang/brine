@@ -28,7 +28,8 @@ from obj import ObjFile, OSym, ORel, new_obj, write_elf, put16, put32, set32, ul
 from obj import SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, R_PC32, R_ABS64, ARCH_A64
 from obj import R_A64_CALL26, R_A64_PAGE, R_A64_LO12, R_A64_GOT_PAGE, R_A64_GOT_LO12, R_A64_LDR12
 import ra64
-from x64 import canon, fl_of, align_up, w128, wide_rt_helpers, emit_order, opt_func
+from x64 import canon, fl_of, align_up, w128, wide_rt_helpers, emit_order, opt_func, div_magic
+from ra import int_div_rt
 
 const T0 = 9
 const T1 = 10
@@ -319,6 +320,9 @@ struct A:
     home: [int]
     # the callee-saved register holding the vreg for the whole function, or -1
     reg: [int]
+    # the value of each vreg set once by an integer Const (kis)
+    kis: [bool]
+    kval: [int]
     freg: [int]
     saved: [int]
     fsaved: [int]
@@ -1139,6 +1143,9 @@ struct A:
     fn ir_call(ref self, x: Inst):
         if x.op == Op.Call and x.b == 1 and self.inline_rc(x):
             return
+        if x.op == Op.Call and x.b == 1 and int_div_rt(x.s) and len(x.args) == 2 and x.d >= 0:
+            self.int_div(x)
+            return
         if (
             x.op == Op.Call
             and x.b == 1
@@ -1217,6 +1224,94 @@ struct A:
                 self.ldst(M_LDRX, self.reg[v], SP, self.keep_off + 8 * j)
             else:
                 self.ldst(M_LDRD, self.freg[v], SP, self.keep_off + 8 * j)
+
+    # The runtime's unchecked integer division inline (as x64.br): `/` rounds
+    # down and `%` takes the sign of the divisor. A constant divisor becomes a
+    # multiplication, or a shift or mask for a power of two; otherwise sdiv or
+    # udiv, then a branchless fix for the rounding.
+    fn int_div(ref self, x: Inst):
+        let k = self.vk[x.d]
+        let rem = x.s.starts_with("brine_fmod_") or x.s.starts_with("brine_mod_")
+        let signed = k.is_signed()
+        let r = self.dst(x.d)
+        let b = x.args[1]
+        if self.kis[b] and self.const_div(r, rem, x.args[0], self.kval[b], k, signed):
+            self.st(r, x.d)
+            return
+        let ra = self.use(T0, x.args[0])
+        let rb = self.use(T1, b)
+        if not signed:
+            if rem:
+                # udiv; msub r, q, b, a
+                self.w(0x9AC00800 | (rb << 16) | (ra << 5) | T2)
+                self.w(0x9B008000 | (rb << 16) | (ra << 10) | (T2 << 5) | r)
+            else:
+                self.w(0x9AC00800 | (rb << 16) | (ra << 5) | r)
+            self.st(r, x.d)
+            return
+        # sdiv q, a, b; msub t, q, b, a (the truncated remainder)
+        self.w(0x9AC00C00 | (rb << 16) | (ra << 5) | T2)
+        self.w(0x9B008000 | (rb << 16) | (ra << 10) | (T2 << 5) | T3)
+        # mi when t != 0 and its sign isn't b's: then q - 1 and t + b
+        # eor x16, t, b; cmp t, #0; ccmp x16, #0, #0, ne
+        self.w(0xCA000000 | (rb << 16) | (T3 << 5) | IP0)
+        self.w(0xF100001F | (T3 << 5))
+        self.w(0xFA400800 | (C_NE << 12) | (IP0 << 5))
+        if rem:
+            # csel x16, b, xzr, mi; add r, t, x16
+            self.w(0x9A800000 | (ZR << 16) | (C_MI << 12) | (rb << 5) | IP0)
+            self.w(0x8B000000 | (IP0 << 16) | (T3 << 5) | r)
+        else:
+            # cset x16, mi; sub r, q, x16
+            self.w(0x9A9F07E0 | ((C_MI ^ 1) << 12) | IP0)
+            self.w(0xCB000000 | (IP0 << 16) | (T2 << 5) | r)
+            # (the smallest narrow a over -1)
+            self.norm(r, k)
+        self.st(r, x.d)
+
+    # r = a / c or a % c for a constant c > 1, if it's one: floor(n / c) =
+    # (n * m) >> p (div_magic). A signed a below 0 divides as ~a, which isn't:
+    # floor(a / c) = ~floor(~a / c) for c > 0.
+    fn const_div(ref self, r: int, rem: bool, a: int, c: int, k: K, signed: bool) -> bool:
+        if c < 2 or c >= 1 << 61:
+            return false
+        let bits = 8 * k.size()
+        let ra = self.use(T0, a)
+        if c & (c - 1) == 0:
+            let s = c.trailing_zeros()
+            if rem:
+                # and r, a, #(c - 1)
+                self.w(0x92400000 | ((s - 1) << 10) | (ra << 5) | r)
+            elif signed:
+                # asr r, a, #s
+                self.w(0x9340FC00 | (s << 16) | (ra << 5) | r)
+            else:
+                # lsr r, a, #s
+                self.w(0xD340FC00 | (s << 16) | (ra << 5) | r)
+            return true
+        let mp = div_magic(c, bits - 1 if signed else bits)
+        if mp.1 == 0:
+            return false
+        var n = ra
+        if signed:
+            # asr x16, a, #63; eor t1, a, x16
+            self.w(0x9340FC00 | (63 << 16) | (ra << 5) | IP0)
+            self.w(0xCA000000 | (IP0 << 16) | (ra << 5) | T1)
+            n = T1
+        self.mov_ri(T2, mp.0)
+        # umulh t3, n, m
+        self.w(0x9BC07C00 | (T2 << 16) | (n << 5) | T3)
+        if mp.1 > 64:
+            self.w(0xD340FC00 | ((mp.1 - 64) << 16) | (T3 << 5) | T3)
+        if signed:
+            self.w(0xCA000000 | (IP0 << 16) | (T3 << 5) | T3)
+        if not rem:
+            self.mov_rr(r, T3)
+            return true
+        # msub r, q, c, a
+        self.mov_ri(T2, c)
+        self.w(0x9B008000 | (T2 << 16) | (ra << 10) | (T3 << 5) | r)
+        return true
 
     # the call itself, to the runtime's version or the function
     fn rt_call(ref self, x: Inst):
@@ -1308,10 +1403,15 @@ struct A:
                         reg_k[x.b] = true
                     case _:
                         pass
+        self.kis = [false] * nv
+        self.kval = [0] * nv
         for v in f.nparams..nv:
             if ndef[v] == 1:
                 let x = f.code[dpos[v]]
                 let k = f.vk[v]
+                if x.op == Op.Const and not k.is_float() and not k.is_wide():
+                    self.kis[v] = true
+                    self.kval[v] = canon(x.n, k)
                 if x.op == Op.Const and k.is_wide():
                     self.wshift[v] = x.n & 127
                 # (in SSA code, constants that take more than one
@@ -3200,6 +3300,8 @@ fn emit(m0: Module, dbg: bool, on: bool, src: str, comp_dir: str, producer: str)
         nparams=0,
         home=[],
         reg=[],
+        kis=[],
+        kval=[],
         freg=[],
         saved=[],
         fsaved=[],
