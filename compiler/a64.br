@@ -1863,28 +1863,43 @@ struct A:
             outs.push(self.fwd(0x54000000 | C_LS))
         for t in k.paths:
             if t.w == 2:
-                self.kpath(t, k.narr)
+                self.kpath(t, k.narr, k.ops)
         for at in outs:
             self.here(at, B19)
         self.mov_rr(0, 8)
 
     # x9 is the count rounded down to a multiple of 2 (x10: of 4, for the
     # body twice over when it can be); x11 + i holds array i's element x8
-    fn kpath(ref self, t: KPath, narr: int):
+    fn kpath(ref self, t: KPath, narr: int, chk: [KOp]):
         self.kvs(t.pre, false)
         let body = no_copies(t.body)
-        let twice = unroll2(t, body)
+        var twice = unroll2(t, body)
+        # (four elements at once when the arrays allow it: see paired4)
+        var paired = false
+        if len(twice) > 0:
+            let p4 = paired4(t, body)
+            if len(p4) > 0:
+                twice = p4
+                paired = true
         self.ldst(M_LDRX, 9, 0, 8 * narr)
         if len(twice) > 0:
             # ands x10, x9, #-4; b.le skip
             self.w(0xF2000000 | (logic_imm(-4) << 10) | (9 << 5) | 10)
-            let skip = self.fwd(0x54000000 | C_LE)
+            var skips = [self.fwd(0x54000000 | C_LE)]
+            if paired:
+                # the tests of kernel_loop, for four lanes
+                for o in chk:
+                    self.add_ri(17, 1 + o.b, o.n - 1)
+                    self.rrr(0xCB000000, 17, 17, 1 + o.a)
+                    self.cmp_ri(17, 8 * 4 - 2)
+                    skips.push(self.fwd(0x54000000 | C_LS))
             let top = self.pos()
             self.kvs(twice, true)
             self.add_ri(8, 8, 4)
             self.rrr(0xEB000000, ZR, 8, 10)
             self.w(0x54000000 | ((((top - self.pos()) / 4) & 0x7FFFF) << 5) | C_LT)
-            self.here(skip, B19)
+            for at in skips:
+                self.here(at, B19)
         # and x9, x9, #-2; cmp x8, x9; b.ge skip
         self.w(0x92000000 | (logic_imm(-2) << 10) | (9 << 5) | 9)
         self.rrr(0xEB000000, ZR, 8, 9)
@@ -1911,8 +1926,28 @@ struct A:
                         assert o.b < 5, "a64: a loop kernel of more than five arrays"
                         # add x11+b, x1+b, x8, lsl #3
                         self.w(0x8B000000 | (8 << 16) | (3 << 10) | ((1 + o.b) << 5) | (11 + o.b))
-        for o in ops:
+        var i = 0
+        while i < len(ops):
+            let o = ops[i]
+            if body and i + 1 < len(ops):
+                let p = ops[i + 1]
+                if (
+                    (o.op == KV_LD or o.op == KV_ST)
+                    and p.op == o.op
+                    and p.b == o.b
+                    and p.n == o.n + 16
+                    and o.n % 16 == 0
+                    and o.n >= -1024
+                    and o.n <= 1008
+                    and (o.op == KV_ST or o.a != p.a)
+                ):
+                    # ldp / stp qa, qp, [x11+b, #n]
+                    let op = 0xAD400000 if o.op == KV_LD else 0xAD000000
+                    self.w(op | (((o.n / 16) & 0x7F) << 15) | (p.a << 10) | ((11 + o.b) << 5) | o.a)
+                    i += 2
+                    continue
             self.kv(o)
+            i += 1
 
     # One operation of a two-lane path; x0 holds the block.
     fn kv(ref self, o: KOp):
@@ -3590,6 +3625,86 @@ fn no_copies(ops: [KOp]) -> [KOp]:
 # needs every register the body writes to be written before it is read (no
 # value carried from one step to the next, as a sum is) and none read after
 # the loop, and enough free registers (of v0-v7 and v16-v29).
+# The body for four elements as a four-lane body would do them: the loads,
+# each next to its copy for the next two elements (kvs makes the two one
+# ldp), then the arithmetic, then the stores (stp). Every value gets its own
+# register. For a body unroll2 takes; empty when the body stores before it
+# loads, when two accesses of one array can meet within four lanes, or when
+# registers run out. The kernel tests the other arrays first (kpath).
+fn paired4(t: KPath, body: [KOp]) -> [KOp]:
+    var used = [false] * 32
+    for ops in [t.pre, t.post, body]:
+        for o in ops:
+            used[o.a] = true
+            if o.op == KV_FOP or o.op == KV_MOV or o.op == KV_RED:
+                used[o.b] = true
+            if o.op == KV_FOP:
+                used[o.m] = true
+    var stored = false
+    for i, o in enumerate(body):
+        match o.op:
+            case KV_LD:
+                if stored:
+                    return []
+            case KV_ST:
+                stored = true
+            case KV_MOV | KV_FOP:
+                pass
+            case _:
+                return []
+        if o.op == KV_LD or o.op == KV_ST:
+            for j in i + 1..len(body):
+                let q = body[j]
+                if (
+                    (q.op == KV_LD or q.op == KV_ST)
+                    and q.b == o.b
+                    and not (o.op == KV_LD and q.op == KV_LD)
+                ):
+                    let d = q.n - o.n
+                    if d > 0 and d < 32:
+                        return []
+    var next = 0
+    var lds: [[KOp]] = [[], []]
+    var mid: [KOp] = []
+    var sts: [[KOp]] = [[], []]
+    for c in 0..2:
+        var cur = [-1] * 32
+        for o in body:
+            var x = o
+            if x.op == KV_ST:
+                if cur[x.a] >= 0:
+                    x.a = cur[x.a]
+                x.n += 16 * c
+                sts[c].push(x)
+                continue
+            if x.op == KV_MOV or x.op == KV_FOP:
+                if cur[x.b] >= 0:
+                    x.b = cur[x.b]
+                if x.op == KV_FOP and cur[x.m] >= 0:
+                    x.m = cur[x.m]
+            # (not v8-v15: the caller's, and only k.regs get saved)
+            while next < 30 and (used[next] or (next >= 8 and next < 16)):
+                next += 1
+            if next >= 30:
+                return []
+            cur[o.a] = next
+            x.a = next
+            next += 1
+            if x.op == KV_LD:
+                x.n += 16 * c
+                lds[c].push(x)
+            else:
+                mid.push(x)
+    var out: [KOp] = []
+    for i in 0..len(lds[0]):
+        out.push(lds[0][i])
+        out.push(lds[1][i])
+    out.extend(mid)
+    for i in 0..len(sts[0]):
+        out.push(sts[0][i])
+        out.push(sts[1][i])
+    return out
+
 fn unroll2(t: KPath, body: [KOp]) -> [KOp]:
     var used = [false] * 32
     for ops in [t.pre, t.post]:
