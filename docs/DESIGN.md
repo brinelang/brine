@@ -21,9 +21,10 @@
    command has `--json` output. `brine explain <code>` and `brine guide` are
    built in.
 5. **Cross-platform.** macOS, Linux and Windows are first-class. Code goes
-   through brine's own IR to native x86-64 and AArch64 backends (quick dev
-   builds on Windows and Linux) or to portable C11 for whatever C compiler is present
-   (optimized builds, every other platform; clang or gcc, MSVC planned).
+   through brine's own IR to native x86-64 and AArch64 backends, linked by
+   brine itself (every build on x86-64 Windows and Linux, dev and debug builds
+   on AArch64 Linux), or to portable C11 for whatever C compiler is present
+   (every other platform; clang or gcc).
 6. **Clean and easy to understand.** Small language surface. No hidden control
    flow, no implicit conversions, no aliasing surprises.
 
@@ -308,16 +309,16 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
       ─► uniform (deadlock freedom for `world`)
       ─► verifier (symbolic execution + solver; proves contracts, elides runtime checks)
       ─► lowering to brine IR (lower.br)
-      ─► x86-64 machine code (x64.br, COFF/ELF objects)    dev and --debug builds on x86-64 Windows/Linux
-       └► AArch64 machine code (a64.br, ELF objects)        dev and --debug builds on AArch64 Linux
-       └► C11 (ir_c.br) ─► system C compiler               --release, other platforms
-      ─► link with the brine_rt runtime ─► native binary
+      ─► x86-64 machine code (x64.br) ─► link.br            every build on x86-64 Windows/Linux
+       └► AArch64 machine code (a64.br) ─► link.br          dev and --debug builds on AArch64 Linux
+       └► C11 (ir_c.br) ─► system C compiler + brine_rt.c  --release on AArch64, other platforms
+      ─► native binary
 ```
 
 * **Written in brine** (`compiler/`). It builds itself; `bootstrap/brinec.c` (its own
   generated C) builds it from scratch with only a C compiler.
-* **Runtime** (`runtime/brine_rt.h` + `runtime/brine_rt.c`) is embedded in the
-  compiler binary: refcounted copy-on-write strings/arrays, checked arithmetic,
+* **Runtime** (`runtime/rt.br` for native code, `runtime/brine_rt.h` +
+  `runtime/brine_rt.c` for C) is embedded in the compiler binary: refcounted copy-on-write strings/arrays, checked arithmetic,
   thread pool, deterministic reductions, TCP world transport. Win32 and POSIX code
   paths. It is compiled once per runtime version and cached (`rt-<hash>/`).
 * **Memory:** values are refcounted with atomic counts; generated code releases
@@ -336,12 +337,14 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
   split into one translation unit per core (by a hash of each function's name, each
   unit declaring only what it uses), compiled in parallel; an edit recompiles only
   the units it touches. An unchanged program skips the link (`.brine-hash` stamp).
-* **CPU levels:** an x86-64 `--release` build compiles the program three times,
-  for plain x86-64, x86-64-v3 (AVX2) and x86-64-v4 (AVX-512), and
-  `runtime/brine_cpu.c` runs the newest one the machine supports. The executable
-  runs anywhere and still uses wide vectors where there are some; float results
-  are the same in all three (no fused multiply-adds). `BRINE_CPU=base` or `=v3`
-  caps the choice at run time.
+* **CPU levels:** native x86-64 `--release` code checks the CPU once and runs its
+  vector loops as SSE2, AVX2 or AVX-512 code. Through C, an x86-64 `--release`
+  build compiles the program three times, for plain x86-64, x86-64-v3 (AVX2)
+  and x86-64-v4 (AVX-512), and `runtime/brine_cpu.c` runs the newest one the
+  machine supports (`BRINE_CPU=base` or `=v3` caps the choice at run time).
+  Either way the executable runs anywhere and still uses wide vectors where
+  there are some; float results are the same at every level (no fused
+  multiply-adds).
 * **Parallel:** the compiler uses `par` itself: imported modules are parsed a wave
   of imports at a time, and the prover takes every function on its own. Results
   are combined in a fixed order, so the output doesn't depend on the thread count.
@@ -358,9 +361,11 @@ reads it:
 
 * **x86-64** (`x64.br`, objects by `obj.br`): writes machine code and a COFF
   (Windows) or ELF (Linux) object directly, in well under a second for the whole
-  compiler. It's the default for dev and debug builds there (debug builds add
-  DWARF and skip the optimizations). The runtime is still C,
-  compiled once and cached, and the system C compiler links.
+  compiler. It's the default for every build there (release builds run the
+  SSA optimizer, debug builds add DWARF and skip the optimizations). The
+  runtime is brine too (`runtime/rt.br`), and `link.br` writes the executable:
+  a PE or ELF file that imports the system's own libraries, so no C compiler
+  is involved.
 * **AArch64** (`a64.br`): the same design for 64-bit ARM, writing ELF objects
   (Linux) through `obj.br`, with .eh_frame unwind info and the same DWARF.
 * **PTX** (`ptx.br`) and **Metal** (`msl.br`): GPU kernels for the `par`
@@ -372,7 +377,7 @@ reads it:
   launch.
   `BRINE_DUMP_PTX=file` writes the module (PTX or MSL) when building.
 * **C** (`ir_c.br`): one statement per IR instruction. gcc/clang at `-O2`/`-O3`
-  make it as fast as hand-written C, so it serves `--release` and every
+  make it as fast as hand-written C, so it serves `--release` on AArch64 and every
   platform without a native backend (with `#line` for `--debug` there). It's also the bootstrap
   seed (`bootstrap/brinec.c`).
 

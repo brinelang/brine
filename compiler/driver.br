@@ -1077,7 +1077,14 @@ fn unit_count(profile: Profile) -> int:
         return 1
     return min(max(os.cpu_count(), 1), 16)
 
-fn lowered(fe: Frontend, tests: bool, profile: Profile, plat: Platform) -> lower.Lowered:
+# `native`: for x64.br or a64.br (else for C).
+fn lowered(
+    fe: Frontend,
+    tests: bool,
+    profile: Profile,
+    plat: Platform,
+    native: bool
+) -> lower.Lowered:
     return lower.lower(
         fe.prog.unwrap(),
         fe.info.unwrap(),
@@ -1087,19 +1094,16 @@ fn lowered(fe: Frontend, tests: bool, profile: Profile, plat: Platform) -> lower
             debug=profile == Profile.Debug,
             gpu=not plat.is_wasm(),
             fast=profile == Profile.Release,
-            vec=profile == Profile.Release and not plat.is_wasm() and not use_native(profile),
-            nvec=profile == Profile.Release
-            and not plat.is_wasm()
-            and use_native(profile)
-            and os.arch() == "x86_64",
+            vec=profile == Profile.Release and not plat.is_wasm() and not native,
+            nvec=profile == Profile.Release and native and os.arch() == "x86_64",
             win=os.name() == "windows",
-            native=not plat.is_wasm() and use_native(profile)
+            native=native
         )
     )
 
-# Native code for dev and debug builds where x64.br or a64.br knows the
-# platform; C for optimized builds and everywhere else. `BRINE_BACKEND=c` or `=native`
-# overrides.
+# Native code where x64.br or a64.br knows the platform; C elsewhere, and
+# for optimized builds on AArch64 (a64.br doesn't optimize yet).
+# `BRINE_BACKEND=c` or `=native` overrides.
 fn use_native(profile: Profile) -> bool:
     match getenv("BRINE_BACKEND"):
         case Some(b):
@@ -1112,7 +1116,12 @@ fn use_native(profile: Profile) -> bool:
     return default_native(profile)
 
 fn default_native(profile: Profile) -> bool:
-    return native_host() and profile != Profile.Release
+    return native_host() and (profile != Profile.Release or os.arch() == "x86_64")
+
+# Whether builds here can need the system C compiler (with the default
+# backends; wasm needs wasi-sdk either way).
+fn needs_cc() -> bool:
+    return not (native_host() and os.arch() == "x86_64")
 
 fn native_host() -> bool:
     if os.arch() == "aarch64":
@@ -1141,9 +1150,10 @@ fn native_obj(m: ir.Module, profile: Profile, win: bool, arm: bool, src: str) ->
 
 fn gen_code(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> Code:
     var t = clock()
-    let l = lowered(fe, tests, profile, plat)
+    let native = use_native(profile) and not plat.is_wasm()
+    let l = lowered(fe, tests, profile, plat, native)
     t = phase_time(t, "lower")
-    if use_native(profile) and not plat.is_wasm():
+    if native:
         let win = os.name() == "windows"
         let arm = os.arch() == "aarch64"
         let o = native_obj(l.m, profile, win, arm, fe.sm.file(0).path)
@@ -1162,14 +1172,14 @@ fn gen_code(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> Code
 # The program's IR as text (`brine emit-ir`); with `opt`, after the IR
 # optimizations the native backend runs.
 fn gen_ir(fe: Frontend, profile: Profile, tests: bool, plat: Platform, opt: bool) -> str:
-    let l = lowered(fe, tests, profile, plat)
+    let l = lowered(fe, tests, profile, plat, use_native(profile) and not plat.is_wasm())
     if not opt:
         return ir.dump(l.m)
     return ir.dump(x64.optimized(l.m, profile == Profile.Release))
 
 # The program as one C file (`brine emit-c`).
 fn gen_c(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> str:
-    return ir_c.emit_c(lowered(fe, tests, profile, plat))
+    return ir_c.emit_c(lowered(fe, tests, profile, plat, false))
 
 # The command that runs a WebAssembly build: BRINE_WASM_RUNNER (say
 # `wasmtime run --dir=.`) or Node.js with the runner script, which is written

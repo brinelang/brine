@@ -70,13 +70,18 @@ main() {
 
     add_to_path
 
-    if ! command -v cc > /dev/null 2>&1 && ! command -v gcc > /dev/null 2>&1 && ! command -v clang > /dev/null 2>&1; then
-        if [ "$os" = macos ]; then
-            hint="xcode-select --install"
-        else
-            hint="your package manager (for example: sudo apt install gcc, sudo dnf install gcc)"
+    # x86-64 Linux builds need no C compiler: brine writes the executables
+    if [ "$os" = macos ] || [ "$arch" = arm64 ]; then
+        if ! command -v cc > /dev/null 2>&1 && ! command -v gcc > /dev/null 2>&1 && ! command -v clang > /dev/null 2>&1; then
+            if [ "$os" = macos ]; then
+                hint="xcode-select --install"
+                what="to build programs"
+            else
+                hint="your package manager (for example: sudo apt install gcc, sudo dnf install gcc)"
+                what="for --release builds"
+            fi
+            warn "brine needs a C compiler $what here, and none was found; install one with $hint"
         fi
-        warn "brine needs a C compiler to build programs, and none was found; install one with $hint"
     fi
     say "run 'brine doctor' to check your setup, and 'brine new hello' to start a project"
 }
