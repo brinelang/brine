@@ -1,0 +1,429 @@
+# Register allocation for the AArch64 backend (a64.br), as ra.br does it for
+# x86-64: liveness over the flat code gives an interference graph, copies
+# that don't interfere are merged (most frequent first), and vregs are colored
+# by priority (uses weighted by loop depth), each preferring the register of a
+# vreg it is copied to or from.
+#
+# A vreg live across a call gets a callee-saved register (x19-x28, d8-d15).
+# One that isn't can take a caller-saved one that no template in a64.br uses:
+# x8, x13-x15 and x17 (x9-x12 and x16 are scratch), and v16-v31 (v0-v2 are
+# scratch, v0-v7 carry arguments). x0-x7 too, except for parameters (set
+# from x0-x7 one by one on entry) and the operands of an instruction that
+# calls (its arguments are set one by one), panic stubs included. Some templates write
+# their result's register before they are done reading the operands, so a
+# result interferes with every operand of its instruction, except in the
+# ones `late_write` lists.
+
+from ir import K, Op, Inst, Func
+from opt import reads
+from ra import is_term, interferes, add_edge, find
+
+struct RA64:
+    # the register of each vreg (-1: its home in the frame)
+    reg: [int]
+    freg: [int]
+    # the callee-saved registers used
+    saved: [int]
+    fsaved: [int]
+    # per instruction, the vregs live across the call of a `cold` function
+    # it makes, in registers that call changes (a64.br saves them around it)
+    keep: [[int]]
+
+# Does a64.br's code for x call anything (and so change the caller-saved
+# registers)? Calls to panic don't count: they don't come back.
+fn callish(x: Inst, vk: [K]) -> bool:
+    if touches_wide(x, vk):
+        match x.op:
+            case Op.Div | Op.Rem | Op.MulO | Op.Call | Op.CallInd | Op.Unreachable:
+                return true
+            case Op.Conv:
+                return vk[x.d].is_float() or vk[x.a].is_float()
+            case Op.Copy | Op.Zero:
+                return x.n > 64
+            case _:
+                # (a64.br's own code, with x17 as scratch: see wide_inline)
+                return false
+    match x.op:
+        case Op.Call:
+            if x.b != 1:
+                return true
+            let n = x.s
+            if (
+                n == "brine_f_sqrt"
+                or n == "brine_f_sqrtf"
+                or n == "brine_thread_ptr"
+                or n == "brine_umulh_u64"
+                or n == "brine_bytes_rev"
+                or n == "brine_bytes_rev0"
+                or n == "brine_clz_u64"
+                or n == "brine_ctz_u64"
+                or n == "brine_bswap_u64"
+            ):
+                return x.d < 0
+            return not (
+                n.starts_with("brine_atomic_")
+                or n == "brine_cpu_relax"
+                or n == "brine_str_retain"
+                or n == "brine_arr_retain"
+                or n == "brine_map_retain"
+                or n == "brine_box_retain"
+                or n == "brine_box_dec"
+            )
+        case Op.CallInd | Op.Unreachable:
+            return true
+        case Op.Copy | Op.Zero:
+            return x.n > 64
+        case Op.Rem:
+            return vk[x.d].is_float()
+        case _:
+            return false
+
+fn touches_wide(x: Inst, vk: [K]) -> bool:
+    for v in reads(x, len(vk)):
+        if vk[v].is_wide():
+            return true
+    return x.d >= 0 and vk[x.d].is_wide()
+
+# Is x 128-bit arithmetic a64.br does itself? Its code changes x17, so no
+# vreg it reads or that lives across it may be there.
+fn wide_inline(x: Inst, vk: [K]) -> bool:
+    return touches_wide(x, vk) and not callish(x, vk)
+
+# Does a64.br's code for x read all its operands before it writes x.d?
+fn late_write(x: Inst, vk: [K]) -> bool:
+    if x.d < 0 or vk[x.d].is_wide():
+        return false
+    for v in reads(x, len(vk)):
+        if vk[v].is_wide():
+            return false
+    match x.op:
+        case Op.Mov | Op.IdxChk | Op.Load | Op.Elem | Op.Neg | Op.Not:
+            return true
+        case Op.Add | Op.Sub | Op.Mul | Op.Div:
+            return true
+        case Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr | Op.Rem:
+            return not vk[x.d].is_float()
+        case Op.Eq | Op.Ne | Op.Lt | Op.Le | Op.Gt | Op.Ge | Op.Conv:
+            return true
+        case _:
+            return false
+
+# Does x's code call anything with x's operands, even to panic?
+fn sets_args(x: Inst, vk: [K]) -> bool:
+    match x.op:
+        case Op.IdxChk | Op.AddO | Op.SubO | Op.MulO:
+            return true
+        case _:
+            return callish(x, vk)
+
+fn set_bit(ref bits: [int], j: int):
+    bits[j >> 6] |= 1 << (j & 63)
+
+fn clear_bit(ref bits: [int], j: int):
+    bits[j >> 6] &= ~(1 << (j & 63))
+
+# ok[v]: may v live in a register? (Not folded into its uses, not 128 bits,
+# not a compare fused into its branch.)
+fn allocate(f: Func, ok: [bool], cold: {str: bool}) -> RA64:
+    let nv = len(f.vk)
+    let ncode = len(f.code)
+    var out = RA64(reg=[-1] * nv, freg=[-1] * nv, saved=[], fsaved=[], keep=[])
+    var ci = [-1] * nv
+    var cv: [int] = []
+    for v in 0..nv:
+        if ok[v]:
+            ci[v] = len(cv)
+            cv.push(v)
+    let nc = len(cv)
+    if nc == 0 or ncode == 0:
+        return out
+    var isf = [false] * nc
+    for j in 0..nc:
+        isf[j] = f.vk[cv[j]].is_float()
+    let wn = (nc + 63) / 64
+    # basic blocks: bstart[b]..bstart[b + 1]
+    var lat = [-1] * f.nlabels
+    for i in 0..ncode:
+        if f.code[i].op == Op.Label:
+            lat[f.code[i].n] = i
+    var bstart: [int] = []
+    var bof = [0] * ncode
+    for i in 0..ncode:
+        if i == 0 or f.code[i].op == Op.Label or is_term(f.code[i - 1].op):
+            bstart.push(i)
+        bof[i] = len(bstart) - 1
+    let nb = len(bstart)
+    bstart.push(ncode)
+    var succ: [[int]] = [[] for _ in 0..nb]
+    for b in 0..nb:
+        let t = f.code[bstart[b + 1] - 1]
+        if t.op == Op.Jmp:
+            succ[b].push(bof[lat[t.n]])
+        elif t.op == Op.Br or t.op == Op.BrNot:
+            succ[b].push(bof[lat[t.n]])
+            if b + 1 < nb:
+                succ[b].push(b + 1)
+        elif t.op == Op.Switch:
+            for l in t.args:
+                succ[b].push(bof[lat[l]])
+        elif t.op != Op.Ret and t.op != Op.Unreachable and b + 1 < nb:
+            succ[b].push(b + 1)
+    # liveness
+    var gen = [0] * (nb * wn)
+    var kill = [0] * (nb * wn)
+    for b in 0..nb:
+        for i in bstart[b]..bstart[b + 1]:
+            let x = f.code[i]
+            for u in reads(x, nv):
+                let j = ci[u]
+                if j >= 0:
+                    let at = b * wn + (j >> 6)
+                    let bit = 1 << (j & 63)
+                    if kill[at] & bit == 0:
+                        gen[at] |= bit
+            if x.d >= 0 and ci[x.d] >= 0:
+                let j = ci[x.d]
+                kill[b * wn + (j >> 6)] |= 1 << (j & 63)
+    var lin = [0] * (nb * wn)
+    var lout = [0] * (nb * wn)
+    var changed = true
+    while changed:
+        changed = false
+        var b = nb - 1
+        while b >= 0:
+            for k in 0..wn:
+                var o = 0
+                for s in succ[b]:
+                    o |= lin[s * wn + k]
+                lout[b * wn + k] = o
+                let n = gen[b * wn + k] | (o & ~kill[b * wn + k])
+                if n != lin[b * wn + k]:
+                    lin[b * wn + k] = n
+                    changed = true
+            b -= 1
+    # loop depth: a backward jump to label L puts L..jump in a loop
+    var depth = [0] * (ncode + 1)
+    var loops = false
+    for i in 0..ncode:
+        let x = f.code[i]
+        if x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot:
+            let l = lat[x.n]
+            if l >= 0 and l <= i:
+                depth[l] += 1
+                depth[i + 1] -= 1
+                loops = true
+    var w = [0] * nc
+    var iw = [0] * ncode
+    var dd = 0
+    for i in 0..ncode:
+        let x = f.code[i]
+        dd += depth[i]
+        let u = 1 << (3 * min(dd, 3))
+        iw[i] = u
+        if x.d >= 0 and ci[x.d] >= 0:
+            w[ci[x.d]] += u
+        for v in reads(x, nv):
+            if ci[v] >= 0:
+                w[ci[v]] += u
+    # the interference graph, walking each block backward from its live-out
+    var mat = [0] * (nc * wn)
+    var adj: [[int]] = [[] for _ in 0..nc]
+    var moves: [[int]] = [[] for _ in 0..nc]
+    # the copies: (-weight, d, a)
+    var copies: [(int, int, int)] = []
+    var cross = [false] * nc
+    var noarg = [false] * nc
+    var no17 = [false] * nc
+    # calls of cold functions (slow paths), and what is live across each
+    var ccalls: [int] = []
+    var clive: [[int]] = []
+    for p in 0..f.nparams:
+        if ci[p] >= 0:
+            noarg[ci[p]] = true
+    var live = [0] * wn
+    for b in 0..nb:
+        for k in 0..wn:
+            live[k] = lout[b * wn + k]
+        var i = bstart[b + 1] - 1
+        while i >= bstart[b]:
+            let x = f.code[i]
+            let cd = ci[x.d] if x.d >= 0 else -1
+            let rs = reads(x, nv)
+            if cd >= 0:
+                clear_bit(ref live, cd)
+                var ca = -1
+                # an index check's result is its index: a copy
+                if (x.op == Op.Mov or x.op == Op.IdxChk) and x.a >= 0:
+                    ca = ci[x.a]
+                    if ca >= 0 and ca != cd and isf[ca] == isf[cd]:
+                        moves[cd].push(ca)
+                        moves[ca].push(cd)
+                        copies.push((-iw[i], cd, ca))
+                elif late_write(x, f.vk) and x.a >= 0 and ci[x.a] >= 0:
+                    # better in a's register, when a dies here
+                    let pa = ci[x.a]
+                    if pa != cd and isf[pa] == isf[cd]:
+                        moves[cd].push(pa)
+                        moves[pa].push(cd)
+                for k in 0..wn:
+                    var wd = live[k]
+                    while wd != 0:
+                        let t = wd.trailing_zeros()
+                        wd ^= 1 << t
+                        let j = k * 64 + t
+                        if j != ca and isf[j] == isf[cd]:
+                            add_edge(ref mat, ref adj, wn, cd, j)
+                if not late_write(x, f.vk):
+                    for u in rs:
+                        let j = ci[u]
+                        if j >= 0 and isf[j] == isf[cd]:
+                            add_edge(ref mat, ref adj, wn, cd, j)
+            if sets_args(x, f.vk):
+                for u in rs:
+                    if ci[u] >= 0:
+                        noarg[ci[u]] = true
+            if wide_inline(x, f.vk):
+                for k in 0..wn:
+                    var wd = live[k]
+                    while wd != 0:
+                        let t = wd.trailing_zeros()
+                        wd ^= 1 << t
+                        no17[k * 64 + t] = true
+                for u in rs:
+                    if ci[u] >= 0:
+                        no17[ci[u]] = true
+                if cd >= 0:
+                    no17[cd] = true
+            if callish(x, f.vk):
+                let slow = x.op == Op.Call and x.b != 1 and x.s in cold
+                var fl: [int] = []
+                for k in 0..wn:
+                    var wd = live[k]
+                    while wd != 0:
+                        let t = wd.trailing_zeros()
+                        wd ^= 1 << t
+                        if slow:
+                            fl.push(k * 64 + t)
+                        else:
+                            cross[k * 64 + t] = true
+                if slow and len(fl) > 0:
+                    ccalls.push(i)
+                    clive.push(fl)
+            for u in rs:
+                let j = ci[u]
+                if j >= 0:
+                    set_bit(ref live, j)
+            i -= 1
+        if b == 0:
+            # the parameters are all set on entry
+            for p in 0..f.nparams:
+                let cp = ci[p]
+                if cp >= 0:
+                    set_bit(ref live, cp)
+            for p in 0..f.nparams:
+                let cp = ci[p]
+                if cp < 0:
+                    continue
+                for k in 0..wn:
+                    var wd = live[k]
+                    while wd != 0:
+                        let t = wd.trailing_zeros()
+                        wd ^= 1 << t
+                        let j = k * 64 + t
+                        if isf[j] == isf[cp]:
+                            add_edge(ref mat, ref adj, wn, cp, j)
+    # colors: 0-31 are x0-x31, 32-63 are v0-v31
+    let callee = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+    let caller = [8, 13, 14, 15, 17, 7, 6, 5, 4, 3, 2, 1, 0]
+    let fcallee = [40, 41, 42, 43, 44, 45, 46, 47]
+    var fcaller: [int] = []
+    for r in 16..32:
+        fcaller.push(32 + r)
+    # merging copies
+    var rep = [j for j in 0..nc]
+    copies.sort()
+    for (_, c, d) in copies:
+        let a = find(rep, c)
+        let b = find(rep, d)
+        if a == b or interferes(mat, wn, a, b):
+            continue
+        rep[b] = a
+        w[a] += w[b]
+        w[b] = 0
+        cross[a] = cross[a] or cross[b]
+        noarg[a] = noarg[a] or noarg[b]
+        no17[a] = no17[a] or no17[b]
+        let nb_ = adj[b]
+        for n in nb_:
+            add_edge(ref mat, ref adj, wn, a, find(rep, n))
+        moves[a].extend(moves[b])
+    # without loops, a callee-saved register only pays off for a vreg used a lot
+    let least = 3 if loops else 6
+    var order: [(int, int)] = []
+    for j in 0..nc:
+        if w[j] > 0 and rep[j] == j:
+            order.push((-w[j], j))
+    order.sort()
+    var color = [-1] * nc
+    var used = [false] * 64
+    for (_, j) in order:
+        var forbid = [false] * 64
+        for k0 in adj[j]:
+            let k = find(rep, k0)
+            if color[k] >= 0:
+                forbid[color[k]] = true
+        if no17[j]:
+            forbid[17] = true
+        let free = not cross[j]
+        let cs = fcaller if isf[j] else caller
+        let ce = fcallee if isf[j] else callee
+        var pick = -1
+        for p in moves[j]:
+            let c = color[find(rep, p)]
+            if (
+                c >= 0
+                and not forbid[c]
+                and (c in ce or (free and c in cs and (c >= 8 or not noarg[j])))
+            ):
+                pick = c
+                break
+        if pick < 0 and free:
+            for c in cs:
+                if not forbid[c] and (c >= 8 or not noarg[j]):
+                    pick = c
+                    break
+        if pick < 0:
+            for c in ce:
+                if used[c] and not forbid[c]:
+                    pick = c
+                    break
+        if pick < 0 and w[j] >= least:
+            for c in ce:
+                if not forbid[c]:
+                    pick = c
+                    break
+        if pick >= 0:
+            color[j] = pick
+            used[pick] = true
+    for j in 0..nc:
+        color[j] = color[find(rep, j)]
+    for j in 0..nc:
+        let c = color[j]
+        if c >= 32:
+            out.freg[cv[j]] = c - 32
+        elif c >= 0:
+            out.reg[cv[j]] = c
+    if len(ccalls) > 0:
+        out.keep = [[] for _ in 0..ncode]
+        for q in 0..len(ccalls):
+            for j in clive[q]:
+                let c = color[j]
+                if c >= 0 and not (c in callee or c in fcallee):
+                    out.keep[ccalls[q]].push(cv[j])
+    for c in callee:
+        if used[c]:
+            out.saved.push(c)
+    for c in fcallee:
+        if used[c]:
+            out.fsaved.push(c - 32)
+    return out

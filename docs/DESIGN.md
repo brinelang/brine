@@ -22,8 +22,8 @@
    built in.
 5. **Cross-platform.** macOS, Linux and Windows are first-class. Code goes
    through brine's own IR to native x86-64 and AArch64 backends, linked by
-   brine itself (every build on x86-64 Windows and Linux, dev and debug builds
-   on AArch64 Linux), or to portable C11 for whatever C compiler is present
+   brine itself (every build on x86-64 Windows, Linux and macOS and on AArch64
+   Linux and macOS), or to portable C11 for whatever C compiler is present
    (every other platform; clang or gcc).
 6. **Clean and easy to understand.** Small language surface. No hidden control
    flow, no implicit conversions, no aliasing surprises.
@@ -310,8 +310,8 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
       ─► verifier (symbolic execution + solver; proves contracts, elides runtime checks)
       ─► lowering to brine IR (lower.br)
       ─► x86-64 machine code (x64.br) ─► link.br            every build on x86-64 Windows/Linux/macOS
-       └► AArch64 machine code (a64.br) ─► link.br          dev and --debug builds on AArch64 Linux/macOS
-       └► C11 (ir_c.br) ─► system C compiler + brine_rt.c  --release on AArch64, other platforms
+       └► AArch64 machine code (a64.br) ─► link.br          every build on AArch64 Linux/macOS
+       └► C11 (ir_c.br) ─► system C compiler + brine_rt.c  other platforms, wasm (wasi-sdk)
       ─► native binary
 ```
 
@@ -379,8 +379,8 @@ reads it:
   launch.
   `BRINE_DUMP_PTX=file` writes the module (PTX or MSL) when building.
 * **C** (`ir_c.br`): one statement per IR instruction. gcc/clang at `-O2`/`-O3`
-  make it as fast as hand-written C, so it serves `--release` on AArch64 and every
-  platform without a native backend (with `#line` for `--debug` there).
+  make it as fast as hand-written C, so it serves every platform without a
+  native backend (with `#line` for `--debug` there).
 
 Rules that keep this working:
 * Nothing above the IR may depend on a backend: no C-only semantics leak into the
@@ -465,8 +465,7 @@ lot to do before then. The order below is a plan, not a promise.
 **Done (0.2):** brine IR; native x86-64 backend (COFF and ELF); C from the IR, in
 parallel translation units with per-unit caching.
 
-**Backends:** an optimizing AArch64 backend, so release builds on Apple silicon and
-ARM Linux need no C compiler either; CodeView debug info (for Visual Studio/WinDbg);
+**Backends:** CodeView debug info (for Visual Studio/WinDbg);
 MSVC support for the C backend. GPUs (§2.3): arrays kept on the device between constructs, `par(...)`
 forks and nested constructs.
 

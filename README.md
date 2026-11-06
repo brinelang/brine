@@ -94,10 +94,9 @@ To uninstall, delete `~/.brine` and the `PATH` line the installer added.
 
 ### Requirements
 
-On x86-64 (Linux, Windows, macOS), brine needs nothing else: it writes and
-links executables itself. On ARM64 (Apple silicon, Linux) it does too, except
-for `--release` builds, which still use a C compiler (`clang` or `gcc`). Check
-your setup with:
+On x86-64 (Linux, Windows, macOS) and ARM64 (Apple silicon, Linux), brine
+needs nothing else: it writes and links executables itself. Check your setup
+with:
 
 ```sh
 brine doctor

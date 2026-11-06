@@ -3,7 +3,7 @@
 # x64.br to encode.
 #
 # The kernel is straight-line code, so registers go by the furthest next
-# use: when all 16 are taken, the value read last goes to a stack slot (or,
+# use: when all of them (16 on SSE2) are taken, the value read last goes to a stack slot (or,
 # for a constant, is loaded again). Every lane does what the scalar code
 # does, the same operation on the same operands, so the results are the same
 # bits as the C kernel's.
@@ -14,7 +14,6 @@ from ir import SSE_ADD, SSE_MUL, SSE_SUB, SSE_DIV, SSE_SQRT, SSE_XOR, SSE_UNPH, 
 import slp
 from slp import Dag, Layout, LOAD, PARAM, CONST, ADD, MUL, DIV, NEG, SQRT
 
-const NREG = 16
 const SIGN = -9223372036854775808
 const MINUS_ONE = -4616189618054758400
 const ONE = 4607182418800017408
@@ -235,6 +234,134 @@ fn gen(d: Dag, w: int) -> Gen:
         g.ops.push(VOp(op=V_RET, d=-1, a=v, b=-1, arr=-1, n=0, m=0))
     return g
 
+# Rough latencies (cycles) of the value-level operations on an AArch64 core.
+fn latency(x: VOp) -> int:
+    match x.op:
+        case V_LD | V_LD2 | V_LDP:
+            return 4
+        case V_SQRT:
+            return 17
+        case V_OP:
+            return 13 if x.n == SSE_DIV else 3
+        case _:
+            return 2
+
+# The operations in critical-path order: the one with the longest chain of
+# latencies after it first, of those whose operands are ready (ties keep
+# their order). For a64.br: NEON cores look less far ahead than x86 ones, so
+# a kernel's square roots and divisions should start as soon as they can,
+# and the work that doesn't wait for them runs meanwhile. While nreg values
+# are live, the operation that leaves the fewest live goes first instead, so
+# the order doesn't spill. Stores and the result stay last, in order.
+fn schedule(g: Gen, nreg: int) -> Gen:
+    let n = len(g.ops)
+    var at = [-1] * g.nval
+    for i, x in enumerate(g.ops):
+        if x.d >= 0:
+            at[x.d] = i
+    var users: [[int]] = [[] for _ in 0..n]
+    var wait = [0] * n
+    # by value: whether it holds a register of its own (loads and constants
+    # are made again where they are read), and its readers not yet placed
+    var heavy = [false] * g.nval
+    var left = [0] * g.nval
+    for i, x in enumerate(g.ops):
+        if x.op == V_OP or x.op == V_SQRT or x.op == V_SHUF:
+            heavy[x.d] = true
+        for v in reads(x):
+            left[v] += 1
+            if x.op != V_ST and x.op != V_RET and at[v] >= 0:
+                users[at[v]].push(i)
+                wait[i] += 1
+    var live = 0
+    for j in g.params:
+        let v = g.params[j]
+        heavy[v] = true
+        if left[v] > 0:
+            live += 1
+    var h = [0] * n
+    var i = n - 1
+    while i >= 0:
+        var m = 0
+        for u in users[i]:
+            m = max(m, h[u])
+        h[i] = latency(g.ops[i]) + m
+        i -= 1
+    var done = [false] * n
+    var out: [VOp] = []
+    while true:
+        var best = -1
+        var bd = 0
+        for j in 0..n:
+            let x = g.ops[j]
+            if done[j] or wait[j] > 0 or x.op == V_ST or x.op == V_RET:
+                continue
+            var d = 0
+            if x.d >= 0 and heavy[x.d] and left[x.d] > 0:
+                d = 1
+            for v in reads(x):
+                if heavy[v] and left[v] == 1:
+                    d -= 1
+            if best < 0:
+                best = j
+                bd = d
+                continue
+            # (over the limit: the fewest live first, then the longest chain)
+            let full = live + max(d, bd) > nreg
+            if (full and (d < bd or (d == bd and h[j] > h[best]))) or (not full and h[j] > h[best]):
+                best = j
+                bd = d
+        if best < 0:
+            break
+        done[best] = true
+        let x = g.ops[best]
+        out.push(x)
+        for v in reads(x):
+            left[v] -= 1
+            if heavy[v] and left[v] == 0:
+                live -= 1
+        if x.d >= 0 and heavy[x.d] and left[x.d] > 0:
+            live += 1
+        for u in users[best]:
+            wait[u] -= 1
+    for x in g.ops:
+        if x.op == V_ST or x.op == V_RET:
+            out.push(x)
+    var r = g
+    r.ops = out
+    return r
+
+# the values x reads, each once
+fn reads(x: VOp) -> [int]:
+    var vs: [int] = []
+    if x.a >= 0:
+        vs.push(x.a)
+    if x.b >= 0 and x.b != x.a:
+        vs.push(x.b)
+    return vs
+
+# For a64.br: a value's two lanes stored next to each other, in a row, as one
+# 16-byte store (V_ST with m = 2).
+fn pair_stores(g: Gen) -> Gen:
+    var out: [VOp] = []
+    var i = 0
+    while i < len(g.ops):
+        let x = g.ops[i]
+        if x.op == V_ST and i + 1 < len(g.ops):
+            let y = g.ops[i + 1]
+            if y.op == V_ST and y.a == x.a and y.arr == x.arr and x.m + y.m == 1:
+                let lo = x if x.m == 0 else y
+                let hi = y if x.m == 0 else x
+                if hi.n == lo.n + 8:
+                    out.push(VOp(op=V_ST, d=-1, a=x.a, b=-1, arr=x.arr, n=lo.n, m=2))
+                    i += 2
+                    continue
+        out.push(x)
+        i += 1
+    var r = g
+    r.ops = out
+    return r
+
 # ================================================================ registers
 
 struct Alloc:
@@ -275,12 +402,12 @@ struct Alloc:
 
     # a free register, making one free if need be (never a pinned one)
     fn free_reg(ref self) -> int:
-        for r in 0..NREG:
+        for r in 0..len(self.held):
             if self.held[r] < 0 and not self.pinned[r]:
                 return r
         var best = -1
         var far = -1
-        for r in 0..NREG:
+        for r in 0..len(self.held):
             if self.pinned[r]:
                 continue
             let nu = self.next_use(self.held[r])
@@ -352,7 +479,7 @@ struct Alloc:
             self.reg[v] = -1
 
     fn unpin(ref self):
-        for r in 0..NREG:
+        for r in 0..len(self.held):
             self.pinned[r] = false
 
     # d = a op b, written over a copy of a (or a itself, read for the last time)
@@ -395,7 +522,8 @@ struct Alloc:
 
 # The kernel's machine operations. `pargs`: where each float parameter
 # comes in, an xmm register (0..15) or a stack offset from rbp (100 + it).
-fn compile(g: Gen, name: str, narr: int, pargs: [int], has_ret: bool) -> KFunc:
+# `nreg`: the vector registers there are (SSE2: 16; a64.br's NEON: 30).
+fn compile(g: Gen, name: str, narr: int, pargs: [int], has_ret: bool, nreg: int) -> KFunc:
     let nv = g.nval
     var al = Alloc(
         ops=[],
@@ -408,10 +536,10 @@ fn compile(g: Gen, name: str, narr: int, pargs: [int], has_ret: bool) -> KFunc:
         lo=[0] * nv,
         hi=[0] * nv,
         arg=[-1] * nv,
-        held=[-1] * NREG,
-        pinned=[false] * NREG,
+        held=[-1] * nreg,
+        pinned=[false] * nreg,
         nslots=0,
-        touched=[false] * NREG
+        touched=[false] * nreg
     )
     var first_st = len(g.ops)
     for i, x in enumerate(g.ops):
@@ -470,7 +598,11 @@ fn compile(g: Gen, name: str, narr: int, pargs: [int], has_ret: bool) -> KFunc:
                 al.define(x.d, r)
             case V_ST:
                 let r = al.need(x.a)
-                al.op(KO_STH if x.m == 1 else KO_ST, r, x.arr, x.n, 0)
+                # (m = 2, from pair_stores: both lanes, KO_ST with m = 1)
+                if x.m == 1:
+                    al.op(KO_STH, r, x.arr, x.n, 0)
+                else:
+                    al.op(KO_ST, r, x.arr, x.n, 1 if x.m == 2 else 0)
                 al.read(x.a)
                 al.unpin()
             case _:
@@ -481,7 +613,7 @@ fn compile(g: Gen, name: str, narr: int, pargs: [int], has_ret: bool) -> KFunc:
                 al.read(x.a)
                 al.unpin()
     var touched: [int] = []
-    for r in 0..NREG:
+    for r in 0..nreg:
         if al.touched[r]:
             touched.push(r)
     return KFunc(

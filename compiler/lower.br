@@ -46,8 +46,13 @@ struct Options:
     fast: bool
     # release builds: small fixed-size kernels as vector code (kernel.br)
     vec: bool
-    # ... made for the x86-64 backend (xkern.br), for Windows or System V
+    # ... made for the native backends (xkern.br: SSE2, which a64.br turns
+    # into NEON), for Windows or System V
     nvec: bool
+    # native code for x86-64 (else AArch64): with nvec, interleaved loops run
+    # 8 iterations at a time for x64.br's AVX2 lane kernels (a64.br has none:
+    # 4 scalar lanes), and kernels have 16 vector registers (NEON: 30)
+    x86: bool
     win: bool
     # for x64.br or a64.br: runtime helpers that runtime/rt.br has in brine
     # are calls of those, which the native inliner can take
@@ -880,9 +885,18 @@ struct Lower:
             if len(k.arrays) > 4:
                 return
             let w = xkern.width(k.dag)
-            let g = xkern.gen(k.dag, w)
+            var g = xkern.gen(k.dag, w)
+            if not self.opts.x86:
+                g = xkern.pair_stores(xkern.schedule(g, 28))
             let pargs = xkern.float_args(len(k.arrays), len(k.floats), self.opts.win)
-            var kf = xkern.compile(g, k.name, len(k.arrays), pargs, k.has_ret)
+            var kf = xkern.compile(
+                g,
+                k.name,
+                len(k.arrays),
+                pargs,
+                k.has_ret,
+                16 if self.opts.x86 else 30
+            )
             let ww = xwide.width(k.dag)
             if ww > 0:
                 kf = xwide.compile(xwide.gen(k.dag, ww), pargs, self.opts.win, kf)
@@ -4058,7 +4072,7 @@ struct Lower:
                 p = x
             case None:
                 return false
-        let n = jam.NATIVE_LANES if self.opts.nvec else jam.LANES
+        let n = jam.NATIVE_LANES if self.opts.nvec and self.opts.x86 else jam.LANES
         self.push_scope()
         self.push_frame()
         let dom = self.domain(iter, true)

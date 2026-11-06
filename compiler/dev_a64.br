@@ -1,0 +1,93 @@
+# Tests for parts of the AArch64 backend (a64.br) that need no AArch64 machine.
+#
+#     brine test compiler/dev_a64.br
+
+from a64 import fmov_imm, logic_imm, mov_cost
+
+# The value of a logical immediate N:immr:imms, as the architecture defines it
+# (DecodeBitMasks), or 0 for a reserved encoding.
+fn decode(enc: int) -> int:
+    let n = (enc >> 12) & 1
+    let immr = (enc >> 6) & 63
+    let imms = enc & 63
+    let combined = (n << 6) | (imms ^ 63)
+    if combined == 0:
+        return 0
+    var len = 6
+    while (combined >> len) & 1 == 0:
+        len -= 1
+    let size = 1 << len
+    let levels = size - 1
+    let s = imms & levels
+    let r = immr & levels
+    if s == levels:
+        return 0
+    # s + 1 ones, rotated right by r, repeated
+    var elem = 0
+    for k in 0..s + 1:
+        elem |= 1 << k
+    var rot = 0
+    for k in 0..size:
+        if (elem >> k) & 1 == 1:
+            rot |= 1 << ((k - r + size) % size)
+    var v = 0
+    var at = 0
+    while at < 64:
+        v |= rot << at
+        at += size
+    return v
+
+test "logical immediates are encoded as the architecture decodes them":
+    var all: {int: bool} = {}
+    for enc in 0..8192:
+        let v = decode(enc)
+        if v != 0:
+            all[v] = true
+    # the architecture's count of distinct logical immediates
+    assert len(all) == 5334, f"{len(all)}"
+    for v in all.keys():
+        let e = logic_imm(v)
+        assert e >= 0, f"{v:x} is a logical immediate"
+        assert decode(e) == v, f"{v:x} encoded as {e:x}"
+    var x = 0x1E3779B97F4A7C15
+    for _ in 0..20000:
+        x ^= x << 13
+        x ^= x >> 7
+        x ^= x << 17
+        for v in [x, x >> 7, x & 0xFFFF00, ~(x & 0xFF)]:
+            if v not in all:
+                assert logic_imm(v) == -1, f"{v:x} isn't a logical immediate"
+
+test "constants cost what mov_ri spends on them":
+    assert mov_cost(0) == 1
+    assert mov_cost(65535) == 1
+    assert mov_cost(-1) == 1
+    assert mov_cost(100_000_000) == 2
+    # orr with a logical immediate
+    assert mov_cost(0x5555555555555555) == 1
+    assert mov_cost(0x123456789ABCDEF0) == 4
+
+# The float bits of `fmov`'s 8-bit immediate (VFPExpandImm).
+fn expand(i8: int, d: bool) -> int:
+    let a = (i8 >> 7) & 1
+    let b = (i8 >> 6) & 1
+    let cdefgh = i8 & 0x3F
+    if d:
+        let exp = ((1 - b) << 10) | ((0xFF * b) << 2) | (cdefgh >> 4)
+        return (a << 63) | (exp << 52) | ((cdefgh & 0xF) << 48)
+    let exp = ((1 - b) << 7) | ((0x1F * b) << 2) | (cdefgh >> 4)
+    return (a << 31) | (exp << 23) | ((cdefgh & 0xF) << 19)
+
+test "fmov immediates are encoded as the architecture expands them":
+    for d in [true, false]:
+        for i8 in 0..256:
+            assert fmov_imm(expand(i8, d), d) == i8, f"{i8}"
+    assert fmov_imm(0, true) == -1
+    assert fmov_imm(1 << 63, true) == -1
+    # 0.1 and 1e10 aren't
+    assert fmov_imm(0x3FB999999999999A, true) == -1
+    assert fmov_imm(0x4202A05F20000000, true) == -1
+    # 1.0, 2.5
+    assert fmov_imm(0x3FF0000000000000, true) == 0x70
+    assert fmov_imm(0x4004000000000000, true) == 0x04
+    assert fmov_imm(0x3F800000, false) == 0x70

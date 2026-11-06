@@ -670,8 +670,10 @@ fn sw_kind(k: K) -> bool:
 # The table jumps over every test but the first, so a later one joins the
 # chain only when what it computes (its load, constant and comparison) is
 # read by nothing else: an optimized function can read a test's load again
-# further down.
-fn sw_test(f: Func, i0: int, ndef: [int], nuse: [int], first: bool) -> Option[SwTest]:
+# further down. The constant is made right before the comparison, or once
+# before the first branch (a64.br's optimized code): `kdef` has where, for
+# those, else -1.
+fn sw_test(f: Func, i0: int, ndef: [int], nuse: [int], kdef: [int], first: bool) -> Option[SwTest]:
     let n = len(f.code)
     var i = i0
     while i < n and f.code[i].op == Op.Line:
@@ -680,22 +682,36 @@ fn sw_test(f: Func, i0: int, ndef: [int], nuse: [int], first: bool) -> Option[Sw
     if i < n and f.code[i].op == Op.Load:
         lv = i
         i += 1
-    if i + 2 >= n:
+    if i >= n:
         return None
-    let c = f.code[i]
-    let e = f.code[i + 1]
-    let b = f.code[i + 2]
-    if c.op != Op.Const or e.op != Op.Eq or b.op != Op.BrNot or b.a != e.d or e.b != c.d:
+    var c = f.code[i]
+    let inline = c.op == Op.Const
+    if inline:
+        i += 1
+    if i + 1 >= n:
         return None
-    if ndef[c.d] != 1 or ndef[e.d] != 1 or not sw_kind(f.vk[e.a]):
+    let e = f.code[i]
+    let b = f.code[i + 1]
+    if e.op != Op.Eq or b.op != Op.BrNot or b.a != e.d or e.b < 0:
         return None
-    if not first and (nuse[c.d] != 1 or nuse[e.d] != 1 or (lv >= 0 and nuse[e.a] != 1)):
+    if inline:
+        if e.b != c.d or ndef[c.d] != 1:
+            return None
+    elif kdef[e.b] >= 0:
+        c = f.code[kdef[e.b]]
+    else:
+        return None
+    if ndef[e.d] != 1 or not sw_kind(f.vk[e.a]):
+        return None
+    if not first and (
+        (inline and nuse[c.d] != 1) or nuse[e.d] != 1 or (lv >= 0 and nuse[e.a] != 1)
+    ):
         return None
     if lv >= 0 and f.code[lv].d != e.a:
         return None
     if c.n < -(1 << 30) or c.n > (1 << 30):
         return None
-    return Some(SwTest(key=e.a, lv=lv, k=c.n, fail=b.n, body=i + 3))
+    return Some(SwTest(key=e.a, lv=lv, k=c.n, fail=b.n, body=i + 2))
 
 # Do two tests read the same value: one vreg, or the same load of a pointer
 # that doesn't change in between?
@@ -720,6 +736,13 @@ fn switches(f: Func) -> Func:
     for i in 0..n:
         if f.code[i].op == Op.Label:
             lat[f.code[i].n] = i
+    var kdef = [-1] * nv
+    for i in 0..n:
+        let x = f.code[i]
+        if x.op == Op.Label or x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot:
+            break
+        if x.op == Op.Const and ndef[x.d] == 1:
+            kdef[x.d] = i
     # the tests that start a chain, and the label to put at each body
     var before: {int: Inst} = {}
     var body_label: {int: int} = {}
@@ -728,7 +751,7 @@ fn switches(f: Func) -> Func:
     for i in 0..n:
         if i in seen:
             continue
-        match sw_test(f, i, ndef, nuse, true):
+        match sw_test(f, i, ndef, nuse, kdef, true):
             case Some(t0):
                 var chain = [t0]
                 var at = i
@@ -737,7 +760,7 @@ fn switches(f: Func) -> Func:
                     let l = lat[last.fail]
                     if l < 0 or l <= at:
                         break
-                    match sw_test(f, l + 1, ndef, nuse, false):
+                    match sw_test(f, l + 1, ndef, nuse, kdef, false):
                         case Some(t):
                             if not sw_same(f, t0, t):
                                 break
@@ -770,9 +793,14 @@ fn switches(f: Func) -> Func:
                             nl += 1
                 var args = [dflt]
                 args.extend(table)
-                # in front of the first test's constant (after its load)
+                # in front of the first test's comparison (after its load and
+                # constant)
                 var pos = i
-                while f.code[pos].op == Op.Line or f.code[pos].op == Op.Load:
+                while (
+                    f.code[pos].op == Op.Line
+                    or f.code[pos].op == Op.Load
+                    or f.code[pos].op == Op.Const
+                ):
                     pos += 1
                 before[pos] = Inst(op=Op.Switch, d=-1, a=t0.key, b=-1, c=-1, n=lo, s="", args=args)
             case None:
