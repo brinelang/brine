@@ -368,6 +368,8 @@ struct A:
     cold: {str: bool}
     keep: [[int]]
     keep_off: int
+    # ra64's share: the vreg whose home each vreg uses
+    share: [int]
     has_ret: bool
     ret: K
     cur: int
@@ -826,6 +828,19 @@ struct A:
         if self.reg[d] >= 0:
             return self.reg[d]
         return T0
+
+    # Do d and v live in one home (merged copies without a register)?
+    fn same_home(self, d: int, v: int) -> bool:
+        return (
+            self.share[d] == self.share[v]
+            and self.fold[d] == F_NONE
+            and self.fold[v] == F_NONE
+            and self.reg[d] < 0
+            and self.reg[v] < 0
+            and self.freg[d] < 0
+            and self.freg[v] < 0
+            and self.home[d] == self.home[v]
+        )
 
     fn set_v(ref self, d: int, v: int):
         if self.reg[d] >= 0:
@@ -1546,6 +1561,7 @@ struct A:
         self.saved = []
         self.fsaved = []
         self.keep = []
+        self.share = [v for v in 0..nv]
         if not self.dbg:
             var ok = [false] * nv
             for v in 0..nv:
@@ -1577,6 +1593,7 @@ struct A:
             self.saved = r.saved
             self.fsaved = r.fsaved
             self.keep = r.keep
+            self.share = r.share
             # a constant with no register is made again where it's used,
             # rather than kept in the frame
             for v in f.nparams..nv:
@@ -1604,21 +1621,27 @@ struct A:
         if hidden:
             self.retp = off
             off += 8
-        for v in 0..nv:
-            if (
-                self.fold[v] != F_NONE
-                or self.reg[v] >= 0
-                or self.freg[v] >= 0
-                or (ndef[v] == 0 and self.nuse[v] == 0)
-            ):
-                continue
-            if f.vk[v].is_wide():
-                off = align_up(off, 16)
-                self.home[v] = off
-                off += 16
-            else:
-                self.home[v] = off
-                off += 8
+        var homed = [false] * nv
+        for round in 0..2:
+            for v in 0..nv:
+                if (
+                    self.fold[v] != F_NONE
+                    or self.reg[v] >= 0
+                    or self.freg[v] >= 0
+                    or (ndef[v] == 0 and self.nuse[v] == 0)
+                    or (self.share[v] != v) != (round == 1)
+                ):
+                    continue
+                homed[v] = true
+                if round == 1 and homed[self.share[v]]:
+                    self.home[v] = self.home[self.share[v]]
+                elif f.vk[v].is_wide():
+                    off = align_up(off, 16)
+                    self.home[v] = off
+                    off += 16
+                else:
+                    self.home[v] = off
+                    off += 8
         var realign = 16
         self.slot_off = []
         for s in f.slots:
@@ -2292,7 +2315,7 @@ struct A:
                     self.mov_ri(T0, b)
                     self.st(T0, x.d)
             case Op.Mov:
-                if x.d != x.a:
+                if x.d != x.a and not self.same_home(x.d, x.a):
                     let k = self.vk[x.d]
                     if k.is_wide():
                         self.copy_v16(x.d, x.a)
@@ -3398,6 +3421,7 @@ fn emit(m0: Module, dbg: bool, on: bool, src: str, comp_dir: str, producer: str)
         cold={},
         keep=[],
         keep_off=0,
+        share=[],
         has_ret=false,
         ret=K.I64,
         cur=0,
