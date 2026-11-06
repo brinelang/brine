@@ -12,7 +12,7 @@ the docs and the tests. Read `docs/DESIGN.md` for the why and `docs/QUICKREF.md`
   object) or `ir_c.br` (C)
   → link). `driver.br` picks the backend and runs the system toolchain.
 - `runtime/` — the C runtime (`brine_rt.h`, `brine_rt.c`), embedded in the compiler.
-- `bootstrap/brinec.c` — the compiler's own generated C: builds brine with only a C compiler.
+- `bootstrap/` — the released brine that builds this one (`VERSION`, `SHA256SUMS`).
 - `tests/integration.br` — end-to-end tests; `tests/programs/` (programs and their
   expected `.out`), `tests/syntax/` (lexer/parser edge cases with expected output).
 - `compiler/dev_solver.br`, `compiler/dev_diag.br`, `compiler/dev_native.br` — unit
@@ -20,13 +20,13 @@ the docs and the tests. Read `docs/DESIGN.md` for the why and `docs/QUICKREF.md`
 
 ## Build
 ```sh
-# once, from the seed (Windows: brine.exe and -lws2_32 -lshell32 instead of -lm -lpthread -ldl)
-cc -std=c11 -O2 -fno-strict-aliasing -w -Iruntime bootstrap/brinec.c runtime/brine_rt.c -o brine -lm -lpthread -ldl
+# once: downloads the release in bootstrap/VERSION, which builds ./brine
+sh scripts/dist.sh bootstrap
 # after changing the compiler: brine rebuilds itself in place
 ./brine build compiler/main.br -o brine
 ```
-If a change breaks the compiler, build `brine` again from the seed, or from the
-last commit that worked. (On Windows the replaced one stays as `brine.exe.old`
+If a change breaks the compiler, bootstrap again, or build from the last commit
+that worked. (On Windows the replaced one stays as `brine.exe.old`
 until the next build, since a running program can't be deleted there.)
 
 A new builtin that the compiler itself uses needs two steps: build the compiler with
@@ -66,25 +66,25 @@ The version is set in one place: `VERSION` in `compiler/driver.br`.
   only the maintainer decides when 1.0 happens.
 - Releases are their own commit, `chore(release): X.Y.Z`: bump `VERSION`, add the
   release notes to `CHANGELOG.md` (from the commit messages since the last release),
-  refresh the bootstrap seed. Once it is merged, tag the merge commit `vX.Y.Z` and
+  Once it is merged, tag the merge commit `vX.Y.Z` and
   push the tag: the release workflow builds, tests and publishes it.
   [docs/RELEASING.md](docs/RELEASING.md) has the steps.
 
 ## Pull requests and CI
 Changes reach `main` through pull requests, merged with a merge commit once CI
-(`.github/workflows/ci.yml`: seed build, `fmt --check`, the integration tests and
+(`.github/workflows/ci.yml`: bootstrap, `fmt --check`, the integration tests and
 packaging on Linux, macOS and Windows) is green. See
 [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Generated files
 Don't commit anything that can be regenerated from the sources (build output,
-caches, generated C, `target/`). The exception is `bootstrap/brinec.c`: it can only
-be produced by a working brine, so it's the seed. Refresh it in release commits, or
-when the compiler starts using a feature the current seed can't compile:
-```sh
-./brine emit-c --release compiler/main.br -o bootstrap/brinec.c
-```
-then check that the seed builds a compiler that passes the tests.
+caches, generated C, `target/`).
+
+## Bootstrap
+The compiler must build with the release in `bootstrap/VERSION` (stage 0). To use
+a language feature that release can't compile in `compiler/`, release first, then
+move `bootstrap/VERSION` to the new release and copy its `SHA256SUMS` into
+`bootstrap/` (`build` commit), then use the feature.
 
 ## Style
 - Run `brine fmt`. Comments are short and plain; say why, not what.
