@@ -496,6 +496,89 @@ fn pack_copies(f: Func) -> Func:
     g.code = code
     return g
 
+# The reference count kind of a retain or release call: "arr" for
+# brine_arr_retain, and so on ("" for any other call).
+fn rc_kind(x: Inst, which: str) -> str:
+    if x.op != Op.Call or len(x.args) != 1:
+        return ""
+    for k in ["arr", "str", "map", "box"]:
+        if x.s == "brine_" + k + "_" + which:
+            return k
+    return ""
+
+# A retain of a value loaded from memory and the releases of that value
+# cancel when nothing in the function can change memory or drop another
+# reference: no stores but to its own slots, no copies, no calls but such
+# retains and releases. Then whatever holds the value (the caller's, through a
+# parameter) holds it until the function returns: `for p in self.t` in a
+# method that only reads. All or nothing: every retain and release in the
+# function must be of such a value, each retained once.
+fn borrowed_rc(f: Func) -> Func:
+    let nv = len(f.vk)
+    var slot = [false] * nv
+    var ndef = [0] * nv
+    var loaded = [false] * nv
+    for x in f.code:
+        if x.d >= 0 and x.d < nv:
+            ndef[x.d] += 1
+            if x.op == Op.SlotAddr:
+                slot[x.d] = true
+            if x.op == Op.Load:
+                loaded[x.d] = true
+    var nret = [0] * nv
+    var nrel = [0] * nv
+    var kind: [str] = [""] * nv
+    var any = false
+    for x in f.code:
+        match x.op:
+            case Op.CallInd:
+                return f
+            case Op.Call:
+                let r = rc_kind(x, "retain")
+                let l = rc_kind(x, "release")
+                if r == "" and l == "":
+                    return f
+                let v = x.args[0]
+                let k = r if r != "" else l
+                if v < 0 or v >= nv or ndef[v] != 1 or not loaded[v]:
+                    return f
+                if kind[v] != "" and kind[v] != k:
+                    return f
+                kind[v] = k
+                if r != "":
+                    nret[v] += 1
+                    any = true
+                else:
+                    nrel[v] += 1
+            case Op.Copy:
+                return f
+            case Op.Store | Op.Zero:
+                if x.a < 0 or x.a >= nv or not slot[x.a]:
+                    return f
+            case _:
+                pass
+    if not any:
+        return f
+    # each such value: retained once and released (a retain with no release
+    # hands the value on, as does a copy of what holds it), and otherwise
+    # only read through
+    for x in f.code:
+        if x.op == Op.Call:
+            continue
+        for v in reads(x, nv):
+            if kind[v] == "":
+                continue
+            let addr = (x.op == Op.Load or x.op == Op.Elem) and x.a == v and x.b != v
+            let cmp = x.op == Op.Eq or x.op == Op.Ne
+            if not addr and not cmp:
+                return f
+    for v in 0..nv:
+        if kind[v] != "" and (nret[v] != 1 or nrel[v] == 0):
+            return f
+    var g = f
+    g.code = [x for x in f.code if x.op != Op.Call]
+    return g
+
 fn promote(f0: Func) -> Func:
     let f = pack_copies(copy_chains(f0))
     let slot = slot_vregs(f)
