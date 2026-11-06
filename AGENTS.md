@@ -88,6 +88,8 @@ move `bootstrap/VERSION` to the new release and copy its `SHA256SUMS` into
 
 ## Style
 - Run `brine fmt`. Comments are short and plain; say why, not what.
-- The compiler has no dependencies beyond a C compiler. Keep it that way.
+- The compiler has no dependencies: on x86-64 and AArch64 it writes and links
+  executables itself. A C compiler is only for other platforms, wasm (wasi-sdk) and
+  `BRINE_BACKEND=c`. Keep it that way.
 - Error messages follow `docs/DESIGN.md` §4: a code, a primary span, why it's wrong
   and how to fix it, and an entry in `compiler/explain.br` for every new code.
