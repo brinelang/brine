@@ -1250,8 +1250,9 @@ fn link_macho(o0: ObjFile, main: str, ident: str) -> Result[[u8], str]:
                     got_local.push(r.sym)
     let nimp = len(imps)
     # __TEXT: the headers, code, import stubs, read-only data, unwind tables
-    let ncmds = 13
-    let cmds_size = 1096
+    let ndw = len(o.dsecs)
+    let ncmds = 13 + (1 if ndw > 0 else 0)
+    let cmds_size = 1096 + (72 + 80 * ndw if ndw > 0 else 0)
     let stub = 16 if a64 else 8
     let text_off = align_up(32 + cmds_size, max(o.text_align, 16))
     let stubs_off = align_up(text_off + len(o.text), 16)
@@ -1262,7 +1263,16 @@ fn link_macho(o0: ObjFile, main: str, ident: str) -> Result[[u8], str]:
     let data_off = text_size
     let got_off = align_up(data_off + len(o.data), 8)
     let data_size = align_up(got_off + 8 * len(got_of) - data_off, MACHO_PAGE)
-    let le_off = data_off + data_size
+    # __DWARF: a debug build's debug info, which debuggers read from the
+    # executable (as Go's linker leaves it: no dsymutil needed)
+    let dw_off = data_off + data_size
+    var dw_at: [int] = []
+    var dw_end = dw_off
+    for d in o.dsecs:
+        dw_at.push(dw_end)
+        dw_end += len(d.bytes)
+    let dw_size = align_up(dw_end - dw_off, MACHO_PAGE)
+    let le_off = dw_off + dw_size
     var addr = [-1] * len(o.syms)
     var dyn = [0] * len(o.syms)
     var got = [-1] * len(o.syms)
@@ -1289,6 +1299,7 @@ fn link_macho(o0: ObjFile, main: str, ident: str) -> Result[[u8], str]:
     if len(relas) > 0:
         return Err("code with addresses in it (they belong in data)")
     elf_apply(ref o.data, o.drel, MACHO_BASE + data_off, addr, got, dyn, ea, ref relas)?
+    let dbg = debug_secs(o, addr, 0)?
     var gotb = [u8(0)] * (8 * len(got_of))
     for si in got_local:
         set64(ref gotb, got[si] - MACHO_BASE - got_off, addr[si])
@@ -1453,6 +1464,13 @@ fn link_macho(o0: ObjFile, main: str, ident: str) -> Result[[u8], str]:
     put_sect(ref out, "__data", "__DATA", data_off, len(o.data), max(o.data_align, 16), 0, 0, 0)
     # S_NON_LAZY_SYMBOL_POINTERS
     put_sect(ref out, "__got", "__DATA", got_off, 8 * len(got_of), 8, 6, nimp, 0)
+    if ndw > 0:
+        # r--
+        put_seg(ref out, "__DWARF", ndw, MACHO_BASE + dw_off, dw_size, dw_off, dw_size, 1)
+        for i, d in enumerate(o.dsecs):
+            # .debug_info -> __debug_info; S_ATTR_DEBUG
+            let nm = "__" + d.name[1:len(d.name)]
+            put_sect(ref out, nm, "__DWARF", dw_at[i], len(d.bytes), 1, 0x02000000, 0, 0)
     # r--
     put_seg(
         ref out,
@@ -1528,6 +1546,9 @@ fn link_macho(o0: ObjFile, main: str, ident: str) -> Result[[u8], str]:
     out.extend(o.data)
     pad_with(ref out, got_off, 0)
     out.extend(gotb)
+    for i, b in enumerate(dbg):
+        pad_with(ref out, dw_at[i], 0)
+        out.extend(b)
     pad_with(ref out, le_off, 0)
     out.extend(rebase)
     out.extend(bind)
