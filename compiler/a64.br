@@ -72,6 +72,9 @@ const F_NOT = 6
 # `a * b` read only by the `+` right after it, which is then a madd (fval:
 # the multiplication's position)
 const F_MUL = 7
+# `a >> k` read only by the `& (2^n - 1)` right after it, which is then a
+# ubfx (fval: the shift's position)
+const F_SHR = 8
 
 # call argument sources
 const A_VAL = 0
@@ -1570,6 +1573,31 @@ struct A:
                 continue
             self.fold[y.d] = F_MUL
             self.fval[y.d] = i - 1
+        for i in 1..ncode:
+            let x = f.code[i]
+            let y = f.code[i - 1]
+            if x.op != Op.And or y.op != Op.Shr or not self.imm(y.b):
+                continue
+            let m = x.b if y.d == x.a else x.a
+            if (y.d != x.a and y.d != x.b) or x.a == x.b or not self.imm(m):
+                continue
+            let k = f.vk[x.d]
+            let mask = self.fval[m]
+            let sh = self.fval[y.b]
+            if (
+                (k != K.I64 and k != K.U64)
+                or f.vk[y.d] != k
+                or self.nuse[y.d] != 1
+                or ndef[y.d] != 1
+                or self.fold[y.d] != F_NONE
+                or mask <= 0
+                or mask & (mask + 1) != 0
+                or sh <= 0
+                or sh + (mask + 1).trailing_zeros() > 64
+            ):
+                continue
+            self.fold[y.d] = F_SHR
+            self.fval[y.d] = i - 1
         var out_bytes = 0
         for x in f.code:
             if x.op == Op.Call or x.op == Op.CallInd:
@@ -2598,6 +2626,15 @@ struct A:
             x.b = x0.a
         let k = self.vk[x.d]
         let r = self.dst(x.d)
+        if x.op == Op.And and self.fold[x.a] == F_SHR:
+            let y = self.code[self.fval[x.a]]
+            let p = self.use(T0, y.a)
+            let sh = self.fval[y.b]
+            let n = (self.fval[x.b] + 1).trailing_zeros()
+            # ubfx r, p, #sh, #n: ubfm r, p, #sh, #(sh + n - 1)
+            self.w(0xD3400000 | (sh << 16) | ((sh + n - 1) << 10) | (p << 5) | r)
+            self.st(r, x.d)
+            return
         # (a `~b` folded into a bic is never made)
         let ra = T0 if self.fold[x.a] == F_NOT else self.use(T0, x.a)
         match x.op:
