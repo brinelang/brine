@@ -9793,3 +9793,891 @@ fn brine_os_enable_ansi():
             if GetConsoleMode(h, m) != 0:
                 # ENABLE_VIRTUAL_TERMINAL_PROCESSING
                 SetConsoleMode(h, load_u32(m, 0) | 4)
+
+# ---- free ports and processes
+extern fn LoadLibraryA(name: ptr) -> ptr
+
+extern fn socket(domain: i32, kind: i32, proto: i32) -> i32
+
+extern fn bind(fd: i32, sa: ptr, n: u32) -> i32
+
+extern fn listen(fd: i32, backlog: i32) -> i32
+
+extern fn getsockname(fd: i32, sa: ptr, n: ptr) -> i32
+
+extern fn close(fd: i32) -> i32
+
+extern fn lseek(fd: i32, off: int, whence: i32) -> int
+
+extern fn kill(pid: i32, sig: i32) -> i32
+
+extern fn strncmp(a: ptr, b: ptr, n: u64) -> i32
+
+extern fn mkostemp(tmpl: ptr, flags: i32) -> i32
+
+extern fn posix_spawn_file_actions_init(fa: ptr) -> i32
+
+extern fn posix_spawn_file_actions_destroy(fa: ptr) -> i32
+
+extern fn posix_spawn_file_actions_addopen(
+    fa: ptr,
+    fd: i32,
+    path: ptr,
+    flags: i32,
+    mode: u32
+) -> i32
+
+extern fn posix_spawn_file_actions_adddup2(fa: ptr, fd: i32, to: i32) -> i32
+
+extern fn posix_spawnattr_init(a: ptr) -> i32
+
+extern fn posix_spawnattr_destroy(a: ptr) -> i32
+
+extern fn posix_spawnattr_setsigdefault(a: ptr, set: ptr) -> i32
+
+extern fn posix_spawnattr_setflags(a: ptr, flags: i16) -> i32
+
+extern fn sigemptyset(set: ptr) -> i32
+
+extern fn sigaddset(set: ptr, sig: i32) -> i32
+
+extern fn pthread_mutex_init(m: ptr, attr: ptr) -> i32
+
+extern fn pthread_mutex_lock(m: ptr) -> i32
+
+extern fn pthread_mutex_unlock(m: ptr) -> i32
+
+extern fn InitializeCriticalSection(m: ptr)
+
+extern fn EnterCriticalSection(m: ptr)
+
+extern fn LeaveCriticalSection(m: ptr)
+
+extern fn GetTickCount() -> u32
+
+extern fn SetFilePointer(h: ptr, lo: i32, hi: ptr, how: u32) -> u32
+
+extern fn GetCurrentProcess() -> ptr
+
+extern fn DuplicateHandle(
+    sp: ptr,
+    h: ptr,
+    tp: ptr,
+    out: ptr,
+    access: u32,
+    inherit: i32,
+    opts: u32
+) -> i32
+
+extern fn GetSystemDirectoryW(buf: ptr, n: u32) -> u32
+
+extern fn GetWindowsDirectoryW(buf: ptr, n: u32) -> u32
+
+extern fn CompareStringOrdinal(a: ptr, na: i32, b: ptr, nb: i32, ignore_case: i32) -> i32
+
+extern fn GetEnvironmentStringsW() -> ptr
+
+extern fn FreeEnvironmentStringsW(p: ptr) -> i32
+
+extern fn TerminateProcess(h: ptr, code: u32) -> i32
+
+fn brine_os_free_ports(n0: int, out: ptr, err: ptr) -> bool:
+    let n = n0 if n0 > 0 else 0
+    # Winsock: loaded on first use (importing it would load it, and the DLLs
+    # it needs, into every program). Both calls count, so repeating them is
+    # cheap and safe from any thread.
+    var f_socket = null_ptr()
+    var f_bind = null_ptr()
+    var f_listen = null_ptr()
+    var f_name = null_ptr()
+    var f_close = null_ptr()
+    var f_err = null_ptr()
+    if os_is("windows"):
+        let ws = LoadLibraryA(ptr_of("ws2_32.dll") + STR_DATA)
+        if addr(ws) == 0:
+            let m = ptr_of("brine: could not load ws2_32.dll\n")
+            fwrite(m + STR_DATA, 1, u64(load_i64(m, STR_LEN)), os_stdio(2))
+            exit(2)
+        let wsa = stack_mem(512)
+        call_i32(GetProcAddress(ws, ptr_of("WSAStartup") + STR_DATA), u16(0x0202), wsa)
+        f_socket = GetProcAddress(ws, ptr_of("socket") + STR_DATA)
+        f_bind = GetProcAddress(ws, ptr_of("bind") + STR_DATA)
+        f_listen = GetProcAddress(ws, ptr_of("listen") + STR_DATA)
+        f_name = GetProcAddress(ws, ptr_of("getsockname") + STR_DATA)
+        f_close = GetProcAddress(ws, ptr_of("closesocket") + STR_DATA)
+        f_err = GetProcAddress(ws, ptr_of("WSAGetLastError") + STR_DATA)
+    let pa = stack_mem(8)
+    store_ptr(
+        pa,
+        0,
+        brine_arr_new(0, 8, null_ptr(), null_ptr(), ptr_of("<os.free_ports>") + STR_DATA)
+    )
+    let socks = blk_alloc(8 * (n if n != 0 else 1))
+    var open = 0
+    var e = 0
+    # every listener stays open until all ports are known, so they differ
+    let sa = stack_mem(16)
+    let len = stack_mem(8)
+    let port = stack_mem(8)
+    for i in 0..n:
+        var s: u64 = 0
+        if os_is("windows"):
+            # AF_INET, SOCK_STREAM
+            s = call_u64(f_socket, i32(2), i32(1), i32(0))
+            if s == ONES:
+                e = int(call_i32(f_err))
+                break
+        else:
+            let fd = socket(2, 1, 0)
+            if fd < 0:
+                e = os_errno()
+                break
+            s = u64(fd)
+        store_u64(socks, open * 8, s)
+        open += 1
+        memset(sa, 0, 16)
+        if os_is("macos"):
+            store_u8(sa, 1, 2)
+        else:
+            store_u16(sa, 0, 2)
+        # 127.0.0.1, port 0: any free one
+        store_u32(sa, 4, 0x0100007f)
+        store_u32(len, 0, 16)
+        var bad = false
+        if os_is("windows"):
+            bad = (
+                call_i32(f_bind, s, sa, i32(16)) != 0
+                or call_i32(f_listen, s, i32(128)) != 0
+                or call_i32(f_name, s, sa, len) != 0
+            )
+            if bad:
+                e = int(call_i32(f_err))
+        else:
+            let fd = i32(s)
+            bad = bind(fd, sa, 16) != 0 or listen(fd, 128) != 0 or getsockname(fd, sa, len) != 0
+            if bad:
+                e = os_errno()
+        if bad:
+            break
+        let p = load_u16(sa, 2)
+        store_i64(port, 0, int((p >> 8) | ((p & 0xff) << 8)))
+        brine_arr_push(pa, port)
+    for i in 0..open:
+        if os_is("windows"):
+            call_i32(f_close, load_u64(socks, i * 8))
+        else:
+            close(i32(load_u64(socks, i * 8)))
+    blk_free(socks)
+    if e != 0:
+        arr_release(load_ptr(pa, 0))
+        store_ptr(err, 0, os_err(e))
+        return false
+    store_ptr(out, 0, load_ptr(pa, 0))
+    return true
+
+# A process record: the process (Windows: its handle; else the pid, i32),
+# the capture files (Windows handles, else fds as i32; deleted when closed),
+# whether it captures, whether it has exited, its exit code, and what it
+# wrote (once it has exited).
+const PR_PROC = 0
+const PR_OUT = 8
+const PR_ERR = 16
+const PR_CAPTURE = 24
+const PR_DONE = 25
+const PR_CODE = 32
+const PR_OUTS = 40
+const PR_ERRS = 48
+const PR_SIZE = 56
+
+# global_mem("os_procs"): every process os.spawn started (records, count,
+# capacity; a handle is an index + 1) and whether the lock was made (by the
+# first os.spawn: spawning can't happen in `par`). global_mem("os_proc_mu"):
+# the lock, an OS mutex (CRITICAL_SECTION or pthread_mutex_t).
+const PT_P = 0
+const PT_N = 8
+const PT_CAP = 16
+const PT_READY = 24
+
+fn os_lock(m: ptr):
+    if os_is("windows"):
+        EnterCriticalSection(m)
+    else:
+        pthread_mutex_lock(m)
+
+fn os_unlock(m: ptr):
+    if os_is("windows"):
+        LeaveCriticalSection(m)
+    else:
+        pthread_mutex_unlock(m)
+
+fn os_proc_get(h: int, what: str, loc: ptr) -> ptr:
+    let t = global_mem("os_procs", 32)
+    if h < 1 or h > load_i64(t, PT_N):
+        if load_i64(t, PT_READY) != 0:
+            os_unlock(global_mem("os_proc_mu", 64))
+        brine_panic_at(loc, f"{what}: {h} is not a process handle from os.spawn")
+    return load_ptr(t, PT_P) + (h - 1) * PR_SIZE
+
+# A new empty temporary file, deleted when its last handle closes. Windows.
+fn os_capture_file() -> ptr:
+    let dir = brine_os_temp_dir()
+    let count = global_mem("os_capture_count", 8)
+    var h = os_bad_handle()
+    var e: u32 = 0
+    for attempt in 0..100:
+        let c = load_i64(count, 0) + 1
+        store_i64(count, 0, c)
+        let name = f"\\brine-out-{GetCurrentProcessId()}-{c}-{GetTickCount()}.tmp"
+        let p = brine_str_concat(dir, ptr_of(name))
+        let w = os_wide(p + STR_DATA)
+        str_release(p)
+        # GENERIC_READ | GENERIC_WRITE, CREATE_NEW,
+        # FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE
+        h = CreateFileW(w, 0xc0000000, SHARE_ALL, null_ptr(), 1, 0x04000100, null_ptr())
+        e = GetLastError()
+        blk_free(w)
+        # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
+        if h != os_bad_handle() or (e != 80 and e != 183):
+            break
+    str_release(dir)
+    SetLastError(e)
+    return h
+
+# A new temporary file, already unlinked. Not Windows.
+fn os_capture_fd() -> int:
+    let dir = brine_os_temp_dir()
+    let p = brine_str_concat(dir, ptr_of("/brine-out-XXXXXX"))
+    str_release(dir)
+    let c = os_cstr(p)
+    var fd = -1
+    if addr(c) != 0:
+        # O_CLOEXEC: the fd isn't left open in other children
+        fd = int(mkostemp(c, i32(0x1000000) if os_is("macos") else i32(0x80000)))
+    if fd >= 0:
+        unlink(c)
+    str_release(p)
+    return fd
+
+# What a capture file holds, as a string (invalid UTF-8 replaced); closes it.
+fn os_read_capture(f: ptr) -> ptr:
+    if os_is("windows"):
+        if addr(f) == 0 or f == os_bad_handle():
+            return new_str(0)
+        SetFilePointer(f, 0, null_ptr(), 0)
+    else:
+        if i32(addr(f)) < 0:
+            return new_str(0)
+        lseek(i32(addr(f)), 0, 0)
+    var buf = null_ptr()
+    var len = 0
+    var cap = 0
+    let got = stack_mem(8)
+    while true:
+        if len == cap:
+            cap = cap * 2 if cap != 0 else 65536
+            buf = brine_x_realloc(buf, cap)
+        if os_is("windows"):
+            store_u32(got, 0, 0)
+            if (
+                ReadFile(f, buf + len, u32(cap - len), got, null_ptr()) == 0
+                or load_u32(got, 0) == 0
+            ):
+                break
+            len += int(load_u32(got, 0))
+        else:
+            let r = read(i32(addr(f)), buf + len, u64(cap - len))
+            if r < 0 and os_errno() == EINTR:
+                continue
+            if r <= 0:
+                break
+            len += r
+    if os_is("windows"):
+        CloseHandle(f)
+    else:
+        close(i32(addr(f)))
+    let s = os_lossy(buf, len)
+    brine_free(buf)
+    return s
+
+# An inheritable copy of h for the child (null when there is none).
+fn os_inheritable(h: ptr) -> ptr:
+    if addr(h) == 0 or h == os_bad_handle():
+        return null_ptr()
+    let d = stack_mem(8)
+    store_ptr(d, 0, null_ptr())
+    # DUPLICATE_SAME_ACCESS
+    if DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), d, 0, 1, 2) == 0:
+        return null_ptr()
+    return load_ptr(d, 0)
+
+# Rust's command-line quoting: the program is always quoted as is; other
+# arguments when they hold a space or tab or are empty, with backslashes
+# before quotes doubled.
+fn os_append_arg(sb: ptr, a: ptr, program: bool):
+    let quote = program or load_u8(a, 0) == 0 or os_has_any(a, " \t")
+    if quote:
+        sb_byte(sb, 34)
+    var slashes = 0
+    var i = 0
+    while load_u8(a, i) != 0:
+        let c = load_u8(a, i)
+        if not program:
+            if c == 92:
+                slashes += 1
+            else:
+                if c == 34:
+                    os_backslashes(sb, slashes + 1)
+                slashes = 0
+        sb_byte(sb, c)
+        i += 1
+    if quote:
+        if not program:
+            os_backslashes(sb, slashes)
+        sb_byte(sb, 34)
+
+fn os_wfile_exists(w: ptr) -> bool:
+    let a = GetFileAttributesW(w)
+    return a != NO_ATTRS and a & ATTR_DIR == 0
+
+# dir (dl units) + "\" + name if that file exists, else null.
+fn os_try_dir(dir: ptr, dl: int, name: ptr) -> ptr:
+    let wl = int(wcslen(name))
+    if dl == 0:
+        return null_ptr()
+    let c = blk_alloc(2 * (dl + wl + 2))
+    memcpy(c, dir, u64(dl * 2))
+    var at = dl
+    let last = load_u16(c, (at - 1) * 2)
+    if last != 92 and last != 47:
+        store_u16(c, at * 2, 92)
+        at += 1
+    memcpy(c + at * 2, name, u64((wl + 1) * 2))
+    if os_wfile_exists(c):
+        return c
+    blk_free(c)
+    return null_ptr()
+
+# MAX_PATH + 1 units
+const DIR_UNITS = 261
+
+# Finds a program the way Rust's Command does on Windows: a name without a
+# path is looked up in the exe's directory, the system directories, then
+# PATH; ".exe" is added when the name has no extension. Null if not found.
+fn os_find_program(prog: ptr, path_var: ptr) -> ptr:
+    let n = int(strlen(prog))
+    var base = 0
+    for q in 0..n:
+        let c = load_u8(prog, q)
+        if c == 47 or c == 92:
+            base = q + 1
+    let name = blk_alloc(n + 5)
+    memcpy(name, prog, u64(n + 1))
+    if addr(memchr(prog + base, 46, u64(n - base))) == 0:
+        memcpy(name + n, ptr_of(".exe") + STR_DATA, 5)
+    let wname = os_wide(name)
+    blk_free(name)
+    # a path: CreateProcess reports it if it's missing
+    if base != 0:
+        return wname
+    # three of DIR_UNITS
+    let dirs = stack_mem(1566)
+    var nd = 0
+    var k = int(GetModuleFileNameW(null_ptr(), dirs, 260))
+    if k > 0 and k < 260:
+        var slash = -1
+        for i in 0..k:
+            if load_u16(dirs, i * 2) == 92:
+                slash = i
+        if slash >= 0:
+            store_u16(dirs, slash * 2, 0)
+            nd += 1
+    k = int(GetSystemDirectoryW(dirs + nd * 2 * DIR_UNITS, 260))
+    if k > 0 and k < 260:
+        nd += 1
+    k = int(GetWindowsDirectoryW(dirs + nd * 2 * DIR_UNITS, 260))
+    if k > 0 and k < 260:
+        nd += 1
+    var found = null_ptr()
+    for i in 0..nd:
+        if addr(found) != 0:
+            break
+        let d = dirs + i * 2 * DIR_UNITS
+        found = os_try_dir(d, int(wcslen(d)), wname)
+    var p = path_var
+    while addr(p) != 0 and load_u16(p, 0) != 0 and addr(found) == 0:
+        var dl = 0
+        while load_u16(p, dl * 2) != 0 and load_u16(p, dl * 2) != 59:
+            dl += 1
+        var d = p
+        p = p + (dl + 1) * 2 if load_u16(p, dl * 2) == 59 else p + dl * 2
+        # entries may be quoted
+        if dl >= 2 and load_u16(d, 0) == 34 and load_u16(d, (dl - 1) * 2) == 34:
+            d = d + 2
+            dl -= 2
+        found = os_try_dir(d, dl, wname)
+    blk_free(wname)
+    return found
+
+# Does environment entry e ("NAME=value") have this name? (Case-insensitive,
+# like Windows; hidden names start with '='.)
+fn os_env_is(e: ptr, name: ptr) -> bool:
+    var el = 1
+    while load_u16(e, el * 2) != 0 and load_u16(e, el * 2) != 61:
+        el += 1
+    let nl = int(wcslen(name))
+    return el == nl and CompareStringOrdinal(e, i32(el), name, i32(nl), 1) == 2
+
+# The parent's environment block with the overrides applied (null: inherit
+# it as is).
+fn os_env_block(ek: ptr, ev: ptr, ne: int) -> ptr:
+    if ne == 0:
+        return null_ptr()
+    let wk = blk_alloc(8 * ne)
+    let wv = blk_alloc(8 * ne)
+    for i in 0..ne:
+        store_ptr(wk, i * 8, os_wide(load_ptr(ek, i * 8)))
+        store_ptr(wv, i * 8, os_wide(load_ptr(ev, i * 8)))
+    let cur = GetEnvironmentStringsW()
+    var cap = 2
+    var len = 0
+    var e = cur
+    while addr(e) != 0 and load_u16(e, 0) != 0:
+        let l = int(wcslen(e)) + 1
+        cap += l
+        e = e + l * 2
+    for i in 0..ne:
+        cap += int(wcslen(load_ptr(wk, i * 8))) + int(wcslen(load_ptr(wv, i * 8))) + 2
+    let block = blk_alloc(2 * cap)
+    e = cur
+    while addr(e) != 0 and load_u16(e, 0) != 0:
+        let l = int(wcslen(e)) + 1
+        var skip = false
+        for i in 0..ne:
+            if os_env_is(e, load_ptr(wk, i * 8)):
+                skip = true
+                break
+        if not skip:
+            memcpy(block + len * 2, e, u64(l * 2))
+            len += l
+        e = e + l * 2
+    if addr(cur) != 0:
+        FreeEnvironmentStringsW(cur)
+    for i in 0..ne:
+        let k = load_ptr(wk, i * 8)
+        let v = load_ptr(wv, i * 8)
+        let kl = int(wcslen(k))
+        let vl = int(wcslen(v))
+        memcpy(block + len * 2, k, u64(kl * 2))
+        len += kl
+        store_u16(block, len * 2, 61)
+        len += 1
+        memcpy(block + len * 2, v, u64(vl * 2))
+        len += vl
+        store_u16(block, len * 2, 0)
+        len += 1
+        blk_free(k)
+        blk_free(v)
+    store_u16(block, len * 2, 0)
+    len += 1
+    # an empty block still needs two NULs
+    if len == 1:
+        store_u16(block, len * 2, 0)
+    blk_free(wk)
+    blk_free(wv)
+    return block
+
+# Is C string a "PATH", ignoring ASCII case?
+fn os_is_path(a: ptr) -> bool:
+    let want = ptr_of("PATH") + STR_DATA
+    for i in 0..5:
+        var c = load_u8(a, i)
+        if c >= 97 and c <= 122:
+            c -= 32
+        if c != load_u8(want, i):
+            return false
+    return true
+
+# Starts the process; false with *err set if it couldn't be started.
+fn os_start(
+    rec: ptr,
+    cv: ptr,
+    n: int,
+    ek: ptr,
+    ev: ptr,
+    ne: int,
+    capture: bool,
+    stdin_ok: bool,
+    err: ptr
+) -> bool:
+    if os_is("windows"):
+        # the program is looked up on the child's PATH
+        var path_var = null_ptr()
+        for i in 0..ne:
+            if os_is_path(load_ptr(ek, i * 8)):
+                if addr(path_var) != 0:
+                    blk_free(path_var)
+                path_var = os_wide(load_ptr(ev, i * 8))
+        if addr(path_var) == 0:
+            let pw = os_wide(ptr_of("PATH") + STR_DATA)
+            let need = GetEnvironmentVariableW(pw, null_ptr(), 0)
+            if need != 0:
+                path_var = blk_alloc(2 * int(need))
+                if GetEnvironmentVariableW(pw, path_var, need) == 0:
+                    store_u16(path_var, 0, 0)
+            blk_free(pw)
+        let app = os_find_program(load_ptr(cv, 0), path_var)
+        if addr(path_var) != 0:
+            blk_free(path_var)
+        if addr(app) == 0:
+            store_ptr(err, 0, os_msg("program not found"))
+            return false
+        let sb = stack_mem(24)
+        brine_sb_init(sb)
+        os_append_arg(sb, load_ptr(cv, 0), true)
+        for i in 1..n:
+            sb_byte(sb, 32)
+            os_append_arg(sb, load_ptr(cv, i * 8), false)
+        let line = brine_sb_finish(sb)
+        let wl = os_wide(line + STR_DATA)
+        str_release(line)
+        let block = os_env_block(ek, ev, ne)
+        var in_h = null_ptr()
+        var out_h = null_ptr()
+        var err_h = null_ptr()
+        if stdin_ok:
+            in_h = os_inheritable(GetStdHandle(STD_INPUT))
+        else:
+            # SECURITY_ATTRIBUTES: nLength, the descriptor, bInheritHandle
+            let sa = stack_mem(24)
+            memset(sa, 0, 24)
+            store_u32(sa, 0, 24)
+            store_u32(sa, 16, 1)
+            let nul = os_wide(ptr_of("NUL") + STR_DATA)
+            # GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE
+            in_h = CreateFileW(nul, 0x80000000, 3, sa, OPEN_EXISTING, 0, null_ptr())
+            blk_free(nul)
+            if in_h == os_bad_handle():
+                in_h = null_ptr()
+        var ok = true
+        store_ptr(rec, PR_OUT, os_bad_handle())
+        store_ptr(rec, PR_ERR, os_bad_handle())
+        if capture:
+            let of = os_capture_file()
+            store_ptr(rec, PR_OUT, of)
+            if of != os_bad_handle():
+                store_ptr(rec, PR_ERR, os_capture_file())
+            if load_ptr(rec, PR_ERR) == os_bad_handle():
+                store_ptr(err, 0, os_err(int(GetLastError())))
+                ok = false
+            out_h = os_inheritable(of)
+            err_h = os_inheritable(load_ptr(rec, PR_ERR))
+        else:
+            out_h = os_inheritable(GetStdHandle(STD_OUTPUT))
+            err_h = os_inheritable(GetStdHandle(STD_ERROR))
+        if ok:
+            let si = stack_mem(SI_SIZE)
+            memset(si, 0, u64(SI_SIZE))
+            store_u32(si, 0, u32(SI_SIZE))
+            # STARTF_USESTDHANDLES
+            store_u32(si, SI_FLAGS, 0x100)
+            store_ptr(si, SI_IN, in_h)
+            store_ptr(si, SI_OUT, out_h)
+            store_ptr(si, SI_ERR, err_h)
+            let pi = stack_mem(24)
+            # CREATE_UNICODE_ENVIRONMENT
+            if (
+                CreateProcessW(app, wl, null_ptr(), null_ptr(), 1, 0x400, block, null_ptr(), si, pi)
+                == 0
+            ):
+                store_ptr(err, 0, os_err(int(GetLastError())))
+                ok = false
+            else:
+                CloseHandle(load_ptr(pi, PI_THREAD))
+                store_ptr(rec, PR_PROC, load_ptr(pi, PI_PROC))
+        if addr(in_h) != 0:
+            CloseHandle(in_h)
+        if addr(out_h) != 0:
+            CloseHandle(out_h)
+        if addr(err_h) != 0:
+            CloseHandle(err_h)
+        if not ok:
+            if load_ptr(rec, PR_OUT) != os_bad_handle():
+                CloseHandle(load_ptr(rec, PR_OUT))
+            if load_ptr(rec, PR_ERR) != os_bad_handle():
+                CloseHandle(load_ptr(rec, PR_ERR))
+        if addr(block) != 0:
+            blk_free(block)
+        blk_free(wl)
+        blk_free(app)
+        return ok
+    else:
+        # the environment: the parent's, minus overridden names, plus the
+        # overrides
+        let env = os_environ()
+        var np = 0
+        while addr(load_ptr(env, np * 8)) != 0:
+            np += 1
+        let envp = blk_alloc(8 * (np + ne + 1))
+        let owned = blk_alloc(8 * (ne + 1))
+        var k = 0
+        for j in 0..np:
+            let e = load_ptr(env, j * 8)
+            var skip = false
+            for i in 0..ne:
+                let key = load_ptr(ek, i * 8)
+                let kl = strlen(key)
+                if strncmp(e, key, kl) == 0 and load_u8(e, int(kl)) == 61:
+                    skip = true
+                    break
+            if not skip:
+                store_ptr(envp, k * 8, e)
+                k += 1
+        for i in 0..ne:
+            let key = load_ptr(ek, i * 8)
+            let v = load_ptr(ev, i * 8)
+            let kl = int(strlen(key))
+            let vl = int(strlen(v))
+            let o = blk_alloc(kl + vl + 2)
+            memcpy(o, key, u64(kl))
+            store_u8(o, kl, 61)
+            memcpy(o + kl + 1, v, u64(vl + 1))
+            store_ptr(owned, i * 8, o)
+            store_ptr(envp, k * 8, o)
+            k += 1
+        store_ptr(envp, k * 8, null_ptr())
+        # posix_spawn_file_actions_t, posix_spawnattr_t and sigset_t, with
+        # room to spare (glibc: 80, 336 and 128 bytes; macOS: 8, 8 and 4)
+        let fa = stack_mem(128)
+        posix_spawn_file_actions_init(fa)
+        let attr = stack_mem(512)
+        posix_spawnattr_init(attr)
+        # like Rust: the child starts with SIGPIPE at its default action
+        let def = stack_mem(128)
+        sigemptyset(def)
+        sigaddset(def, 13)
+        posix_spawnattr_setsigdefault(attr, def)
+        # POSIX_SPAWN_SETSIGDEF
+        posix_spawnattr_setflags(attr, i16(4))
+        store_i64(rec, PR_OUT, -1)
+        store_i64(rec, PR_ERR, -1)
+        if not stdin_ok:
+            posix_spawn_file_actions_addopen(fa, 0, ptr_of("/dev/null") + STR_DATA, 0, 0)
+        var r = 0
+        if capture:
+            os_set_errno(0)
+            let o = os_capture_fd()
+            store_i64(rec, PR_OUT, o)
+            var e = -1
+            if o >= 0:
+                e = os_capture_fd()
+                store_i64(rec, PR_ERR, e)
+            if o < 0 or e < 0:
+                r = os_errno()
+                if r == 0:
+                    r = EIO
+            else:
+                posix_spawn_file_actions_adddup2(fa, i32(o), 1)
+                posix_spawn_file_actions_adddup2(fa, i32(e), 2)
+        if r == 0:
+            r = int(posix_spawnp(rec + PR_PROC, load_ptr(cv, 0), fa, attr, cv, envp))
+        posix_spawn_file_actions_destroy(fa)
+        posix_spawnattr_destroy(attr)
+        if r != 0:
+            store_ptr(err, 0, os_err(r))
+            if load_i64(rec, PR_OUT) >= 0:
+                close(i32(load_i64(rec, PR_OUT)))
+            if load_i64(rec, PR_ERR) >= 0:
+                close(i32(load_i64(rec, PR_ERR)))
+        for i in 0..ne:
+            blk_free(load_ptr(owned, i * 8))
+        blk_free(owned)
+        blk_free(envp)
+        return r == 0
+
+fn brine_os_spawn(cmd: ptr, env: ptr, capture: bool, stdin_ok: bool, handle: ptr, err: ptr) -> bool:
+    store_i64(handle, 0, 0)
+    if not capture:
+        brine_flush()
+    let t = global_mem("os_procs", 32)
+    let mu = global_mem("os_proc_mu", 64)
+    if load_i64(t, PT_READY) == 0:
+        if os_is("windows"):
+            InitializeCriticalSection(mu)
+        else:
+            pthread_mutex_init(mu, null_ptr())
+        store_i64(t, PT_READY, 1)
+    let n = load_i64(cmd, ARR_LEN)
+    if n == 0:
+        store_ptr(err, 0, os_msg("os.spawn needs a program name, but the command list is empty"))
+        return false
+    let d = load_ptr(cmd, ARR_DATA)
+    let cv = blk_alloc(8 * (n + 1))
+    var ok = true
+    var bad_name = false
+    for i in 0..n:
+        let c = os_cstr(load_ptr(d, i * 8))
+        store_ptr(cv, i * 8, c)
+        if addr(c) == 0:
+            ok = false
+    store_ptr(cv, n * 8, null_ptr())
+    # the environment overrides
+    let used = load_i64(env, MAP_USED)
+    let ek = blk_alloc(8 * (used + 1))
+    let ev = blk_alloc(8 * (used + 1))
+    var ne = 0
+    let live = load_ptr(env, MAP_LIVE)
+    for i in 0..used:
+        if load_u8(live, i) == 0:
+            continue
+        let k = os_cstr(load_ptr(load_ptr(env, MAP_KEYS), i * 8))
+        let v = os_cstr(load_ptr(load_ptr(env, MAP_VALS), i * 8))
+        store_ptr(ek, ne * 8, k)
+        store_ptr(ev, ne * 8, v)
+        if addr(k) == 0 or addr(v) == 0:
+            ok = false
+        elif load_u8(k, 0) == 0 or addr(memchr(k + 1, 61, strlen(k + 1))) != 0:
+            bad_name = true
+        ne += 1
+    let rec = stack_mem(PR_SIZE)
+    memset(rec, 0, u64(PR_SIZE))
+    store_u8(rec, PR_CAPTURE, 1 if capture else 0)
+    if not ok:
+        store_ptr(err, 0, os_msg("nul byte found in provided data"))
+    elif bad_name:
+        store_ptr(err, 0, os_msg("os.spawn: invalid environment variable name"))
+        ok = false
+    else:
+        fflush(os_stdio(1))
+        fflush(os_stdio(2))
+        ok = os_start(rec, cv, n, ek, ev, ne, capture, stdin_ok, err)
+    blk_free(cv)
+    blk_free(ek)
+    blk_free(ev)
+    if not ok:
+        return false
+    os_lock(mu)
+    var np = load_i64(t, PT_N)
+    if np == load_i64(t, PT_CAP):
+        let cap = load_i64(t, PT_CAP) * 2 if load_i64(t, PT_CAP) != 0 else 8
+        store_i64(t, PT_CAP, cap)
+        store_ptr(t, PT_P, brine_x_realloc(load_ptr(t, PT_P), PR_SIZE * cap))
+    memcpy(load_ptr(t, PT_P) + np * PR_SIZE, rec, u64(PR_SIZE))
+    np += 1
+    store_i64(t, PT_N, np)
+    store_i64(handle, 0, np)
+    os_unlock(mu)
+    return true
+
+# Has it exited? (block: wait until it has.) Collects its output when it has.
+fn os_proc_reap(p: ptr, block: bool) -> bool:
+    if load_u8(p, PR_DONE) != 0:
+        return true
+    var code = 0
+    let capture = load_u8(p, PR_CAPTURE) != 0
+    if os_is("windows"):
+        let h = load_ptr(p, PR_PROC)
+        # WAIT_OBJECT_0
+        if WaitForSingleObject(h, INFINITE if block else 0) != 0:
+            return false
+        let c = stack_mem(8)
+        store_u32(c, 0, 0)
+        GetExitCodeProcess(h, c)
+        CloseHandle(h)
+        store_ptr(p, PR_PROC, null_ptr())
+        code = int(load_i32(c, 0))
+    else:
+        let st = stack_mem(8)
+        store_i64(st, 0, 0)
+        var r: i32 = 0
+        while true:
+            # WNOHANG
+            r = waitpid(load_i32(p, PR_PROC), st, 0 if block else 1)
+            if r >= 0 or os_errno() != EINTR:
+                break
+        if r == 0:
+            return false
+        let s = int(load_i32(st, 0))
+        # WIFEXITED: the exit code, else 101
+        code = 101 if r < 0 or s & 0x7f != 0 else (s >> 8) & 0xff
+    store_ptr(p, PR_OUTS, os_read_capture(load_ptr(p, PR_OUT)) if capture else new_str(0))
+    store_ptr(p, PR_ERRS, os_read_capture(load_ptr(p, PR_ERR)) if capture else new_str(0))
+    store_u8(p, PR_DONE, 1)
+    store_i64(p, PR_CODE, code)
+    return true
+
+# The process for a handle, with the lock held (panics on a bad handle).
+fn os_proc_lock(h: int, what: str, loc: ptr) -> ptr:
+    # nothing was spawned: always invalid
+    if load_i64(global_mem("os_procs", 32), PT_READY) == 0:
+        os_proc_get(h, what, loc)
+    os_lock(global_mem("os_proc_mu", 64))
+    return os_proc_get(h, what, loc)
+
+fn brine_os_wait(handle: int, loc: ptr) -> int:
+    let p = os_proc_lock(handle, "os.wait", loc)
+    os_proc_reap(p, true)
+    let c = load_i64(p, PR_CODE)
+    os_unlock(global_mem("os_proc_mu", 64))
+    return c
+
+fn brine_os_poll(handle: int, code: ptr, loc: ptr) -> bool:
+    let p = os_proc_lock(handle, "os.poll", loc)
+    let done = os_proc_reap(p, false)
+    store_i64(code, 0, load_i64(p, PR_CODE) if done else 0)
+    os_unlock(global_mem("os_proc_mu", 64))
+    return done
+
+fn brine_os_kill(handle: int, loc: ptr):
+    let p = os_proc_lock(handle, "os.kill", loc)
+    if load_u8(p, PR_DONE) == 0:
+        if os_is("windows"):
+            TerminateProcess(load_ptr(p, PR_PROC), 1)
+        else:
+            # SIGKILL
+            kill(load_i32(p, PR_PROC), 9)
+        os_proc_reap(p, true)
+    os_unlock(global_mem("os_proc_mu", 64))
+
+fn brine_os_output(handle: int, out: ptr, err: ptr, loc: ptr):
+    let p = os_proc_lock(handle, "os.output", loc)
+    if not os_proc_reap(p, false):
+        os_unlock(global_mem("os_proc_mu", 64))
+        brine_panic_at(loc, "os.output: the process is still running; call os.wait first")
+    let o = load_ptr(p, PR_OUTS)
+    let e = load_ptr(p, PR_ERRS)
+    str_retain(o)
+    str_retain(e)
+    store_ptr(out, 0, o)
+    store_ptr(err, 0, e)
+    os_unlock(global_mem("os_proc_mu", 64))
+
+# At exit: drops what finished processes wrote (running ones are left
+# alone). Called by brine_rt_shutdown.
+fn brine_x_os_procs_free():
+    let t = global_mem("os_procs", 32)
+    let n = load_i64(t, PT_N)
+    for i in 0..n:
+        let p = load_ptr(t, PT_P) + i * PR_SIZE
+        if load_u8(p, PR_DONE) == 0:
+            continue
+        str_release(load_ptr(p, PR_OUTS))
+        str_release(load_ptr(p, PR_ERRS))
+        store_ptr(p, PR_OUTS, null_ptr())
+        store_ptr(p, PR_ERRS, null_ptr())
+    brine_free(load_ptr(t, PT_P))
+    store_ptr(t, PT_P, null_ptr())
+    store_i64(t, PT_N, 0)
+    store_i64(t, PT_CAP, 0)
+
+# ---- program arguments
+fn brine_args() -> ptr:
+    let pa = stack_mem(8)
+    store_ptr(pa, 0, new_strs())
+    var i = 1
+    while true:
+        let a = brine_arg(i)
+        if addr(a) == 0:
+            break
+        push_str(pa, os_text(a))
+        i += 1
+    return load_ptr(pa, 0)

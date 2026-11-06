@@ -2621,11 +2621,13 @@ double brine_clock(void) {
 }
 #endif
 const char *brine_arg(int64_t i) { return i >= 0 && i < br_argc ? br_argv[i] : NULL; }
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_arr *brine_args(void) {
     brine_arr *a = br_strs();
     for (int i = 1; i < br_argc; i++) br_push_str(&a, brine_str_new(br_argv[i], (int64_t)strlen(br_argv[i])));
     return a;
 }
+#endif
 
 /* ============================================================ thread pool */
 typedef struct br_job {
@@ -5563,6 +5565,7 @@ void brine_rt_shutdown(void) {
 extern char **environ;
 #endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 static void *br_grow(void *p, size_t n) {
     void *q = realloc(p, n ? n : 1);
     if (!q) {
@@ -5608,7 +5611,6 @@ static int64_t br_utf8_bad(const unsigned char *p, int64_t n) {
 }
 static int br_valid_utf8(const unsigned char *p, int64_t n) { return br_utf8_bad(p, n) < 0; }
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_str_from_utf8(brine_arr *a, brine_str **out) {
     int64_t bad = br_utf8_bad((const unsigned char *)a->data, a->len);
     if (bad >= 0) {
@@ -5619,7 +5621,6 @@ bool brine_str_from_utf8(brine_arr *a, brine_str **out) {
     *out = brine_str_new(a->data, a->len);
     return true;
 }
-#endif
 
 /* text read from outside as a string: bytes that aren't UTF-8 become U+FFFD */
 static brine_str *br_lossy_str(const char *p, int64_t n) {
@@ -5697,7 +5698,6 @@ static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) 
     return !bad;
 }
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_read_file(brine_str *path, brine_str **out) {
     char *buf;
     size_t len;
@@ -5713,9 +5713,7 @@ bool brine_read_file(brine_str *path, brine_str **out) {
     free(buf);
     return ok;
 }
-#endif
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_read_bytes(brine_str *path, brine_arr **out, brine_str **err) {
     char *buf;
     size_t len;
@@ -5726,7 +5724,6 @@ bool brine_os_read_bytes(brine_str *path, brine_arr **out, brine_str **err) {
     *out = a;
     return true;
 }
-#endif
 
 /* writes (mode "wb") or appends ("ab") n bytes to the file at `path` */
 static bool br_put_file(brine_str *path, const char *data, int64_t n, const char *mode, brine_str **err) {
@@ -5750,26 +5747,18 @@ static bool br_put_file(brine_str *path, const char *data, int64_t n, const char
     return !bad;
 }
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_write_file(brine_str *path, brine_str *text, brine_str **err) {
     return br_put_file(path, text->data, text->len, "wb", err);
 }
-#endif
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_append_file(brine_str *path, brine_str *text, brine_str **err) {
     return br_put_file(path, text->data, text->len, "ab", err);
 }
-#endif
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_write_bytes(brine_str *path, brine_arr *data, brine_str **err) {
     return br_put_file(path, data->data, data->len, "wb", err);
 }
-#endif
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_append_bytes(brine_str *path, brine_arr *data, brine_str **err) {
     return br_put_file(path, data->data, data->len, "ab", err);
 }
-#endif
 
 /* ============================================================ stdin */
 /* Read with read() / ReadFile, which return what has arrived, so a program
@@ -5864,7 +5853,6 @@ static bool br_in_fill(void) {
     br_in.len += got;
     return true;
 }
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_input(brine_str *prompt) {
     br_lock(&br_io_mu);
     if (prompt && prompt->len) fwrite(prompt->data, 1, (size_t)prompt->len, stdout);
@@ -5892,8 +5880,6 @@ brine_str *brine_input(brine_str *prompt) {
     if (n > 0 && line[n - 1] == '\r') n--;
     return br_lossy_str(line, n);
 }
-#endif
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_read_stdin(brine_str **out) {
     brine_flush();
     while (br_in_fill()) {
@@ -5912,9 +5898,7 @@ bool brine_read_stdin(brine_str **out) {
     *out = brine_str_new(n ? p : "", n);
     return true;
 }
-#endif
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_file_exists(brine_str *path) {
     char *p = br_cstr(path);
     if (!p) return false;
@@ -5931,10 +5915,8 @@ bool brine_file_exists(brine_str *path) {
     return r == 0;
 #endif
 }
-#endif
 
 /* the variable's value, or NULL when it isn't set */
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_getenv(brine_str *name) {
     char *n = br_cstr(name);
     if (!n || !n[0] || strchr(n, '=')) {
@@ -5966,7 +5948,6 @@ brine_str *brine_getenv(brine_str *name) {
     return v ? brine_str_new(v, (int64_t)strlen(v)) : NULL;
 #endif
 }
-#endif
 
 #ifdef _WIN32
 /* append one argument to a command line, quoted so the child's argv parser gets it back unchanged */
@@ -5995,7 +5976,6 @@ static void br_quote_arg(brine_sb *sb, const char *a) {
 #endif
 
 /* Run a program and wait for it. false (with *err set) if it couldn't be started. */
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_run(brine_arr *argv, int64_t *code, brine_str **err) {
     *code = 0;
     /* the child writes to the same stdout: what we printed comes first */
@@ -6071,7 +6051,6 @@ bool brine_run(brine_arr *argv, int64_t *code, brine_str **err) {
     free(cv);
     return ok;
 }
-#endif
 
 /* ============================================================ the os module */
 #ifndef _WIN32
@@ -6156,7 +6135,6 @@ static brine_str *br_lossy(const unsigned char *p, size_t n) {
 
 static int br_cmp_strp(const void *a, const void *b) { return brine_str_cmp(*(brine_str *const *)a, *(brine_str *const *)b); }
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_list_dir(brine_str *path, brine_arr **out, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
@@ -6213,7 +6191,6 @@ bool brine_os_list_dir(brine_str *path, brine_arr **out, brine_str **err) {
     *out = a;
     return true;
 }
-#endif
 
 /* 0: missing, 1: regular file, 2: directory, 3: something else. Follows links. */
 static int br_kind(const char *p) {
@@ -6240,7 +6217,6 @@ static int br_kind(const char *p) {
 #endif
 }
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_is_dir(brine_str *path) {
     char *p = br_cstr(path);
     if (!p) return false;
@@ -6248,9 +6224,7 @@ bool brine_os_is_dir(brine_str *path) {
     free(p);
     return k == 2;
 }
-#endif
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_is_file(brine_str *path) {
     char *p = br_cstr(path);
     if (!p) return false;
@@ -6258,7 +6232,6 @@ bool brine_os_is_file(brine_str *path) {
     free(p);
     return k == 1;
 }
-#endif
 
 static int br_is_sep(char c) {
 #ifdef _WIN32
@@ -6325,7 +6298,6 @@ static int br_mkdir_all(const char *p) {
     return !e || br_kind(p) == 2 ? 0 : e;
 }
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_make_dir(brine_str *path, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
@@ -6338,9 +6310,7 @@ bool brine_os_make_dir(brine_str *path, brine_str **err) {
     else if (e) *err = br_os_err(e);
     return e == 0;
 }
-#endif
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_remove_file(brine_str *path, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
@@ -6358,9 +6328,7 @@ bool brine_os_remove_file(brine_str *path, brine_str **err) {
     if (e) *err = br_os_err(e);
     return e == 0;
 }
-#endif
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_rename(brine_str *src, brine_str *dst, brine_str **err) {
     char *a = br_cstr(src), *b = br_cstr(dst);
     if (!a || !b) {
@@ -6382,9 +6350,7 @@ bool brine_os_rename(brine_str *src, brine_str *dst, brine_str **err) {
     if (e) *err = br_os_err(e);
     return e == 0;
 }
-#endif
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_os_cwd(void) {
 #ifdef _WIN32
     DWORD n = GetCurrentDirectoryW(0, NULL);
@@ -6408,9 +6374,7 @@ brine_str *brine_os_cwd(void) {
     }
 #endif
 }
-#endif
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_set_cwd(brine_str *path, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
@@ -6428,13 +6392,11 @@ bool brine_os_set_cwd(brine_str *path, brine_str **err) {
     if (e) *err = br_os_err(e);
     return e == 0;
 }
-#endif
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
 /* the absolute path of the running executable */
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_os_exe_path(void) {
 #ifdef _WIN32
     for (DWORD cap = 260; cap < (1u << 20); cap *= 2) {
@@ -6476,9 +6438,7 @@ brine_str *brine_os_exe_path(void) {
     const char *a0 = br_argv && br_argv[0] ? br_argv[0] : "";
     return brine_str_new(a0, (int64_t)strlen(a0));
 }
-#endif
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_os_temp_dir(void) {
     brine_str *s;
 #ifdef _WIN32
@@ -6507,9 +6467,7 @@ brine_str *brine_os_temp_dir(void) {
     }
     return s;
 }
-#endif
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_abs_path(brine_str *path, brine_str **out, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
@@ -6552,10 +6510,8 @@ bool brine_os_abs_path(brine_str *path, brine_str **out, brine_str **err) {
     return true;
 #endif
 }
-#endif
 
 /* the names Rust uses in std::env::consts */
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_os_name(void) {
 #if defined(_WIN32)
     const char *n = "windows";
@@ -6582,9 +6538,7 @@ brine_str *brine_os_name(void) {
 #endif
     return brine_str_new(n, (int64_t)strlen(n));
 }
-#endif
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str *brine_os_arch(void) {
 #if defined(__wasm32__)
     const char *n = "wasm32";
@@ -6653,6 +6607,7 @@ void brine_os_sleep(double seconds) {
 }
 #endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 #ifdef _WIN32
 /* an MSYS/Cygwin terminal is a named pipe called like `msys-...-pty0-to-master` (same test as Rust) */
 static int br_msys_tty(HANDLE h) {
@@ -6680,7 +6635,6 @@ static int br_msys_tty(HANDLE h) {
 }
 #endif
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 bool brine_os_is_terminal(int64_t fd) {
     if (fd < 0 || fd > 2) return false;
 #ifdef _WIN32
@@ -6694,9 +6648,7 @@ bool brine_os_is_terminal(int64_t fd) {
     return isatty((int)fd) == 1;
 #endif
 }
-#endif
 
-#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 void brine_os_enable_ansi(void) {
 #ifdef _WIN32
     DWORD which[2] = {STD_OUTPUT_HANDLE, STD_ERROR_HANDLE};
@@ -6707,7 +6659,6 @@ void brine_os_enable_ansi(void) {
     }
 #endif
 }
-#endif
 
 bool brine_os_free_ports(int64_t n, brine_arr **out, brine_str **err) {
 #ifdef BR_WASM
@@ -7347,6 +7298,10 @@ static void br_procs_free(void) {
     br_procs = NULL;
     br_nprocs = br_cap_procs = 0;
 }
+#else
+void brine_x_os_procs_free(void);
+static void br_procs_free(void) { brine_x_os_procs_free(); }
+#endif
 
 /* ------------------------------------------------------------ entry points for native code
  * Natively compiled brine (the x86-64 backend) can't call the `static inline`
