@@ -304,6 +304,163 @@ fn copy_chains(f: Func) -> Func:
     g.code = [x for i, x in enumerate(code) if not drop[i]]
     return g
 
+# A slot t filled by one copy from p (another slot, or a field of one),
+# `copy t <- p; ...; load [t + k]; copy u <- t`, then only read: its reads
+# read p instead where nothing between the copy and the read can change p
+# (the `?` and `match` of a struct moves it through several temporaries).
+# When every read can, the copy goes. Calls change only the slots they're
+# passed, since nothing else holds a slot's address.
+fn copy_forward(f: Func) -> Func:
+    let slot = slot_vregs(f)
+    let ns = len(f.slots)
+    let nv = len(f.vk)
+    let n = len(f.code)
+    var ndef = [0] * nv
+    for x in f.code:
+        if x.d >= 0:
+            ndef[x.d] += 1
+    # base[v]: the slot v points into (v is its address, one inside it, or a
+    # copy of one)
+    var base = slot
+    var more = true
+    while more:
+        more = false
+        for x in f.code:
+            if (
+                (x.op == Op.Elem or x.op == Op.Mov)
+                and base[x.d] < 0
+                and base[x.a] >= 0
+                and ndef[x.d] == 1
+                and x.d >= f.nparams
+            ):
+                base[x.d] = base[x.a]
+                more = true
+    # esc[s]: s's address goes somewhere this pass doesn't follow; other[s]:
+    # s is read through an address inside it; wr[s]: the instructions that
+    # write s, rd[s]: those that read it through its own address
+    var esc = [false] * ns
+    var other = [false] * ns
+    var wr: [[int]] = [[] for _ in 0..ns]
+    var rd: [[int]] = [[] for _ in 0..ns]
+    for i, x in enumerate(f.code):
+        if x.op == Op.SlotAddr:
+            if base[x.d] < 0:
+                esc[x.a] = true
+            continue
+        if same_slot(x, slot):
+            continue
+        if (x.op == Op.Elem or x.op == Op.Mov) and base[x.d] >= 0:
+            continue
+        var addr = -1
+        match x.op:
+            case Op.Load:
+                addr = x.a
+                if slot[x.a] >= 0:
+                    rd[slot[x.a]].push(i)
+                elif base[x.a] >= 0:
+                    other[base[x.a]] = true
+            case Op.Store | Op.Zero:
+                addr = x.a
+                if base[x.a] >= 0:
+                    wr[base[x.a]].push(i)
+            case Op.Copy:
+                if base[x.a] >= 0:
+                    wr[base[x.a]].push(i)
+                if slot[x.b] >= 0 and base[x.a] != slot[x.b]:
+                    rd[slot[x.b]].push(i)
+                elif base[x.b] >= 0:
+                    other[base[x.b]] = true
+                for v in reads(x, nv):
+                    if v != x.a and v != x.b and base[v] >= 0:
+                        esc[base[v]] = true
+                continue
+            case Op.Call:
+                for v in x.args:
+                    if base[v] >= 0:
+                        wr[base[v]].push(i)
+                continue
+            case _:
+                pass
+        for v in reads(x, nv):
+            if v != addr and base[v] >= 0:
+                esc[base[v]] = true
+    # the jumps to each label
+    var from: [[int]] = [[] for _ in 0..f.nlabels]
+    for i, x in enumerate(f.code):
+        for l in ssa_targets(x):
+            from[l].push(i)
+    var code = f.code
+    var drop = [false] * n
+    # (in order of their copies, so a chain t1 <- p, t2 <- t1 reads p)
+    var order: [(int, int)] = []
+    for t in 0..ns:
+        if not esc[t] and not other[t] and len(wr[t]) == 1 and len(rd[t]) > 0:
+            let a = wr[t][0]
+            let x = f.code[a]
+            if x.op == Op.Copy and slot[x.a] == t and x.n == f.slots[t].size:
+                order.push((a, t))
+    order.sort()
+    for at in order:
+        let a = at.0
+        let t = at.1
+        let p = code[a].b
+        let ps = base[p]
+        if ps < 0 or ps == t or esc[ps] or ndef[p] != 1:
+            continue
+        var all = true
+        for u in rd[t]:
+            if u <= a or u - a > 4000 or not unchanged(code, from, base, a, u, ps):
+                all = false
+                continue
+            # (memcpy's regions can't overlap)
+            if code[u].op == Op.Copy and base[code[u].a] == ps:
+                all = false
+                continue
+            if code[u].op == Op.Load:
+                code[u].a = p
+            else:
+                code[u].b = p
+        if all:
+            drop[a] = true
+    var g = f
+    g.code = [x for i, x in enumerate(code) if not drop[i]]
+    return g
+
+# Nothing after code[a] and before code[u] writes slot ps, and control
+# reaches u from a only through code in between.
+fn unchanged(code: [Inst], from: [[int]], base: [int], a: int, u: int, ps: int) -> bool:
+    for i in a + 1..u:
+        let y = code[i]
+        match y.op:
+            case Op.Label:
+                for j in from[y.n]:
+                    if j < a or j > u:
+                        return false
+            case Op.Store | Op.Zero | Op.Copy:
+                if base[y.a] == ps:
+                    return false
+            case Op.Call:
+                for v in y.args:
+                    if base[v] == ps:
+                        return false
+            case Op.CallInd:
+                return false
+            case _:
+                pass
+    return true
+
+# The labels a terminator can go to (ssa.targets).
+fn ssa_targets(x: Inst) -> [int]:
+    match x.op:
+        case Op.Jmp:
+            return [x.n]
+        case Op.Br | Op.BrNot:
+            return [x.n, x.c] if x.c >= 0 else [x.n]
+        case Op.Switch:
+            return x.args
+        case _:
+            return []
+
 # The unsigned kind of n bytes (1, 2, 4 or 8).
 fn ukind(n: int) -> K:
     if n == 1:
@@ -580,7 +737,7 @@ fn borrowed_rc(f: Func) -> Func:
     return g
 
 fn promote(f0: Func) -> Func:
-    let f = pack_copies(copy_chains(f0))
+    let f = pack_copies(copy_chains(copy_forward(f0)))
     let slot = slot_vregs(f)
     let fs = promotable(f, slot)
     var g = f
