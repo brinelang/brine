@@ -1341,6 +1341,90 @@ fn bit_loads(ref sf: SF):
                 code.push(x)
         sf.bs[b].code = code
 
+# An integer kind of 64 bits or less (a 128-bit value converted to it keeps
+# its low word).
+fn narrow_int(k: K) -> bool:
+    return not k.is_wide() and not k.is_float() and k != K.Bool
+
+# A 128-bit load only ever cut down to 64 bits or less, as it is or after a
+# shift right by 64 (a hash of an i128: its two words): two 64-bit loads
+# instead, so no 128-bit value is made, kept in the frame and taken apart.
+fn wide_halves(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var users: [[(int, int)]] = [[] for _ in 0..nv]
+    var c64 = [false] * nv
+    for b in 0..len(sf.bs):
+        for i, x in enumerate(sf.bs[b].code):
+            if x.op == Op.Const and x.n == 64 and x.c == 0:
+                c64[x.d] = true
+            for u in uses(x):
+                users[u].push((b, i))
+    var gone: [[bool]] = [[false] * len(b.code) for b in sf.bs]
+    var hi_after: [[int]] = [[-1] * len(b.code) for b in sf.bs]
+    var any = false
+    for lb in 0..len(sf.bs):
+        for li in 0..len(sf.bs[lb].code):
+            let ld = sf.bs[lb].code[li]
+            if ld.op != Op.Load or not sf.f.vk[ld.d].is_wide():
+                continue
+            # the load and its 128-bit conversions; what reads their words
+            var al = [ld.d]
+            var lows: [(int, int)] = []
+            var highs: [(int, int)] = []
+            var dead: [(int, int)] = []
+            var ok = true
+            var k = 0
+            while k < len(al) and ok:
+                let v = al[k]
+                k += 1
+                for ub, ui in users[v]:
+                    let y = sf.bs[ub].code[ui]
+                    if y.op == Op.Conv and sf.f.vk[y.d].is_wide():
+                        al.push(y.d)
+                        dead.push((ub, ui))
+                    elif y.op == Op.Conv and narrow_int(sf.f.vk[y.d]):
+                        lows.push((ub, ui))
+                    elif y.op == Op.Shr and y.a == v and y.b != v and c64[y.b]:
+                        dead.push((ub, ui))
+                        for hb, hi in users[y.d]:
+                            let z = sf.bs[hb].code[hi]
+                            if z.op == Op.Conv and narrow_int(sf.f.vk[z.d]):
+                                highs.push((hb, hi))
+                            else:
+                                ok = false
+                    else:
+                        ok = false
+            if not ok:
+                continue
+            any = true
+            let lo = len(sf.f.vk)
+            sf.f.vk.push(K.U64)
+            sf.bs[lb].code[li].d = lo
+            for ub, ui in lows:
+                sf.bs[ub].code[ui].a = lo
+            if len(highs) > 0:
+                let hv = len(sf.f.vk)
+                sf.f.vk.push(K.U64)
+                hi_after[lb][li] = hv
+                for hb, hi in highs:
+                    sf.bs[hb].code[hi].a = hv
+            for db, di in dead:
+                gone[db][di] = true
+    if not any:
+        return
+    for b in 0..len(sf.bs):
+        var code: [Inst] = []
+        for i, x in enumerate(sf.bs[b].code):
+            if gone[b][i]:
+                continue
+            code.push(x)
+            if hi_after[b][i] >= 0:
+                var y = x
+                y.d = hi_after[b][i]
+                y.n = x.n + 8
+                code.push(y)
+        sf.bs[b].code = code
+
 # ================================================================ memory
 
 # The slots whose address only ever serves as the address of a load, a store,
@@ -3592,6 +3676,7 @@ fn optimize(f: Func, vw: int, a64: bool) -> (Func, [KFunc]):
     gvn(ref sf, a64)
     copies(ref sf)
     bit_loads(ref sf)
+    wide_halves(ref sf)
     # dead phis (of inlined calls' results) would hide loops' shapes
     dce(ref sf)
     # (a64.br: loop kernels of two lanes, which it makes NEON code)
