@@ -309,8 +309,8 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
       ─► uniform (deadlock freedom for `world`)
       ─► verifier (symbolic execution + solver; proves contracts, elides runtime checks)
       ─► lowering to brine IR (lower.br)
-      ─► x86-64 machine code (x64.br) ─► link.br            every build on x86-64 Windows/Linux
-       └► AArch64 machine code (a64.br) ─► link.br          dev and --debug builds on AArch64 Linux
+      ─► x86-64 machine code (x64.br) ─► link.br            every build on x86-64 Windows/Linux/macOS
+       └► AArch64 machine code (a64.br) ─► link.br          dev and --debug builds on AArch64 Linux/macOS
        └► C11 (ir_c.br) ─► system C compiler + brine_rt.c  --release on AArch64, other platforms
       ─► native binary
 ```
@@ -364,10 +364,12 @@ reads it:
   compiler. It's the default for every build there (release builds run the
   SSA optimizer, debug builds add DWARF and skip the optimizations). The
   runtime is brine too (`runtime/rt.br`), and `link.br` writes the executable:
-  a PE or ELF file that imports the system's own libraries, so no C compiler
-  is involved.
-* **AArch64** (`a64.br`): the same design for 64-bit ARM, writing ELF objects
-  (Linux) through `obj.br`, with .eh_frame unwind info and the same DWARF.
+  a PE, ELF or Mach-O file that imports the system's own libraries, so no C
+  compiler is involved. Mach-O executables bind to libSystem through dyld's
+  opcodes and carry the ad-hoc code signature Apple silicon requires; their
+  debug info stays in a `__DWARF` segment, where lldb reads it.
+* **AArch64** (`a64.br`): the same design for 64-bit ARM (Linux and macOS),
+  with .eh_frame unwind info and the same DWARF.
 * **PTX** (`ptx.br`) and **Metal** (`msl.br`): GPU kernels for the `par`
   constructs that can run on a GPU (§2.3), next to the machine or C code for the
   CPU. `ptx.br` also decides which constructs are eligible, for both. Metal has no
@@ -464,10 +466,9 @@ lot to do before then. The order below is a plan, not a promise.
 **Done (0.2):** brine IR; native x86-64 backend (COFF and ELF); C from the IR, in
 parallel translation units with per-unit caching.
 
-**Backends:** Mach-O objects, so macOS on Apple silicon gets native dev builds; CodeView debug info (for Visual Studio/WinDbg);
-register allocation and optimization passes on the IR; a built-in linker and a
-prebuilt runtime, so builds don't need a C toolchain at all; SIMD, MSVC support for
-the C backend. GPUs (§2.3): arrays kept on the device between constructs, `par(...)`
+**Backends:** an optimizing AArch64 backend, so release builds on Apple silicon and
+ARM Linux need no C compiler either; CodeView debug info (for Visual Studio/WinDbg);
+MSVC support for the C backend. GPUs (§2.3): arrays kept on the device between constructs, `par(...)`
 forks and nested constructs.
 
 **WebAssembly:** `--target wasm` and `web` compile the generated C with wasi-sdk
