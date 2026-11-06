@@ -17,6 +17,7 @@
 from ir import K, Op, Inst, Func
 from opt import reads
 from ra import is_term, interferes, add_edge, find, int_div_rt
+from ssa import Block, postorder, idoms
 
 struct RA64:
     # the register of each vreg (-1: its home in the frame)
@@ -121,6 +122,49 @@ fn sets_args(x: Inst, vk: [K]) -> bool:
         case _:
             return callish(x, vk)
 
+# Each block's loop depth: how many natural loops (a back edge's target, the
+# header, dominates its source) hold it. Not from the code's order: slow paths
+# sit after their loop and jump back into it, without being in it.
+fn loop_depth(succ: [[int]]) -> [int]:
+    let nb = len(succ)
+    var bs: [Block] = [Block(label=b, code=[], succ=succ[b], pred=[]) for b in 0..nb]
+    for b in 0..nb:
+        for s in succ[b]:
+            bs[s].pred.push(b)
+    let idom = idoms(bs, postorder(bs))
+    var depth = [0] * nb
+    var mark = [-1] * nb
+    for h in 0..nb:
+        if idom[h] < 0:
+            continue
+        var work: [int] = []
+        for p in bs[h].pred:
+            if dominates(idom, h, p):
+                work.push(p)
+        if len(work) == 0:
+            continue
+        mark[h] = h
+        depth[h] += 1
+        while len(work) > 0:
+            let b = work.pop()
+            if mark[b] == h or idom[b] < 0:
+                continue
+            mark[b] = h
+            depth[b] += 1
+            for p in bs[b].pred:
+                work.push(p)
+    return depth
+
+fn dominates(idom: [int], h: int, b: int) -> bool:
+    if idom[b] < 0:
+        return false
+    var x = b
+    while x != h:
+        if x == 0:
+            return false
+        x = idom[x]
+    return true
+
 fn set_bit(ref bits: [int], j: int):
     bits[j >> 6] |= 1 << (j & 63)
 
@@ -213,24 +257,13 @@ fn allocate(f: Func, ok: [bool], cold: {str: bool}) -> RA64:
                     lin[b * wn + k] = n
                     changed = true
             b -= 1
-    # loop depth: a backward jump to label L puts L..jump in a loop
-    var depth = [0] * (ncode + 1)
-    var loops = false
-    for i in 0..ncode:
-        let x = f.code[i]
-        if x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot:
-            let l = lat[x.n]
-            if l >= 0 and l <= i:
-                depth[l] += 1
-                depth[i + 1] -= 1
-                loops = true
+    let bd = loop_depth(succ)
+    let loops = any(d > 0 for d in bd)
     var w = [0] * nc
     var iw = [0] * ncode
-    var dd = 0
     for i in 0..ncode:
         let x = f.code[i]
-        dd += depth[i]
-        let u = 1 << (3 * min(dd, 3))
+        let u = 1 << (3 * min(bd[bof[i]], 3))
         iw[i] = u
         if x.d >= 0 and ci[x.d] >= 0:
             w[ci[x.d]] += u
