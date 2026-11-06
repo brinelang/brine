@@ -323,6 +323,11 @@ struct A:
     fval: [int]
     # by vreg: the low 7 bits of a 128-bit constant (-1: not one), for shifts
     wshift: [int]
+    # the last st16: where its code ends, its registers and its home (a
+    # load right after it, that nothing jumps to, reads the registers)
+    st_end: int
+    st_lo: int
+    st_home: int
     nuse: [int]
     # sp-relative offset of each stack slot
     slot_off: [int]
@@ -720,6 +725,7 @@ struct A:
 
     fn here(ref self, at: int, kind: int):
         self.patch(at, self.pos(), kind)
+        self.st_end = -1
 
     fn bcc_stub(ref self, cc: int, kind: int, a: int, b: int, c: int):
         self.stubs.push(Stub(at=self.pos(), kind=kind, a=a, b=b, c=c))
@@ -843,10 +849,25 @@ struct A:
         return (self.use(r, p), n)
 
     fn copy16(ref self, db: int, dd: int, sb: int, sd: int):
-        self.ldst(M_LDRX, T2, sb, sd)
-        self.ldst(M_LDRX, T3, sb, sd + 8)
-        self.ldst(M_STRX, T2, db, dd)
-        self.ldst(M_STRX, T3, db, dd + 8)
+        var r = T2
+        if (
+            sb == SP
+            and self.st_end == self.pos()
+            and self.st_home == sd
+            and db != self.st_lo
+            and db != self.st_lo + 1
+        ):
+            # (just stored from registers: copy from them)
+            r = self.st_lo
+        else:
+            self.ldst(M_LDRX, T2, sb, sd)
+            self.ldst(M_LDRX, T3, sb, sd + 8)
+        self.ldst(M_STRX, r, db, dd)
+        self.ldst(M_STRX, r + 1, db, dd + 8)
+        if db == SP:
+            self.st_end = self.pos()
+            self.st_lo = r
+            self.st_home = dd
 
     # copies 128-bit vreg s to d
     fn copy_v16(ref self, d: int, s: int):
@@ -2096,6 +2117,7 @@ struct A:
                     self.ir_call(x)
             case Op.Label:
                 self.lpos[x.n] = self.pos()
+                self.st_end = -1
             case Op.Jmp:
                 # no jump to the next instruction
                 if not self.falls_to(i + 1, x.n):
@@ -2279,12 +2301,19 @@ struct A:
 
     # the two halves of 128-bit vreg v: x11, x12 (a) or x9, x10 (b)
     fn ld16(ref self, lo: int, v: int):
+        if self.st_end == self.pos() and self.st_home == self.home[v]:
+            self.mov_rr(lo, self.st_lo)
+            self.mov_rr(lo + 1, self.st_lo + 1)
+            return
         self.ldst(M_LDRX, lo, SP, self.home[v])
         self.ldst(M_LDRX, lo + 1, SP, self.home[v] + 8)
 
     fn st16(ref self, lo: int, v: int):
         self.ldst(M_STRX, lo, SP, self.home[v])
         self.ldst(M_STRX, lo + 1, SP, self.home[v] + 8)
+        self.st_end = self.pos()
+        self.st_lo = lo
+        self.st_home = self.home[v]
 
     fn wide_bin(ref self, x: Inst):
         let k = self.vk[x.d]
@@ -2992,6 +3021,9 @@ fn emit(m0: Module, dbg: bool, on: bool, src: str, comp_dir: str, producer: str)
         fold=[],
         fval=[],
         wshift=[],
+        st_end=-1,
+        st_lo=0,
+        st_home=0,
         nuse=[],
         slot_off=[],
         ploc=[],
