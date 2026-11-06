@@ -8852,7 +8852,7 @@ fn brine_par_run(lo: int, hi: int, nchunks: int, f: ptr, ctx: ptr):
         return
     let mt = mt_count()
     # (before the workers can see the job, after they are done below)
-    atomic_add(mt, 1)
+    atomic_add(mt, MT_STEP)
     if load_i64(pl, PL_STARTED) == 0:
         store_i64(pl, PL_STARTED, 1)
         let th = stack_mem(8)
@@ -8880,7 +8880,7 @@ fn brine_par_run(lo: int, hi: int, nchunks: int, f: ptr, ctx: ptr):
             cond_wait(pl + PL_CV_DONE, pl + PL_MU)
         atomic_store(pl + PL_MAIN_WAITS, 0)
         unlock(pl + PL_MU)
-    atomic_add(mt, -1)
+    atomic_add(mt, -MT_STEP)
     unlock(pl + PL_JOB_LOCK)
 
 # `par` tasks: a thread for each but the last while the budget lasts; the
@@ -8897,7 +8897,7 @@ fn brine_par_tasks(k: int, f: ptr, ctx: ptr):
         store_i64(tasks, i * 24 + 16, i)
         store_u8(spawned, i, u8(0))
     let mt = mt_count()
-    atomic_add(mt, 1)
+    atomic_add(mt, MT_STEP)
     for i in 0..k - 1:
         # (the budget was at least 1)
         if (
@@ -8914,7 +8914,7 @@ fn brine_par_tasks(k: int, f: ptr, ctx: ptr):
         if load_u8(spawned, i) != 0:
             thread_join(load_u64(ths, i * 8))
             atomic_add(pl + PL_BUDGET, 1)
-    atomic_add(mt, -1)
+    atomic_add(mt, -MT_STEP)
     brine_free(tasks)
     brine_free(ths)
     brine_free(spawned)
@@ -14844,8 +14844,12 @@ const P_IO = 64
 fn proc_mem() -> ptr:
     return global_mem("proc", 128)
 
-# how many threads may touch values besides the main one (brine_rt.h's
-# brine_mt: generated code reads it too)
+# how many threads may touch values besides the main one, times MT_STEP
+# (brine_rt.h's brine_mt: generated code reads it too). On an arm64 CPU
+# without ARMv8.1's atomics it is odd, as if there always were: the one load
+# a64.br's reference counts make tells them both.
+const MT_STEP = 2
+
 fn mt_count() -> ptr:
     return global_mem("brine_mt", 8)
 
@@ -15288,6 +15292,8 @@ fn brine_rt_init(argc: i32, argv: ptr):
             elif os_is("linux"):
                 if (getauxval(u64(16)) & u64(256)) != u64(0):
                     store_i64(lse_flag(), 0, 1)
+            if load_i64(lse_flag(), 0) == 0:
+                store_i64(mt_count(), 0, 1)
         bytes_init()
         stack_setup()
         store_i64(pr, P_ARGC, int(argc))
