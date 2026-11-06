@@ -1903,6 +1903,201 @@ fn cond_incs(ref sf: SF) -> bool:
         changed = true
     return changed
 
+# A loop that only counts a bit array's set bits, one index at a time
+# (`for k in lo..hi: if bits[k]: n += 1` once cond_incs made it
+# `n += (word >> k) & 1`), counts them a word at a time instead: before the
+# loop n gets brine_x_bits_count added and k starts at hi, so the loop exits
+# at once. Its indices are in bounds: an unproven one would have an IdxChk.
+fn bit_counts(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var def: [Option[Inst]] = [None] * nv
+    var def_b = [-1] * nv
+    for bi, b in enumerate(sf.bs):
+        for x in b.code:
+            if x.d >= 0:
+                def[x.d] = Some(x)
+                def_b[x.d] = bi
+    for lp in find_loops(sf):
+        var inl = [false] * len(sf.bs)
+        for b in lp.body:
+            inl[b] = true
+        let h = lp.header
+        # the header: two phis (k and n), `k < hi` and the exit
+        var phis: [Inst] = []
+        var rest: [Inst] = []
+        for x in sf.bs[h].code:
+            if x.op == Op.Phi:
+                phis.push(x)
+            elif x.op != Op.Line:
+                rest.push(x)
+        if len(phis) != 2 or len(rest) != 2 or len(sf.bs[h].pred) != 2:
+            continue
+        let t = rest[0]
+        let j = rest[1]
+        if t.op != Op.Lt or j.a != t.d or (j.op != Op.Br and j.op != Op.BrNot):
+            continue
+        let inside = j.c if j.op == Op.BrNot else j.n
+        let outside = j.n if j.op == Op.BrNot else j.c
+        if not inl[sf.lab[inside]] or inl[sf.lab[outside]]:
+            continue
+        var pre = -1
+        var latch = -1
+        for p in sf.bs[h].pred:
+            if inl[p]:
+                latch = p
+            else:
+                pre = p
+        if pre < 0 or latch < 0:
+            continue
+        let pt = sf.bs[pre].code[len(sf.bs[pre].code) - 1]
+        if pt.op != Op.Jmp or pt.n != sf.bs[h].label:
+            continue
+        let ki = 0 if phis[0].d == t.a else 1
+        let kp = phis[ki]
+        let np = phis[1 - ki]
+        let hi = t.b
+        let nk = sf.f.vk[np.d]
+        if (
+            kp.d != t.a
+            or sf.f.vk[kp.d] != K.I64
+            or (nk != K.I64 and nk != K.U64)
+            or (def_b[hi] >= 0 and inl[def_b[hi]])
+        ):
+            continue
+        let pl = sf.bs[pre].label
+        let ll = sf.bs[latch].label
+        # n' = n + z, z = (w >> k) & 1 (maybe converted), w = d[k >> 6]
+        var ok = true
+        var want = 0
+        var d = -1
+        let kv = through(def, phi_value(kp, ll))
+        let nv2 = through(def, phi_value(np, ll))
+        if kv < 0 or nv2 < 0:
+            continue
+        match (def[kv], def[nv2]):
+            case (Some(k2), Some(n2)):
+                ok = k2.op == Op.Add and k2.a == kp.d and is_const(def, k2.b, 1)
+                ok = ok and n2.op == Op.Add and n2.a == np.d and n2.b >= 0
+                var z = n2.b if ok else 0
+                want = 2
+                match def[z]:
+                    case Some(cv):
+                        if cv.op == Op.Conv:
+                            z = cv.a
+                            want += 1
+                    case None:
+                        pass
+                let s = arg_of(def, z, Op.And, 1)
+                let w = arg_of(def, s, Op.Shr, -1)
+                ok = ok and s >= 0 and w >= 0 and def_is(def, s, Op.Shr, w, kp.d)
+                ok = ok and (sf.f.vk[w] == K.U64 or sf.f.vk[w] == K.I64)
+                match def[w if ok else 0]:
+                    case Some(ld):
+                        if ok and ld.op == Op.Load and ld.n == 0 and ld.a >= 0:
+                            match def[ld.a]:
+                                case Some(el):
+                                    ok = ok and el.op == Op.Elem and el.n == 8
+                                    ok = ok and arg_of(def, el.b, Op.Shr, 6) == kp.d
+                                    d = el.a
+                                case None:
+                                    ok = false
+                        else:
+                            ok = false
+                    case None:
+                        ok = false
+                want += 5
+            case _:
+                ok = false
+        if not ok or d < 0 or (def_b[d] >= 0 and inl[def_b[d]]):
+            continue
+        # nothing else in the loop; k and the test unused after it
+        var count = 0
+        for b in lp.body:
+            if b == h:
+                continue
+            for i, x in enumerate(sf.bs[b].code):
+                if i == len(sf.bs[b].code) - 1:
+                    ok = ok and x.op == Op.Jmp
+                elif x.op != Op.Line and x.op != Op.Const and not one_phi(x):
+                    count += 1
+        for b in 0..len(sf.bs):
+            if not inl[b]:
+                for x in sf.bs[b].code:
+                    for u in uses(x):
+                        ok = ok and u != kp.d and u != t.d
+        if not ok or count != want:
+            continue
+        let k0 = phi_value(kp, pl)
+        let n0 = phi_value(np, pl)
+        let r = new_v(ref sf, nk)
+        let n1 = new_v(ref sf, nk)
+        var call = mk(Op.Call, r, -1, 0, -1, 0)
+        call.s = "brine_x_bits_count"
+        call.args = [d, k0, hi]
+        var code = sf.bs[pre].code
+        let jt = code.pop()
+        code.push(call)
+        code.push(mk(Op.Add, n1, n0, r, -1, 0))
+        code.push(jt)
+        sf.bs[pre].code = code
+        for i in 0..2:
+            var p = sf.bs[h].code[i]
+            var q = 0
+            while q < len(p.args):
+                if p.args[q] == pl:
+                    p.args[q + 1] = hi if p.d == kp.d else n1
+                q += 2
+            sf.bs[h].code[i] = p
+
+# v, or what it copies through phis of one entry (blocks left behind by
+# cond_incs)
+fn through(def: [Option[Inst]], v: int) -> int:
+    var u = v
+    var hops = 0
+    while u >= 0 and hops < 8:
+        match def[u]:
+            case Some(x):
+                if not one_phi(x):
+                    return u
+                u = x.args[1]
+            case None:
+                return u
+        hops += 1
+    return u
+
+fn one_phi(x: Inst) -> bool:
+    return x.op == Op.Phi and len(x.args) == 2
+
+fn is_const(def: [Option[Inst]], v: int, n: int) -> bool:
+    if v < 0:
+        return false
+    match def[v]:
+        case Some(c):
+            return c.op == Op.Const and c.n == n
+        case None:
+            return false
+
+# a, where v = op(a, n) for a const n (n -1: any b); else -1
+fn arg_of(def: [Option[Inst]], v: int, op: Op, n: int) -> int:
+    if v < 0:
+        return -1
+    match def[v]:
+        case Some(x):
+            if x.op == op and (n < 0 or is_const(def, x.b, n)):
+                return x.a
+            return -1
+        case None:
+            return -1
+
+fn def_is(def: [Option[Inst]], v: int, op: Op, a: int, b: int) -> bool:
+    if v < 0:
+        return false
+    match def[v]:
+        case Some(x):
+            return x.op == op and x.a == a and x.b == b
+        case None:
+            return false
+
 # Can block p get an edge to label l? Not when it has one already and l's phis
 # would then need two values for p.
 fn edge_ok(sf: SF, p: int, l: int) -> bool:
@@ -3749,4 +3944,6 @@ fn optimize(f: Func, vw: int, a64: bool) -> (Func, [KFunc]):
     if a64 and cond_incs(ref sf):
         relink(ref sf)
     dce(ref sf)
+    if a64:
+        bit_counts(ref sf)
     return (from_ssa(sf), ks)
