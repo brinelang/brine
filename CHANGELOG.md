@@ -5,6 +5,39 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) 
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-06
+### Added
+- `brine emit-ir` prints a program's intermediate representation, the code the
+  native backends compile.
+
+### Changed
+- brine no longer needs a C compiler on x86-64 (Linux, Windows, macOS) or ARM64
+  (Linux, Apple silicon). Every build there, dev, `--debug` and `--release`, is
+  native machine code, linked by brine itself into PE, ELF or Mach-O
+  executables. A C compiler is still used on other platforms, with
+  `BRINE_BACKEND=c`, and for WebAssembly (through wasi-sdk).
+- Release builds on x86-64 and ARM64 are native, and as fast as or faster than
+  the C backend's on every benchmark in `bench/compare.br`. Examples on x86-64:
+  mandelbrot 1.3x, binarytrees 1.2x and fannkuch 1.15x faster than release C;
+  on ARM64: mandelbrot 1.5x, binarytrees 1.1x and sieve 1.1x faster.
+- The native code generator has an SSA optimizer, register allocation from
+  liveness, inlining, and vector kernels (SSE2, AVX2 and AVX-512 on x86-64, NEON
+  on ARM64) for float and integer array loops.
+- Native release builds optimize functions in parallel: a release build of the
+  compiler on x86-64 takes 1.8 s instead of 3.3 s.
+- The runtime's string, array and map fast paths are written in brine
+  (`runtime/rt.br`) and inlined into native programs.
+- Building brine itself starts from the previous release's binary
+  (`sh scripts/dist.sh bootstrap`), not a generated C seed.
+- `brine rules --receipt` names the C compiler as trusted only where builds use one.
+
+### Fixed
+- `brine` can replace itself on Windows while it runs.
+- A `match` compiled to a jump table could skip a value it reads.
+- Debuggers see `ptr` values as pointers.
+- Const arrays accept `u64` values above `i64`'s range.
+- `BRINE_LEAKCHECK` counts live objects on macOS too.
+
 ## [0.8.0] - 2026-11-04
 ### Added
 - `RULES.br`: rules that say what the whole program must do, written and
@@ -359,7 +392,8 @@ The first version.
 - The compiler is written in brine and builds itself; `bootstrap/brinec.c` builds it
   from scratch with only a C compiler.
 
-[Unreleased]: https://github.com/brinelang/brine/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/brinelang/brine/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/brinelang/brine/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/brinelang/brine/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/brinelang/brine/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/brinelang/brine/compare/v0.5.1...v0.6.0
