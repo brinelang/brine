@@ -321,6 +321,8 @@ struct A:
     fsaved: [int]
     fold: [int]
     fval: [int]
+    # by vreg: the low 7 bits of a 128-bit constant (-1: not one), for shifts
+    wshift: [int]
     nuse: [int]
     # sp-relative offset of each stack slot
     slot_off: [int]
@@ -1199,6 +1201,7 @@ struct A:
         self.ret = f.ret
         self.fold = [0] * nv
         self.fval = [0] * nv
+        self.wshift = [-1] * nv
         self.home = [0] * nv
         self.nuse = [0] * nv
         self.lpos = [-1] * f.nlabels
@@ -1242,6 +1245,8 @@ struct A:
             if ndef[v] == 1:
                 let x = f.code[dpos[v]]
                 let k = f.vk[v]
+                if x.op == Op.Const and k.is_wide():
+                    self.wshift[v] = x.n & 127
                 # (in SSA code, constants that take more than one
                 # instruction are made once, in a register)
                 if (
@@ -2306,9 +2311,14 @@ struct A:
                 self.rrr(hi, T1, T1, T3)
                 self.st16(T0, x.d)
             case Op.Shl | Op.Shr:
+                self.ld16(T0, x.a)
+                let c = self.shift_amount(x.b)
+                if c >= 0:
+                    self.wide_shift_by(x.op == Op.Shl, k.is_signed(), c)
+                    self.st16(T2, x.d)
+                    return
                 # by s & 127: the halves shifted by s & 63, joined, then
                 # moved over a whole half when s & 64
-                self.ld16(T0, x.a)
                 let s = self.use(IP0, x.b)
                 # x17 = ~s: (63 - s) & 63 as a shift amount
                 self.rrr(0xAA200000, 17, ZR, s)
@@ -2365,6 +2375,43 @@ struct A:
                         CArg(how=A_ADDR, v=x.b, fl=0)
                     ]
                 )
+
+    # a shift's amount & 127 when it is a constant (-1: it isn't)
+    fn shift_amount(self, v: int) -> int:
+        if self.wshift[v] >= 0:
+            return self.wshift[v]
+        if self.imm(v):
+            return self.fval[v] & 127
+        return -1
+
+    # x11, x12 = x9, x10 (lo, hi) shifted by c (0 <= c < 128)
+    fn wide_shift_by(ref self, left: bool, signed: bool, c: int):
+        if c == 0:
+            self.mov_rr(T2, T0)
+            self.mov_rr(T3, T1)
+        elif left and c < 64:
+            # extr x12, x10, x9, #(64 - c); lsl x11, x9, #c
+            self.w(0x93C00000 | (T0 << 16) | ((64 - c) << 10) | (T1 << 5) | T3)
+            self.w(0xD3400000 | (((64 - c) & 63) << 16) | ((63 - c) << 10) | (T0 << 5) | T2)
+        elif left:
+            # lsl x12, x9, #(c - 64); x11 = 0
+            let e = c - 64
+            self.w(0xD3400000 | (((64 - e) & 63) << 16) | ((63 - e) << 10) | (T0 << 5) | T3)
+            self.mov_rr(T2, ZR)
+        elif c < 64:
+            # extr x11, x10, x9, #c; lsr / asr x12, x10, #c
+            self.w(0x93C00000 | (T0 << 16) | (c << 10) | (T1 << 5) | T2)
+            self.w((0x9340FC00 if signed else 0xD340FC00) | (c << 16) | (T1 << 5) | T3)
+        else:
+            # lsr / asr x11, x10, #(c - 64); x12 = 0, or the sign
+            if c == 64:
+                self.mov_rr(T2, T1)
+            else:
+                self.w((0x9340FC00 if signed else 0xD340FC00) | ((c - 64) << 16) | (T1 << 5) | T2)
+            if signed:
+                self.w(0x9340FC00 | (63 << 16) | (T1 << 5) | T3)
+            else:
+                self.mov_rr(T3, ZR)
 
     fn unary(ref self, x: Inst):
         let k = self.vk[x.d]
@@ -2944,6 +2991,7 @@ fn emit(m0: Module, dbg: bool, on: bool, src: str, comp_dir: str, producer: str)
         fsaved=[],
         fold=[],
         fval=[],
+        wshift=[],
         nuse=[],
         slot_off=[],
         ploc=[],
