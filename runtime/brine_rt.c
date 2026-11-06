@@ -2627,11 +2627,13 @@ double brine_clock(void) {
 }
 #endif
 const char *brine_arg(int64_t i) { return i >= 0 && i < br_argc ? br_argv[i] : NULL; }
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_arr *brine_args(void) {
     brine_arr *a = br_strs();
     for (int i = 1; i < br_argc; i++) br_push_str(&a, brine_str_new(br_argv[i], (int64_t)strlen(br_argv[i])));
     return a;
 }
+#endif
 
 /* ============================================================ thread pool */
 #ifndef BRINE_RT_BR /* runtime/rt.br has the pool */
@@ -5628,6 +5630,7 @@ void brine_rt_shutdown(void) {
 extern char **environ;
 #endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 static void *br_grow(void *p, size_t n) {
     void *q = realloc(p, n ? n : 1);
     if (!q) {
@@ -6625,6 +6628,7 @@ brine_str *brine_os_arch(void) {
 #endif
     return brine_str_new(n, (int64_t)strlen(n));
 }
+#endif
 
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 int64_t brine_os_pid(void) {
@@ -6638,10 +6642,12 @@ int64_t brine_os_pid(void) {
 }
 #endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 int64_t brine_os_cpu_count(void) {
     int n = br_ncpu();
     return n > 0 ? n : 1;
 }
+#endif
 int64_t brine_os_thread_count(void) { return br_threads(); }
 
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
@@ -6666,6 +6672,7 @@ void brine_os_sleep(double seconds) {
 }
 #endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 #ifdef _WIN32
 /* an MSYS/Cygwin terminal is a named pipe called like `msys-...-pty0-to-master` (same test as Rust) */
 static int br_msys_tty(HANDLE h) {
@@ -7356,6 +7363,10 @@ static void br_procs_free(void) {
     br_procs = NULL;
     br_nprocs = br_cap_procs = 0;
 }
+#else
+void brine_x_os_procs_free(void);
+static void br_procs_free(void) { brine_x_os_procs_free(); }
+#endif
 
 /* ------------------------------------------------------------ entry points for native code
  * Natively compiled brine (the x86-64 backend) can't call the `static inline`
