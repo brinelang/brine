@@ -709,7 +709,15 @@ static void br_heap_info_init(void) {
     hi->fast = 1;
 }
 #endif
+#ifdef BRINE_RT_BR /* runtime/rt.br counts them */
+void brine_x_live(int64_t d);
+int64_t brine_x_live_count(void);
+#define BR_LIVE(d) (BR_UNLIKELY(br_leakcheck) ? brine_x_live(d) : (void)0)
+#define BR_LIVE_COUNT() brine_x_live_count()
+#else
 #define BR_LIVE(d) (BR_UNLIKELY(br_leakcheck) ? (void)__atomic_fetch_add(&br_live, (d), __ATOMIC_RELAXED) : (void)0)
+#define BR_LIVE_COUNT() __atomic_load_n(&br_live, __ATOMIC_RELAXED)
+#endif
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 void brine_str_free(brine_str *s) {
     BR_LIVE(-1);
@@ -755,19 +763,13 @@ void brine_drop(void *p, void (*fn)(void *)) {
     h->drop_depth--;
 }
 #endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 static void br_arr_drop(void *p) {
     brine_arr *a = (brine_arr *)p;
     for (int64_t i = 0; i < a->len; i++) a->release(a->data + i * a->esz);
     if (a->data) free(a->data);
     free(a);
 }
-#ifdef BRINE_RT_BR
-/* runtime/rt.br's brine_arr_free, for elements that need releasing */
-void brine_x_arr_drop(brine_arr *a) {
-    BR_LIVE(-1);
-    brine_drop(a, br_arr_drop);
-}
-#else
 void brine_arr_free(brine_arr *a) {
     BR_LIVE(-1);
     if (a->release) {
@@ -778,6 +780,7 @@ void brine_arr_free(brine_arr *a) {
     free(a);
 }
 #endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void *brine_box_new(int64_t size, int64_t tag) {
     brine_box *b = (brine_box *)brine_alloc(size);
     BR_LIVE(1);
@@ -793,40 +796,20 @@ void brine_rt_str(void *p) { brine_str_retain(*(brine_str **)p); }
 void brine_rl_str(void *p) { brine_str_release(*(brine_str **)p); }
 void brine_rt_arr(void *p) { brine_arr_retain(*(brine_arr **)p); }
 void brine_rl_arr(void *p) { brine_arr_release(*(brine_arr **)p); }
+#endif
 
 /* ============================================================ strings */
 #define br_str_size brine_str_size
+#ifdef BRINE_RT_BR /* runtime/rt.br has it */
+brine_str *brine_x_str_alloc(int64_t n);
+#define br_str_alloc brine_x_str_alloc
+#else
 static brine_str *br_str_alloc(int64_t n) {
     brine_str *s = (brine_str *)br_alloc(br_str_size(n));
     BR_LIVE(1);
     s->rc = 1;
     s->len = n;
     s->data[n] = 0;
-    return s;
-}
-#ifdef BRINE_RT_BR
-/* what runtime/rt.br's strings still take from here */
-brine_str *brine_x_str_alloc(int64_t n) { return br_str_alloc(n); }
-void *brine_x_counted(int64_t n) {
-    BR_LIVE(1);
-    return brine_alloc(n);
-}
-void *brine_x_calloc(int64_t n) {
-    void *p = calloc(n > 0 ? (size_t)n : 1, 1);
-    if (!p) {
-        fprintf(stderr, "out of memory\n");
-        abort();
-    }
-    return p;
-}
-brine_str *brine_x_str_grow(brine_str *s, int64_t n) {
-    if (br_str_size(n) > br_str_size(s->len)) {
-        s = (brine_str *)realloc(s, br_str_size(n));
-        if (!s) {
-            fprintf(stderr, "out of memory\n");
-            abort();
-        }
-    }
     return s;
 }
 #endif
@@ -2083,10 +2066,9 @@ brine_arr *brine_arr_slice(brine_arr *a, int64_t lo, int64_t hi, const char *loc
 #endif
 
 /* ============================================================ maps */
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_rt_map(void *p) { brine_map_retain(*(brine_map **)p); }
 void brine_rl_map(void *p) { brine_map_release(*(brine_map **)p); }
-
-#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 brine_map *brine_map_new(const brine_map_ty *ty) {
     brine_map *m = (brine_map *)brine_alloc(sizeof(brine_map));
     BR_LIVE(1);
@@ -2095,7 +2077,6 @@ brine_map *brine_map_new(const brine_map_ty *ty) {
     m->ty = ty;
     return m;
 }
-#endif
 static void br_map_drop(void *p) {
     brine_map *m = (brine_map *)p;
     const brine_map_ty *t = m->ty;
@@ -2111,13 +2092,6 @@ static void br_map_drop(void *p) {
     free(m->index);
     free(m);
 }
-#ifdef BRINE_RT_BR
-/* runtime/rt.br's brine_map_free, for keys or values that need releasing */
-void brine_x_map_drop(brine_map *m) {
-    BR_LIVE(-1);
-    brine_drop(m, br_map_drop);
-}
-#else
 void brine_map_free(brine_map *m) {
     BR_LIVE(-1);
     if (m->ty->krelease || m->ty->vrelease) {
@@ -5603,7 +5577,7 @@ void brine_rt_shutdown(void) {
     br_gpu_settle();
     br_world_finish("it returned from `main`");
     br_flush();
-    if (br_leakcheck) fprintf(stderr, "brine: %lld live objects at exit\n", (long long)__atomic_load_n(&br_live, __ATOMIC_RELAXED));
+    if (br_leakcheck) fprintf(stderr, "brine: %lld live objects at exit\n", (long long)BR_LIVE_COUNT());
 }
 
 /* ============================================================ files and processes */

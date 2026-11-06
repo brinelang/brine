@@ -72,10 +72,6 @@ extern fn brine_x_str_room(n: int) -> int
 
 extern fn brine_x_app_byte(ps: ptr, ap: ptr, c: u8)
 
-extern fn brine_box_new(size: int, tag: int) -> ptr
-
-extern fn brine_box_free(p: ptr)
-
 # the low n bytes of a word, 0 <= n <= 8
 fn lowmask(n: u64) -> u64:
     if n >= 8:
@@ -260,8 +256,56 @@ fn class_size(c: int) -> int:
         return (c + 1) * 16
     return 128 + (c - 7) * 32
 
+# ------------------------------------------------------------ counts
+# BRINE_LEAKCHECK counts the objects alive: [0] whether it is on, [8] the count
+fn leaks() -> ptr:
+    return global_mem("leaks", 16)
+
+fn live(d: int):
+    let l = leaks()
+    if load_i64(l, 0) != 0:
+        atomic_add(l + 8, d)
+
+fn brine_x_live(d: int):
+    live(d)
+
+fn brine_x_live_count() -> int:
+    return atomic_load(leaks() + 8)
+
+# Reference counts need locked instructions only while other threads may
+# touch values (brine_mt, see brine_rt.h).
+fn one_thread() -> bool:
+    return load_i64(symbol("brine_mt"), 0) == 0
+
+fn rc_inc(p: ptr):
+    if one_thread():
+        store_i64(p, 0, load_i64(p, 0) + 1)
+    else:
+        atomic_add(p, 1)
+
+# drops a reference that isn't the last (count `was` > 1); true if it was
+# after all
+fn rc_dec(p: ptr, was: int) -> bool:
+    if one_thread():
+        store_i64(p, 0, was - 1)
+        return false
+    return atomic_add(p, -1) == 1
+
 # n bytes of brine_alloc's, counted for BRINE_LEAKCHECK (strings, arrays)
-extern fn brine_x_counted(n: int) -> ptr
+fn brine_x_counted(n: int) -> ptr:
+    live(1)
+    return brine_alloc(n)
+
+fn brine_box_new(size: int, tag: int) -> ptr:
+    let b = brine_alloc(size)
+    live(1)
+    store_i64(b, 0, 1)
+    store_i64(b, 8, tag)
+    return b
+
+fn brine_box_free(p: ptr):
+    live(-1)
+    brine_free(p)
 
 # A block of n bytes (1 <= n <= SMALL) off the thread's free list, or 0
 # when C must make it: the list is empty, or BRINE_LEAKCHECK counts blocks.
@@ -343,7 +387,13 @@ extern fn memcpy(d: ptr, s: ptr, n: u64) -> ptr
 extern fn memcmp(a: ptr, b: ptr, n: u64) -> i32
 
 # a block for a string of n bytes: count 1, length n, the NUL (br_str_alloc)
-extern fn brine_x_str_alloc(n: int) -> ptr
+fn brine_x_str_alloc(n: int) -> ptr:
+    let s = brine_alloc(str_block(n))
+    live(1)
+    store_i64(s, STR_RC, 1)
+    store_i64(s, STR_LEN, n)
+    store_u8(s, STR_DATA + n, 0)
+    return s
 
 # The bytes a string of length n takes (brine_str_size): rounded up by at
 # most a quarter, so `+=` can usually grow it in place.
@@ -370,7 +420,32 @@ fn brine_str_free(s: ptr):
     free_counted(s)
 
 # s's block made big enough for a string of n bytes; it may move
-extern fn brine_x_str_grow(s: ptr, n: int) -> ptr
+fn brine_x_str_grow(s: ptr, n: int) -> ptr:
+    let t = str_block(n)
+    if t > str_block(load_i64(s, STR_LEN)):
+        return brine_x_realloc(s, t)
+    return s
+
+# the element callbacks of arrays of strings and of arrays
+fn brine_rt_str(p: ptr):
+    let s = load_ptr(p, 0)
+    if load_i64(s, STR_RC) >= 0:
+        rc_inc(s)
+
+fn brine_rl_str(p: ptr):
+    let s = load_ptr(p, 0)
+    let rc = load_i64(s, STR_RC)
+    if rc >= 0 and (rc == 1 or rc_dec(s, rc)):
+        brine_str_free(s)
+
+fn brine_rt_arr(p: ptr):
+    rc_inc(load_ptr(p, 0))
+
+fn brine_rl_arr(p: ptr):
+    let a = load_ptr(p, 0)
+    let rc = load_i64(a, ARR_RC)
+    if rc == 1 or rc_dec(a, rc):
+        brine_arr_free(a)
 
 extern fn brine_panic_at(loc: ptr, msg: str)
 
@@ -4947,7 +5022,11 @@ const ARR_DATA = 48
 const ARR_SIZE = 56
 
 # n zero bytes from the C library's heap
-extern fn brine_x_calloc(n: int) -> ptr
+fn brine_x_calloc(n: int) -> ptr:
+    let p = calloc(u64(max(n, 1)), u64(1))
+    if addr(p) == 0:
+        oom_cold()
+    return p
 
 extern fn memchr(p: ptr, c: i32, n: u64) -> ptr
 
@@ -4972,7 +5051,20 @@ fn arr_header(len: int, cap: int, esz: int, rt: ptr, rl: ptr) -> ptr:
     return a
 
 # frees the elements first, past a depth on a list (brine_drop)
-extern fn brine_x_arr_drop(a: ptr)
+fn brine_x_arr_drop(a: ptr):
+    live(-1)
+    drop(a, symbol("brine_x_arr_dead"))
+
+# finishes freeing a dead array whose elements hold something
+fn brine_x_arr_dead(a: ptr):
+    let esz = load_i64(a, ARR_ESZ)
+    let rl = load_ptr(a, ARR_RL)
+    let d = load_ptr(a, ARR_DATA)
+    for i in 0..load_i64(a, ARR_LEN):
+        call_void(rl, d + i * esz)
+    if addr(d) != 0:
+        brine_free(d)
+    brine_free(a)
 
 fn brine_arr_free(a: ptr):
     if addr(load_ptr(a, ARR_RL)) != 0:
@@ -5278,7 +5370,40 @@ const MT_VRL = 72
 
 # frees a map whose keys or values hold something, past a depth on a list
 # (brine_drop)
-extern fn brine_x_map_drop(m: ptr)
+fn brine_x_map_drop(m: ptr):
+    live(-1)
+    drop(m, symbol("brine_x_map_dead"))
+
+fn brine_x_map_dead(m: ptr):
+    let t = load_ptr(m, MAP_TY)
+    let krl = load_ptr(t, MT_KRL)
+    let vrl = load_ptr(t, MT_VRL)
+    let ksz = load_i64(t, MT_KSZ)
+    let vsz = load_i64(t, MT_VSZ)
+    let keys = load_ptr(m, MAP_KEYS)
+    let vals = load_ptr(m, MAP_VALS)
+    let lv = load_ptr(m, MAP_LIVE)
+    for i in 0..load_i64(m, MAP_USED):
+        if load_bool(lv, i):
+            if addr(krl) != 0:
+                call_void(krl, keys + i * ksz)
+            if addr(vrl) != 0:
+                call_void(vrl, vals + i * vsz)
+    free_if(keys)
+    free_if(vals)
+    free_if(load_ptr(m, MAP_HASHES))
+    free_if(lv)
+    free_if(load_ptr(m, MAP_INDEX))
+    brine_free(m)
+
+fn brine_rt_map(p: ptr):
+    rc_inc(load_ptr(p, 0))
+
+fn brine_rl_map(p: ptr):
+    let m = load_ptr(p, 0)
+    let rc = load_i64(m, MAP_RC)
+    if rc == 1 or rc_dec(m, rc):
+        brine_map_free(m)
 
 fn brine_map_new(ty: ptr) -> ptr:
     let m = new_counted(MAP_SIZE)
@@ -8961,6 +9086,7 @@ fn brine_x_heap_init(leakcheck: int):
             return
         store_i64(hi, HI_OFF, off)
     store_i64(hi, HI_TH, 1)
+    store_i64(leaks(), 0, leakcheck)
     if leakcheck == 0:
         store_i64(hi, HI_FAST, 1)
 
