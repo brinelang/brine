@@ -1467,10 +1467,7 @@ struct A:
             self.w(0x910003F0)
             let k = log2(realign)
             self.w(0x92400000 | (((64 - k) & 63) << 16) | ((63 - k) << 10) | (IP0 << 5) | SP)
-        for i, r in enumerate(self.saved):
-            self.ldst(M_STRX, r, FP, -8 * (i + 1))
-        for j, r in enumerate(self.fsaved):
-            self.ldst(M_STRD, r, FP, -8 * (len(self.saved) + j + 1))
+        self.save_regs(false)
         self.u.pro_end = self.pos()
         self.store_params(f)
         # body
@@ -1545,8 +1542,7 @@ struct A:
         self.u.fp = self.pos()
         if frame > 0:
             self.add_ri(SP, SP, -frame)
-        for j, r in enumerate(self.fsaved):
-            self.ldst(M_STRD, r, FP, -8 * (j + 1))
+        self.save_regs(false)
         self.u.pro_end = self.pos()
         if k.loop:
             self.kernel_loop(k)
@@ -1818,11 +1814,37 @@ struct A:
         self.w(op | (b << 16) | (a << 5) | 31)
         self.w(0x6E080400 | (31 << 5) | a)
 
+    # The callee-saved registers to (or from, `load`) their slots: slot n
+    # (x29 - 8(n + 1)) holds saved[n], then fsaved; neighbours of the same
+    # kind go in one stp / ldp.
+    fn save_regs(ref self, load: bool):
+        var rs: [int] = []
+        var fl: [bool] = []
+        for r in self.saved:
+            rs.push(r)
+            fl.push(false)
+        for r in self.fsaved:
+            rs.push(r)
+            fl.push(true)
+        var n = 0
+        while n < len(rs):
+            if n + 1 < len(rs) and fl[n + 1] == fl[n]:
+                # stp / ldp rs[n + 1], rs[n], [x29, #-8(n + 2)]
+                var op = 0x6D000000 if fl[n] else 0xA9000000
+                if load:
+                    op = op | 0x400000
+                let imm = (-(n + 2)) & 0x7F
+                self.w(op | (imm << 15) | (rs[n] << 10) | (FP << 5) | rs[n + 1])
+                n += 2
+            else:
+                var op = M_STRD if fl[n] else M_STRX
+                if load:
+                    op = M_LDRD if fl[n] else M_LDRX
+                self.ldst(op, rs[n], FP, -8 * (n + 1))
+                n += 1
+
     fn epilogue(ref self):
-        for i, r in enumerate(self.saved):
-            self.ldst(M_LDRX, r, FP, -8 * (i + 1))
-        for j, r in enumerate(self.fsaved):
-            self.ldst(M_LDRD, r, FP, -8 * (len(self.saved) + j + 1))
+        self.save_regs(true)
         # mov sp, x29; ldp x29, x30, [sp], #16
         self.w(0x910003BF)
         self.w(0xA8C17BFD)
