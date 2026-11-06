@@ -333,6 +333,30 @@ fn link_pe(o0: ObjFile, entry: str, dlls: [str]) -> Result[[u8], str]:
             init_size += n
     let last = secs[len(secs) - 1]
     let image_size = align_up(last.rva + len(last.bytes), PAGE)
+    # a COFF symbol table of the functions after the sections, for debuggers
+    # and profilers (the loader ignores it)
+    var syms: [u8] = []
+    var strs: [u8] = [0, 0, 0, 0]
+    var nsyms = 0
+    for sy in o.syms:
+        if sy.sec != SEC_TEXT or not sy.func:
+            continue
+        let nb = sy.name.bytes()
+        if len(nb) <= 8:
+            syms.extend(nb)
+            pad_with(ref syms, 18 * nsyms + 8, 0)
+        else:
+            put32(ref syms, 0)
+            put32(ref syms, len(strs))
+            strs.extend(nb)
+            strs.push(0)
+        put32(ref syms, sy.off)
+        # in .text, a function, external or static
+        put16(ref syms, 1)
+        put16(ref syms, 32)
+        syms.extend([2 if sy.global else 3, 0])
+        nsyms += 1
+    set32(ref strs, 0, len(strs))
     var out: [u8] = [77, 90]
     pad_with(ref out, 60, 0)
     put32(ref out, 64)
@@ -341,8 +365,8 @@ fn link_pe(o0: ObjFile, entry: str, dlls: [str]) -> Result[[u8], str]:
     put16(ref out, 34404)
     put16(ref out, len(secs))
     put32(ref out, 0)
-    put32(ref out, 0)
-    put32(ref out, 0)
+    put32(ref out, raw if nsyms > 0 else 0)
+    put32(ref out, nsyms)
     put16(ref out, 240)
     put16(ref out, 34)
     # optional header (PE32+)
@@ -402,6 +426,9 @@ fn link_pe(o0: ObjFile, entry: str, dlls: [str]) -> Result[[u8], str]:
         pad_with(ref out, s.raw, 0)
         out.extend(s.bytes)
     pad_with(ref out, align_up(len(out), FILE_ALIGN), 0)
+    if nsyms > 0:
+        out.extend(syms)
+        out.extend(strs)
     return Ok(out)
 
 # ================================================================ ELF (Linux)
@@ -459,6 +486,103 @@ fn elf_arch(arch: int) -> ElfArch:
         r_abs=1,
         r_glob=6
     )
+
+# ---------------------------------------------------------------- symbol versions
+# glibc keeps the old versions of some functions for old programs
+# (realpath@GLIBC_2.2.5 rejects a null buffer, exp@GLIBC_2.2.5 is a slower
+# wrapper), and a reference without a version binds to the oldest. So each
+# import asks for the version a C linker picks: the library's default.
+
+fn get64(b: [u8], at: int) -> int:
+    return get32(b, at) | (get32(b, at + 4) << 32)
+
+fn c_str_at(b: [u8], at: int) -> str:
+    var e = at
+    while e < len(b) and b[e] != 0:
+        e += 1
+    return str.from_utf8(b[at:e]).unwrap_or("")
+
+fn lib_dirs(a64: bool) -> [str]:
+    let t = "aarch64-linux-gnu" if a64 else "x86_64-linux-gnu"
+    return [f"/lib/{t}", f"/usr/lib/{t}", "/lib64", "/usr/lib64", "/lib", "/usr/lib"]
+
+# What a shared library defines: each symbol with its default version (""
+# for none). None when the library isn't on this machine for `machine`.
+fn lib_versions(name: str, machine: int, a64: bool) -> Option[{str: str}]:
+    for d in lib_dirs(a64):
+        match os.read_bytes(d + "/" + name):
+            case Ok(b):
+                if (
+                    len(b) >= 64
+                    and b[0] == 127
+                    and b[1] == 69
+                    and b[4] == 2
+                    and get16(b, 18) == machine
+                ):
+                    return Some(elf_versions(b))
+            case Err(_):
+                pass
+    return None
+
+fn elf_versions(b: [u8]) -> {str: str}:
+    var out: {str: str} = {}
+    let shoff = get64(b, 40)
+    var dynsym = -1
+    var versym = -1
+    var verdef = -1
+    for i in 0..get16(b, 60):
+        let h = shoff + 64 * i
+        let t = get32(b, h + 4)
+        if t == 11:
+            dynsym = h
+        elif t == 1879048191:
+            versym = h
+        elif t == 1879048189:
+            verdef = h
+    if dynsym < 0:
+        return out
+    let strs = get64(b, shoff + 64 * get32(b, dynsym + 40) + 24)
+    # version names by index; the base one (the library's own name) is none
+    var names: {int: str} = {}
+    if verdef >= 0:
+        var at = get64(b, verdef + 24)
+        for _ in 0..get32(b, verdef + 44):
+            let aux = at + get32(b, at + 12)
+            names[get16(b, at + 4)] = (
+                "" if get16(b, at + 2) & 1 != 0 else c_str_at(b, strs + get32(b, aux))
+            )
+            let next = get32(b, at + 16)
+            if next == 0:
+                break
+            at += next
+    let syms = get64(b, dynsym + 24)
+    for i in 1..get64(b, dynsym + 32) / 24:
+        let s = syms + 24 * i
+        let bind = int(b[s + 4]) >> 4
+        # defined, and global, weak or unique
+        if get16(b, s + 6) == 0 or (bind != 1 and bind != 2 and bind != 10):
+            continue
+        var v = ""
+        if versym >= 0:
+            let x = get16(b, get64(b, versym + 24) + 2 * i)
+            # an old version, hidden from new programs
+            if x & 32768 != 0:
+                continue
+            v = names.get(x).unwrap_or("")
+        let nm = c_str_at(b, strs + get32(b, s))
+        if nm not in out or out[nm] == "":
+            out[nm] = v
+    return out
+
+fn elf_hash(s: str) -> int:
+    var h = 0
+    for c in s.bytes():
+        h = (h << 4) + int(c)
+        let g = h & 4026531840
+        if g != 0:
+            h = h ^ (g >> 24)
+        h = h & ~g
+    return h
 
 # A dynamic relocation: R_* `typ` at `off`.
 struct Rela:
@@ -600,7 +724,37 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
             if k == R_ABS64:
                 nabs += 1
     let nrela = nabs + len(got_of)
-    # dynamic strings: libraries, then imports
+    # each import's library and version, when the libraries are on this
+    # machine (not when linking for another one)
+    var defs: {str: (int, str)} = {}
+    var known = true
+    for li, l in enumerate(libs):
+        match lib_versions(l, ea.machine, ea.a64):
+            case Some(lm):
+                for nm, v in lm.items():
+                    if nm not in defs:
+                        defs[nm] = (li, v)
+            case None:
+                known = false
+    # the versions needed, (library, name), and each import's (2 up; 1 is none)
+    var need: [(int, str)] = []
+    var ver_of = [1] * len(imps)
+    if known:
+        for i, nm in enumerate(imps):
+            match defs.get(nm):
+                case Some(d):
+                    if d.1 != "":
+                        var k = -1
+                        for j, x in enumerate(need):
+                            if x == d:
+                                k = j
+                        if k < 0:
+                            need.push(d)
+                            k = len(need) - 1
+                        ver_of[i] = k + 2
+                case None:
+                    return Err(f"undefined symbol `{nm}`: not in {', '.join(libs)}")
+    # dynamic strings: libraries, then imports, then versions
     var dynstr: [u8] = [0]
     var lib_at: [int] = []
     for l in libs:
@@ -619,6 +773,41 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
         put64(ref dynsym, 0)
         put64(ref dynsym, 0)
     let nsym = len(imps) + 1
+    # .gnu.version: each dynamic symbol's; .gnu.version_r: per library, the
+    # versions needed from it
+    var versym: [u8] = []
+    var verneed: [u8] = []
+    var nlibs_ver = 0
+    if len(need) > 0:
+        put16(ref versym, 0)
+        for v in ver_of:
+            put16(ref versym, v)
+        var ver_at: [int] = []
+        for _, vn in need:
+            ver_at.push(len(dynstr))
+            str_bytes(ref dynstr, vn)
+            dynstr.push(0)
+        var with: [int] = []
+        for li in 0..len(libs):
+            if any(x.0 == li for x in need):
+                with.push(li)
+        nlibs_ver = len(with)
+        for wi, li in enumerate(with):
+            var mine: [int] = []
+            for j, x in enumerate(need):
+                if x.0 == li:
+                    mine.push(j)
+            put16(ref verneed, 1)
+            put16(ref verneed, len(mine))
+            put32(ref verneed, lib_at[li])
+            put32(ref verneed, 16)
+            put32(ref verneed, 0 if wi + 1 == len(with) else 16 + 16 * len(mine))
+            for k, j in enumerate(mine):
+                put32(ref verneed, elf_hash(need[j].1))
+                put16(ref verneed, 0)
+                put16(ref verneed, j + 2)
+                put32(ref verneed, ver_at[j])
+                put32(ref verneed, 0 if k + 1 == len(mine) else 16)
     # one hash bucket chaining every symbol (only undefined ones here)
     var hash: [u8] = []
     put32(ref hash, 1)
@@ -639,6 +828,10 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     pos = align_up(pos + len(dynstr), 8)
     let hash_at = pos
     pos = align_up(pos + len(hash), 8)
+    let versym_at = pos
+    pos = align_up(pos + len(versym), 8)
+    let verneed_at = pos
+    pos = align_up(pos + len(verneed), 8)
     let rela_at = pos
     pos = align_up(pos + 24 * nrela, max(o.rodata_align, 8))
     let rodata_at = pos
@@ -658,7 +851,7 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     let data_at = data_off + 2 * SEG
     let got_at = align_up(data_at + len(o.data), 8)
     let dynamic_at = got_at + 8 * len(got_of)
-    let ndyn = len(libs) + 12
+    let ndyn = len(libs) + 12 + (3 if len(need) > 0 else 0)
     let w_end = dynamic_at + 16 * ndyn
     var addr = [-1] * len(o.syms)
     var dyn = [0] * len(o.syms)
@@ -750,6 +943,10 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     out.extend(dynstr)
     pad_with(ref out, hash_at, 0)
     out.extend(hash)
+    pad_with(ref out, versym_at, 0)
+    out.extend(versym)
+    pad_with(ref out, verneed_at, 0)
+    out.extend(verneed)
     pad_with(ref out, rela_at, 0)
     for r in relas:
         put64(ref out, r.off)
@@ -771,7 +968,7 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
         # DT_NEEDED
         put64(ref out, 1)
         put64(ref out, at)
-    for tv in [
+    var tags = [
         (4, hash_at),
         (5, dynstr_at),
         (6, dynsym_at),
@@ -784,7 +981,11 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
         (21, 0),
         (30, 8),
         (1879048187, 134217729)
-    ]:
+    ]
+    if len(need) > 0:
+        # DT_VERSYM, DT_VERNEED, DT_VERNEEDNUM
+        tags.extend([(1879048176, versym_at), (1879048190, verneed_at), (1879048191, nlibs_ver)])
+    for tv in tags:
         put64(ref out, tv.0)
         put64(ref out, tv.1)
     put64(ref out, 0)
@@ -821,7 +1022,9 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
         ".dynamic",
         ".symtab",
         ".strtab",
-        ".shstrtab"
+        ".shstrtab",
+        ".gnu.version",
+        ".gnu.version_r"
     ]:
         name_at.push(len(shstr))
         str_bytes(ref shstr, nm)
@@ -860,6 +1063,23 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     put_shdr(ref out, n[8], 2, 0, 0, symtab_at, len(symtab), 9, len(funcs) + 1, 8, 24)
     put_shdr(ref out, n[9], 3, 0, 0, strtab_at, len(strtab), 0, 0, 1, 0)
     put_shdr(ref out, n[10], 3, 0, 0, shstr_at, len(shstr), 0, 0, 1, 0)
+    var nsh = 11
+    if len(need) > 0:
+        put_shdr(ref out, n[11], 1879048191, 2, versym_at, versym_at, len(versym), 1, 0, 2, 2)
+        put_shdr(
+            ref out,
+            n[12],
+            1879048190,
+            2,
+            verneed_at,
+            verneed_at,
+            len(verneed),
+            2,
+            nlibs_ver,
+            8,
+            0
+        )
+        nsh = 13
     set64(ref out, shoff_at, shoff)
-    set32(ref out, shnum_at, 11 | (10 << 16))
+    set32(ref out, shnum_at, nsh | (10 << 16))
     return Ok(out)
