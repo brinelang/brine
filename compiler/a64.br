@@ -68,6 +68,9 @@ const F_ELEM = 4
 const F_FCONST = 5
 # `~b` read only by the `and` right after it, which is then a bic (fval: b)
 const F_NOT = 6
+# `a * b` read only by the `+` right after it, which is then a madd (fval:
+# the multiplication's position)
+const F_MUL = 7
 
 # call argument sources
 const A_VAL = 0
@@ -1322,6 +1325,22 @@ struct A:
                 continue
             self.fold[y.d] = F_NOT
             self.fval[y.d] = y.a
+        for i in 1..ncode:
+            let x = f.code[i]
+            let y = f.code[i - 1]
+            if x.op != Op.Add or y.op != Op.Mul or (y.d != x.a and y.d != x.b) or x.a == x.b:
+                continue
+            let k = f.vk[x.d]
+            if (
+                (k != K.I64 and k != K.U64)
+                or f.vk[y.d] != k
+                or self.nuse[y.d] != 1
+                or ndef[y.d] != 1
+                or self.fold[y.d] != F_NONE
+            ):
+                continue
+            self.fold[y.d] = F_MUL
+            self.fval[y.d] = i - 1
         var out_bytes = 0
         for x in f.code:
             if x.op == Op.Call or x.op == Op.CallInd:
@@ -2193,6 +2212,17 @@ struct A:
         self.epilogue()
 
     fn int_bin(ref self, x0: Inst):
+        if x0.op == Op.Add and (self.fold[x0.a] == F_MUL or self.fold[x0.b] == F_MUL):
+            let m = x0.a if self.fold[x0.a] == F_MUL else x0.b
+            let y = self.code[self.fval[m]]
+            let r = self.dst(x0.d)
+            let p = self.use(T0, y.a)
+            let q = self.use(T1, y.b)
+            let c = self.use(T2, x0.b if m == x0.a else x0.a)
+            # madd r, p, q, c
+            self.w(0x9B000000 | (q << 16) | (c << 10) | (p << 5) | r)
+            self.st(r, x0.d)
+            return
         var x = x0
         if (
             (x.op == Op.Add or x.op == Op.And or x.op == Op.Or or x.op == Op.Xor)
