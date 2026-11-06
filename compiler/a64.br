@@ -26,7 +26,7 @@ from opt import promote, const_arrs, arr_data, prune_rt, inline_small, reads
 from dwarf import Dwarf, DFn, DRow, DLocal, new_dwarf, loc_breg, loc_deref, write_dwarf
 from obj import ObjFile, OSym, ORel, new_obj, write_elf, put16, put32, set32, uleb, sleb, log2
 from obj import SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, R_PC32, R_ABS64, ARCH_A64
-from obj import R_A64_CALL26, R_A64_PAGE, R_A64_LO12, R_A64_GOT_PAGE, R_A64_GOT_LO12
+from obj import R_A64_CALL26, R_A64_PAGE, R_A64_LO12, R_A64_GOT_PAGE, R_A64_GOT_LO12, R_A64_LDR12
 import ra64
 from x64 import canon, fl_of, align_up, w128, wide_rt_helpers, emit_order, opt_func
 
@@ -752,6 +752,17 @@ struct A:
             self.reloc(R_A64_GOT_LO12, s, 0)
             self.w(0xF9400000 | (r << 5) | r)
 
+    # r = the 8 bytes at symbol s + n (n a multiple of 8), as adrp; ldr
+    fn ld_sym_x(ref self, r: int, s: int, n: int):
+        if self.o.syms[s].sec != SEC_UNDEF:
+            self.reloc(R_A64_PAGE, s, n)
+            self.w(0x90000000 | r)
+            self.reloc(R_A64_LDR12, s, n)
+            self.w(0xF9400000 | (r << 5) | r)
+        else:
+            self.ld_sym(r, s)
+            self.ldst(M_LDRX, r, r, n)
+
     # r = the value of v (64 bits, canonical; the low half of a 128-bit vreg)
     fn ld(ref self, r: int, v: int):
         let f = self.fold[v]
@@ -969,15 +980,13 @@ struct A:
     # (`brine_mt`, see brine_rt.h): only then do counts need exclusive
     # loads and stores. Uses x12.
     fn if_mt(ref self) -> int:
-        self.ld_sym(T3, self.sym_ref("brine_mt"))
-        self.ldst(M_LDRX, T3, T3, 0)
+        self.ld_sym_x(T3, self.sym_ref("brine_mt"), 0)
         return self.fwd(0xB5000000 | T3)
 
     # A cbz to patch (B19) taken when the CPU lacks ARMv8.1's atomic
     # instructions (`brine_lse`, see rt.br). Uses x12.
     fn if_no_lse(ref self) -> int:
-        self.ld_sym(T3, self.sym_ref("brine_lse"))
-        self.ldst(M_LDRX, T3, T3, 0)
+        self.ld_sym_x(T3, self.sym_ref("brine_lse"), 0)
         return self.fwd(0xB4000000 | T3)
 
     fn inline_rc(ref self, x: Inst) -> bool:
@@ -2133,6 +2142,18 @@ struct A:
                         let r = self.dst(x.d)
                         self.ldst_elem(load_op(k), r, x.a)
                         self.st(r, x.d)
+                    return i + 1
+                if (
+                    self.fold[x.a] == F_GLOBAL
+                    and not k.is_wide()
+                    and load_op(k) == M_LDRX
+                    and self.freg[x.d] < 0
+                    and x.n % 8 == 0
+                    and x.n >= 0
+                ):
+                    let r = self.dst(x.d)
+                    self.ld_sym_x(r, self.fval[x.a], x.n)
+                    self.st(r, x.d)
                     return i + 1
                 let (b, o) = self.addr(x.a, x.n, T1)
                 if k.is_wide():
