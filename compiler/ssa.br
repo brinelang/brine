@@ -1191,6 +1191,44 @@ fn addressing(ref sf: SF):
                     y.n = x.n + off[x.a]
                     sf.bs[bi].code[i] = y
 
+# `elem p + (i << k) * 1`, the shift (and a conversion between 64-bit ints
+# after it) used only there, is `elem p + i * 2^k`: rt.br's `load_i64(p, i * 8)`
+# whose `* 8` became a shift. The backends fold that index into the load.
+fn elem_scales(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var nuse = [0] * nv
+    var db = [-1] * nv
+    var di = [-1] * nv
+    var sh = [-1] * nv
+    for b in 0..len(sf.bs):
+        for i, x in enumerate(sf.bs[b].code):
+            for u in uses(x):
+                nuse[u] += 1
+            if x.d >= 0:
+                db[x.d] = b
+                di[x.d] = i
+                if x.op == Op.Const and x.n >= 1 and x.n <= 3 and tracked(sf.f.vk[x.d]):
+                    sh[x.d] = x.n
+    for b in 0..len(sf.bs):
+        for i in 0..len(sf.bs[b].code):
+            let x = sf.bs[b].code[i]
+            if x.op != Op.Elem or x.n != 1 or x.b < 0 or nuse[x.b] != 1 or db[x.b] < 0:
+                continue
+            var y = sf.bs[db[x.b]].code[di[x.b]]
+            if y.op == Op.Conv and y.a >= 0 and db[y.a] >= 0 and nuse[y.a] == 1:
+                if not int64(sf.f.vk[y.d]) or not int64(sf.f.vk[y.a]):
+                    continue
+                y = sf.bs[db[y.a]].code[di[y.a]]
+            if y.op != Op.Shl or y.b < 0 or sh[y.b] < 0 or not int64(sf.f.vk[y.d]):
+                continue
+            var z = x
+            z.b = y.a
+            z.n = 1 << sh[y.b]
+            sf.bs[b].code[i] = z
+
+fn int64(k: K) -> bool:
+    return k == K.I64 or k == K.U64
+
 fn log2i(v: int) -> int:
     var n = 0
     while (1 << n) < v:
@@ -3689,6 +3727,7 @@ fn optimize(f: Func, vw: int, a64: bool) -> (Func, [KFunc]):
     ffold(ref sf)
     rewrites(ref sf)
     copies(ref sf)
+    elem_scales(ref sf)
     addressing(ref sf)
     gvn(ref sf, a64)
     copies(ref sf)
