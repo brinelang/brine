@@ -226,7 +226,16 @@ static void br_sock_close(br_sock s) { close(s); }
 #endif
 
 /* ============================================================ globals */
+#ifdef BRINE_RT_BR /* runtime/rt.br has the output lock */
+void brine_x_io_lock(void);
+void brine_x_io_unlock(void);
+#define BR_IO_LOCK() brine_x_io_lock()
+#define BR_IO_UNLOCK() brine_x_io_unlock()
+#else
 static br_mutex br_io_mu;
+#define BR_IO_LOCK() br_lock(&br_io_mu)
+#define BR_IO_UNLOCK() br_unlock(&br_io_mu)
+#endif
 static int br_argc;
 static char **br_argv;
 #ifdef BRINE_RT_BR
@@ -260,21 +269,23 @@ static void br_panic_claim(void) {
     if (__atomic_exchange_n(&br_panicking, 1, __ATOMIC_SEQ_CST)) br_park();
 }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 void brine_panic_at(const char *loc, const char *msg) {
     br_panic_claim();
     /* under the output lock, so other threads' output (the GPU log) can't
      * land in the middle */
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     br_flush();
     if (br_size > 1)
         fprintf(stderr, "\npanic (rank %lld): %s\n  --> %s\n", (long long)br_rank, msg, loc);
     else
         fprintf(stderr, "\npanic: %s\n  --> %s\n", msg, loc);
     fflush(stderr);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
     br_gpu_settle();
     exit(101);
 }
+#endif
 
 static BR_NORETURN void br_panicf(const char *loc, const char *fmt, ...) {
     char buf[1024];
@@ -285,6 +296,7 @@ static BR_NORETURN void br_panicf(const char *loc, const char *fmt, ...) {
     brine_panic_at(loc, buf);
 }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_panic_idx(int64_t i, int64_t len, const char *loc) {
     br_panicf(loc, "index %lld is out of bounds for an array of length %lld", (long long)i, (long long)len);
 }
@@ -295,6 +307,7 @@ void brine_assert_fail(const char *loc, const char *src, brine_str *msg) {
         br_panicf(loc, "assertion failed: %s\n  message: %.*s", src, (int)msg->len, msg->data);
     br_panicf(loc, "assertion failed: %s", src);
 }
+#endif
 /* ------------------------------------------------------------ stack overflow */
 /* Deep recursion runs into the guard page under the stack. Instead of dying
  * silently (and losing what is still buffered for stdout), report it like a
@@ -373,6 +386,7 @@ static void br_stack_leave(void) {
 #ifndef BRINE_RT_BR
 static void br_world_finish(const char *how);
 #endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_exit(int64_t code) {
     br_flush();
     br_gpu_settle();
@@ -386,6 +400,7 @@ void brine_unreachable(void) {
     fprintf(stderr, "internal error: reached unreachable code\n");
     abort();
 }
+#endif
 
 /* ============================================================ memory */
 /* Small blocks (strings, boxes, array headers) come from a heap of our own:
@@ -2558,6 +2573,7 @@ brine_str *brine_sb_finish(brine_sb *sb) {
     return s;
 }
 #endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 /* stdout going to a terminal or a pipe is flushed at the end of each line,
  * since something may be reading it as it comes (a person, or a program
  * talking a line protocol); to a file it's written when the buffer fills.
@@ -2579,27 +2595,27 @@ static int br_stdout_streams(void) {
 /* write a finished builder (and free it); `print` adds its own `end` */
 void brine_out_sb(brine_sb *sb) {
     if (BR_UNLIKELY(__atomic_load_n(&br_panicking, __ATOMIC_RELAXED))) br_park();
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     fwrite(sb->p, 1, (size_t)sb->len, stdout);
     if (br_out_lines && memchr(sb->p, '\n', (size_t)sb->len)) fflush(stdout);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
     free(sb->p);
     sb->p = NULL;
 }
 void brine_err_sb(brine_sb *sb) {
     if (BR_UNLIKELY(__atomic_load_n(&br_panicking, __ATOMIC_RELAXED))) br_park();
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     fflush(stdout);
     fwrite(sb->p, 1, (size_t)sb->len, stderr);
     fflush(stderr);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
     free(sb->p);
     sb->p = NULL;
 }
 void brine_flush(void) {
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     fflush(stdout);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
 }
 void brine_print_sb(brine_sb *sb) {
     brine_sb_cat(sb, "\n", 1);
@@ -2609,6 +2625,7 @@ void brine_eprint_sb(brine_sb *sb) {
     brine_sb_cat(sb, "\n", 1);
     brine_err_sb(sb);
 }
+#endif
 
 /* ============================================================ misc */
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
@@ -2626,7 +2643,9 @@ double brine_clock(void) {
 #endif
 }
 #endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 const char *brine_arg(int64_t i) { return i >= 0 && i < br_argc ? br_argv[i] : NULL; }
+#endif
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_arr *brine_args(void) {
     brine_arr *a = br_strs();
@@ -2680,11 +2699,6 @@ static void br_in_par_set(int v) { br_th_get()->in_par = v; }
 /* see brine_rt.h */
 int64_t brine_mt = 0;
 #ifdef BRINE_RT_BR
-void brine_x_thread_enter(void) { br_stack_enter(); }
-void brine_x_thread_leave(void) {
-    br_heap_exit();
-    br_stack_leave();
-}
 int64_t brine_x_threads(void);
 void brine_x_pool_init(void);
 void brine_x_heap_init(int64_t leakcheck);
@@ -3158,21 +3172,6 @@ static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *
  * construct ran, and how long it took, to stderr. */
 
 #ifdef BRINE_RT_BR /* runtime/rt.br has the GPU code */
-/* what it needs of the C that stays: the stderr lock, the rank's place on
- * its machine, and the reductions' fold */
-void brine_x_io_lock(void) { br_lock(&br_io_mu); }
-void brine_x_io_unlock(void) { br_unlock(&br_io_mu); }
-int64_t brine_x_local_rank(void) { return br_local_rank; }
-_Static_assert(sizeof(br_fold) <= 1600 && _Alignof(br_fold) <= 16, "rt.br's FOLD_SIZE");
-void brine_x_fold_init(void *f, int64_t op, int64_t vk, const char *loc) {
-    br_fold_init((br_fold *)f, br_comb_pick(op, vk), br_vk_size[vk], loc);
-}
-void brine_x_fold_push(void *f, int64_t h, const void *v, int64_t has) { br_fold_push((br_fold *)f, (int)h, v, has != 0); }
-int64_t brine_x_fold_finish(void *f, void *out) { return br_fold_finish((br_fold *)f, out); }
-void brine_x_reduce_cpu(int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *ctx, int64_t op, int64_t vk, void *val, bool *has,
-                        const char *loc) {
-    br_reduce_cpu(n, fn, efn, ctx, op, vk, val, has, loc);
-}
 void brine_x_gpu_setup(void);
 void brine_x_gpu_settle(void);
 static void br_gpu_setup(void) { brine_x_gpu_setup(); }
@@ -3245,13 +3244,13 @@ static void br_gpu_setup(void) {
 static void br_gpu_logf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     fputs("brine gpu: ", stderr);
     if (br_size > 1) fprintf(stderr, "rank %lld: ", (long long)br_rank);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     fflush(stderr);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
     va_end(ap);
 }
 
@@ -4756,9 +4755,9 @@ static BR_NORETURN void br_peer_lost(int64_t r, const char *loc) {
 static void br_send(int64_t dest, int64_t kind, const void *data, int64_t len, const char *loc) {
     /* what this rank printed so far comes out before anything another rank
        prints after hearing from it (ranks share stdout, each with its own buffer) */
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     fflush(stdout);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
     br_peer *pr = &br_peers[dest];
     int64_t slen = (int64_t)strlen(br_cur_site);
     if (slen > 4096) slen = 4096;
@@ -5462,6 +5461,7 @@ brine_arr *brine_world_reduce_arr(const char *ed, brine_arr *xs, int op, const c
 }
 #endif /* BRINE_RT_BR */
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 /* ============================================================ init / shutdown */
 #ifdef _WIN32
 #include <io.h>
@@ -5619,6 +5619,7 @@ void brine_rt_shutdown(void) {
     br_flush();
     if (br_leakcheck) fprintf(stderr, "brine: %lld live objects at exit\n", (long long)BR_LIVE_COUNT());
 }
+#endif
 
 /* ============================================================ files and processes */
 #ifdef BR_WASM
@@ -5919,11 +5920,11 @@ static bool br_in_fill(void) {
     return true;
 }
 brine_str *brine_input(brine_str *prompt) {
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     if (prompt && prompt->len) fwrite(prompt->data, 1, (size_t)prompt->len, stdout);
     /* what was printed before (a prompt with `end=""`) shows before the wait */
     fflush(stdout);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
     int64_t seen = 0, n;
     for (;;) {
         const char *at = br_in.p + br_in.pos;
@@ -7383,8 +7384,10 @@ void brine_x_box_retain(void *p) { brine_box_retain(p); }
 bool brine_x_box_dec(void *p) { return brine_box_dec(p); }
 void brine_x_map_retain(brine_map *m) { brine_map_retain(m); }
 void brine_x_map_release(brine_map *m) { brine_map_release(m); }
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_x_arr_push_in(brine_arr **pa, const void *elem, int64_t esz) { brine_arr_push_in(pa, elem, esz); }
 void brine_x_arr_pop_in(brine_arr **pa, void *out, int64_t esz, const char *loc) { brine_arr_pop_in(pa, out, esz, loc); }
+#endif
 void brine_x_arr_clear_in(brine_arr **pa) { brine_arr_clear_in(pa); }
 brine_str *brine_x_str_at(brine_str *s, int64_t i, const char *loc) { return brine_str_at(s, i, loc); }
 brine_str *brine_x_str_byte(brine_str *s, int64_t i) { return brine_str_byte(s, i); }
