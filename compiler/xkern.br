@@ -340,6 +340,100 @@ fn reads(x: VOp) -> [int]:
         vs.push(x.b)
     return vs
 
+fn is_sign(g: Gen, at: [int], v: int) -> bool:
+    if v < 0 or at[v] < 0:
+        return false
+    let x = g.ops[at[v]]
+    return (
+        x.op == V_CONST2 and (x.n == ONE or x.n == MINUS_ONE) and (x.m == ONE or x.m == MINUS_ONE)
+    )
+
+# For a64.br: t = b * s, s a vector of 1s and -1s (from a sum some of whose
+# lanes subtract), where b = p * q is read only by t, becomes b = (p * s) * q,
+# with p * s made once for every such b. Times -1 is exact, so these are the
+# same bits; nbody's three velocity updates share one sign multiply this way.
+fn sign_hoist(g: Gen) -> Gen:
+    let n = len(g.ops)
+    var at = [-1] * g.nval
+    var nuse = [0] * g.nval
+    for i, x in enumerate(g.ops):
+        if x.d >= 0:
+            at[x.d] = i
+        for v in reads(x):
+            nuse[v] += 1
+    # candidates: (t's op, b's op, s), and how many could share each p * s
+    var cand: [(int, int, int)] = []
+    var count: {str: int} = {}
+    for i, x in enumerate(g.ops):
+        if x.op != V_OP or x.n != SSE_MUL or x.m != PFX_PD:
+            continue
+        var b = x.a
+        var s = x.b
+        if not is_sign(g, at, s):
+            b = x.b
+            s = x.a
+        if not is_sign(g, at, s) or is_sign(g, at, b) or at[b] < 0 or nuse[b] != 1:
+            continue
+        let y = g.ops[at[b]]
+        if y.op != V_OP or y.n != SSE_MUL or y.m != PFX_PD or y.a == y.b:
+            continue
+        if is_sign(g, at, y.a) or is_sign(g, at, y.b):
+            continue
+        cand.push((i, at[b], s))
+        for p in [y.a, y.b]:
+            let k = f"{p},{s}"
+            count[k] = count.get(k).unwrap_or(0) + 1
+    # by op: the operand to sign (b's op), dropped (t's op); t -> b
+    var side = [-1] * n
+    var sgn = [-1] * n
+    var skip = [false] * n
+    var to = [-1] * g.nval
+    var front = [false] * n
+    for i, j, s in cand:
+        let y = g.ops[j]
+        let ca = count.get(f"{y.a},{s}").unwrap_or(0)
+        let cb = count.get(f"{y.b},{s}").unwrap_or(0)
+        if max(ca, cb) < 2:
+            continue
+        side[j] = 0 if ca >= cb else 1
+        sgn[j] = s
+        skip[i] = true
+        to[g.ops[i].d] = y.d
+        front[at[s]] = true
+    var r = g
+    var out: [VOp] = []
+    for i, x in enumerate(g.ops):
+        if front[i]:
+            out.push(x)
+    var made: {str: int} = {}
+    for i, x0 in enumerate(g.ops):
+        if front[i] or skip[i]:
+            continue
+        var x = x0
+        if x.a >= 0 and to[x.a] >= 0:
+            x.a = to[x.a]
+        if x.b >= 0 and to[x.b] >= 0:
+            x.b = to[x.b]
+        if side[i] >= 0:
+            let p = x.a if side[i] == 0 else x.b
+            let k = f"{p},{sgn[i]}"
+            var ps = -1
+            match made.get(k):
+                case Some(v):
+                    ps = v
+                case None:
+                    ps = r.nval
+                    r.nval += 1
+                    out.push(VOp(op=V_OP, d=ps, a=p, b=sgn[i], arr=-1, n=SSE_MUL, m=PFX_PD))
+                    made[k] = ps
+            if side[i] == 0:
+                x.a = ps
+            else:
+                x.b = ps
+        out.push(x)
+    r.ops = out
+    return r
+
 # For a64.br: a value's two lanes stored next to each other, in a row, as one
 # 16-byte store (V_ST with m = 2).
 fn pair_stores(g: Gen) -> Gen:
@@ -557,7 +651,9 @@ fn compile(g: Gen, name: str, narr: int, pargs: [int], has_ret: bool, nreg: int)
             first_st = i
     for x in g.ops:
         let u = al.uses[x.d] if x.d >= 0 else []
-        let ld = x.op == V_LD or x.op == V_LD2 or x.op == V_LDP
+        # (NEON: a two-place load costs a lane insert on the vector pipes,
+        # more than a spill and a fill, so it is made once)
+        let ld = x.op == V_LD or x.op == V_LDP or (x.op == V_LD2 and nreg <= 16)
         if (
             x.op == V_CONST
             or x.op == V_CONST2
