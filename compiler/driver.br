@@ -652,8 +652,6 @@ enum Code:
     # `once` are compiled a single time even when `units` are compiled for
     # several CPU levels (the big data blocks)
     C(units: [str], once: [str])
-    # a native object file (x64.br), for the C compiler to link
-    Obj(bytes: [u8])
     # a native object that brine links itself (link.br)
     Native(o: ObjFile)
 
@@ -847,12 +845,6 @@ fn compile_levels(
                 return Err(no_cc_diag())
     make_dirs(dir)?
     flags.extend(profile.cflags())
-    # native code brings the functions runtime/rt.br has in brine
-    match code:
-        case Code.Obj(_):
-            flags.push("-DBRINE_RT_BR")
-        case _:
-            pass
     # the web build is a folder; the module in it is the linker's output
     let out_exe = project.join(dest, "program.wasm") if plat == Platform.Web else dest
     let key = cc + "|" + " ".join(flags) + "|" + VERSION
@@ -863,7 +855,6 @@ fn compile_levels(
     let ukey = key + "|" + hex16(fnv(RT_H))
     # C files with the extra flags each is compiled with
     var units: [(str, [str])] = []
-    var native: [u8] = []
     var hashes: [str] = []
     match code:
         case Code.C(us, once):
@@ -892,9 +883,6 @@ fn compile_levels(
                 units.push((CPU_C, []))
             for u, extra in units:
                 hashes.push(hex16(fnv(u + ukey + " ".join(extra))))
-        case Code.Obj(b):
-            native = b
-            hashes.push(hex16(fnv_bytes(b)))
         case Code.Native(_):
             panic("compile links native objects itself")
     let prog_hash = fnv(" ".join(hashes) + rt_obj)
@@ -937,19 +925,6 @@ fn compile_levels(
             case Err(e):
                 return Err(diag.error("E0705", f"could not run the C compiler: {e}"))
     var t = clock()
-    if len(native) > 0:
-        let obj = project.join(obj_dir, hashes[0] + ".o")
-        objs.push(obj)
-        if not file_exists(obj):
-            let tmp = project.join(obj_dir, f"{hashes[0]}.{os.pid()}.o")
-            match os.write_bytes(tmp, native):
-                case Ok(_):
-                    pass
-                case Err(e):
-                    return Err(io_diag(e))
-            match os.rename(tmp, obj):
-                case _:
-                    pass
     var failure = ""
     for h, c_path, tmp, obj in jobs:
         let rc = os.wait(h)
@@ -1102,7 +1077,14 @@ fn unit_count(profile: Profile) -> int:
         return 1
     return min(max(os.cpu_count(), 1), 16)
 
-fn lowered(fe: Frontend, tests: bool, profile: Profile, plat: Platform) -> lower.Lowered:
+# `native`: for x64.br or a64.br (else for C).
+fn lowered(
+    fe: Frontend,
+    tests: bool,
+    profile: Profile,
+    plat: Platform,
+    native: bool
+) -> lower.Lowered:
     return lower.lower(
         fe.prog.unwrap(),
         fe.info.unwrap(),
@@ -1112,19 +1094,16 @@ fn lowered(fe: Frontend, tests: bool, profile: Profile, plat: Platform) -> lower
             debug=profile == Profile.Debug,
             gpu=not plat.is_wasm(),
             fast=profile == Profile.Release,
-            vec=profile == Profile.Release and not plat.is_wasm() and not use_native(profile),
-            nvec=profile == Profile.Release
-            and not plat.is_wasm()
-            and use_native(profile)
-            and os.arch() == "x86_64",
+            vec=profile == Profile.Release and not plat.is_wasm() and not native,
+            nvec=profile == Profile.Release and native and os.arch() == "x86_64",
             win=os.name() == "windows",
-            native=not plat.is_wasm() and use_native(profile)
+            native=native
         )
     )
 
-# Native code for dev and debug builds where x64.br or a64.br knows the
-# platform; C for optimized builds and everywhere else. `BRINE_BACKEND=c` or `=native`
-# overrides.
+# Native code where x64.br or a64.br knows the platform; C elsewhere, and
+# for optimized builds on AArch64 (a64.br doesn't optimize yet).
+# `BRINE_BACKEND=c` or `=native` overrides.
 fn use_native(profile: Profile) -> bool:
     match getenv("BRINE_BACKEND"):
         case Some(b):
@@ -1137,7 +1116,12 @@ fn use_native(profile: Profile) -> bool:
     return default_native(profile)
 
 fn default_native(profile: Profile) -> bool:
-    return native_host() and profile != Profile.Release
+    return native_host() and (profile != Profile.Release or os.arch() == "x86_64")
+
+# Whether builds here can need the system C compiler (with the default
+# backends; wasm needs wasi-sdk either way).
+fn needs_cc() -> bool:
+    return not (native_host() and os.arch() == "x86_64")
 
 fn native_host() -> bool:
     if os.arch() == "aarch64":
@@ -1154,30 +1138,25 @@ fn out_name(profile: Profile, plat: Platform) -> str:
         return profile.name()
     return profile.name() + ("-native" if use_native(profile) else "-c")
 
+# The program as a native object; a debug build's carries DWARF for `src`.
+fn native_obj(m: ir.Module, profile: Profile, win: bool, arm: bool, src: str) -> ObjFile:
+    let dbg = profile == Profile.Debug
+    let prod = "brine " + VERSION
+    if arm:
+        return a64.emit_obj(m, dbg, src, os.cwd(), prod)
+    if dbg:
+        return x64.emit_obj_debug(m, win, src, os.cwd(), prod)
+    return x64.emit_obj(m, win, profile == Profile.Release)
+
 fn gen_code(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> Code:
     var t = clock()
-    let l = lowered(fe, tests, profile, plat)
+    let native = use_native(profile) and not plat.is_wasm()
+    let l = lowered(fe, tests, profile, plat, native)
     t = phase_time(t, "lower")
-    if use_native(profile) and not plat.is_wasm():
+    if native:
         let win = os.name() == "windows"
         let arm = os.arch() == "aarch64"
-        let src = fe.sm.file(0).path
-        let prod = "brine " + VERSION
-        # debug builds keep the C toolchain's linker for now: link.br
-        # doesn't carry DWARF over yet
-        if profile == Profile.Debug:
-            var b: [u8] = []
-            if arm:
-                b = a64.emit_object_debug(l.m, src, os.cwd(), prod)
-            else:
-                b = x64.emit_object_debug(l.m, win, src, os.cwd(), prod)
-            phase_time(t, "aarch64" if arm else "x86-64")
-            return Code.Obj(b)
-        var o = (
-            a64.emit_obj(l.m, false, "", "", "")
-            if arm
-            else x64.emit_obj(l.m, win, profile == Profile.Release)
-        )
+        let o = native_obj(l.m, profile, win, arm, fe.sm.file(0).path)
         phase_time(t, "aarch64" if arm else "x86-64")
         return Code.Native(o)
     let n = unit_count(profile)
@@ -1193,14 +1172,14 @@ fn gen_code(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> Code
 # The program's IR as text (`brine emit-ir`); with `opt`, after the IR
 # optimizations the native backend runs.
 fn gen_ir(fe: Frontend, profile: Profile, tests: bool, plat: Platform, opt: bool) -> str:
-    let l = lowered(fe, tests, profile, plat)
+    let l = lowered(fe, tests, profile, plat, use_native(profile) and not plat.is_wasm())
     if not opt:
         return ir.dump(l.m)
     return ir.dump(x64.optimized(l.m, profile == Profile.Release))
 
 # The program as one C file (`brine emit-c`).
 fn gen_c(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> str:
-    return ir_c.emit_c(lowered(fe, tests, profile, plat))
+    return ir_c.emit_c(lowered(fe, tests, profile, plat, false))
 
 # The command that runs a WebAssembly build: BRINE_WASM_RUNNER (say
 # `wasmtime run --dir=.`) or Node.js with the runner script, which is written

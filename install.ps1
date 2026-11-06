@@ -92,10 +92,6 @@ function Install-Brine {
     }
     if (-not (($env:Path -split ';') -contains $binDir)) { $env:Path = "$binDir;$env:Path" }
 
-    if (-not (Get-Command gcc, clang, cc -ErrorAction SilentlyContinue)) {
-        Write-Warning ('brine needs a C compiler to build programs, and none was found; install one with ' +
-            '`winget install -e --id BrechtSanders.WinLibs.POSIX.UCRT` or `scoop install mingw-winlibs`')
-    }
     Write-Host "brine: run 'brine doctor' to check your setup, and 'brine new hello' to start a project"
 }
 
