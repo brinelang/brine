@@ -304,6 +304,163 @@ fn copy_chains(f: Func) -> Func:
     g.code = [x for i, x in enumerate(code) if not drop[i]]
     return g
 
+# A slot t filled by one copy from p (another slot, or a field of one),
+# `copy t <- p; ...; load [t + k]; copy u <- t`, then only read: its reads
+# read p instead where nothing between the copy and the read can change p
+# (the `?` and `match` of a struct moves it through several temporaries).
+# When every read can, the copy goes. Calls change only the slots they're
+# passed, since nothing else holds a slot's address.
+fn copy_forward(f: Func) -> Func:
+    let slot = slot_vregs(f)
+    let ns = len(f.slots)
+    let nv = len(f.vk)
+    let n = len(f.code)
+    var ndef = [0] * nv
+    for x in f.code:
+        if x.d >= 0:
+            ndef[x.d] += 1
+    # base[v]: the slot v points into (v is its address, one inside it, or a
+    # copy of one)
+    var base = slot
+    var more = true
+    while more:
+        more = false
+        for x in f.code:
+            if (
+                (x.op == Op.Elem or x.op == Op.Mov)
+                and base[x.d] < 0
+                and base[x.a] >= 0
+                and ndef[x.d] == 1
+                and x.d >= f.nparams
+            ):
+                base[x.d] = base[x.a]
+                more = true
+    # esc[s]: s's address goes somewhere this pass doesn't follow; other[s]:
+    # s is read through an address inside it; wr[s]: the instructions that
+    # write s, rd[s]: those that read it through its own address
+    var esc = [false] * ns
+    var other = [false] * ns
+    var wr: [[int]] = [[] for _ in 0..ns]
+    var rd: [[int]] = [[] for _ in 0..ns]
+    for i, x in enumerate(f.code):
+        if x.op == Op.SlotAddr:
+            if base[x.d] < 0:
+                esc[x.a] = true
+            continue
+        if same_slot(x, slot):
+            continue
+        if (x.op == Op.Elem or x.op == Op.Mov) and base[x.d] >= 0:
+            continue
+        var addr = -1
+        match x.op:
+            case Op.Load:
+                addr = x.a
+                if slot[x.a] >= 0:
+                    rd[slot[x.a]].push(i)
+                elif base[x.a] >= 0:
+                    other[base[x.a]] = true
+            case Op.Store | Op.Zero:
+                addr = x.a
+                if base[x.a] >= 0:
+                    wr[base[x.a]].push(i)
+            case Op.Copy:
+                if base[x.a] >= 0:
+                    wr[base[x.a]].push(i)
+                if slot[x.b] >= 0 and base[x.a] != slot[x.b]:
+                    rd[slot[x.b]].push(i)
+                elif base[x.b] >= 0:
+                    other[base[x.b]] = true
+                for v in reads(x, nv):
+                    if v != x.a and v != x.b and base[v] >= 0:
+                        esc[base[v]] = true
+                continue
+            case Op.Call:
+                for v in x.args:
+                    if base[v] >= 0:
+                        wr[base[v]].push(i)
+                continue
+            case _:
+                pass
+        for v in reads(x, nv):
+            if v != addr and base[v] >= 0:
+                esc[base[v]] = true
+    # the jumps to each label
+    var from: [[int]] = [[] for _ in 0..f.nlabels]
+    for i, x in enumerate(f.code):
+        for l in ssa_targets(x):
+            from[l].push(i)
+    var code = f.code
+    var drop = [false] * n
+    # (in order of their copies, so a chain t1 <- p, t2 <- t1 reads p)
+    var order: [(int, int)] = []
+    for t in 0..ns:
+        if not esc[t] and not other[t] and len(wr[t]) == 1 and len(rd[t]) > 0:
+            let a = wr[t][0]
+            let x = f.code[a]
+            if x.op == Op.Copy and slot[x.a] == t and x.n == f.slots[t].size:
+                order.push((a, t))
+    order.sort()
+    for at in order:
+        let a = at.0
+        let t = at.1
+        let p = code[a].b
+        let ps = base[p]
+        if ps < 0 or ps == t or esc[ps] or ndef[p] != 1:
+            continue
+        var all = true
+        for u in rd[t]:
+            if u <= a or u - a > 4000 or not unchanged(code, from, base, a, u, ps):
+                all = false
+                continue
+            # (memcpy's regions can't overlap)
+            if code[u].op == Op.Copy and base[code[u].a] == ps:
+                all = false
+                continue
+            if code[u].op == Op.Load:
+                code[u].a = p
+            else:
+                code[u].b = p
+        if all:
+            drop[a] = true
+    var g = f
+    g.code = [x for i, x in enumerate(code) if not drop[i]]
+    return g
+
+# Nothing after code[a] and before code[u] writes slot ps, and control
+# reaches u from a only through code in between.
+fn unchanged(code: [Inst], from: [[int]], base: [int], a: int, u: int, ps: int) -> bool:
+    for i in a + 1..u:
+        let y = code[i]
+        match y.op:
+            case Op.Label:
+                for j in from[y.n]:
+                    if j < a or j > u:
+                        return false
+            case Op.Store | Op.Zero | Op.Copy:
+                if base[y.a] == ps:
+                    return false
+            case Op.Call:
+                for v in y.args:
+                    if base[v] == ps:
+                        return false
+            case Op.CallInd:
+                return false
+            case _:
+                pass
+    return true
+
+# The labels a terminator can go to (ssa.targets).
+fn ssa_targets(x: Inst) -> [int]:
+    match x.op:
+        case Op.Jmp:
+            return [x.n]
+        case Op.Br | Op.BrNot:
+            return [x.n, x.c] if x.c >= 0 else [x.n]
+        case Op.Switch:
+            return x.args
+        case _:
+            return []
+
 # The unsigned kind of n bytes (1, 2, 4 or 8).
 fn ukind(n: int) -> K:
     if n == 1:
@@ -496,8 +653,91 @@ fn pack_copies(f: Func) -> Func:
     g.code = code
     return g
 
+# The reference count kind of a retain or release call: "arr" for
+# brine_arr_retain, and so on ("" for any other call).
+fn rc_kind(x: Inst, which: str) -> str:
+    if x.op != Op.Call or len(x.args) != 1:
+        return ""
+    for k in ["arr", "str", "map", "box"]:
+        if x.s == "brine_" + k + "_" + which:
+            return k
+    return ""
+
+# A retain of a value loaded from memory and the releases of that value
+# cancel when nothing in the function can change memory or drop another
+# reference: no stores but to its own slots, no copies, no calls but such
+# retains and releases. Then whatever holds the value (the caller's, through a
+# parameter) holds it until the function returns: `for p in self.t` in a
+# method that only reads. All or nothing: every retain and release in the
+# function must be of such a value, each retained once.
+fn borrowed_rc(f: Func) -> Func:
+    let nv = len(f.vk)
+    var slot = [false] * nv
+    var ndef = [0] * nv
+    var loaded = [false] * nv
+    for x in f.code:
+        if x.d >= 0 and x.d < nv:
+            ndef[x.d] += 1
+            if x.op == Op.SlotAddr:
+                slot[x.d] = true
+            if x.op == Op.Load:
+                loaded[x.d] = true
+    var nret = [0] * nv
+    var nrel = [0] * nv
+    var kind: [str] = [""] * nv
+    var any = false
+    for x in f.code:
+        match x.op:
+            case Op.CallInd:
+                return f
+            case Op.Call:
+                let r = rc_kind(x, "retain")
+                let l = rc_kind(x, "release")
+                if r == "" and l == "":
+                    return f
+                let v = x.args[0]
+                let k = r if r != "" else l
+                if v < 0 or v >= nv or ndef[v] != 1 or not loaded[v]:
+                    return f
+                if kind[v] != "" and kind[v] != k:
+                    return f
+                kind[v] = k
+                if r != "":
+                    nret[v] += 1
+                    any = true
+                else:
+                    nrel[v] += 1
+            case Op.Copy:
+                return f
+            case Op.Store | Op.Zero:
+                if x.a < 0 or x.a >= nv or not slot[x.a]:
+                    return f
+            case _:
+                pass
+    if not any:
+        return f
+    # each such value: retained once and released (a retain with no release
+    # hands the value on, as does a copy of what holds it), and otherwise
+    # only read through
+    for x in f.code:
+        if x.op == Op.Call:
+            continue
+        for v in reads(x, nv):
+            if kind[v] == "":
+                continue
+            let addr = (x.op == Op.Load or x.op == Op.Elem) and x.a == v and x.b != v
+            let cmp = x.op == Op.Eq or x.op == Op.Ne
+            if not addr and not cmp:
+                return f
+    for v in 0..nv:
+        if kind[v] != "" and (nret[v] != 1 or nrel[v] == 0):
+            return f
+    var g = f
+    g.code = [x for x in f.code if x.op != Op.Call]
+    return g
+
 fn promote(f0: Func) -> Func:
-    let f = pack_copies(copy_chains(f0))
+    let f = pack_copies(copy_chains(copy_forward(f0)))
     let slot = slot_vregs(f)
     let fs = promotable(f, slot)
     var g = f
@@ -670,8 +910,10 @@ fn sw_kind(k: K) -> bool:
 # The table jumps over every test but the first, so a later one joins the
 # chain only when what it computes (its load, constant and comparison) is
 # read by nothing else: an optimized function can read a test's load again
-# further down.
-fn sw_test(f: Func, i0: int, ndef: [int], nuse: [int], first: bool) -> Option[SwTest]:
+# further down. The constant is made right before the comparison, or once
+# before the first branch (a64.br's optimized code): `kdef` has where, for
+# those, else -1.
+fn sw_test(f: Func, i0: int, ndef: [int], nuse: [int], kdef: [int], first: bool) -> Option[SwTest]:
     let n = len(f.code)
     var i = i0
     while i < n and f.code[i].op == Op.Line:
@@ -680,22 +922,36 @@ fn sw_test(f: Func, i0: int, ndef: [int], nuse: [int], first: bool) -> Option[Sw
     if i < n and f.code[i].op == Op.Load:
         lv = i
         i += 1
-    if i + 2 >= n:
+    if i >= n:
         return None
-    let c = f.code[i]
-    let e = f.code[i + 1]
-    let b = f.code[i + 2]
-    if c.op != Op.Const or e.op != Op.Eq or b.op != Op.BrNot or b.a != e.d or e.b != c.d:
+    var c = f.code[i]
+    let inline = c.op == Op.Const
+    if inline:
+        i += 1
+    if i + 1 >= n:
         return None
-    if ndef[c.d] != 1 or ndef[e.d] != 1 or not sw_kind(f.vk[e.a]):
+    let e = f.code[i]
+    let b = f.code[i + 1]
+    if e.op != Op.Eq or b.op != Op.BrNot or b.a != e.d or e.b < 0:
         return None
-    if not first and (nuse[c.d] != 1 or nuse[e.d] != 1 or (lv >= 0 and nuse[e.a] != 1)):
+    if inline:
+        if e.b != c.d or ndef[c.d] != 1:
+            return None
+    elif kdef[e.b] >= 0:
+        c = f.code[kdef[e.b]]
+    else:
+        return None
+    if ndef[e.d] != 1 or not sw_kind(f.vk[e.a]):
+        return None
+    if not first and (
+        (inline and nuse[c.d] != 1) or nuse[e.d] != 1 or (lv >= 0 and nuse[e.a] != 1)
+    ):
         return None
     if lv >= 0 and f.code[lv].d != e.a:
         return None
     if c.n < -(1 << 30) or c.n > (1 << 30):
         return None
-    return Some(SwTest(key=e.a, lv=lv, k=c.n, fail=b.n, body=i + 3))
+    return Some(SwTest(key=e.a, lv=lv, k=c.n, fail=b.n, body=i + 2))
 
 # Do two tests read the same value: one vreg, or the same load of a pointer
 # that doesn't change in between?
@@ -720,6 +976,13 @@ fn switches(f: Func) -> Func:
     for i in 0..n:
         if f.code[i].op == Op.Label:
             lat[f.code[i].n] = i
+    var kdef = [-1] * nv
+    for i in 0..n:
+        let x = f.code[i]
+        if x.op == Op.Label or x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot:
+            break
+        if x.op == Op.Const and ndef[x.d] == 1:
+            kdef[x.d] = i
     # the tests that start a chain, and the label to put at each body
     var before: {int: Inst} = {}
     var body_label: {int: int} = {}
@@ -728,7 +991,7 @@ fn switches(f: Func) -> Func:
     for i in 0..n:
         if i in seen:
             continue
-        match sw_test(f, i, ndef, nuse, true):
+        match sw_test(f, i, ndef, nuse, kdef, true):
             case Some(t0):
                 var chain = [t0]
                 var at = i
@@ -737,7 +1000,7 @@ fn switches(f: Func) -> Func:
                     let l = lat[last.fail]
                     if l < 0 or l <= at:
                         break
-                    match sw_test(f, l + 1, ndef, nuse, false):
+                    match sw_test(f, l + 1, ndef, nuse, kdef, false):
                         case Some(t):
                             if not sw_same(f, t0, t):
                                 break
@@ -770,9 +1033,14 @@ fn switches(f: Func) -> Func:
                             nl += 1
                 var args = [dflt]
                 args.extend(table)
-                # in front of the first test's constant (after its load)
+                # in front of the first test's comparison (after its load and
+                # constant)
                 var pos = i
-                while f.code[pos].op == Op.Line or f.code[pos].op == Op.Load:
+                while (
+                    f.code[pos].op == Op.Line
+                    or f.code[pos].op == Op.Load
+                    or f.code[pos].op == Op.Const
+                ):
                     pos += 1
                 before[pos] = Inst(op=Op.Switch, d=-1, a=t0.key, b=-1, c=-1, n=lo, s="", args=args)
             case None:
@@ -852,8 +1120,11 @@ fn inlinable(f: Func, hot: {str: bool}) -> bool:
                 calls = true
     return f.hot or not calls or len(f.code) <= INLINE_CALLS
 
-fn inline_small(fs: [Func]) -> [Func]:
-    var cur = fs
+# With `borrow` (optimized builds), the retains and releases a read-only
+# function needs for what it borrows are dropped first, so they don't count
+# against it as calls (`Lin.coef`'s loop over its terms is inlined then).
+fn inline_small(fs: [Func], borrow: bool) -> [Func]:
+    var cur = [borrowed_rc(f) for f in fs] if borrow else fs
     for _ in 0..INLINE_ROUNDS:
         let (next, changed) = inline_round(cur)
         cur = next

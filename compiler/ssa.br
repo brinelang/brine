@@ -1191,6 +1191,44 @@ fn addressing(ref sf: SF):
                     y.n = x.n + off[x.a]
                     sf.bs[bi].code[i] = y
 
+# `elem p + (i << k) * 1`, the shift (and a conversion between 64-bit ints
+# after it) used only there, is `elem p + i * 2^k`: rt.br's `load_i64(p, i * 8)`
+# whose `* 8` became a shift. The backends fold that index into the load.
+fn elem_scales(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var nuse = [0] * nv
+    var db = [-1] * nv
+    var di = [-1] * nv
+    var sh = [-1] * nv
+    for b in 0..len(sf.bs):
+        for i, x in enumerate(sf.bs[b].code):
+            for u in uses(x):
+                nuse[u] += 1
+            if x.d >= 0:
+                db[x.d] = b
+                di[x.d] = i
+                if x.op == Op.Const and x.n >= 1 and x.n <= 3 and tracked(sf.f.vk[x.d]):
+                    sh[x.d] = x.n
+    for b in 0..len(sf.bs):
+        for i in 0..len(sf.bs[b].code):
+            let x = sf.bs[b].code[i]
+            if x.op != Op.Elem or x.n != 1 or x.b < 0 or nuse[x.b] != 1 or db[x.b] < 0:
+                continue
+            var y = sf.bs[db[x.b]].code[di[x.b]]
+            if y.op == Op.Conv and y.a >= 0 and db[y.a] >= 0 and nuse[y.a] == 1:
+                if not int64(sf.f.vk[y.d]) or not int64(sf.f.vk[y.a]):
+                    continue
+                y = sf.bs[db[y.a]].code[di[y.a]]
+            if y.op != Op.Shl or y.b < 0 or sh[y.b] < 0 or not int64(sf.f.vk[y.d]):
+                continue
+            var z = x
+            z.b = y.a
+            z.n = 1 << sh[y.b]
+            sf.bs[b].code[i] = z
+
+fn int64(k: K) -> bool:
+    return k == K.I64 or k == K.U64
+
 fn log2i(v: int) -> int:
     var n = 0
     while (1 << n) < v:
@@ -1341,6 +1379,90 @@ fn bit_loads(ref sf: SF):
                 code.push(x)
         sf.bs[b].code = code
 
+# An integer kind of 64 bits or less (a 128-bit value converted to it keeps
+# its low word).
+fn narrow_int(k: K) -> bool:
+    return not k.is_wide() and not k.is_float() and k != K.Bool
+
+# A 128-bit load only ever cut down to 64 bits or less, as it is or after a
+# shift right by 64 (a hash of an i128: its two words): two 64-bit loads
+# instead, so no 128-bit value is made, kept in the frame and taken apart.
+fn wide_halves(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var users: [[(int, int)]] = [[] for _ in 0..nv]
+    var c64 = [false] * nv
+    for b in 0..len(sf.bs):
+        for i, x in enumerate(sf.bs[b].code):
+            if x.op == Op.Const and x.n == 64 and x.c == 0:
+                c64[x.d] = true
+            for u in uses(x):
+                users[u].push((b, i))
+    var gone: [[bool]] = [[false] * len(b.code) for b in sf.bs]
+    var hi_after: [[int]] = [[-1] * len(b.code) for b in sf.bs]
+    var any = false
+    for lb in 0..len(sf.bs):
+        for li in 0..len(sf.bs[lb].code):
+            let ld = sf.bs[lb].code[li]
+            if ld.op != Op.Load or not sf.f.vk[ld.d].is_wide():
+                continue
+            # the load and its 128-bit conversions; what reads their words
+            var al = [ld.d]
+            var lows: [(int, int)] = []
+            var highs: [(int, int)] = []
+            var dead: [(int, int)] = []
+            var ok = true
+            var k = 0
+            while k < len(al) and ok:
+                let v = al[k]
+                k += 1
+                for ub, ui in users[v]:
+                    let y = sf.bs[ub].code[ui]
+                    if y.op == Op.Conv and sf.f.vk[y.d].is_wide():
+                        al.push(y.d)
+                        dead.push((ub, ui))
+                    elif y.op == Op.Conv and narrow_int(sf.f.vk[y.d]):
+                        lows.push((ub, ui))
+                    elif y.op == Op.Shr and y.a == v and y.b != v and c64[y.b]:
+                        dead.push((ub, ui))
+                        for hb, hi in users[y.d]:
+                            let z = sf.bs[hb].code[hi]
+                            if z.op == Op.Conv and narrow_int(sf.f.vk[z.d]):
+                                highs.push((hb, hi))
+                            else:
+                                ok = false
+                    else:
+                        ok = false
+            if not ok:
+                continue
+            any = true
+            let lo = len(sf.f.vk)
+            sf.f.vk.push(K.U64)
+            sf.bs[lb].code[li].d = lo
+            for ub, ui in lows:
+                sf.bs[ub].code[ui].a = lo
+            if len(highs) > 0:
+                let hv = len(sf.f.vk)
+                sf.f.vk.push(K.U64)
+                hi_after[lb][li] = hv
+                for hb, hi in highs:
+                    sf.bs[hb].code[hi].a = hv
+            for db, di in dead:
+                gone[db][di] = true
+    if not any:
+        return
+    for b in 0..len(sf.bs):
+        var code: [Inst] = []
+        for i, x in enumerate(sf.bs[b].code):
+            if gone[b][i]:
+                continue
+            code.push(x)
+            if hi_after[b][i] >= 0:
+                var y = x
+                y.d = hi_after[b][i]
+                y.n = x.n + 8
+                code.push(y)
+        sf.bs[b].code = code
+
 # ================================================================ memory
 
 # The slots whose address only ever serves as the address of a load, a store,
@@ -1389,8 +1511,17 @@ fn may_alias(w: Place, r: Place) -> bool:
 
 # ================================================================ value numbering
 
-fn gvn_key(x: Inst, vk: [K]) -> str:
+# (consts: constants too, for a64.br, which keeps them in registers, while
+# x64.br folds them into the instructions using them; each is then made once,
+# in the entry block, when one is made there)
+fn gvn_key(x: Inst, vk: [K], consts: bool) -> str:
     match x.op:
+        case Op.Const | Op.FConst:
+            if consts:
+                # (c: the high half of a 128-bit constant)
+                let hi = x.c if vk[x.d].is_wide() else 0
+                return f"{x.op.name()}|{vk[x.d].name()}|{hi}|{x.n}"
+            return ""
         case Op.Add | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Eq | Op.Ne:
             let a = min(x.a, x.b)
             let b = max(x.a, x.b)
@@ -1415,7 +1546,7 @@ struct Avail:
     k: K
     v: int
 
-fn gvn(ref sf: SF):
+fn gvn(ref sf: SF, consts: bool):
     let n = len(sf.bs)
     let nv = len(sf.f.vk)
     let po = postorder(sf.bs)
@@ -1495,7 +1626,7 @@ fn gvn(ref sf: SF):
                 avail = avail[len(avail) - 64:]
             if x.d < 0:
                 continue
-            let key = gvn_key(x, sf.f.vk)
+            let key = gvn_key(x, sf.f.vk, consts)
             if key == "":
                 continue
             match table.get(key):
@@ -1503,8 +1634,12 @@ fn gvn(ref sf: SF):
                     repl[x.d] = v
                     code[i] = mk(Op.Mov, x.d, v, -1, -1, 0)
                 case None:
-                    table[key] = x.d
-                    log_k.push(key)
+                    # (only the entry block's constants are shared: code
+                    # that jumps over a constant's definition, like a
+                    # switch's table, can then still read it)
+                    if b == 0 or (x.op != Op.Const and x.op != Op.FConst):
+                        table[key] = x.d
+                        log_k.push(key)
         sf.bs[b].code = code
         for c in ch[b]:
             if len(sf.bs[c].pred) == 1:
@@ -1557,7 +1692,7 @@ fn empty_ifs(ref sf: SF) -> bool:
     return changed
 
 # A block that only picks a bool and branches on it (the end of `a and b`, `a
-# or b`): a predecessor whose value for it is known (a constant, or the
+# or b`), or on its negation (`if not f(x)` with f inlined): a predecessor whose value for it is known (a constant, or the
 # condition it branched there on) goes straight to where that leads; one that
 # jumps there branches on its value itself, which native code fuses with the
 # comparison that made it. The bool is then never made. True if it changed
@@ -1575,16 +1710,47 @@ fn bool_ifs(ref sf: SF) -> bool:
     var changed = false
     # (a block changed once waits for relink: its successors are stale)
     var touched = [false] * len(sf.bs)
+    # A bool picked here that only a branch right after an empty block uses
+    # (an inlined call's result): branch here, so the loop below sees it.
     for b in 0..len(sf.bs):
-        if len(sf.bs[b].code) != 2:
+        let code = sf.bs[b].code
+        if len(code) != 2 or code[0].op != Op.Phi or code[1].op != Op.Jmp:
+            continue
+        let s = sf.lab[code[1].n]
+        if s < 0 or s == b or len(sf.bs[s].code) != 1:
+            continue
+        let t = sf.bs[s].code[0]
+        if (t.op != Op.Br and t.op != Op.BrNot) or t.a != code[0].d or nuse[t.a] != 1:
+            continue
+        if t.n == t.c or not edge_ok(sf, b, t.n) or not edge_ok(sf, b, t.c):
+            continue
+        let bl = sf.bs[b].label
+        sf.bs[b].code[1] = t
+        add_entries(ref sf, t.n, bl, sf.bs[s].label)
+        add_entries(ref sf, t.c, bl, sf.bs[s].label)
+        touched[b] = true
+        changed = true
+    for b in 0..len(sf.bs):
+        let nc = len(sf.bs[b].code)
+        if nc != 2 and nc != 3:
             continue
         let ph = sf.bs[b].code[0]
-        let t = sf.bs[b].code[1]
+        var t = sf.bs[b].code[nc - 1]
         let bl = sf.bs[b].label
-        if ph.op != Op.Phi or (t.op != Op.Br and t.op != Op.BrNot) or t.a != ph.d:
+        var cond = ph.d
+        if nc == 3:
+            # the phi negated: branch the other way on the phi itself
+            let ng = sf.bs[b].code[1]
+            if ng.op != Op.Not or sf.f.vk[ng.d] != K.Bool or ng.a != ph.d or nuse[ng.d] != 1:
+                continue
+            cond = ng.d
+        if ph.op != Op.Phi or (t.op != Op.Br and t.op != Op.BrNot) or t.a != cond:
             continue
         if nuse[ph.d] != 1 or t.n == bl or t.c == bl:
             continue
+        if nc == 3:
+            t.op = Op.BrNot if t.op == Op.Br else Op.Br
+            t.a = ph.d
         for p in sf.bs[b].pred:
             if touched[p]:
                 continue
@@ -1615,6 +1781,322 @@ fn bool_ifs(ref sf: SF) -> bool:
                 touched[p] = true
                 changed = true
     return changed
+
+# `if c: x += 1` adds the condition instead of branching on it: a branch
+# that is hard to predict (say on bits of data) costs more than the add. The
+# condition `v & 1 != 0` is that bit itself. True if it changed any.
+fn cond_incs(ref sf: SF) -> bool:
+    let nv = len(sf.f.vk)
+    var nuse = [0] * nv
+    var def: [Option[Inst]] = [None] * nv
+    for b in sf.bs:
+        for x in b.code:
+            for u in uses(x):
+                nuse[u] += 1
+            if x.d >= 0:
+                def[x.d] = Some(x)
+    var changed = false
+    for b in 0..len(sf.bs):
+        let m = len(sf.bs[b].code)
+        let t = sf.bs[b].code[m - 1]
+        # the block e that runs when the condition is true, then goes to x_lab
+        var e_lab = -1
+        var x_lab = -1
+        if t.op == Op.Br:
+            e_lab = t.n
+            x_lab = t.c
+        elif t.op == Op.BrNot:
+            e_lab = t.c
+            x_lab = t.n
+        else:
+            continue
+        let e = sf.lab[e_lab]
+        if e == b or e_lab == x_lab or len(sf.bs[e].pred) != 1:
+            continue
+        # e: `y = x + 1` and a jump to where the other edge goes (maybe
+        # through a block that only jumps on: `via`, the label of the
+        # merge's edge from that side)
+        let ej = sf.bs[e].code[len(sf.bs[e].code) - 1]
+        var via = sf.bs[b].label
+        if ej.op == Op.Jmp and ej.n != x_lab:
+            let o = sf.lab[x_lab]
+            if not skips_to(sf.bs[o], ej.n) or len(sf.bs[o].pred) != 1:
+                continue
+            via = x_lab
+        var inc = -1
+        var ok = true
+        for i, x in enumerate(sf.bs[e].code):
+            if i == len(sf.bs[e].code) - 1:
+                ok = ok and x.op == Op.Jmp
+            elif x.op == Op.Add and inc < 0:
+                inc = i
+            elif x.op != Op.Line:
+                ok = false
+        if not ok or inc < 0:
+            continue
+        let y = sf.bs[e].code[inc]
+        let k = sf.f.vk[y.d]
+        if k.is_float() or k.is_wide() or k == K.Bool or nuse[y.d] != 1:
+            continue
+        match def[y.b]:
+            case Some(c):
+                if c.op != Op.Const or c.n != 1:
+                    continue
+            case None:
+                continue
+        # the merge: a phi takes y from e and x from b; the others the same
+        # value from both
+        let s = sf.lab[ej.n]
+        var phi = -1
+        for j, x in enumerate(sf.bs[s].code):
+            if x.op != Op.Phi:
+                break
+            let ve = phi_value(x, e_lab)
+            let vb = phi_value(x, via)
+            if ve == y.d and vb == y.a and phi < 0:
+                phi = j
+            elif ve != vb:
+                ok = false
+        if not ok or phi < 0:
+            continue
+        # z = the condition as 0 or 1, of y's kind
+        var z = -1
+        match def[t.a]:
+            case Some(c):
+                if c.op == Op.Ne:
+                    match (def[c.a], def[c.b]):
+                        case (Some(a), Some(zero)):
+                            if (
+                                a.op == Op.And
+                                and zero.op == Op.Const
+                                and zero.n == 0
+                                and sf.f.vk[a.a] == sf.f.vk[c.a]
+                            ):
+                                match def[a.b]:
+                                    case Some(one):
+                                        if one.op == Op.Const and one.n == 1:
+                                            z = c.a
+                                    case None:
+                                        pass
+                        case _:
+                            pass
+            case None:
+                pass
+        var code = sf.bs[b].code
+        code.pop()
+        if z < 0 or sf.f.vk[z] != k:
+            let w = new_v(ref sf, k)
+            code.push(mk(Op.Conv, w, z if z >= 0 else t.a, -1, -1, 0))
+            z = w
+        code.push(mk(Op.Add, y.d, y.a, z, -1, 0))
+        code.push(mk(Op.Jmp, -1, -1, -1, -1, x_lab))
+        sf.bs[b].code = code
+        # (relink drops the phis' entries for e, which nothing reaches now)
+        var p = sf.bs[s].code[phi]
+        var q = 0
+        while q < len(p.args):
+            if p.args[q] == via:
+                p.args[q + 1] = y.d
+            q += 2
+        sf.bs[s].code[phi] = p
+        nuse[t.a] = 0
+        changed = true
+    return changed
+
+# A loop that only counts a bit array's set bits, one index at a time
+# (`for k in lo..hi: if bits[k]: n += 1` once cond_incs made it
+# `n += (word >> k) & 1`), counts them a word at a time instead: before the
+# loop n gets brine_x_bits_count added and k starts at hi, so the loop exits
+# at once. Its indices are in bounds: an unproven one would have an IdxChk.
+fn bit_counts(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var def: [Option[Inst]] = [None] * nv
+    var def_b = [-1] * nv
+    for bi, b in enumerate(sf.bs):
+        for x in b.code:
+            if x.d >= 0:
+                def[x.d] = Some(x)
+                def_b[x.d] = bi
+    for lp in find_loops(sf):
+        var inl = [false] * len(sf.bs)
+        for b in lp.body:
+            inl[b] = true
+        let h = lp.header
+        # the header: two phis (k and n), `k < hi` and the exit
+        var phis: [Inst] = []
+        var rest: [Inst] = []
+        for x in sf.bs[h].code:
+            if x.op == Op.Phi:
+                phis.push(x)
+            elif x.op != Op.Line:
+                rest.push(x)
+        if len(phis) != 2 or len(rest) != 2 or len(sf.bs[h].pred) != 2:
+            continue
+        let t = rest[0]
+        let j = rest[1]
+        if t.op != Op.Lt or j.a != t.d or (j.op != Op.Br and j.op != Op.BrNot):
+            continue
+        let inside = j.c if j.op == Op.BrNot else j.n
+        let outside = j.n if j.op == Op.BrNot else j.c
+        if not inl[sf.lab[inside]] or inl[sf.lab[outside]]:
+            continue
+        var pre = -1
+        var latch = -1
+        for p in sf.bs[h].pred:
+            if inl[p]:
+                latch = p
+            else:
+                pre = p
+        if pre < 0 or latch < 0:
+            continue
+        let pt = sf.bs[pre].code[len(sf.bs[pre].code) - 1]
+        if pt.op != Op.Jmp or pt.n != sf.bs[h].label:
+            continue
+        let ki = 0 if phis[0].d == t.a else 1
+        let kp = phis[ki]
+        let np = phis[1 - ki]
+        let hi = t.b
+        let nk = sf.f.vk[np.d]
+        if (
+            kp.d != t.a
+            or sf.f.vk[kp.d] != K.I64
+            or (nk != K.I64 and nk != K.U64)
+            or (def_b[hi] >= 0 and inl[def_b[hi]])
+        ):
+            continue
+        let pl = sf.bs[pre].label
+        let ll = sf.bs[latch].label
+        # n' = n + z, z = (w >> k) & 1 (maybe converted), w = d[k >> 6]
+        var ok = true
+        var want = 0
+        var d = -1
+        let kv = through(def, phi_value(kp, ll))
+        let nv2 = through(def, phi_value(np, ll))
+        if kv < 0 or nv2 < 0:
+            continue
+        match (def[kv], def[nv2]):
+            case (Some(k2), Some(n2)):
+                ok = k2.op == Op.Add and k2.a == kp.d and is_const(def, k2.b, 1)
+                ok = ok and n2.op == Op.Add and n2.a == np.d and n2.b >= 0
+                var z = n2.b if ok else 0
+                want = 2
+                match def[z]:
+                    case Some(cv):
+                        if cv.op == Op.Conv:
+                            z = cv.a
+                            want += 1
+                    case None:
+                        pass
+                let s = arg_of(def, z, Op.And, 1)
+                let w = arg_of(def, s, Op.Shr, -1)
+                ok = ok and s >= 0 and w >= 0 and def_is(def, s, Op.Shr, w, kp.d)
+                ok = ok and (sf.f.vk[w] == K.U64 or sf.f.vk[w] == K.I64)
+                match def[w if ok else 0]:
+                    case Some(ld):
+                        if ok and ld.op == Op.Load and ld.n == 0 and ld.a >= 0:
+                            match def[ld.a]:
+                                case Some(el):
+                                    ok = ok and el.op == Op.Elem and el.n == 8
+                                    ok = ok and arg_of(def, el.b, Op.Shr, 6) == kp.d
+                                    d = el.a
+                                case None:
+                                    ok = false
+                        else:
+                            ok = false
+                    case None:
+                        ok = false
+                want += 5
+            case _:
+                ok = false
+        if not ok or d < 0 or (def_b[d] >= 0 and inl[def_b[d]]):
+            continue
+        # nothing else in the loop; k and the test unused after it
+        var count = 0
+        for b in lp.body:
+            if b == h:
+                continue
+            for i, x in enumerate(sf.bs[b].code):
+                if i == len(sf.bs[b].code) - 1:
+                    ok = ok and x.op == Op.Jmp
+                elif x.op != Op.Line and x.op != Op.Const and not one_phi(x):
+                    count += 1
+        for b in 0..len(sf.bs):
+            if not inl[b]:
+                for x in sf.bs[b].code:
+                    for u in uses(x):
+                        ok = ok and u != kp.d and u != t.d
+        if not ok or count != want:
+            continue
+        let k0 = phi_value(kp, pl)
+        let n0 = phi_value(np, pl)
+        let r = new_v(ref sf, nk)
+        let n1 = new_v(ref sf, nk)
+        var call = mk(Op.Call, r, -1, 0, -1, 0)
+        call.s = "brine_x_bits_count"
+        call.args = [d, k0, hi]
+        var code = sf.bs[pre].code
+        let jt = code.pop()
+        code.push(call)
+        code.push(mk(Op.Add, n1, n0, r, -1, 0))
+        code.push(jt)
+        sf.bs[pre].code = code
+        for i in 0..2:
+            var p = sf.bs[h].code[i]
+            var q = 0
+            while q < len(p.args):
+                if p.args[q] == pl:
+                    p.args[q + 1] = hi if p.d == kp.d else n1
+                q += 2
+            sf.bs[h].code[i] = p
+
+# v, or what it copies through phis of one entry (blocks left behind by
+# cond_incs)
+fn through(def: [Option[Inst]], v: int) -> int:
+    var u = v
+    var hops = 0
+    while u >= 0 and hops < 8:
+        match def[u]:
+            case Some(x):
+                if not one_phi(x):
+                    return u
+                u = x.args[1]
+            case None:
+                return u
+        hops += 1
+    return u
+
+fn one_phi(x: Inst) -> bool:
+    return x.op == Op.Phi and len(x.args) == 2
+
+fn is_const(def: [Option[Inst]], v: int, n: int) -> bool:
+    if v < 0:
+        return false
+    match def[v]:
+        case Some(c):
+            return c.op == Op.Const and c.n == n
+        case None:
+            return false
+
+# a, where v = op(a, n) for a const n (n -1: any b); else -1
+fn arg_of(def: [Option[Inst]], v: int, op: Op, n: int) -> int:
+    if v < 0:
+        return -1
+    match def[v]:
+        case Some(x):
+            if x.op == op and (n < 0 or is_const(def, x.b, n)):
+                return x.a
+            return -1
+        case None:
+            return -1
+
+fn def_is(def: [Option[Inst]], v: int, op: Op, a: int, b: int) -> bool:
+    if v < 0:
+        return false
+    match def[v]:
+        case Some(x):
+            return x.op == op and x.a == a and x.b == b
+        case None:
+            return false
 
 # Can block p get an edge to label l? Not when it has one already and l's phis
 # would then need two values for p.
@@ -3145,7 +3627,7 @@ fn inv_index(four: [int], ref at: {str: int}, ref invs: [[int]]) -> int:
 
 # A reversal of a prefix, d[0..=j] (lower.br's idiom), whose next block reads
 # d[0] before anything writes memory: that read takes the new d[0] from the
-# reversal instead (`brine_bytes_rev0`, which x64.br keeps in a register), so
+# reversal instead (`brine_bytes_rev0`, which native code keeps in a register), so
 # it doesn't wait for the reversal's stores to reach memory.
 fn rev_first(ref sf: SF):
     var zero = [false] * len(sf.f.vk)
@@ -3233,29 +3715,235 @@ fn lane_store(ref sf: SF, ref code: [Inst], blk: int, v: int, off: int):
 
 # f optimized, and the vector loop kernels it calls (x86-64; `vw`: their
 # most lanes).
-fn optimize(f: Func, vw: int) -> (Func, [KFunc]):
+# ================================================================ ranges
+
+# Overflow checks that value ranges show can't fail become plain arithmetic:
+# the multiplication in `s = (s * 1103515245 + 12345) % 2147483648` can't
+# overflow, since s is such a remainder. Every integer vreg gets an interval:
+# constants, `& m` with m >= 0, remainders and quotients by constants and
+# shifts by them bound it; a checked operation's result is in its kind's
+# range (or it panicked); a phi joins its values. Rounds over the blocks in
+# reverse postorder grow the intervals to a fixed point; a phi still growing
+# after a few rounds gets its kind's whole range.
+fn range_kind(k: K) -> bool:
+    return tracked(k) and k != K.Bool and k != K.Ptr
+
+# x * y for intervals, or (false, ..) when a bound is too big to multiply
+fn mul_iv(la: i128, ha: i128, lb: i128, hb: i128) -> (bool, i128, i128):
+    let big = two(63)
+    if la < -big or ha > big or lb < -big or hb > big:
+        return (false, 0, 0)
+    let ps = [la * lb, la * hb, ha * lb, ha * hb]
+    var l = ps[0]
+    var h = ps[0]
+    for q in ps:
+        l = min(l, q)
+        h = max(h, q)
+    return (true, l, h)
+
+# x's result interval from its operands' (`ok` false: not known yet)
+fn range_of(x: Inst, vk: [K], seen: [bool], lo: [i128], hi: [i128]) -> (bool, i128, i128):
+    let k = vk[x.d]
+    let full = (true, kmin(k), kmax(k))
+    if x.op == Op.Phi:
+        var any = false
+        var l = i128(0)
+        var h = i128(0)
+        var i = 1
+        while i < len(x.args):
+            let v = x.args[i]
+            if not range_kind(vk[v]):
+                return full
+            if seen[v]:
+                if not any:
+                    l = lo[v]
+                    h = hi[v]
+                    any = true
+                else:
+                    l = min(l, lo[v])
+                    h = max(h, hi[v])
+            i += 2
+        return (any, l, h)
+    if x.op == Op.Const:
+        let c = num(wrapk(i128(x.n), k), k)
+        return (true, c, c)
+    for v in uses(x):
+        if v >= 0 and range_kind(vk[v]) and not seen[v]:
+            return (false, 0, 0)
+    let ia = x.a >= 0 and range_kind(vk[x.a])
+    let ib = x.b >= 0 and range_kind(vk[x.b])
+    let la = lo[x.a] if ia else i128(0)
+    let ha = hi[x.a] if ia else i128(0)
+    let lb = lo[x.b] if ib else i128(0)
+    let hb = hi[x.b] if ib else i128(0)
+    match x.op:
+        case Op.Mov:
+            return (true, la, ha) if ia else full
+        case Op.Conv:
+            if ia and la >= kmin(k) and ha <= kmax(k):
+                return (true, la, ha)
+            return full
+        case Op.And:
+            if not ia or not ib:
+                return full
+            if la >= 0 and lb >= 0:
+                return (true, 0, min(ha, hb))
+            if la >= 0:
+                return (true, 0, ha)
+            if lb >= 0:
+                return (true, 0, hb)
+            return full
+        case Op.Rem:
+            if not ia or not ib or lb != hb or lb == 0:
+                return full
+            let m = (lb if lb > 0 else -lb) - 1
+            if la >= 0:
+                return (true, 0, min(m, ha))
+            if ha <= 0:
+                return (true, max(-m, la), 0)
+            return (true, -m, m)
+        case Op.Div:
+            if not ia or not ib or lb != hb or lb <= 0:
+                return full
+            return (true, tdiv(la, lb), tdiv(ha, lb))
+        case Op.Shr:
+            if not ia or not ib or lb != hb or lb < 0 or lb > 63:
+                return full
+            return (true, la >> int(lb), ha >> int(lb))
+        case Op.IdxChk:
+            if not ia or not ib:
+                return (true, 0, kmax(k))
+            return (true, max(la, 0), max(min(ha, hb - 1), 0))
+        case Op.Add | Op.AddO | Op.Sub | Op.SubO | Op.Mul | Op.MulO:
+            if not ia or not ib:
+                return full
+            var ok = true
+            var l = la + lb
+            var h = ha + hb
+            if x.op == Op.Sub or x.op == Op.SubO:
+                l = la - hb
+                h = ha - lb
+            elif x.op == Op.Mul or x.op == Op.MulO:
+                let (mok, ml, mh) = mul_iv(la, ha, lb, hb)
+                ok = mok
+                l = ml
+                h = mh
+            if not ok or (l < kmin(k) and h > kmax(k)):
+                return full
+            if x.op == Op.AddO or x.op == Op.SubO or x.op == Op.MulO:
+                # (outside the kind's range, it panicked)
+                return (true, max(l, kmin(k)), min(h, kmax(k)))
+            if l < kmin(k) or h > kmax(k):
+                return full
+            return (true, l, h)
+        case _:
+            return full
+
+fn check_ranges(ref sf: SF):
+    let nv = len(sf.f.vk)
+    let vk = sf.f.vk
+    var lo: [i128] = [i128(0)] * nv
+    var hi: [i128] = [i128(0)] * nv
+    var seen = [false] * nv
+    var grew = [0] * nv
+    for v in 0..sf.f.nparams:
+        if range_kind(vk[v]):
+            seen[v] = true
+            lo[v] = kmin(vk[v])
+            hi[v] = kmax(vk[v])
+    let po = postorder(sf.bs)
+    var round = 0
+    var changed = true
+    while changed:
+        if round == 12:
+            # (no fixed point: assume nothing)
+            return
+        round += 1
+        changed = false
+        var j = len(po) - 1
+        while j >= 0:
+            for x in sf.bs[po[j]].code:
+                if x.d < 0 or not range_kind(vk[x.d]):
+                    continue
+                let (ok, l0, h0) = range_of(x, vk, seen, lo, hi)
+                if not ok:
+                    continue
+                let k = vk[x.d]
+                var l = max(l0, kmin(k))
+                var h = min(h0, kmax(k))
+                if not seen[x.d]:
+                    seen[x.d] = true
+                    lo[x.d] = l
+                    hi[x.d] = h
+                    changed = true
+                elif l < lo[x.d] or h > hi[x.d]:
+                    grew[x.d] += 1
+                    l = min(l, lo[x.d])
+                    h = max(h, hi[x.d])
+                    if grew[x.d] > 3:
+                        l = kmin(k)
+                        h = kmax(k)
+                    lo[x.d] = l
+                    hi[x.d] = h
+                    changed = true
+            j -= 1
+    for b in 0..len(sf.bs):
+        for i in 0..len(sf.bs[b].code):
+            let x = sf.bs[b].code[i]
+            if not (x.op == Op.AddO or x.op == Op.SubO or x.op == Op.MulO):
+                continue
+            if not seen[x.a] or not seen[x.b]:
+                continue
+            let k = vk[x.d]
+            var l = lo[x.a] + lo[x.b]
+            var h = hi[x.a] + hi[x.b]
+            var op = Op.Add
+            if x.op == Op.SubO:
+                l = lo[x.a] - hi[x.b]
+                h = hi[x.a] - lo[x.b]
+                op = Op.Sub
+            elif x.op == Op.MulO:
+                let (ok, ml, mh) = mul_iv(lo[x.a], hi[x.a], lo[x.b], hi[x.b])
+                if not ok:
+                    continue
+                l = ml
+                h = mh
+                op = Op.Mul
+            if l >= kmin(k) and h <= kmax(k):
+                sf.bs[b].code[i] = mk(op, x.d, x.a, x.b, -1, 0)
+
+fn optimize(f: Func, vw: int, a64: bool) -> (Func, [KFunc]):
     var sf = build(f)
     to_ssa(ref sf)
     copies(ref sf)
     sccp(ref sf)
+    check_ranges(ref sf)
     simplify(ref sf)
     ffold(ref sf)
     rewrites(ref sf)
     copies(ref sf)
+    elem_scales(ref sf)
     addressing(ref sf)
-    gvn(ref sf)
+    gvn(ref sf, a64)
     copies(ref sf)
     licm(ref sf)
-    gvn(ref sf)
+    gvn(ref sf, a64)
     copies(ref sf)
     bit_loads(ref sf)
+    wide_halves(ref sf)
     # dead phis (of inlined calls' results) would hide loops' shapes
     dce(ref sf)
+    # (a64.br: loop kernels of two lanes, which it makes NEON code)
     var ks = vector_loops(ref sf, f"brv_{f.name}", vw)
-    if vw >= 4:
+    if vw >= 4 and not a64:
         ks.extend(lane_loops(ref sf, f"brl_{f.name}"))
     rev_first(ref sf)
     while bool_ifs(ref sf):
         relink(ref sf)
+    # (x64.br makes the same as a bt and an adc)
+    if a64 and cond_incs(ref sf):
+        relink(ref sf)
     dce(ref sf)
+    if a64:
+        bit_counts(ref sf)
     return (from_ssa(sf), ks)

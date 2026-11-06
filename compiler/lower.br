@@ -46,8 +46,13 @@ struct Options:
     fast: bool
     # release builds: small fixed-size kernels as vector code (kernel.br)
     vec: bool
-    # ... made for the x86-64 backend (xkern.br), for Windows or System V
+    # ... made for the native backends (xkern.br: SSE2, which a64.br turns
+    # into NEON), for Windows or System V
     nvec: bool
+    # native code for x86-64 (else AArch64): with nvec, interleaved loops run
+    # 8 iterations at a time for x64.br's AVX2 lane kernels (a64.br has none:
+    # 4 scalar lanes), and kernels have 16 vector registers (NEON: 30)
+    x86: bool
     win: bool
     # for x64.br or a64.br: runtime helpers that runtime/rt.br has in brine
     # are calls of those, which the native inliner can take
@@ -336,6 +341,7 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
         clones=[],
         cloned={},
         nc_body=false,
+        slow_body=false,
         rt_body=false,
         odecls={},
         own_clones=[],
@@ -428,6 +434,9 @@ struct Lower:
     cloned: {int: bool}
     # the body being lowered is such a clone
     nc_body: bool
+    # the body as written of a function with a kernel (AArch64), whose
+    # entry is a function of its own
+    slow_body: bool
     # lowering a function of the runtime module: its arithmetic wraps
     rt_body: bool
     # every brine function by id, the clones that own some by-value
@@ -797,9 +806,29 @@ struct Lower:
             if self.tracks_caller(f.id):
                 self.cx.loc = len(ks) - 1
             elif (
-                f.id in self.khints and not self.nc_body and not self.br_body and self.own_body == 0
+                f.id in self.khints
+                and not self.nc_body
+                and not self.br_body
+                and not self.slow_body
+                and self.own_body == 0
             ):
-                self.kernel_entry(f, name)
+                if self.kernel_entry(f, name) and not self.opts.x86 and not self.opts.debug:
+                    # the rest in a function of its own: the kernel's entry
+                    # is then small enough to inline where it is called
+                    let slow = "brs_" + name
+                    let args = [i for i in 0..len(ks)]
+                    if has:
+                        let r = self.cx.fb.call(rk, slow, args)
+                        self.cx.fb.ret(r)
+                    else:
+                        self.cx.fb.call_void(slow, args)
+                        self.cx.fb.ret(-1)
+                    self.cx.fb.f.hot = true
+                    self.funcs.push(self.cx.fb.f)
+                    self.slow_body = true
+                    self.gen_body(f, slow, false)
+                    self.slow_body = false
+                    return
         var nw = narrow.Narrow(arrs={}, guards=[])
         if self.opts.fast and not self.opts.debug and self.own_body == 0:
             nw = narrow.find(f.body, f.locals)
@@ -846,7 +875,7 @@ struct Lower:
     # A function kernel.br found a kernel for: when its arrays have the
     # lengths the kernel was made for, call it and return; else go on to
     # the body as written.
-    fn kernel_entry(ref self, f: FnDecl, name: str):
+    fn kernel_entry(ref self, f: FnDecl, name: str) -> bool:
         let sig = self.info.fns[f.id]
         var lays: [(int, [int])] = []
         for p in sig.params:
@@ -875,14 +904,23 @@ struct Lower:
             case Some(x):
                 k = x
             case None:
-                return
+                return false
         if self.opts.nvec:
             if len(k.arrays) > 4:
-                return
+                return false
             let w = xkern.width(k.dag)
-            let g = xkern.gen(k.dag, w)
+            var g = xkern.gen(k.dag, w)
+            if not self.opts.x86:
+                g = xkern.pair_stores(xkern.schedule(xkern.sign_hoist(g), 28))
             let pargs = xkern.float_args(len(k.arrays), len(k.floats), self.opts.win)
-            var kf = xkern.compile(g, k.name, len(k.arrays), pargs, k.has_ret)
+            var kf = xkern.compile(
+                g,
+                k.name,
+                len(k.arrays),
+                pargs,
+                k.has_ret,
+                16 if self.opts.x86 else 30
+            )
             let ww = xwide.width(k.dag)
             if ww > 0:
                 kf = xwide.compile(xwide.gen(k.dag, ww), pargs, self.opts.win, kf)
@@ -911,6 +949,7 @@ struct Lower:
             self.cx.fb.call_void(k.name, args)
             self.cx.fb.ret(-1)
         self.cx.fb.place(slow)
+        return self.opts.nvec
 
     # The array parameter `i` (by value: its vreg; `ref`: behind its pointer).
     fn param_arr(ref self, i: int, by_ref: bool) -> int:
@@ -4058,7 +4097,7 @@ struct Lower:
                 p = x
             case None:
                 return false
-        let n = jam.NATIVE_LANES if self.opts.nvec else jam.LANES
+        let n = jam.NATIVE_LANES if self.opts.nvec and self.opts.x86 else jam.LANES
         self.push_scope()
         self.push_frame()
         let dom = self.domain(iter, true)

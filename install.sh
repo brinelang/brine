@@ -70,17 +70,6 @@ main() {
 
     add_to_path
 
-    # x86-64 builds need no C compiler: brine writes the executables
-    if [ "$arch" = arm64 ]; then
-        if ! command -v cc > /dev/null 2>&1 && ! command -v gcc > /dev/null 2>&1 && ! command -v clang > /dev/null 2>&1; then
-            if [ "$os" = macos ]; then
-                hint="xcode-select --install"
-            else
-                hint="your package manager (for example: sudo apt install gcc, sudo dnf install gcc)"
-            fi
-            warn "brine needs a C compiler for --release builds here, and none was found; install one with $hint"
-        fi
-    fi
     say "run 'brine doctor' to check your setup, and 'brine new hello' to start a project"
 }
 
@@ -133,7 +122,6 @@ sha256() {
 }
 
 say() { printf 'brine: %s\n' "$1"; }
-warn() { printf 'brine: warning: %s\n' "$1" >&2; }
 die() {
     printf 'brine: error: %s\n' "$1" >&2
     exit 1
