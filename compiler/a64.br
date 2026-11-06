@@ -1591,17 +1591,26 @@ struct A:
             self.kernel_loop(k)
         else:
             let hd = hi_dead(k.ops)
+            let el = kmul_lanes(k.ops, hd, k.has_ret)
             var i = 0
             while i < len(k.ops):
+                if el[i] == -2:
+                    i += 1
+                    continue
                 if (
                     k.ops[i].op == KO_MOV
                     and i + 1 < len(k.ops)
-                    and self.kop_from(k.ops[i + 1], k.ops[i].b, k.ops[i].a, hd[i + 1])
+                    and self.kop_from(k.ops[i + 1], k.ops[i].b, k.ops[i].a, hd[i + 1], el[i + 1])
                 ):
                     i += 2
                     continue
                 if i + 1 < len(k.ops) and self.kop_pair(k.ops[i], k.ops[i + 1]):
                     i += 2
+                    continue
+                if el[i] >= 0:
+                    let o = k.ops[i]
+                    self.kmul_el(o.a, el[i] >> 6, el[i], o.m == PFX_PD, hd[i])
+                    i += 1
                     continue
                 self.kop(k.ops[i], k.nslots, hd[i])
                 i += 1
@@ -1816,10 +1825,14 @@ struct A:
     # A copy of v src into o.a, then o (a = a op b): one NEON operation
     # reading src, when o is one with three registers that reads all of a.
     # False if it isn't (nothing emitted).
-    fn kop_from(ref self, o: KOp, src: int, a: int, hd: bool) -> bool:
+    fn kop_from(ref self, o: KOp, src: int, a: int, hd: bool, el: int) -> bool:
         if o.a != a or (o.op != KO_OP and o.op != KO_SHUF):
             return false
         let m = src if o.b == a else o.b
+        if el >= 0:
+            # a = src * the lane (o.b is the splat, so o.b != a)
+            self.kmul_el(a, src, el, o.m == PFX_PD, hd)
+            return true
         var op = -1
         if o.op == KO_OP and o.m != PFX_PD and hd and o.n != SSE_XOR and o.n != SSE_UNPH:
             # a scalar operation, a's upper lane unread
@@ -1851,6 +1864,20 @@ struct A:
             return false
         self.w(op | (m << 16) | (src << 5) | a)
         return true
+
+    # d = n * lane el & 1 of v (el & 63) >> 1: both lanes, or the low one
+    # (hd: d's upper lane unread, else it stays)
+    fn kmul_el(ref self, d: int, n: int, el: int, pd: bool, hd: bool):
+        let lane = ((el & 1) << 11) | (((el & 63) >> 1) << 16)
+        if pd:
+            # fmul vd.2d, vn.2d, vs.d[l]
+            self.w(0x4FC09000 | lane | (n << 5) | d)
+        elif hd:
+            # fmul dd, dn, vs.d[l]
+            self.w(0x5FC09000 | lane | (n << 5) | d)
+        else:
+            self.w(0x5FC09000 | lane | (n << 5) | 31)
+            self.w(0x6E080400 | (31 << 5) | d)
 
     # a = a op b, SSE2 opcode o.n: packed (both lanes) or scalar (the low one)
     fn kop_arith(ref self, o: KOp, hd: bool):
@@ -3414,6 +3441,79 @@ fn hi_dead(ops: [KOp]) -> [bool]:
                 live[a] = true
         i -= 1
     return dead
+
+# Splats NEON doesn't need: a copy t = s then t = (s[l], s[l]), when every
+# read of t before it's written again is a multiply (NEON multiplies by a
+# lane) and s stays the same until then. For each operation: -2 to leave it
+# out, 64x + 2s + l for a multiply of x and s's lane l (in place of t), -1
+# else.
+fn kmul_lanes(ops: [KOp], hd: [bool], has_ret: bool) -> [int]:
+    var el = [-1] * len(ops)
+    var i = 0
+    while i + 1 < len(ops):
+        let c = ops[i]
+        let p = ops[i + 1]
+        let t = c.a
+        let s = c.b
+        var l = -1
+        if c.op == KO_MOV and t != s and p.a == t and (p.b == t or p.b == s):
+            if p.op == KO_SHUF and (p.n & 3) == 0:
+                l = 0
+            elif p.op == KO_SHUF and (p.n & 3) == 3:
+                l = 1
+            elif p.op == KO_OP and p.n == SSE_UNPH:
+                l = 1
+        if l < 0 or el[i] != -1 or el[i + 1] != -1:
+            i += 1
+            continue
+        var uses: [int] = []
+        var ok = true
+        var dirty = false
+        var j = i + 2
+        while j < len(ops):
+            let o = ops[j]
+            let mul = o.op == KO_OP and o.n == SSE_MUL and (o.m == PFX_PD or hd[j])
+            if mul and (o.a == t) != (o.b == t) and el[j] == -1:
+                if dirty:
+                    ok = false
+                    break
+                uses.push(j)
+                if o.a == t:
+                    break
+            elif kop_reads(o, t):
+                ok = false
+                break
+            elif o.a == t:
+                break
+            if o.a == s and o.op != KO_ST and o.op != KO_STH and o.op != KO_SPILL:
+                dirty = true
+            j += 1
+        if j == len(ops) and has_ret and t == 0:
+            ok = false
+        if ok and len(uses) > 0:
+            el[i] = -2
+            el[i + 1] = -2
+            for u in uses:
+                let o = ops[u]
+                el[u] = 64 * (o.b if o.a == t else o.a) + 2 * s + l
+            i += 2
+        else:
+            i += 1
+    return el
+
+# Does o read register r (any lane)?
+fn kop_reads(o: KOp, r: int) -> bool:
+    match o.op:
+        case KO_LD | KO_LDP | KO_CONST | KO_CONST2 | KO_FILL | KO_ARG:
+            return false
+        case KO_MOV:
+            return o.b == r
+        case KO_ST | KO_STH | KO_SPILL | KO_LDH:
+            return o.a == r
+        case KO_SQRT:
+            return o.b == r or (o.a == r and o.m != PFX_PD)
+        case _:
+            return o.a == r or o.b == r
 
 # The kind of branch to patch at a release's exits: tbnz (B14), b (B26), or
 # b.cond / cbnz (B19).
