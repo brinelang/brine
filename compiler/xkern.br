@@ -287,6 +287,28 @@ fn schedule(g: Gen, nreg: int) -> Gen:
             m = max(m, h[u])
         h[i] = latency(g.ops[i]) + m
         i -= 1
+    # The slow unit's work (square roots, divisions) by longest chain, each
+    # right after the work it waits for: the first starts sooner, while the
+    # last of the call before may still run (nbody: the next step's first
+    # square root waits on this one's last division). The rest comes after.
+    let none = 1000000000
+    var rank = [none] * n
+    var slow: [int] = []
+    for j, x in enumerate(g.ops):
+        if x.op == V_SQRT or (x.op == V_OP and x.n == SSE_DIV):
+            var k = len(slow)
+            slow.push(j)
+            while k > 0 and h[slow[k - 1]] < h[j]:
+                slow[k] = slow[k - 1]
+                k -= 1
+            slow[k] = j
+    for r, j in enumerate(slow):
+        rank[j] = r
+    i = n - 1
+    while i >= 0:
+        for u in users[i]:
+            rank[i] = min(rank[i], rank[u])
+        i -= 1
     var done = [false] * n
     var out: [VOp] = []
     while true:
@@ -306,9 +328,11 @@ fn schedule(g: Gen, nreg: int) -> Gen:
                 best = j
                 bd = d
                 continue
-            # (over the limit: the fewest live first, then the longest chain)
+            # (over the limit: the fewest live first, then by rank and the
+            # longest chain)
             let full = live + max(d, bd) > nreg
-            if (full and (d < bd or (d == bd and h[j] > h[best]))) or (not full and h[j] > h[best]):
+            let first = rank[j] < rank[best] or (rank[j] == rank[best] and h[j] > h[best])
+            if (full and (d < bd or (d == bd and first))) or (not full and first):
                 best = j
                 bd = d
         if best < 0:
