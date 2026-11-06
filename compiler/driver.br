@@ -16,6 +16,8 @@ import ir
 import ir_c
 import x64
 import a64
+from obj import ObjFile
+from link import link_pe, link_elf, PE_DLLS, ELF_LIBS
 from verify import Report
 import rules
 from rules import Rules
@@ -650,8 +652,10 @@ enum Code:
     # `once` are compiled a single time even when `units` are compiled for
     # several CPU levels (the big data blocks)
     C(units: [str], once: [str])
-    # a native object file (x64.br)
+    # a native object file (x64.br), for the C compiler to link
     Obj(bytes: [u8])
+    # a native object that brine links itself (link.br)
+    Native(o: ObjFile)
 
 fn make_dirs(d: str) -> Result[(), Diag]:
     match os.make_dir(d):
@@ -784,6 +788,11 @@ fn cpu_levels(profile: Profile, plat: Platform, units: int) -> [[str]]:
 # Compile generated code to an executable. `dir` is a cache directory for
 # intermediate files. Returns Ok(true) if the C compiler actually ran.
 fn compile(code: Code, dest: str, dir: str, profile: Profile, plat: Platform) -> Result[bool, Diag]:
+    match code:
+        case Code.Native(o):
+            return link_native(o, dest)
+        case _:
+            pass
     match compile_levels(code, dest, dir, profile, plat, true):
         case Ok(ran):
             return Ok(ran)
@@ -886,6 +895,8 @@ fn compile_levels(
         case Code.Obj(b):
             native = b
             hashes.push(hex16(fnv_bytes(b)))
+        case Code.Native(_):
+            panic("compile links native objects itself")
     let prog_hash = fnv(" ".join(hashes) + rt_obj)
     # a web folder is what gets deployed: keep the stamp out of it
     var stamp = with_extension(out_exe, "brine-hash")
@@ -980,6 +991,65 @@ fn compile_levels(
     if plat == Platform.Web:
         web_files(dest)?
     match write_file(stamp, hex16(prog_hash)):
+        case _:
+            pass
+    return Ok(true)
+
+# Links a native object into an executable with brine's own linker: no C
+# compiler involved. Ok(true) if the executable changed.
+fn link_native(o: ObjFile, out_exe: str) -> Result[bool, Diag]:
+    let t = clock()
+    var r: Result[[u8], str] = Err("")
+    if os.name() == "windows":
+        r = link_pe(o, "brine_x_start", PE_DLLS)
+    else:
+        r = link_elf(o, "main", ELF_LIBS)
+    var b: [u8] = []
+    match r:
+        case Ok(x):
+            b = x
+        case Err(e):
+            return Err(cc_failed("linking the program failed", e, ""))
+    let h = hex16(fnv_bytes(b))
+    let stamp = with_extension(out_exe, "brine-hash")
+    if file_exists(out_exe):
+        match read_file(stamp):
+            case Ok(st):
+                if st.strip() == h:
+                    return Ok(false)
+            case Err(_):
+                pass
+    match project.parent(out_exe):
+        case Some(d):
+            if d != "":
+                make_dirs(d)?
+        case None:
+            pass
+    # written next to it and renamed over it: Linux can't write over a
+    # program that is running, but it can replace it
+    let tmp = f"{out_exe}.{os.pid()}.tmp"
+    match os.write_bytes(tmp, b):
+        case Ok(_):
+            pass
+        case Err(e):
+            return Err(io_diag(e))
+    if os.name() != "windows" and not runs_ok(["chmod", "+x", tmp]):
+        return Err(diag.error("E0704", f"cannot make `{display_path(out_exe)}` executable"))
+    move_self_aside(out_exe)
+    match os.rename(tmp, out_exe):
+        case Ok(_):
+            pass
+        case Err(e):
+            match os.remove_file(tmp):
+                case _:
+                    pass
+            return Err(
+                diag.error("E0704", f"cannot write `{display_path(out_exe)}`").note(e).with_help(
+                    "is the program still running? Stop it and build again, or build somewhere else with `-o`"
+                )
+            )
+    phase_time(t, "link")
+    match write_file(stamp, h):
         case _:
             pass
     return Ok(true)
@@ -1093,17 +1163,23 @@ fn gen_code(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> Code
         let arm = os.arch() == "aarch64"
         let src = fe.sm.file(0).path
         let prod = "brine " + VERSION
-        var b: [u8] = []
-        if arm and profile == Profile.Debug:
-            b = a64.emit_object_debug(l.m, src, os.cwd(), prod)
-        elif arm:
-            b = a64.emit_object(l.m)
-        elif profile == Profile.Debug:
-            b = x64.emit_object_debug(l.m, win, src, os.cwd(), prod)
-        else:
-            b = x64.emit_object(l.m, win, profile == Profile.Release)
+        # debug builds keep the C toolchain's linker for now: link.br
+        # doesn't carry DWARF over yet
+        if profile == Profile.Debug:
+            var b: [u8] = []
+            if arm:
+                b = a64.emit_object_debug(l.m, src, os.cwd(), prod)
+            else:
+                b = x64.emit_object_debug(l.m, win, src, os.cwd(), prod)
+            phase_time(t, "aarch64" if arm else "x86-64")
+            return Code.Obj(b)
+        var o = (
+            a64.emit_obj(l.m, false, "", "", "")
+            if arm
+            else x64.emit_obj(l.m, win, profile == Profile.Release)
+        )
         phase_time(t, "aarch64" if arm else "x86-64")
-        return Code.Obj(b)
+        return Code.Native(o)
     let n = unit_count(profile)
     if n > 1:
         let units = ir_c.emit_units(l, n)

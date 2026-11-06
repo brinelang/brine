@@ -101,7 +101,12 @@ _Static_assert(offsetof(brine_map, keys) == 48 && sizeof(brine_map) == 88, "brin
 _Static_assert(sizeof(brine_map_ty) == 80 && sizeof(brine_sb) == 24, "brine_map_ty/brine_sb layout");
 
 /* ============================================================ platform layer */
+#ifdef BRINE_RT_BR /* runtime/rt.br has the heap */
+void brine_x_heap_exit(void);
+#define br_heap_exit brine_x_heap_exit
+#else
 static void br_heap_exit(void);
+#endif
 /* Every thread brine code runs on, `main` included, has a stack this big
  * (reserved, not committed). */
 #define BR_STACK ((size_t)64 << 20)
@@ -221,12 +226,33 @@ static void br_sock_close(br_sock s) { close(s); }
 #endif
 
 /* ============================================================ globals */
+#ifdef BRINE_RT_BR /* runtime/rt.br has the output lock */
+void brine_x_io_lock(void);
+void brine_x_io_unlock(void);
+#define BR_IO_LOCK() brine_x_io_lock()
+#define BR_IO_UNLOCK() brine_x_io_unlock()
+#else
 static br_mutex br_io_mu;
+#define BR_IO_LOCK() br_lock(&br_io_mu)
+#define BR_IO_UNLOCK() br_unlock(&br_io_mu)
+#endif
 static int br_argc;
 static char **br_argv;
+#ifdef BRINE_RT_BR
+/* the world is runtime/rt.br's; the rest reads it from there */
+int64_t brine_x_world_local_rank(void);
+void brine_x_world_init(void);
+void brine_x_world_finish(const char *how);
+#define br_rank brine_world_rank()
+#define br_size brine_world_size()
+#define br_local_rank brine_x_world_local_rank()
+#define br_world_init brine_x_world_init
+#define br_world_finish brine_x_world_finish
+#else
 static int64_t br_rank = 0, br_size = 1;
 /* how many lower ranks run on this rank's machine (GPUs go one per rank) */
 static int64_t br_local_rank = 0;
+#endif
 
 /* ============================================================ panics */
 static void br_flush(void) { fflush(stdout); }
@@ -243,21 +269,23 @@ static void br_panic_claim(void) {
     if (__atomic_exchange_n(&br_panicking, 1, __ATOMIC_SEQ_CST)) br_park();
 }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 void brine_panic_at(const char *loc, const char *msg) {
     br_panic_claim();
     /* under the output lock, so other threads' output (the GPU log) can't
      * land in the middle */
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     br_flush();
     if (br_size > 1)
         fprintf(stderr, "\npanic (rank %lld): %s\n  --> %s\n", (long long)br_rank, msg, loc);
     else
         fprintf(stderr, "\npanic: %s\n  --> %s\n", msg, loc);
     fflush(stderr);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
     br_gpu_settle();
     exit(101);
 }
+#endif
 
 static BR_NORETURN void br_panicf(const char *loc, const char *fmt, ...) {
     char buf[1024];
@@ -268,6 +296,7 @@ static BR_NORETURN void br_panicf(const char *loc, const char *fmt, ...) {
     brine_panic_at(loc, buf);
 }
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_panic_idx(int64_t i, int64_t len, const char *loc) {
     br_panicf(loc, "index %lld is out of bounds for an array of length %lld", (long long)i, (long long)len);
 }
@@ -278,6 +307,7 @@ void brine_assert_fail(const char *loc, const char *src, brine_str *msg) {
         br_panicf(loc, "assertion failed: %s\n  message: %.*s", src, (int)msg->len, msg->data);
     br_panicf(loc, "assertion failed: %s", src);
 }
+#endif
 /* ------------------------------------------------------------ stack overflow */
 /* Deep recursion runs into the guard page under the stack. Instead of dying
  * silently (and losing what is still buffered for stdout), report it like a
@@ -353,7 +383,10 @@ static void br_stack_leave(void) {
 }
 #endif
 
+#ifndef BRINE_RT_BR
 static void br_world_finish(const char *how);
+#endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_exit(int64_t code) {
     br_flush();
     br_gpu_settle();
@@ -367,6 +400,7 @@ void brine_unreachable(void) {
     fprintf(stderr, "internal error: reached unreachable code\n");
     abort();
 }
+#endif
 
 /* ============================================================ memory */
 /* Small blocks (strings, boxes, array headers) come from a heap of our own:
@@ -388,6 +422,7 @@ void brine_unreachable(void) {
 #define BR_RESERVE ((uintptr_t)1 << 36)
 #endif
 #define BR_SPARE ((int64_t)1 << 16) /* bytes a thread may keep free per class */
+#ifndef BRINE_RT_BR
 static uintptr_t br_heap_base, br_heap_end, br_heap_next;
 static uint8_t br_chunk_class[BR_RESERVE / BR_CHUNK];
 static br_mutex br_heap_mu;
@@ -483,6 +518,7 @@ static char *br_chunk_new(int c) {
     return (char *)ch;
 }
 
+#ifndef BRINE_RT_BR
 static void *br_big(size_t n) {
     void *p = malloc(n ? n : 1);
     if (!p) {
@@ -528,6 +564,9 @@ static void *br_alloc_slow(br_heap_th *h, int c, size_t n) {
     h->end[c] = ch + BR_CHUNK;
     return ch;
 }
+#endif
+
+#endif
 
 /* the common cases of br_alloc and br_free inline and without a stack frame;
    the rest out of line */
@@ -538,6 +577,7 @@ static void *br_alloc_slow(br_heap_th *h, int c, size_t n) {
 #define BR_HOT inline
 #define BR_COLD
 #endif
+#ifndef BRINE_RT_BR
 static BR_COLD void *br_alloc_miss(size_t n) {
     if (n > BR_SMALL || !br_heap_base) return br_big(n);
     int c = br_class_of(n ? n : 1);
@@ -624,6 +664,12 @@ static void br_heap_exit(void) {
     }
     br_th_done(h);
 }
+#else
+void *brine_x_realloc(void *p, int64_t n);
+#define br_alloc(n) brine_alloc((int64_t)(n))
+#define br_free(p) brine_free(p)
+#define br_realloc(p, n) brine_x_realloc((p), (int64_t)(n))
+#endif
 
 #define free(p) br_free(p)
 #define realloc(p, n) br_realloc(p, n)
@@ -645,15 +691,20 @@ static void *br_thread_ptr(void) {
     return NULL;
 #endif
 }
+#ifndef BRINE_RT_BR /* the backends do it inline */
 void *brine_x_thread_ptr(void) { return br_thread_ptr(); }
+#endif
 
+#ifndef BRINE_RT_BR
 void *brine_alloc(int64_t n) { return br_alloc(n > 0 ? (size_t)n : 1); }
 void brine_free(void *p) { br_free(p); }
+#endif
 /* live string/array count, reported at exit when BRINE_LEAKCHECK is set */
 static int64_t br_live;
 /* counted only for BRINE_LEAKCHECK: a locked add on every allocation costs */
 static bool br_leakcheck;
 
+#ifndef BRINE_RT_BR
 /* What native code's inline allocation (runtime/rt.br) reads: a thread's
    heap is at its thread pointer plus th_off, or at the address stored there
    when th_ind; the heap's range; each chunk's size class. fast is 0 when
@@ -688,13 +739,23 @@ static void br_heap_info_init(void) {
 #endif
     hi->fast = 1;
 }
+#endif
+#ifdef BRINE_RT_BR /* runtime/rt.br counts them */
+void brine_x_live(int64_t d);
+int64_t brine_x_live_count(void);
+#define BR_LIVE(d) (BR_UNLIKELY(br_leakcheck) ? brine_x_live(d) : (void)0)
+#define BR_LIVE_COUNT() brine_x_live_count()
+#else
 #define BR_LIVE(d) (BR_UNLIKELY(br_leakcheck) ? (void)__atomic_fetch_add(&br_live, (d), __ATOMIC_RELAXED) : (void)0)
+#define BR_LIVE_COUNT() __atomic_load_n(&br_live, __ATOMIC_RELAXED)
+#endif
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 void brine_str_free(brine_str *s) {
     BR_LIVE(-1);
     free(s);
 }
 #endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 /* Freeing an object frees what it holds first, so a deep structure (a long
    enum list, a tree 100k levels deep) would recurse once per level and
    overflow the stack. `fn(p)` finishes freeing a dead object; past
@@ -732,19 +793,14 @@ void brine_drop(void *p, void (*fn)(void *)) {
     }
     h->drop_depth--;
 }
+#endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 static void br_arr_drop(void *p) {
     brine_arr *a = (brine_arr *)p;
     for (int64_t i = 0; i < a->len; i++) a->release(a->data + i * a->esz);
     if (a->data) free(a->data);
     free(a);
 }
-#ifdef BRINE_RT_BR
-/* runtime/rt.br's brine_arr_free, for elements that need releasing */
-void brine_x_arr_drop(brine_arr *a) {
-    BR_LIVE(-1);
-    brine_drop(a, br_arr_drop);
-}
-#else
 void brine_arr_free(brine_arr *a) {
     BR_LIVE(-1);
     if (a->release) {
@@ -755,6 +811,7 @@ void brine_arr_free(brine_arr *a) {
     free(a);
 }
 #endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void *brine_box_new(int64_t size, int64_t tag) {
     brine_box *b = (brine_box *)brine_alloc(size);
     BR_LIVE(1);
@@ -770,45 +827,20 @@ void brine_rt_str(void *p) { brine_str_retain(*(brine_str **)p); }
 void brine_rl_str(void *p) { brine_str_release(*(brine_str **)p); }
 void brine_rt_arr(void *p) { brine_arr_retain(*(brine_arr **)p); }
 void brine_rl_arr(void *p) { brine_arr_release(*(brine_arr **)p); }
+#endif
 
 /* ============================================================ strings */
 #define br_str_size brine_str_size
+#ifdef BRINE_RT_BR /* runtime/rt.br has it */
+brine_str *brine_x_str_alloc(int64_t n);
+#define br_str_alloc brine_x_str_alloc
+#else
 static brine_str *br_str_alloc(int64_t n) {
     brine_str *s = (brine_str *)br_alloc(br_str_size(n));
     BR_LIVE(1);
     s->rc = 1;
     s->len = n;
     s->data[n] = 0;
-    return s;
-}
-#ifdef BRINE_RT_BR
-/* what runtime/rt.br's strings still take from here */
-brine_str *brine_x_str_alloc(int64_t n) { return br_str_alloc(n); }
-void *brine_x_counted(int64_t n) {
-    BR_LIVE(1);
-    return brine_alloc(n);
-}
-void *brine_x_calloc(int64_t n) {
-    void *p = calloc(n > 0 ? (size_t)n : 1, 1);
-    if (!p) {
-        fprintf(stderr, "out of memory\n");
-        abort();
-    }
-    return p;
-}
-void *brine_x_realloc(void *p, int64_t n) {
-    p = realloc(p, (size_t)n);
-    if (!p) abort();
-    return p;
-}
-brine_str *brine_x_str_grow(brine_str *s, int64_t n) {
-    if (br_str_size(n) > br_str_size(s->len)) {
-        s = (brine_str *)realloc(s, br_str_size(n));
-        if (!s) {
-            fprintf(stderr, "out of memory\n");
-            abort();
-        }
-    }
     return s;
 }
 #endif
@@ -870,6 +902,7 @@ void brine_str_add_byte_slow(brine_str **ps, uint8_t c) {
     *ps = s;
 }
 #endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it (app_byte) */
 /* brine_app_byte past the appender's fast paths: the 9th byte, a shared
    string, or a full block */
 brine_app_st brine_app_more(brine_str *a, int64_t n, int64_t room, uint64_t w0, uint8_t c) {
@@ -898,6 +931,7 @@ brine_app_st brine_app_more(brine_str *a, int64_t n, int64_t room, uint64_t w0, 
     x.w0 = brine_ld8(a->data) & brine_lowmask((uint64_t)n);
     return x;
 }
+#endif
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
 bool brine_str_eq_long(brine_str *a, brine_str *b) { return memcmp(a->data, b->data, (size_t)a->len) == 0; }
 bool brine_str_contains(brine_str *s, brine_str *sub) {
@@ -911,7 +945,9 @@ bool brine_str_contains(brine_str *s, brine_str *sub) {
 #define BR_B4(i) BR_B1(i), BR_B1((i) + 1), BR_B1((i) + 2), BR_B1((i) + 3)
 #define BR_B16(i) BR_B4(i), BR_B4((i) + 4), BR_B4((i) + 8), BR_B4((i) + 12)
 #define BR_B64(i) BR_B16(i), BR_B16((i) + 16), BR_B16((i) + 32), BR_B16((i) + 48)
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str1 brine_bytes[256] = {BR_B64(0), BR_B64(64), BR_B64(128), BR_B64(192)};
+#endif
 
 static brine_str *br_sub(brine_str *s, int64_t lo, int64_t hi) {
     if (lo == 0 && hi == s->len) {
@@ -2065,10 +2101,9 @@ brine_arr *brine_arr_slice(brine_arr *a, int64_t lo, int64_t hi, const char *loc
 #endif
 
 /* ============================================================ maps */
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_rt_map(void *p) { brine_map_retain(*(brine_map **)p); }
 void brine_rl_map(void *p) { brine_map_release(*(brine_map **)p); }
-
-#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 brine_map *brine_map_new(const brine_map_ty *ty) {
     brine_map *m = (brine_map *)brine_alloc(sizeof(brine_map));
     BR_LIVE(1);
@@ -2077,7 +2112,6 @@ brine_map *brine_map_new(const brine_map_ty *ty) {
     m->ty = ty;
     return m;
 }
-#endif
 static void br_map_drop(void *p) {
     brine_map *m = (brine_map *)p;
     const brine_map_ty *t = m->ty;
@@ -2093,13 +2127,6 @@ static void br_map_drop(void *p) {
     free(m->index);
     free(m);
 }
-#ifdef BRINE_RT_BR
-/* runtime/rt.br's brine_map_free, for keys or values that need releasing */
-void brine_x_map_drop(brine_map *m) {
-    BR_LIVE(-1);
-    brine_drop(m, br_map_drop);
-}
-#else
 void brine_map_free(brine_map *m) {
     BR_LIVE(-1);
     if (m->ty->krelease || m->ty->vrelease) {
@@ -2552,6 +2579,7 @@ brine_str *brine_sb_finish(brine_sb *sb) {
     return s;
 }
 #endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 /* stdout going to a terminal or a pipe is flushed at the end of each line,
  * since something may be reading it as it comes (a person, or a program
  * talking a line protocol); to a file it's written when the buffer fills.
@@ -2573,27 +2601,27 @@ static int br_stdout_streams(void) {
 /* write a finished builder (and free it); `print` adds its own `end` */
 void brine_out_sb(brine_sb *sb) {
     if (BR_UNLIKELY(__atomic_load_n(&br_panicking, __ATOMIC_RELAXED))) br_park();
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     fwrite(sb->p, 1, (size_t)sb->len, stdout);
     if (br_out_lines && memchr(sb->p, '\n', (size_t)sb->len)) fflush(stdout);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
     free(sb->p);
     sb->p = NULL;
 }
 void brine_err_sb(brine_sb *sb) {
     if (BR_UNLIKELY(__atomic_load_n(&br_panicking, __ATOMIC_RELAXED))) br_park();
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     fflush(stdout);
     fwrite(sb->p, 1, (size_t)sb->len, stderr);
     fflush(stderr);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
     free(sb->p);
     sb->p = NULL;
 }
 void brine_flush(void) {
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     fflush(stdout);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
 }
 void brine_print_sb(brine_sb *sb) {
     brine_sb_cat(sb, "\n", 1);
@@ -2603,8 +2631,10 @@ void brine_eprint_sb(brine_sb *sb) {
     brine_sb_cat(sb, "\n", 1);
     brine_err_sb(sb);
 }
+#endif
 
 /* ============================================================ misc */
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 double brine_clock(void) {
 #ifdef _WIN32
     static LARGE_INTEGER freq;
@@ -2618,14 +2648,20 @@ double brine_clock(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 #endif
 }
+#endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 const char *brine_arg(int64_t i) { return i >= 0 && i < br_argc ? br_argv[i] : NULL; }
+#endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_arr *brine_args(void) {
     brine_arr *a = br_strs();
     for (int i = 1; i < br_argc; i++) br_push_str(&a, brine_str_new(br_argv[i], (int64_t)strlen(br_argv[i])));
     return a;
 }
+#endif
 
 /* ============================================================ thread pool */
+#ifndef BRINE_RT_BR /* runtime/rt.br has the pool */
 typedef struct br_job {
     brine_chunk_fn fn;
     void *ctx;
@@ -2650,17 +2686,33 @@ static struct {
     int active;
     int main_waits;
 } br_pool;
+#endif
 
 /* whether this thread runs a parallel region (a field of the per-thread heap
    struct: MinGW gcc would emulate a _Thread_local with libwinpthread) */
+#ifdef BRINE_RT_BR
+int64_t brine_x_in_par_get(void);
+void brine_x_in_par_set(int64_t v);
+static int br_in_par_get(void) { return (int)brine_x_in_par_get(); }
+static void br_in_par_set(int v) { brine_x_in_par_set(v); }
+#else
 static int br_in_par_get(void) {
     br_heap_th *h = br_th_peek();
     return h ? h->in_par : 0;
 }
 static void br_in_par_set(int v) { br_th_get()->in_par = v; }
-static int64_t br_task_budget = 0;
+#endif
 /* see brine_rt.h */
-int brine_mt = 0;
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
+int64_t brine_mt = 0;
+#endif
+#ifdef BRINE_RT_BR
+int64_t brine_x_threads(void);
+void brine_x_pool_init(void);
+void brine_x_heap_init(int64_t leakcheck);
+static int br_threads(void) { return (int)brine_x_threads(); }
+#else
+static int64_t br_task_budget = 0;
 
 static int br_threads(void) {
     if (br_pool.nthreads == 0) {
@@ -2676,6 +2728,7 @@ static int br_threads(void) {
     }
     return br_pool.nthreads;
 }
+#endif
 
 /* Waking a sleeping thread takes tens of microseconds, longer than many
    parallel regions run, so threads busy-wait a little before they sleep. */
@@ -2687,6 +2740,7 @@ static int br_threads(void) {
 #define BR_RELAX() ((void)0)
 #endif
 #define BR_SPINS 20000
+#ifndef BRINE_RT_BR
 static void br_spin_while_eq(uint64_t *p, uint64_t v) {
     for (int i = 0; i < BR_SPINS && __atomic_load_n(p, __ATOMIC_ACQUIRE) == v; i++) BR_RELAX();
 }
@@ -2769,9 +2823,13 @@ void brine_par_run(int64_t lo, int64_t hi, int64_t nchunks, brine_chunk_fn fn, v
     __atomic_sub_fetch(&brine_mt, 1, __ATOMIC_SEQ_CST);
     br_unlock(&br_pool.job_lock);
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 int64_t brine_par_chunks(int64_t n) { return brine_par_plan(n); }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 bool brine_first_stopped(const int64_t *stop, int64_t chunk) {
     return __atomic_load_n(stop, __ATOMIC_RELAXED) < chunk;
 }
@@ -2781,7 +2839,9 @@ void brine_first_found(int64_t *stop, int64_t chunk) {
     while (chunk < cur && !__atomic_compare_exchange_n(stop, &cur, chunk, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
     }
 }
+#endif
 
+#ifndef BRINE_RT_BR
 typedef struct {
     brine_task_fn fn;
     void *ctx;
@@ -2828,6 +2888,7 @@ void brine_par_tasks(int64_t k, brine_task_fn fn, void *ctx) {
     free(ths);
     free(spawned);
 }
+#endif
 
 /* ============================================================ reductions */
 /* `par sum(...)` and the other reductions combine in one fixed order that
@@ -3120,6 +3181,12 @@ static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *
  * it for every construct it can run. BRINE_GPU_LOG=1 prints where each
  * construct ran, and how long it took, to stderr. */
 
+#ifdef BRINE_RT_BR /* runtime/rt.br has the GPU code */
+void brine_x_gpu_setup(void);
+void brine_x_gpu_settle(void);
+static void br_gpu_setup(void) { brine_x_gpu_setup(); }
+static void br_gpu_settle(void) { brine_x_gpu_settle(); }
+#else
 typedef int br_gpu_res;
 typedef unsigned long long br_gpu_ptr;
 
@@ -3187,13 +3254,13 @@ static void br_gpu_setup(void) {
 static void br_gpu_logf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     fputs("brine gpu: ", stderr);
     if (br_size > 1) fprintf(stderr, "rank %lld: ", (long long)br_rank);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     fflush(stderr);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
     va_end(ap);
 }
 
@@ -4483,7 +4550,9 @@ void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, brine_leaf_f
     if (k->ptx && !br_in_par_get() && n >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n, dt);
     if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt);
 }
+#endif
 
+#ifndef BRINE_RT_BR
 /* ============================================================ world: transport */
 enum { BR_K_EMPTY = 0, BR_K_I64 = 1, BR_K_F64 = 2, BR_K_MSG = 7 };
 static const char *br_kind_name(int64_t k) {
@@ -4696,9 +4765,9 @@ static BR_NORETURN void br_peer_lost(int64_t r, const char *loc) {
 static void br_send(int64_t dest, int64_t kind, const void *data, int64_t len, const char *loc) {
     /* what this rank printed so far comes out before anything another rank
        prints after hearing from it (ranks share stdout, each with its own buffer) */
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     fflush(stdout);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
     br_peer *pr = &br_peers[dest];
     int64_t slen = (int64_t)strlen(br_cur_site);
     if (slen > 4096) slen = 4096;
@@ -5400,7 +5469,9 @@ brine_arr *brine_world_reduce_arr(const char *ed, brine_arr *xs, int op, const c
     br_allreduce(res->data, xs->len, *ed == 'f', op, loc);
     return res;
 }
+#endif /* BRINE_RT_BR */
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 /* ============================================================ init / shutdown */
 #ifdef _WIN32
 #include <io.h>
@@ -5517,8 +5588,12 @@ void brine_rt_init(int argc, char **argv) {
     }
 #endif
     br_leakcheck = getenv("BRINE_LEAKCHECK") != NULL;
+#ifdef BRINE_RT_BR
+    brine_x_heap_init(br_leakcheck);
+#else
     br_heap_init();
     br_heap_info_init();
+#endif
     br_argc = argc;
     br_argv = argv;
 #ifdef _WIN32
@@ -5529,10 +5604,14 @@ void brine_rt_init(int argc, char **argv) {
     SetConsoleOutputCP(CP_UTF8);
 #endif
     br_mutex_init(&br_io_mu);
+#ifdef BRINE_RT_BR
+    brine_x_pool_init();
+#else
     br_mutex_init(&br_pool.mu);
     br_mutex_init(&br_pool.job_lock);
     br_cond_init(&br_pool.cv_work);
     br_cond_init(&br_pool.cv_done);
+#endif
     br_gpu_setup();
     static char outbuf[1 << 16];
     setvbuf(stdout, outbuf, _IOFBF, sizeof outbuf);
@@ -5548,8 +5627,9 @@ void brine_rt_shutdown(void) {
     br_gpu_settle();
     br_world_finish("it returned from `main`");
     br_flush();
-    if (br_leakcheck) fprintf(stderr, "brine: %lld live objects at exit\n", (long long)__atomic_load_n(&br_live, __ATOMIC_RELAXED));
+    if (br_leakcheck) fprintf(stderr, "brine: %lld live objects at exit\n", (long long)BR_LIVE_COUNT());
 }
+#endif
 
 /* ============================================================ files and processes */
 #ifdef BR_WASM
@@ -5561,6 +5641,7 @@ void brine_rt_shutdown(void) {
 extern char **environ;
 #endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 static void *br_grow(void *p, size_t n) {
     void *q = realloc(p, n ? n : 1);
     if (!q) {
@@ -5849,11 +5930,11 @@ static bool br_in_fill(void) {
     return true;
 }
 brine_str *brine_input(brine_str *prompt) {
-    br_lock(&br_io_mu);
+    BR_IO_LOCK();
     if (prompt && prompt->len) fwrite(prompt->data, 1, (size_t)prompt->len, stdout);
     /* what was printed before (a prompt with `end=""`) shows before the wait */
     fflush(stdout);
-    br_unlock(&br_io_mu);
+    BR_IO_UNLOCK();
     int64_t seen = 0, n;
     for (;;) {
         const char *at = br_in.p + br_in.pos;
@@ -6558,7 +6639,9 @@ brine_str *brine_os_arch(void) {
 #endif
     return brine_str_new(n, (int64_t)strlen(n));
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 int64_t brine_os_pid(void) {
 #ifdef _WIN32
     return (int64_t)GetCurrentProcessId();
@@ -6568,13 +6651,19 @@ int64_t brine_os_pid(void) {
     return (int64_t)getpid();
 #endif
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 int64_t brine_os_cpu_count(void) {
     int n = br_ncpu();
     return n > 0 ? n : 1;
 }
+#endif
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 int64_t brine_os_thread_count(void) { return br_threads(); }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 void brine_os_sleep(double seconds) {
     if (!(seconds > 0)) return;
 #ifdef _WIN32
@@ -6594,7 +6683,9 @@ void brine_os_sleep(double seconds) {
     }
 #endif
 }
+#endif
 
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 #ifdef _WIN32
 /* an MSYS/Cygwin terminal is a named pipe called like `msys-...-pty0-to-master` (same test as Rust) */
 static int br_msys_tty(HANDLE h) {
@@ -7285,6 +7376,10 @@ static void br_procs_free(void) {
     br_procs = NULL;
     br_nprocs = br_cap_procs = 0;
 }
+#else
+void brine_x_os_procs_free(void);
+static void br_procs_free(void) { brine_x_os_procs_free(); }
+#endif
 
 /* ------------------------------------------------------------ entry points for native code
  * Natively compiled brine (the x86-64 backend) can't call the `static inline`
@@ -7293,6 +7388,7 @@ static void br_procs_free(void) {
  * pointer to it, and an i128/u128 result is written through an extra first
  * argument. The `brine_x_i128_*` / `brine_x_u128_*` functions are the plain
  * (wrapping) 128-bit operations the native backend doesn't do inline. */
+#ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_x_str_retain(brine_str *s) { brine_str_retain(s); }
 void brine_x_str_release(brine_str *s) { brine_str_release(s); }
 void brine_x_arr_retain(brine_arr *a) { brine_arr_retain(a); }
@@ -7338,6 +7434,7 @@ uint64_t brine_x_hash_mix(uint64_t h, uint64_t x) { return brine_hash_mix(h, x);
 uint64_t brine_x_hash_u128(const brine_u128 *x) { return brine_hash_u128(*x); }
 int64_t brine_x_idx(int64_t i, int64_t len, const char *loc) { return brine_idx(i, len, loc); }
 int64_t brine_x_par_plan(int64_t n) { return brine_par_plan(n); }
+#endif
 
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
 #define BR_X_MATH1(name) \

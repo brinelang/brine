@@ -252,6 +252,50 @@ struct A:
     fn pos(self) -> int:
         return len(self.o.text)
 
+    # The runtime module's atomics (`atomic_add` etc. in check.br) on the 8
+    # bytes at args[0]: load-acquire / store-release, and exclusive-pair loops
+    # for the others (no LSE: ARMv8.0 has none), as C compilers make them for
+    # sequentially consistent operations.
+    fn atomic(ref self, x: Inst):
+        if x.s == "brine_cpu_relax":
+            # yield
+            self.w(0xD503203F)
+            return
+        let n = x.s[13:]
+        let p = self.use(T0, x.args[0])
+        var old = T2
+        if n == "load":
+            # ldar x2, [p]
+            self.w(0xC8DFFC00 | (p << 5) | T2)
+        elif n == "store":
+            let v = self.use(T1, x.args[1])
+            # stlr v, [p]
+            self.w(0xC89FFC00 | (p << 5) | v)
+        elif n == "cas":
+            let e = self.use(T1, x.args[1])
+            let v = self.use(T2, x.args[2])
+            old = T3
+            let top = self.pos()
+            # ldaxr old, [p]; cmp old, e; b.ne done; stlxr w16, v, [p]; cbnz w16, top
+            self.w(0xC85FFC00 | (p << 5) | old)
+            self.w(0xEB000000 | (e << 16) | (old << 5) | ZR)
+            self.w(0x54000000 | (3 << 5) | 1)
+            self.w(0xC800FC00 | (IP0 << 16) | (p << 5) | v)
+            self.w(0x35000000 | ((((top - self.pos()) / 4) & 0x7FFFF) << 5) | IP0)
+        else:
+            let v = self.use(T1, x.args[1])
+            let top = self.pos()
+            # ldaxr old, [p]; (add x3, old, v;) stlxr w16, x3 / v, [p]; cbnz w16, top
+            self.w(0xC85FFC00 | (p << 5) | old)
+            var put = v
+            if n == "add":
+                put = T3
+                self.w(0x8B000000 | (v << 16) | (old << 5) | T3)
+            self.w(0xC800FC00 | (IP0 << 16) | (p << 5) | put)
+            self.w(0x35000000 | ((((top - self.pos()) / 4) & 0x7FFFF) << 5) | IP0)
+        if x.d >= 0:
+            self.st(old, x.d)
+
     fn get32(self, at: int) -> int:
         let t = self.o.text
         return int(t[at]) | (int(t[at + 1]) << 8) | (int(t[at + 2]) << 16) | (int(t[at + 3]) << 24)
@@ -725,6 +769,13 @@ struct A:
             # mrs r, tpidr_el0
             self.w(0xD53BD040 | r)
             self.st(r, x.d)
+            return
+        if (
+            x.op == Op.Call
+            and x.b == 1
+            and (x.s.starts_with("brine_atomic_") or x.s == "brine_cpu_relax")
+        ):
+            self.atomic(x)
             return
         if x.op == Op.Call and x.b == 1 and x.s == "brine_umulh_u64" and x.d >= 0:
             let r = self.dst(x.d)
@@ -1846,14 +1897,20 @@ struct A:
 # ================================================================ module
 
 fn emit_object(m: Module) -> [u8]:
-    return emit(m, false, "", "", "")
+    var o = emit(m, false, "", "", "")
+    return write_elf(ref o)
 
 # The same with DWARF debug info. `src` is the main source file, `comp_dir`
 # the directory relative source paths start from.
 fn emit_object_debug(m: Module, src: str, comp_dir: str, producer: str) -> [u8]:
-    return emit(m, true, src, comp_dir, producer)
+    var o = emit(m, true, src, comp_dir, producer)
+    return write_elf(ref o)
 
-fn emit(m0: Module, dbg: bool, src: str, comp_dir: str, producer: str) -> [u8]:
+# The object in memory, for brine's own linker (link.br).
+fn emit_obj(m: Module, dbg: bool, src: str, comp_dir: str, producer: str) -> ObjFile:
+    return emit(m, dbg, src, comp_dir, producer)
+
+fn emit(m0: Module, dbg: bool, src: str, comp_dir: str, producer: str) -> ObjFile:
     let m = prune_rt(m0)
     var dw = new_dwarf()
     # DW_OP_reg29
@@ -1921,7 +1978,8 @@ fn emit(m0: Module, dbg: bool, src: str, comp_dir: str, producer: str) -> [u8]:
                 x.o.data.push(0)
             x.o.data_align = max(x.o.data_align, a)
             base = len(x.o.data)
-            x.sym_def(d.name, SEC_DATA, base, false, false)
+            # (the runtime's variables C reads too)
+            x.sym_def(d.name, SEC_DATA, base, d.name.starts_with("brine_"), false)
             x.o.data.extend(d.bytes)
         for r in d.relocs:
             let rs = x.sym_ref(r.sym)
@@ -1941,4 +1999,4 @@ fn emit(m0: Module, dbg: bool, src: str, comp_dir: str, producer: str) -> [u8]:
     x.o.trel = keep
     if dbg:
         write_dwarf(ref x.o, x.dw, m.dtypes, x.text_sym, src, comp_dir, producer)
-    return write_elf(ref x.o)
+    return x.o

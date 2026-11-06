@@ -351,6 +351,45 @@ fn lower(prog: Program, info: ProgramInfo, sm: SourceMap, opts: Options) -> Lowe
     )
     return g.run()
 
+# An `os_is("...")` of the runtime module, or `not` one: whether the program
+# is built for that OS, which is the compiler's own (native code is built for
+# the machine it runs on); None for any other expression. "posix" is every
+# OS but Windows.
+fn os_test(e: Expr) -> Option[bool]:
+    match e.kind:
+        case ExprKind.Unary(op, x):
+            match op:
+                case UnOp.Not:
+                    match os_test(x):
+                        case Some(v):
+                            return Some(not v)
+                        case None:
+                            return None
+                case _:
+                    return None
+        case ExprKind.Call(_, args):
+            match e.cres:
+                case CallRes.Prim(n):
+                    if n == "os_is":
+                        return Some(os_is_cond(args[0].expr))
+                    return None
+                case _:
+                    return None
+        case _:
+            return None
+
+fn os_is_cond(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Str(s):
+            if s == "posix":
+                return os.name() != "windows"
+            # (native builds are for this machine)
+            if s == "x86_64" or s == "aarch64":
+                return os.arch() == s
+            return os.name() == s
+        case _:
+            panic("os_is takes a string literal")
+
 struct Lower:
     prog: Program
     info: ProgramInfo
@@ -512,6 +551,26 @@ struct Lower:
                     self.funcs[fi].code[xi].b = 0
         return cold
 
+    # An `if` of the runtime module on `os_is`: only the branch taken is
+    # lowered, so the other OS's functions are never called.
+    fn os_if(ref self, branches: [(Expr, Block)], els: Option[Block]) -> bool:
+        if os_test(branches[0].0).is_none():
+            return false
+        for br_ in branches:
+            match os_test(br_.0):
+                case Some(v):
+                    if v:
+                        self.block(br_.1)
+                        return true
+                case None:
+                    panic("an `if` on os_is() tests only os_is() in every branch")
+        match els:
+            case Some(eb):
+                self.block(eb)
+            case None:
+                pass
+        return true
+
     # A memory operation of the runtime module (`prim_sig` in check.br).
     fn prim(ref self, n: str, args: [Arg]) -> int:
         if n == "symbol":
@@ -520,6 +579,19 @@ struct Lower:
                     return self.cx.fb.global(s)
                 case _:
                     panic("symbol takes a string literal")
+        if n == "os_is":
+            return self.cx.fb.konst(K.Bool, 1 if os_is_cond(args[0].expr) else 0)
+        if n == "global_mem":
+            match (args[0].expr.kind, args[1].expr.kind):
+                case (ExprKind.Str(s), ExprKind.Int(size)):
+                    let sym = s if s.starts_with("brine_") else "__rtg_" + s
+                    if sym not in self.dnames:
+                        self.dnames[sym] = true
+                        let b = [u8(0)] * int(size)
+                        self.data.push(Data(name=sym, align=16, bytes=b, relocs=[], readonly=false))
+                    return self.cx.fb.global(sym)
+                case _:
+                    panic("global_mem takes a string literal and an integer literal")
         var vs: [int] = []
         for a in args:
             vs.push(self.expr(a.expr))
@@ -539,6 +611,13 @@ struct Lower:
             return self.cx.fb.rt(K.U64, "brine_divlu_u64", vs)
         if n == "thread_ptr":
             return self.cx.fb.rt(K.Ptr, "brine_thread_ptr", vs)
+        # (calls the backends write inline: no optimization moves memory
+        # operations across a call)
+        if n == "atomic_store" or n == "cpu_relax":
+            self.cx.fb.rt_void("brine_" + n, vs)
+            return self.unit()
+        if n.starts_with("atomic_"):
+            return self.cx.fb.rt(K.I64, "brine_" + n, vs)
         if n == "addr":
             return self.cx.fb.conv(K.U64, vs[0])
         if n == "str_of" or n == "ptr_of":
@@ -935,20 +1014,20 @@ struct Lower:
         self.gen_streq()
         let saved = self.start_main()
         let fb0 = self.cx.fb
-        # the arguments come from the runtime (`brine_arg`), not C's argv, whose
-        # pointers aren't 8 bytes everywhere (WebAssembly)
-        let argc = 0
+        # the arguments come from the runtime (`brine_arg`, null past the
+        # last), not C's argc and argv: their pointers aren't 8 bytes
+        # everywhere (WebAssembly), and a program brine links itself on
+        # Windows gets none
         let done = self.cx.fb.label()
         let not_list = self.cx.fb.label()
         let not_run = self.cx.fb.label()
-        let two = self.cx.fb.konst(K.I32, 2)
-        let three = self.cx.fb.konst(K.I32, 3)
+        let null = self.cx.fb.konst(K.Ptr, 0)
         let one64 = self.cx.fb.konst(K.I64, 1)
         let two64 = self.cx.fb.konst(K.I64, 2)
         # --list
-        let ge2 = self.cx.fb.cmp(Op.Ge, argc, two)
-        self.cx.fb.brnot(ge2, not_list)
         let a1 = self.cx.fb.call(K.Ptr, "brine_arg", [one64])
+        let has1 = self.cx.fb.cmp(Op.Ne, a1, null)
+        self.cx.fb.brnot(has1, not_list)
         let ls = self.cstr("--list")
         let is_list = self.cx.fb.call(K.Bool, "br_streq", [a1, ls])
         self.cx.fb.brnot(is_list, not_list)
@@ -962,13 +1041,13 @@ struct Lower:
         self.cx.fb.jmp(done)
         self.cx.fb.place(not_list)
         # --run k
-        let ge3 = self.cx.fb.cmp(Op.Ge, argc, three)
-        self.cx.fb.brnot(ge3, not_run)
+        let a2 = self.cx.fb.call(K.Ptr, "brine_arg", [two64])
+        let has2 = self.cx.fb.cmp(Op.Ne, a2, null)
+        self.cx.fb.brnot(has2, not_run)
         let a1b = self.cx.fb.call(K.Ptr, "brine_arg", [one64])
         let rs = self.cstr("--run")
         let is_run = self.cx.fb.call(K.Bool, "br_streq", [a1b, rs])
         self.cx.fb.brnot(is_run, not_run)
-        let a2 = self.cx.fb.call(K.Ptr, "brine_arg", [two64])
         let k = self.cx.fb.call(K.I64, "br_atoi", [a2])
         for i, t in enumerate(tests):
             let iv = self.cx.fb.konst(K.I64, i)
@@ -3007,6 +3086,8 @@ struct Lower:
                 self.expr(e)
                 self.pop_frame()
             case StmtKind.If(branches, els):
+                if self.rt_body and self.os_if(branches, els):
+                    return
                 let end = self.cx.fb.label()
                 for br_ in branches:
                     self.push_frame()
