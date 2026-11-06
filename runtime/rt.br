@@ -10582,3 +10582,2005 @@ fn brine_world_reduce_arr(ed: ptr, xs: ptr, op: i32, loc: ptr) -> ptr:
     coll(red_op(op), loc)
     allreduce(load_ptr(res, ARR_DATA), n, load_u8(ed, 0) == 102, op, loc)
     return res
+# ---------------------------------------------------------------- GPU
+
+# `par` constructs whose bodies only compute (ptx.br decides, at compile
+# time) can run on a GPU: NVIDIA's through CUDA, Apple's through Metal. The
+# driver or framework is loaded when first needed: there's no toolkit or
+# link-time dependency, and without a GPU everything runs on the thread pool.
+#
+# Results are the same either way: kernels compute exactly what the CPU code
+# does (ptx.br, msl.br), reductions combine in the same tree, and a failing
+# check on the device (overflow, an index, ...) discards the device's work
+# and runs the construct on the CPU, which reports the error as usual.
+#
+# BRINE_GPU=off|on|auto (default auto): auto uses the GPU when the estimate
+# says it's faster (the CPU's speed measured on the first elements, the
+# GPU's after its first run, the copies at the measured bandwidth); on uses
+# it for every construct it can run. BRINE_GPU_LOG=1 prints where each
+# construct ran, and how long it took, to stderr.
+#
+# Device calls return 0 or an error dev_err describes (a C int: CUresult);
+# device pointers are addresses the kernels use as they are.
+
+const GPU_OOM: i32 = 2
+const GPU_OFF = 0
+const GPU_AUTO = 1
+const GPU_ON = 2
+const GS_NONE = 0
+const GS_INIT = 1
+const GS_READY = 2
+const GS_FAILED = 3
+
+# threads per block: the combine kernels' fan-in (BLOCK in ptx.br)
+const GPU_BLOCK = 256
+# smallest construct auto considers (elements)
+const GPU_MIN_N = 4096
+# a launch should take about this long (seconds): Windows resets a GPU
+# whose kernel runs for 2 s
+const GPU_SLICE = 0.03
+# how much one hardware thread adds to the pool's speed: most CPUs run two
+# threads per core
+const CPU_EFF = 0.5
+# arrays up to this many bytes are copied with the context, in one piece
+const GPU_SMALL = 65536
+# BRINE_LEAF (brine_rt.h)
+const LEAF = 16
+
+# the runtime's GPU state (br_gpu in the C): locks, then the fields `mu`
+# guards; `run` is held while the device is in use
+const G_MU = 0
+const G_CV = 64
+const G_RUN = 128
+const G_MODE = 192
+const G_LOG = 200
+const G_STATE = 208
+const G_PTX = 216
+# the error flag kernels set (a device address)
+const G_ERR = 224
+const G_BUF = 232
+const G_CAP = 240
+const G_STAGE = 248
+const G_STAGE_CAP = 256
+const G_PINNED = 264
+# bytes per second, host <-> device
+const G_BW = 272
+# how long getting the device ready takes
+const G_INIT_S = 280
+const G_SMS = 288
+# how much faster than one CPU thread at f32 and integer code; at f64 code
+const G_SPEED = 296
+const G_F64 = 304
+const G_WHY = 312
+const G_NAME = 568
+const WHY_SIZE = 256
+const NAME_SIZE = 128
+
+# brine_kernel (brine_rt.h)
+const K_PTX = 0
+const K_ENTRY = 8
+const K_WHERE = 16
+const K_KIND = 24
+const K_OP = 32
+const K_VK = 40
+const K_CTX_SIZE = 48
+const K_PTRS = 56
+const K_COST = 64
+const K_COST64 = 72
+const K_COMB = 80
+const K_STATE = 88
+const K_WHY = 96
+
+# what the runtime learned about one construct (k.state): its kernels, and
+# per element: one CPU thread, the thread pool, the device (0: not
+# measured); `seen`: the pool's time was measured, not estimated
+const KS_FN = 0
+const KS_COMB = 8
+const KS_SEQ = 16
+const KS_CPU = 24
+const KS_GPU = 32
+const KS_SEEN = 40
+const KS_SIZE = 48
+
+# brine_rt.c's br_fold (a reduction's partial tree), which stays C with the
+# reductions for now; checked there with a _Static_assert
+const FOLD_SIZE = 1600
+
+extern fn strcmp(a: ptr, b: ptr) -> i32
+
+extern fn strncmp(a: ptr, b: ptr, n: u64) -> i32
+
+extern fn strtoull(s: ptr, end: ptr, base: i32) -> u64
+
+extern fn strdup(s: ptr) -> ptr
+
+extern fn dlopen(name: ptr, flags: i32) -> ptr
+
+extern fn dlsym(lib: ptr, name: ptr) -> ptr
+
+# (brine_rt.c: the lock around stderr, which C still writes too, and the
+# rank's place among the ranks on its machine)
+extern fn brine_x_io_lock()
+
+extern fn brine_x_io_unlock()
+
+extern fn brine_x_local_rank() -> int
+
+# (brine_rt.c, with the reductions)
+extern fn brine_x_fold_init(f: ptr, op: int, vk: int, loc: ptr)
+
+extern fn brine_x_fold_push(f: ptr, h: int, v: ptr, has: int)
+
+extern fn brine_x_fold_finish(f: ptr, out: ptr) -> int
+
+extern fn brine_x_reduce_cpu(
+    n: int,
+    f: ptr,
+    ef: ptr,
+    ctx: ptr,
+    op: int,
+    vk: int,
+    val: ptr,
+    has: ptr,
+    loc: ptr
+)
+
+fn gpu() -> ptr:
+    return global_mem("gpu", 704)
+
+# a literal as a C string
+fn cz(s: str) -> ptr:
+    return ptr_of(s) + STR_DATA
+
+fn cstr_is(p: ptr, s: str) -> bool:
+    return strcmp(p, cz(s)) == 0
+
+fn sb_c(sb: ptr, p: ptr):
+    brine_sb_cat(sb, p, int(strlen(p)))
+
+# printf's %.<most>s
+fn sb_cmax(sb: ptr, p: ptr, most: int):
+    var n = 0
+    while n < most and load_u8(p, n) != 0:
+        n += 1
+    brine_sb_cat(sb, p, n)
+
+# A finished message (and its builder freed) to the buffer of `size`
+# bytes at d, cut short as snprintf would.
+fn sb_to(sb: ptr, d: ptr, size: int):
+    var n = load_i64(sb, SB_LEN)
+    if n > size - 1:
+        n = size - 1
+    memcpy(d, load_ptr(sb, SB_P), u64(n))
+    store_u8(d, n, 0)
+    blk_free(load_ptr(sb, SB_P))
+
+fn why_lit(d: ptr, s: str):
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    sb_lit(sb, s)
+    sb_to(sb, d, WHY_SIZE)
+
+fn why_c(d: ptr, s: str, p: ptr):
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    sb_lit(sb, s)
+    sb_c(sb, p)
+    sb_to(sb, d, WHY_SIZE)
+
+fn err_write(p: ptr, n: int):
+    var i = 0
+    while i < n:
+        var w = 0
+        if os_is("windows"):
+            w = int(_write(i32(2), p + i, u32(n - i)))
+        else:
+            w = write(i32(2), p + i, u64(n - i))
+        if w <= 0:
+            return
+        i += w
+
+# "brine gpu: [rank r: ]<the message>" on stderr (and the builder freed)
+fn gpu_log(sb: ptr):
+    let o = stack_mem(24)
+    brine_sb_init(o)
+    sb_lit(o, "brine gpu: ")
+    if brine_world_size() > 1:
+        sb_lit(o, f"rank {brine_world_rank()}: ")
+    brine_sb_cat(o, load_ptr(sb, SB_P), load_i64(sb, SB_LEN))
+    sb_byte(o, 10)
+    blk_free(load_ptr(sb, SB_P))
+    brine_x_io_lock()
+    err_write(load_ptr(o, SB_P), load_i64(o, SB_LEN))
+    brine_x_io_unlock()
+    blk_free(load_ptr(o, SB_P))
+
+fn gpu_logging() -> bool:
+    return load_i64(gpu(), G_LOG) != 0
+
+fn gpu_mode() -> int:
+    return load_i64(gpu(), G_MODE)
+
+fn gpu_state() -> int:
+    return atomic_load(gpu() + G_STATE)
+
+# (brine_rt_init, once)
+fn brine_x_gpu_setup():
+    let g = gpu()
+    lock_init(g + G_MU)
+    lock_init(g + G_RUN)
+    cond_init(g + G_CV)
+    let m = getenv(cz("BRINE_GPU"))
+    var mode = GPU_AUTO
+    if addr(m) != 0 and (cstr_is(m, "off") or cstr_is(m, "0")):
+        mode = GPU_OFF
+    if addr(m) != 0 and (cstr_is(m, "on") or cstr_is(m, "1")):
+        mode = GPU_ON
+    store_i64(g, G_MODE, mode)
+    let l = getenv(cz("BRINE_GPU_LOG"))
+    let on = addr(l) != 0 and load_u8(l, 0) != 0 and not cstr_is(l, "0")
+    store_i64(g, G_LOG, 1 if on else 0)
+    store_f64(g, G_BW, 8.0e9)
+    store_f64(g, G_INIT_S, 0.3)
+    store_f64(g, G_SPEED, 150.0)
+    store_f64(g, G_F64, 40.0)
+
+# "; cpu estimate X ms" for the log, or nothing when the CPU time isn't
+# known yet (BRINE_GPU=on sends work to the GPU before the CPU has run any)
+fn sb_cpu_est(sb: ptr, cpu_s: float):
+    if cpu_s <= 0.0:
+        return
+    sb_lit(sb, f"; cpu estimate {cpu_s * 1.0e3:.3f} ms")
+
+# Which of the machine's n GPUs this rank uses, or -1. Ranks sharing a GPU
+# would queue for it and each run slower than the CPU it gave up, so in
+# auto mode the k-th rank on a machine gets GPU k, and the ranks beyond the
+# GPUs stay on the CPU; BRINE_GPU=on shares them out round-robin.
+fn gpu_ordinal(n: int, why: ptr) -> int:
+    if n <= 0:
+        return -1
+    let r = brine_x_local_rank()
+    if r < n:
+        return r
+    if gpu_mode() == GPU_ON:
+        return r % n
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    let s1 = "" if r == 1 else "s"
+    let s2 = "s" if r == 1 else ""
+    let s3 = "" if n == 1 else "s"
+    sb_lit(
+        sb,
+        f"{r} lower rank{s1} on this machine use{s2} its {n} GPU{s3} (one rank per GPU; BRINE_GPU=on shares them)"
+    )
+    sb_to(sb, why, WHY_SIZE)
+    return -1
+
+# ---- CUDA: the driver is loaded when first needed (nvcuda.dll,
+# libcuda.so.1), and JIT-compiles the program's PTX (ptx.br)
+
+# the driver's functions, then the context and the module
+const CU_INIT = 0
+const CU_COUNT = 8
+const CU_GET = 16
+const CU_ATTR = 24
+const CU_NAME = 32
+const CU_RETAIN = 40
+const CU_SET_CUR = 48
+const CU_SYNC = 56
+const CU_LOAD = 64
+const CU_FUNC = 72
+const CU_GLOBAL = 80
+const CU_ALLOC = 88
+const CU_FREE = 96
+const CU_HALLOC = 104
+const CU_HFREE = 112
+const CU_HTOD = 120
+const CU_DTOH = 128
+const CU_SET = 136
+const CU_LAUNCH = 144
+const CU_ERRSTR = 152
+const CU_CTX = 160
+const CU_MOD = 168
+
+# CU_DEVICE_ATTRIBUTE_*, CU_JIT_*
+const CU_ATTR_SMS: i32 = 16
+const CU_ATTR_CC_MAJOR: i32 = 75
+const CU_ATTR_CC_MINOR: i32 = 76
+const CU_JIT_ERROR_LOG = 5
+const CU_JIT_ERROR_LOG_SIZE = 6
+
+fn cu() -> ptr:
+    return global_mem("gpu_cu", 176)
+
+fn cu_fn(off: int) -> ptr:
+    return load_ptr(cu(), off)
+
+fn cu_err(r: i32) -> ptr:
+    let s = stack_mem(8)
+    store_ptr(s, 0, null_ptr())
+    let f = cu_fn(CU_ERRSTR)
+    if addr(f) != 0:
+        call_i32(f, r, s)
+    let p = load_ptr(s, 0)
+    return p if addr(p) != 0 else cz("unknown CUDA error")
+
+fn cu_open() -> ptr:
+    if os_is("windows"):
+        return LoadLibraryA(cz("nvcuda.dll"))
+    else:
+        # RTLD_NOW | RTLD_LOCAL
+        let h = dlopen(cz("libcuda.so.1"), i32(2))
+        return h if addr(h) != 0 else dlopen(cz("libcuda.so"), i32(2))
+
+fn cu_sym(lib: ptr, name: ptr) -> ptr:
+    if os_is("windows"):
+        return GetProcAddress(lib, name)
+    else:
+        return dlsym(lib, name)
+
+fn cu_load(lib: ptr, off: int, name: str, why: ptr) -> bool:
+    let f = cu_sym(lib, cz(name))
+    store_ptr(cu(), off, f)
+    if addr(f) == 0:
+        let sb = stack_mem(24)
+        brine_sb_init(sb)
+        sb_lit(sb, f"the CUDA driver has no {name}")
+        sb_to(sb, why, WHY_SIZE)
+        return false
+    return true
+
+# Loads the driver, picks the device and JIT-compiles the program's PTX. On
+# failure, `why` says what's missing. Called without the state's lock.
+fn cu_open_dev(ptx: ptr, why: ptr) -> bool:
+    let lib = cu_open()
+    if addr(lib) == 0:
+        why_lit(why, "no CUDA driver")
+        return false
+    if not cu_load(lib, CU_INIT, "cuInit", why):
+        return false
+    if not cu_load(lib, CU_COUNT, "cuDeviceGetCount", why):
+        return false
+    if not cu_load(lib, CU_GET, "cuDeviceGet", why):
+        return false
+    if not cu_load(lib, CU_ATTR, "cuDeviceGetAttribute", why):
+        return false
+    if not cu_load(lib, CU_NAME, "cuDeviceGetName", why):
+        return false
+    if not cu_load(lib, CU_RETAIN, "cuDevicePrimaryCtxRetain", why):
+        return false
+    if not cu_load(lib, CU_SET_CUR, "cuCtxSetCurrent", why):
+        return false
+    if not cu_load(lib, CU_SYNC, "cuCtxSynchronize", why):
+        return false
+    if not cu_load(lib, CU_LOAD, "cuModuleLoadDataEx", why):
+        return false
+    if not cu_load(lib, CU_FUNC, "cuModuleGetFunction", why):
+        return false
+    if not cu_load(lib, CU_GLOBAL, "cuModuleGetGlobal_v2", why):
+        return false
+    if not cu_load(lib, CU_ALLOC, "cuMemAlloc_v2", why):
+        return false
+    if not cu_load(lib, CU_FREE, "cuMemFree_v2", why):
+        return false
+    if not cu_load(lib, CU_HALLOC, "cuMemAllocHost_v2", why):
+        return false
+    if not cu_load(lib, CU_HFREE, "cuMemFreeHost", why):
+        return false
+    if not cu_load(lib, CU_HTOD, "cuMemcpyHtoD_v2", why):
+        return false
+    if not cu_load(lib, CU_DTOH, "cuMemcpyDtoH_v2", why):
+        return false
+    if not cu_load(lib, CU_SET, "cuMemsetD8_v2", why):
+        return false
+    if not cu_load(lib, CU_LAUNCH, "cuLaunchKernel", why):
+        return false
+    if not cu_load(lib, CU_ERRSTR, "cuGetErrorString", why):
+        return false
+    if strncmp(ptx, cz("// brine metal"), 14) == 0:
+        why_lit(why, "the program was built for Metal")
+        return false
+    let g = gpu()
+    let c = cu()
+    # (CUdevice and the attributes are C ints)
+    let v = stack_mem(16)
+    store_i64(v, 0, 0)
+    store_i64(v, 8, 0)
+    var r = call_i32(cu_fn(CU_INIT), u32(0))
+    if r == 0:
+        r = call_i32(cu_fn(CU_COUNT), v)
+    if r != 0:
+        why_c(why, "cuInit: ", cu_err(r))
+        return false
+    let n = int(load_i32(v, 0))
+    if n <= 0:
+        why_lit(why, "no CUDA device")
+        return false
+    let ord = gpu_ordinal(n, why)
+    if ord < 0:
+        return false
+    if call_i32(cu_fn(CU_GET), v + 4, i32(ord)) != 0:
+        let sb = stack_mem(24)
+        brine_sb_init(sb)
+        sb_lit(sb, f"no CUDA device {ord}")
+        sb_to(sb, why, WHY_SIZE)
+        return false
+    let dev = load_i32(v, 4)
+    let at = stack_mem(16)
+    store_i64(at, 0, 0)
+    store_i64(at, 8, 0)
+    call_i32(cu_fn(CU_ATTR), at, CU_ATTR_CC_MAJOR, dev)
+    call_i32(cu_fn(CU_ATTR), at + 4, CU_ATTR_CC_MINOR, dev)
+    let major = load_i32(at, 0)
+    let minor = load_i32(at, 4)
+    # x.0 data-center parts (P100, V100, A100, H100, B200) run f64 at half
+    # the f32 rate; the others at 1/32 or 1/64
+    if minor == 0 and major >= 6:
+        store_f64(g, G_F64, 75.0)
+    call_i32(cu_fn(CU_ATTR), at + 8, CU_ATTR_SMS, dev)
+    store_i64(g, G_SMS, int(load_i32(at, 8)))
+    call_i32(cu_fn(CU_NAME), g + G_NAME, i32(NAME_SIZE), dev)
+    if major < 5:
+        let sb = stack_mem(24)
+        brine_sb_init(sb)
+        sb_c(sb, g + G_NAME)
+        sb_lit(sb, " is older than compute capability 5.0")
+        sb_to(sb, why, WHY_SIZE)
+        return false
+    r = call_i32(cu_fn(CU_RETAIN), c + CU_CTX, dev)
+    if r == 0:
+        r = call_i32(cu_fn(CU_SET_CUR), load_ptr(c, CU_CTX))
+    if r != 0:
+        why_c(why, "no CUDA context: ", cu_err(r))
+        return false
+    let log = global_mem("gpu_cu_log", 4096)
+    let opts = stack_mem(8)
+    store_i32(opts, 0, i32(CU_JIT_ERROR_LOG))
+    store_i32(opts, 4, i32(CU_JIT_ERROR_LOG_SIZE))
+    let vals = stack_mem(16)
+    store_ptr(vals, 0, log)
+    store_i64(vals, 8, 4096)
+    r = call_i32(cu_fn(CU_LOAD), c + CU_MOD, ptx, u32(2), opts, vals)
+    if r != 0:
+        let sb = stack_mem(24)
+        brine_sb_init(sb)
+        sb_lit(sb, "the PTX doesn't compile (")
+        sb_c(sb, cu_err(r))
+        sb_lit(sb, "): ")
+        sb_cmax(sb, log, 180)
+        sb_to(sb, why, WHY_SIZE)
+        return false
+    let sz = stack_mem(8)
+    r = call_i32(cu_fn(CU_GLOBAL), g + G_ERR, sz, load_ptr(c, CU_MOD), cz("brine_gpu_err"))
+    if r != 0:
+        why_c(why, "cuModuleGetGlobal: ", cu_err(r))
+        return false
+    return true
+
+fn cu_launch(f: ptr, blocks: int, args: ptr, nargs: int) -> i32:
+    let p = stack_mem(64)
+    var i = 0
+    while i < nargs and i < 8:
+        store_ptr(p, i * 8, args + i * 8)
+        i += 1
+    let one = u32(1)
+    let r = call_i32(
+        cu_fn(CU_LAUNCH),
+        f,
+        u32(blocks),
+        one,
+        one,
+        u32(GPU_BLOCK),
+        one,
+        one,
+        u32(0),
+        null_ptr(),
+        p,
+        null_ptr()
+    )
+    return r if r != 0 else call_i32(cu_fn(CU_SYNC))
+
+# ---- Metal (macOS), through the Objective-C runtime: the frameworks are
+# loaded when first needed, so there's nothing to link. The program's module
+# is MSL source (msl.br); "// stack N" on its second line is the device
+# stack each thread needs. Memory is shared with the CPU, so copies are
+# memcpy. Every objc_msgSend is called with the C's argument types for that
+# message.
+
+const M_CLS = 0
+const M_SEL = 8
+const M_MSG = 16
+const M_PUSH = 24
+const M_POP = 32
+const M_DEV = 40
+const M_QUEUE = 48
+const M_LIB = 56
+# the main buffer, the error flag's, the stack's; their GPU addresses
+const M_BUF = 64
+const M_FLAG = 72
+const M_STK = 80
+const M_BUF_AT = 88
+const M_FLAG_AT = 96
+const M_STK_AT = 104
+const M_BUF_MEM = 112
+const M_FLAG_MEM = 120
+const M_BUF_LEN = 128
+const M_STK_LEN = 136
+const M_STACK = 144
+# the kernels: (name, pipeline state) pairs
+const M_FNS = 152
+const M_NFNS = 160
+const M_ERR = 168
+
+const MTL_FAIL: i32 = 1
+const MTL_STATUS_ERROR: u64 = 5
+const MTL_KERNEL: u64 = 3
+const MTL_MATH_SAFE = 0
+const MTL_FUNCTIONS_PRECISE = 1
+const MTL_FAMILY_APPLE7 = 1007
+
+fn mtl() -> ptr:
+    return global_mem("gpu_mtl", 424)
+
+fn mtl_msg() -> ptr:
+    return load_ptr(mtl(), M_MSG)
+
+fn mtl_sel(s: str) -> ptr:
+    return call_ptr(load_ptr(mtl(), M_SEL), cz(s))
+
+fn mtl_cls(s: str) -> ptr:
+    return call_ptr(load_ptr(mtl(), M_CLS), cz(s))
+
+fn oc(o: ptr, s: str) -> ptr:
+    return call_ptr(mtl_msg(), o, mtl_sel(s))
+
+fn oc_o(o: ptr, s: str, a: ptr) -> ptr:
+    return call_ptr(mtl_msg(), o, mtl_sel(s), a)
+
+fn oc_u(o: ptr, s: str) -> u64:
+    return call_u64(mtl_msg(), o, mtl_sel(s))
+
+fn oc_void(o: ptr, s: str):
+    call_void(mtl_msg(), o, mtl_sel(s))
+
+fn oc_has(o: ptr, s: str) -> bool:
+    return call_u8(mtl_msg(), o, mtl_sel("respondsToSelector:"), mtl_sel(s)) != 0
+
+fn oc_str(p: ptr) -> ptr:
+    return call_ptr(mtl_msg(), mtl_cls("NSString"), mtl_sel("stringWithUTF8String:"), p)
+
+fn oc_cstr(nsstr: ptr) -> ptr:
+    var s = null_ptr()
+    if addr(nsstr) != 0:
+        s = call_ptr(mtl_msg(), nsstr, mtl_sel("UTF8String"))
+    return s if addr(s) != 0 else cz("unknown error")
+
+# an NSError's description, or "" for none
+fn oc_errtext(e: ptr) -> ptr:
+    return oc_cstr(oc(e, "localizedDescription")) if addr(e) != 0 else cz("")
+
+fn mtl_fail(what: str, nserr: ptr) -> i32:
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    sb_lit(sb, what)
+    if addr(nserr) != 0:
+        sb_lit(sb, ": ")
+        sb_c(sb, oc_errtext(nserr))
+    sb_to(sb, mtl() + M_ERR, 256)
+    return MTL_FAIL
+
+fn mtl_err_lit(s: str):
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    sb_lit(sb, s)
+    sb_to(sb, mtl() + M_ERR, 256)
+
+# a shared buffer of n bytes, and its GPU address at `at`
+fn mtl_buffer(n: int, at: ptr) -> ptr:
+    let b = call_ptr(
+        mtl_msg(),
+        load_ptr(mtl(), M_DEV),
+        mtl_sel("newBufferWithLength:options:"),
+        u64(n),
+        u64(0)
+    )
+    if addr(b) != 0:
+        store_u64(at, 0, oc_u(b, "gpuAddress"))
+    return b
+
+# "<what>: <the error's description>" (at most `most` bytes of it) to why
+fn mtl_why_err(why: ptr, what: str, e: ptr, most: int):
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    sb_lit(sb, what)
+    sb_cmax(sb, oc_errtext(e), most)
+    sb_to(sb, why, WHY_SIZE)
+
+fn mtl_why_name(why: ptr, rest: str):
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    sb_c(sb, gpu() + G_NAME)
+    sb_lit(sb, rest)
+    sb_to(sb, why, WHY_SIZE)
+
+fn mtl_open_dev(code: ptr, why: ptr) -> bool:
+    if strncmp(code, cz("// brine metal\n// stack "), 24) != 0:
+        why_lit(why, "the program wasn't built for Metal")
+        return false
+    let m = mtl()
+    store_u64(m, M_STACK, strtoull(code + 24, null_ptr(), i32(10)))
+    if gpu_ordinal(1, why) < 0:
+        return false
+    # RTLD_NOW | RTLD_LOCAL
+    let fl = i32(6)
+    let objc = dlopen(cz("/usr/lib/libobjc.A.dylib"), fl)
+    let fnd = dlopen(cz("/System/Library/Frameworks/Foundation.framework/Foundation"), fl)
+    let lib = dlopen(cz("/System/Library/Frameworks/Metal.framework/Metal"), fl)
+    if addr(objc) == 0 or addr(fnd) == 0 or addr(lib) == 0:
+        why_lit(why, "no Metal framework")
+        return false
+    store_ptr(m, M_CLS, dlsym(objc, cz("objc_getClass")))
+    store_ptr(m, M_SEL, dlsym(objc, cz("sel_registerName")))
+    store_ptr(m, M_MSG, dlsym(objc, cz("objc_msgSend")))
+    store_ptr(m, M_PUSH, dlsym(objc, cz("objc_autoreleasePoolPush")))
+    store_ptr(m, M_POP, dlsym(objc, cz("objc_autoreleasePoolPop")))
+    let create = dlsym(lib, cz("MTLCreateSystemDefaultDevice"))
+    if (
+        addr(load_ptr(m, M_CLS)) == 0
+        or addr(load_ptr(m, M_SEL)) == 0
+        or addr(load_ptr(m, M_MSG)) == 0
+        or addr(load_ptr(m, M_PUSH)) == 0
+        or addr(load_ptr(m, M_POP)) == 0
+        or addr(create) == 0
+    ):
+        why_lit(why, "the Objective-C runtime or Metal is missing a function")
+        return false
+    let ar = call_ptr(load_ptr(m, M_PUSH))
+    let ok = mtl_setup(code, create, why)
+    call_void(load_ptr(m, M_POP), ar)
+    return ok
+
+# The device, its kernels' pipelines and a queue (in an autorelease pool).
+fn mtl_setup(code: ptr, create: ptr, why: ptr) -> bool:
+    let m = mtl()
+    let g = gpu()
+    let msg = mtl_msg()
+    let dev = call_ptr(create)
+    if addr(dev) == 0:
+        why_lit(why, "no Metal device")
+        return false
+    store_ptr(m, M_DEV, dev)
+    let nsb = stack_mem(24)
+    brine_sb_init(nsb)
+    sb_c(nsb, oc_cstr(oc(dev, "name")))
+    sb_to(nsb, g + G_NAME, NAME_SIZE)
+    # Only Apple GPUs (M1 and later) are tested. The AMD and Intel GPUs of
+    # Intel Macs wait for hardware to test on (see docs/DESIGN.md); the
+    # virtual GPU of an Intel Mac VM gave wrong results.
+    if (
+        not oc_has(dev, "supportsFamily:")
+        or call_u8(msg, dev, mtl_sel("supportsFamily:"), MTL_FAMILY_APPLE7) == 0
+    ):
+        mtl_why_name(why, " isn't an Apple GPU (AMD and Intel GPUs aren't supported yet)")
+        return false
+    let flag = mtl_buffer(256, m + M_FLAG_AT)
+    store_ptr(m, M_FLAG, flag)
+    if addr(flag) == 0 or not oc_has(flag, "gpuAddress"):
+        mtl_why_name(why, " has no Metal 3 (GPU addresses need macOS 13)")
+        return false
+    store_ptr(m, M_FLAG_MEM, oc(flag, "contents"))
+    # exact arithmetic, as on the CPU
+    let opts = oc(oc(mtl_cls("MTLCompileOptions"), "alloc"), "init")
+    # (the safe math mode alone still has approximate sqrt and division)
+    if oc_has(opts, "setMathMode:") and oc_has(opts, "setMathFloatingPointFunctions:"):
+        call_void(msg, opts, mtl_sel("setMathMode:"), MTL_MATH_SAFE)
+        call_void(msg, opts, mtl_sel("setMathFloatingPointFunctions:"), MTL_FUNCTIONS_PRECISE)
+    else:
+        call_void(msg, opts, mtl_sel("setFastMathEnabled:"), false)
+    let err = stack_mem(8)
+    store_ptr(err, 0, null_ptr())
+    let lib = call_ptr(
+        msg,
+        dev,
+        mtl_sel("newLibraryWithSource:options:error:"),
+        oc_str(code),
+        opts,
+        err
+    )
+    store_ptr(m, M_LIB, lib)
+    oc_void(opts, "release")
+    if addr(lib) == 0:
+        mtl_why_err(why, "the Metal source doesn't compile: ", load_ptr(err, 0), 180)
+        return false
+    # every kernel's pipeline now, while the program runs on the CPU
+    let names = oc(lib, "functionNames")
+    let nn = oc_u(names, "count")
+    let fns = calloc(nn if nn != 0 else u64(1), u64(16))
+    store_ptr(m, M_FNS, fns)
+    if addr(fns) == 0:
+        why_lit(why, "out of memory")
+        return false
+    var i: u64 = 0
+    while i < nn:
+        let nm = call_ptr(msg, names, mtl_sel("objectAtIndex:"), i)
+        i += 1
+        let cn = oc_cstr(nm)
+        let f = oc_o(lib, "newFunctionWithName:", nm)
+        # kernels only
+        if addr(f) != 0 and oc_u(f, "functionType") != MTL_KERNEL:
+            oc_void(f, "release")
+            continue
+        store_ptr(err, 0, null_ptr())
+        var ps = null_ptr()
+        if addr(f) != 0:
+            ps = call_ptr(msg, dev, mtl_sel("newComputePipelineStateWithFunction:error:"), f, err)
+            oc_void(f, "release")
+        if addr(ps) == 0:
+            let sb = stack_mem(24)
+            brine_sb_init(sb)
+            sb_lit(sb, "no pipeline for ")
+            sb_c(sb, cn)
+            sb_lit(sb, ": ")
+            sb_cmax(sb, oc_errtext(load_ptr(err, 0)), 160)
+            sb_to(sb, why, WHY_SIZE)
+            return false
+        let k = load_i64(m, M_NFNS)
+        store_ptr(fns, k * 16, strdup(cn))
+        store_ptr(fns, k * 16 + 8, ps)
+        store_i64(m, M_NFNS, k + 1)
+    let q = oc(dev, "newCommandQueue")
+    store_ptr(m, M_QUEUE, q)
+    if addr(q) == 0:
+        why_lit(why, "no Metal command queue")
+        return false
+    store_u64(g, G_ERR, load_u64(m, M_FLAG_AT))
+    # memory is shared: copies run at memcpy speed
+    store_f64(g, G_BW, 30.0e9)
+    store_f64(g, G_SPEED, 60.0)
+    return true
+
+# where device memory is in the CPU's view of it
+fn mtl_host(d: u64, n: int) -> ptr:
+    let m = mtl()
+    let b = load_u64(m, M_BUF_AT)
+    if addr(load_ptr(m, M_BUF)) != 0 and d >= b and d + u64(n) <= b + load_u64(m, M_BUF_LEN):
+        return load_ptr(m, M_BUF_MEM) + int(d - b)
+    let f = load_u64(m, M_FLAG_AT)
+    if d >= f and d + u64(n) <= f + 256:
+        return load_ptr(m, M_FLAG_MEM) + int(d - f)
+    mtl_err_lit("an address outside the GPU's buffers")
+    return null_ptr()
+
+# Runs one dispatch and waits for it: `groups` threadgroups of `per`
+# threads, or (groups 0) `threads` threads.
+fn mtl_dispatch(ps: ptr, a: ptr, na: int, threads: u64, groups: u64, per: u64) -> i32:
+    let m = mtl()
+    let ar = call_ptr(load_ptr(m, M_PUSH))
+    let r = mtl_encode(ps, a, na, threads, groups, per)
+    call_void(load_ptr(m, M_POP), ar)
+    return r
+
+fn mtl_encode(ps: ptr, a: ptr, na: int, threads: u64, groups: u64, per: u64) -> i32:
+    let m = mtl()
+    let msg = mtl_msg()
+    let cb = oc(load_ptr(m, M_QUEUE), "commandBuffer")
+    var enc = null_ptr()
+    if addr(cb) != 0:
+        enc = oc(cb, "computeCommandEncoder")
+    if addr(enc) == 0:
+        return mtl_fail("no Metal command buffer", null_ptr())
+    call_void(msg, enc, mtl_sel("setComputePipelineState:"), ps)
+    let sel_set = mtl_sel("setBuffer:offset:atIndex:")
+    call_void(msg, enc, sel_set, load_ptr(m, M_BUF), u64(0), u64(0))
+    call_void(msg, enc, mtl_sel("setBytes:length:atIndex:"), a, u64(na * 8), u64(1))
+    call_void(msg, enc, sel_set, load_ptr(m, M_FLAG), u64(0), u64(2))
+    # the kernels reach memory by address, not through their arguments
+    # (which the Metal compiler drops when unused): every buffer has to be
+    # made resident (read and write)
+    let sel_use = mtl_sel("useResource:usage:")
+    call_void(msg, enc, sel_use, load_ptr(m, M_BUF), u64(3))
+    call_void(msg, enc, sel_use, load_ptr(m, M_FLAG), u64(3))
+    if addr(load_ptr(m, M_STK)) != 0:
+        call_void(msg, enc, sel_use, load_ptr(m, M_STK), u64(3))
+    # MTLSize {width, height, depth}, by value: 24 bytes, which AArch64
+    # passes as the address of a copy (the only Macs that get here)
+    let tg = stack_mem(24)
+    store_u64(tg, 0, per)
+    store_u64(tg, 8, 1)
+    store_u64(tg, 16, 1)
+    let gs = stack_mem(24)
+    store_u64(gs, 8, 1)
+    store_u64(gs, 16, 1)
+    if groups != 0:
+        store_u64(gs, 0, groups)
+        call_void(msg, enc, mtl_sel("dispatchThreadgroups:threadsPerThreadgroup:"), gs, tg)
+    else:
+        store_u64(gs, 0, threads)
+        call_void(msg, enc, mtl_sel("dispatchThreads:threadsPerThreadgroup:"), gs, tg)
+    oc_void(enc, "endEncoding")
+    oc_void(cb, "commit")
+    oc_void(cb, "waitUntilCompleted")
+    if oc_u(cb, "status") == MTL_STATUS_ERROR:
+        return mtl_fail("a Metal command failed", oc(cb, "error"))
+    return i32(0)
+
+# the device stack for the threads of one dispatch (bytes)
+fn mtl_stack(bytes: u64) -> i32:
+    let m = mtl()
+    if load_u64(m, M_STK_LEN) >= bytes:
+        return i32(0)
+    if addr(load_ptr(m, M_STK)) != 0:
+        oc_void(load_ptr(m, M_STK), "release")
+    let s = mtl_buffer(int(bytes), m + M_STK_AT)
+    store_ptr(m, M_STK, s)
+    store_u64(m, M_STK_LEN, bytes if addr(s) != 0 else u64(0))
+    return i32(0) if addr(s) != 0 else GPU_OOM
+
+fn mtl_run(f: ptr, count: int, args: ptr, nargs: int) -> i32:
+    let m = mtl()
+    # msl.br's kernel arguments: context, n, first index, count, error flag,
+    # stack, stack per thread, first thread, values, flags
+    let a = stack_mem(80)
+    memset(a, 0, 80)
+    var i = 0
+    while i < nargs and i < 6:
+        store_u64(a, (i if i < 4 else i + 4) * 8, load_u64(args, i * 8))
+        i += 1
+    let stack = load_u64(m, M_STACK)
+    store_u64(a, 32, load_u64(m, M_FLAG_AT))
+    store_u64(a, 48, stack)
+    let most_tg = oc_u(f, "maxTotalThreadsPerThreadgroup")
+    let per = most_tg if most_tg < u64(GPU_BLOCK) else u64(GPU_BLOCK)
+    # threads at a time: as many as 256 MB of stack holds
+    var step = count
+    if stack > 0:
+        var most = int(u64(256 << 20) / stack)
+        if most < 1:
+            most = 1
+        if step > most:
+            step = most
+        let r = mtl_stack(u64(step) * stack)
+        if r != 0:
+            return r
+        store_u64(a, 40, load_u64(m, M_STK_AT))
+    var t0 = 0
+    while t0 < count:
+        let k = count - t0 if count - t0 < step else step
+        store_u64(a, 56, u64(t0))
+        let r = mtl_dispatch(f, a, 10, u64(k), u64(0), per)
+        if r != 0:
+            return r
+        t0 += step
+    return i32(0)
+
+fn mtl_comb(f: ptr, blocks: int, args: ptr, nargs: int) -> i32:
+    let a = stack_mem(48)
+    memset(a, 0, 48)
+    var i = 0
+    while i < nargs and i < 5:
+        store_u64(a, i * 8, load_u64(args, i * 8))
+        i += 1
+    store_u64(a, 40, load_u64(mtl(), M_FLAG_AT))
+    if oc_u(f, "maxTotalThreadsPerThreadgroup") < u64(GPU_BLOCK):
+        mtl_err_lit(f"a combine kernel can't run {GPU_BLOCK} threads per threadgroup")
+        return MTL_FAIL
+    return mtl_dispatch(f, a, 6, u64(0), u64(blocks), u64(GPU_BLOCK))
+
+# ---- the device, CUDA or Metal
+
+fn dev_open(code: ptr, why: ptr) -> bool:
+    if os_is("macos"):
+        return mtl_open_dev(code, why)
+    else:
+        return cu_open_dev(code, why)
+
+fn dev_err(r: i32) -> ptr:
+    if os_is("macos"):
+        return cz("out of memory") if r == GPU_OOM else mtl() + M_ERR
+    else:
+        return cu_err(r)
+
+# makes the device current on this thread
+fn dev_bind() -> i32:
+    if os_is("macos"):
+        return i32(0)
+    else:
+        return call_i32(cu_fn(CU_SET_CUR), load_ptr(cu(), CU_CTX))
+
+# Metal has one main buffer at a time: gpu_reserve frees the old one first
+fn dev_alloc(p: ptr, n: int) -> i32:
+    if os_is("macos"):
+        let m = mtl()
+        let b = mtl_buffer(n, p)
+        if addr(b) == 0:
+            return GPU_OOM
+        store_ptr(m, M_BUF, b)
+        store_u64(m, M_BUF_AT, load_u64(p, 0))
+        store_ptr(m, M_BUF_MEM, oc(b, "contents"))
+        store_i64(m, M_BUF_LEN, n)
+        return i32(0)
+    else:
+        return call_i32(cu_fn(CU_ALLOC), p, u64(n))
+
+fn dev_free(d: u64):
+    if os_is("macos"):
+        let m = mtl()
+        if addr(load_ptr(m, M_BUF)) == 0 or d != load_u64(m, M_BUF_AT):
+            return
+        oc_void(load_ptr(m, M_BUF), "release")
+        store_ptr(m, M_BUF, null_ptr())
+        store_i64(m, M_BUF_LEN, 0)
+    else:
+        call_i32(cu_fn(CU_FREE), d)
+
+# host memory the device copies from quickly, or null
+fn dev_host_alloc(n: int) -> ptr:
+    if os_is("macos"):
+        return null_ptr()
+    else:
+        let p = stack_mem(8)
+        store_ptr(p, 0, null_ptr())
+        if call_i32(cu_fn(CU_HALLOC), p, u64(n)) != 0:
+            return null_ptr()
+        return load_ptr(p, 0)
+
+fn dev_host_free(p: ptr):
+    if not os_is("macos"):
+        call_i32(cu_fn(CU_HFREE), p)
+
+fn dev_htod(d: u64, h: ptr, n: int) -> i32:
+    if os_is("macos"):
+        let m = mtl_host(d, n)
+        if addr(m) == 0:
+            return MTL_FAIL
+        memcpy(m, h, u64(n))
+        return i32(0)
+    else:
+        return call_i32(cu_fn(CU_HTOD), d, h, u64(n))
+
+fn dev_dtoh(h: ptr, d: u64, n: int) -> i32:
+    if os_is("macos"):
+        let m = mtl_host(d, n)
+        if addr(m) == 0:
+            return MTL_FAIL
+        memcpy(h, m, u64(n))
+        return i32(0)
+    else:
+        return call_i32(cu_fn(CU_DTOH), h, d, u64(n))
+
+fn dev_zero(d: u64, n: int) -> i32:
+    if os_is("macos"):
+        let m = mtl_host(d, n)
+        if addr(m) == 0:
+            return MTL_FAIL
+        memset(m, 0, u64(n))
+        return i32(0)
+    else:
+        return call_i32(cu_fn(CU_SET), d, u8(0), u64(n))
+
+# the kernel `name` to the 8 bytes at f
+fn dev_func(f: ptr, name: ptr) -> i32:
+    if os_is("macos"):
+        let m = mtl()
+        let fns = load_ptr(m, M_FNS)
+        for i in 0..load_i64(m, M_NFNS):
+            if strcmp(load_ptr(fns, i * 16), name) == 0:
+                store_ptr(f, 0, load_ptr(fns, i * 16 + 8))
+                return i32(0)
+        let sb = stack_mem(24)
+        brine_sb_init(sb)
+        sb_lit(sb, "no kernel ")
+        sb_c(sb, name)
+        sb_to(sb, m + M_ERR, 256)
+        return MTL_FAIL
+    else:
+        return call_i32(cu_fn(CU_FUNC), f, load_ptr(cu(), CU_MOD), name)
+
+# `count` threads of a construct's kernel, and waits for them. args (u64s):
+# the context, n, the first index, count, and for reductions where the
+# leaves' values and flags go.
+fn dev_run(f: ptr, count: int, args: ptr, nargs: int) -> i32:
+    if os_is("macos"):
+        return mtl_run(f, count, args, nargs)
+    else:
+        return cu_launch(f, (count + GPU_BLOCK - 1) / GPU_BLOCK, args, nargs)
+
+# `blocks` blocks of GPU_BLOCK threads of a combine kernel. args: values and
+# flags in, their count, values and flags out.
+fn dev_comb(f: ptr, blocks: int, args: ptr, nargs: int) -> i32:
+    if os_is("macos"):
+        return mtl_comb(f, blocks, args, nargs)
+    else:
+        return cu_launch(f, blocks, args, nargs)
+
+# ---- getting the device ready
+
+fn brine_x_gpu_init_main(code: ptr):
+    let g = gpu()
+    let why = stack_mem(256)
+    memset(why, 0, 256)
+    let t0 = brine_clock()
+    let ok = dev_open(code, why)
+    let dt = brine_clock() - t0
+    lock(g + G_MU)
+    atomic_store(g + G_STATE, GS_READY if ok else GS_FAILED)
+    if ok:
+        store_f64(g, G_INIT_S, dt)
+    memcpy(g + G_WHY, why, 256)
+    cond_broadcast(g + G_CV)
+    unlock(g + G_MU)
+    if gpu_logging():
+        let sb = stack_mem(24)
+        brine_sb_init(sb)
+        if ok:
+            sb_c(sb, g + G_NAME)
+            sb_lit(sb, f" ready in {dt * 1.0e3:.0f} ms")
+        else:
+            sb_lit(sb, "not used: ")
+            sb_c(sb, why)
+        gpu_log(sb)
+
+# Starts getting the device ready (in the background). Holds the lock.
+fn gpu_start(code: ptr):
+    let g = gpu()
+    if gpu_state() != GS_NONE:
+        return
+    atomic_store(g + G_STATE, GS_INIT)
+    store_ptr(g, G_PTX, code)
+    let th = stack_mem(8)
+    if not thread_start(symbol("brine_x_gpu_init_main"), code, th):
+        atomic_store(g + G_STATE, GS_FAILED)
+        why_lit(g + G_WHY, "no thread to start the GPU")
+
+# Exiting while the CUDA driver starts up on its thread crashes in the
+# driver, so the way out waits for that to finish.
+fn brine_x_gpu_settle():
+    let g = gpu()
+    if gpu_state() != GS_INIT:
+        return
+    lock(g + G_MU)
+    while gpu_state() == GS_INIT:
+        cond_wait(g + G_CV, g + G_MU)
+    unlock(g + G_MU)
+
+# Waits until the device is ready or has failed. Holds the lock.
+fn gpu_wait(code: ptr) -> bool:
+    let g = gpu()
+    gpu_start(code)
+    while gpu_state() == GS_INIT:
+        cond_wait(g + G_CV, g + G_MU)
+    return gpu_state() == GS_READY
+
+# A device call failed: no more GPU for this run.
+fn gpu_fail(what: str, r: i32):
+    let g = gpu()
+    lock(g + G_MU)
+    atomic_store(g + G_STATE, GS_FAILED)
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    sb_lit(sb, what)
+    sb_lit(sb, ": ")
+    sb_c(sb, dev_err(r))
+    sb_to(sb, g + G_WHY, WHY_SIZE)
+    unlock(g + G_MU)
+    if gpu_logging():
+        let lb = stack_mem(24)
+        brine_sb_init(lb)
+        sb_lit(lb, "disabled: ")
+        sb_lit(lb, what)
+        sb_lit(lb, ": ")
+        sb_c(lb, dev_err(r))
+        gpu_log(lb)
+
+fn kstate(k: ptr) -> ptr:
+    if addr(load_ptr(k, K_STATE)) == 0:
+        let s = calloc(u64(1), u64(KS_SIZE))
+        if addr(s) == 0:
+            return s
+        store_ptr(k, K_STATE, s)
+    return load_ptr(k, K_STATE)
+
+# ---- copies
+
+# One array the device needs: its header at `hoff` and its elements at
+# `doff` in the device buffer. Staged ones are copied with the context in
+# one piece (headers, small arrays, arrays of arrays, whose pointers are
+# rewritten); the others straight from the array. `dense`
+# (BRINE_GA_DENSE): iteration k writes element first + k only.
+const GA_HOST = 0
+const GA_NODE = 8
+const GA_HOFF = 16
+const GA_DOFF = 24
+const GA_BYTES = 32
+const GA_WRITTEN = 40
+const GA_READ = 48
+const GA_STAGED = 56
+const GA_DENSE = 64
+const GA_FIRST = 72
+const GA_SIZE = 80
+
+# The arrays of a construct: `tab` finds one by its host address (open
+# addressing, index + 1); [lo, hi) are the iterations the device runs.
+const GP_K = 0
+const GP_NODES = 8
+const GP_A = 16
+const GP_NA = 24
+const GP_ACAP = 32
+const GP_TAB = 40
+const GP_TCAP = 48
+const GP_STAGE = 56
+const GP_DIRECT = 64
+const GP_LO = 72
+const GP_HI = 80
+const GP_OK = 88
+const GP_SIZE = 96
+
+# brine_kernel.ptrs' flags (BRINE_GA_*)
+const GA_F_WRITTEN = 1
+const GA_F_DENSE = 2
+
+fn align_up(x: int, a: int) -> int:
+    return (x + a - 1) & ~(a - 1)
+
+fn pl_arr(p: ptr, i: int) -> ptr:
+    return load_ptr(p, GP_A) + i * GA_SIZE
+
+# The index of host array h, or -1 and where it would go in `slot`.
+fn gplan_find(p: ptr, h: ptr, slot: ptr) -> int:
+    var x = addr(h)
+    x ^= x >> 33
+    x *= 0xff51afd7ed558ccd
+    x ^= x >> 33
+    let mask = load_i64(p, GP_TCAP) - 1
+    let tab = load_ptr(p, GP_TAB)
+    var i = int(x & u64(mask))
+    while load_i64(tab, i * 8) != 0:
+        let j = load_i64(tab, i * 8) - 1
+        if load_ptr(pl_arr(p, j), GA_HOST) == h:
+            return j
+        i = (i + 1) & mask
+    store_i64(slot, 0, i)
+    return -1
+
+fn gplan_grow(p: ptr):
+    let tc = load_i64(p, GP_TCAP)
+    let nc = tc * 2 if tc != 0 else 64
+    free(load_ptr(p, GP_TAB))
+    let tab = calloc(u64(nc), u64(8))
+    store_ptr(p, GP_TAB, tab)
+    store_i64(p, GP_TCAP, nc)
+    if addr(tab) == 0:
+        store_i64(p, GP_OK, 0)
+        return
+    let slot = stack_mem(8)
+    for j in 0..load_i64(p, GP_NA):
+        store_i64(slot, 0, 0)
+        gplan_find(p, load_ptr(pl_arr(p, j), GA_HOST), slot)
+        store_i64(tab, load_i64(slot, 0) * 8, j + 1)
+
+fn gplan_add(
+    p: ptr,
+    a: ptr,
+    node: int,
+    written: int,
+    read: int,
+    dense: int,
+    first: int,
+    depth: int
+):
+    if load_i64(p, GP_OK) == 0 or addr(a) == 0:
+        return
+    if depth > 16:
+        store_i64(p, GP_OK, 0)
+        return
+    if (load_i64(p, GP_NA) + 1) * 2 > load_i64(p, GP_TCAP):
+        gplan_grow(p)
+        if load_i64(p, GP_OK) == 0:
+            return
+    let slot = stack_mem(8)
+    store_i64(slot, 0, 0)
+    let i = gplan_find(p, a, slot)
+    if i >= 0:
+        let g = pl_arr(p, i)
+        store_i64(g, GA_WRITTEN, load_i64(g, GA_WRITTEN) | written)
+        store_i64(g, GA_READ, load_i64(g, GA_READ) | read)
+        if load_i64(g, GA_DENSE) != dense or load_i64(g, GA_FIRST) != first:
+            store_i64(g, GA_DENSE, 0)
+            store_i64(g, GA_READ, 1)
+        return
+    let na = load_i64(p, GP_NA)
+    if na == load_i64(p, GP_ACAP):
+        let ac = load_i64(p, GP_ACAP)
+        let nc = ac * 2 if ac != 0 else 16
+        store_i64(p, GP_ACAP, nc)
+        let n2 = realloc(load_ptr(p, GP_A), u64(nc * GA_SIZE))
+        if addr(n2) == 0:
+            store_i64(p, GP_OK, 0)
+            return
+        store_ptr(p, GP_A, n2)
+    let nd = load_ptr(p, GP_NODES) + node * 8
+    let esz = load_i64(nd, 0)
+    let nsub = load_i64(nd, 8)
+    let len = load_i64(a, ARR_LEN)
+    if load_i64(a, ARR_ESZ) != esz and len > 0:
+        store_i64(p, GP_OK, 0)
+        return
+    let g = pl_arr(p, na)
+    let bytes = len * esz
+    store_ptr(g, GA_HOST, a)
+    store_i64(g, GA_NODE, node)
+    store_i64(g, GA_BYTES, bytes)
+    store_i64(g, GA_WRITTEN, written)
+    store_i64(g, GA_READ, read)
+    store_i64(g, GA_DENSE, dense)
+    store_i64(g, GA_FIRST, first)
+    let st = load_i64(p, GP_STAGE)
+    store_i64(g, GA_HOFF, st)
+    let staged = nsub > 0 or u64(bytes) <= u64(GPU_SMALL)
+    store_i64(g, GA_STAGED, 1 if staged else 0)
+    if staged:
+        store_i64(g, GA_DOFF, st + 64)
+        store_i64(p, GP_STAGE, align_up(st + 64 + bytes, 64))
+    else:
+        store_i64(p, GP_STAGE, st + 64)
+        let d = load_i64(p, GP_DIRECT)
+        store_i64(g, GA_DOFF, d)
+        store_i64(p, GP_DIRECT, align_up(d + bytes, 256))
+    store_i64(load_ptr(p, GP_TAB), load_i64(slot, 0) * 8, na + 1)
+    store_i64(p, GP_NA, na + 1)
+    if nsub > 0:
+        let data = load_ptr(a, ARR_DATA)
+        for e in 0..len:
+            for s in 0..nsub:
+                let c = load_ptr(data, e * esz + load_i64(nd, (2 + 2 * s) * 8))
+                gplan_add(p, c, load_i64(nd, (3 + 2 * s) * 8), 0, 1, 0, 0, depth + 1)
+
+# The arrays a construct's context reaches (p: GP_SIZE bytes).
+fn gplan_make(p: ptr, k: ptr, ctx: ptr) -> bool:
+    memset(p, 0, u64(GP_SIZE))
+    store_ptr(p, GP_K, k)
+    store_i64(p, GP_OK, 1)
+    let ptrs = load_ptr(k, K_PTRS)
+    let nf = load_i64(ptrs, 0)
+    store_ptr(p, GP_NODES, ptrs + (1 + 3 * nf) * 8)
+    store_i64(p, GP_STAGE, align_up(load_i64(k, K_CTX_SIZE), 64))
+    for f in 0..nf:
+        let fd = ptrs + (1 + 3 * f) * 8
+        let a = load_ptr(ctx, load_i64(fd, 0))
+        let fl = load_i64(fd, 8)
+        var first = 0
+        if fl >> 8 != 0:
+            first = load_i64(ctx, (fl >> 8) - 1)
+        let dense = 1 if fl & GA_F_DENSE != 0 else 0
+        let written = 1 if fl & GA_F_WRITTEN != 0 else 0
+        gplan_add(p, a, load_i64(fd, 16), written, 1 - dense, dense, first, 0)
+    let at = align_up(load_i64(p, GP_STAGE), 256)
+    for i in 0..load_i64(p, GP_NA):
+        let g = pl_arr(p, i)
+        if load_i64(g, GA_STAGED) == 0:
+            store_i64(g, GA_DOFF, load_i64(g, GA_DOFF) + at)
+    return load_i64(p, GP_OK) != 0
+
+fn gplan_free(p: ptr):
+    free(load_ptr(p, GP_A))
+    free(load_ptr(p, GP_TAB))
+
+fn gplan_size(p: ptr) -> int:
+    return align_up(load_i64(p, GP_STAGE), 256) + load_i64(p, GP_DIRECT)
+
+# The bytes of g that go back: all of them, or the elements the device's
+# iterations write; (offset, bytes) to o.
+fn garr_out(p: ptr, g: ptr, o: ptr):
+    store_i64(o, 0, 0)
+    store_i64(o, 8, load_i64(g, GA_BYTES))
+    if load_i64(g, GA_DENSE) == 0:
+        return
+    let esz = load_i64(load_ptr(p, GP_NODES), load_i64(g, GA_NODE) * 8)
+    let len = load_i64(load_ptr(g, GA_HOST), ARR_LEN)
+    let first = load_i64(g, GA_FIRST)
+    var a = first + load_i64(p, GP_LO)
+    var b = first + load_i64(p, GP_HI)
+    if a < 0:
+        a = 0
+    if b > len:
+        b = len
+    if b < a:
+        b = a
+    store_i64(o, 0, a * esz)
+    store_i64(o, 8, (b - a) * esz)
+
+fn gplan_bytes(p: ptr) -> int:
+    var b = load_i64(p, GP_STAGE)
+    let o = stack_mem(16)
+    for i in 0..load_i64(p, GP_NA):
+        let g = pl_arr(p, i)
+        garr_out(p, g, o)
+        if load_i64(g, GA_STAGED) == 0 and load_i64(g, GA_READ) != 0:
+            b += load_i64(g, GA_BYTES)
+        if load_i64(g, GA_WRITTEN) != 0:
+            b += load_i64(o, 8)
+    return b
+
+fn gplan_index(p: ptr, h: ptr) -> int:
+    let slot = stack_mem(8)
+    return gplan_find(p, h, slot)
+
+# Device memory for n bytes (one buffer, kept between launches); the
+# error, if any, to r.
+fn gpu_reserve(n: int, r: ptr) -> bool:
+    let g = gpu()
+    store_i32(r, 0, i32(0))
+    if load_u64(g, G_CAP) >= u64(n):
+        return true
+    if load_u64(g, G_BUF) != 0:
+        dev_free(load_u64(g, G_BUF))
+    store_u64(g, G_BUF, 0)
+    store_u64(g, G_CAP, 0)
+    let c = n + n / 4
+    let e = dev_alloc(g + G_BUF, c)
+    store_i32(r, 0, e)
+    if e != 0:
+        store_u64(g, G_BUF, 0)
+        return false
+    store_i64(g, G_CAP, c)
+    return true
+
+fn gpu_stage(n: int) -> ptr:
+    let g = gpu()
+    if load_u64(g, G_STAGE_CAP) >= u64(n):
+        return load_ptr(g, G_STAGE)
+    let old = load_ptr(g, G_STAGE)
+    if addr(old) != 0:
+        if load_i64(g, G_PINNED) != 0:
+            dev_host_free(old)
+        else:
+            free(old)
+    let c = n + n / 4 + 4096
+    var p = dev_host_alloc(c)
+    store_i64(g, G_PINNED, 1 if addr(p) != 0 else 0)
+    if addr(p) == 0:
+        p = malloc(u64(c))
+    store_ptr(g, G_STAGE, p)
+    store_i64(g, G_STAGE_CAP, c if addr(p) != 0 else 0)
+    return p
+
+# Copies the context and the arrays to the device: the device context is at
+# the buffer's start. Holds `run`.
+fn gpu_copy_in(p: ptr, ctx: ptr) -> i32:
+    let stage = load_i64(p, GP_STAGE)
+    let st = gpu_stage(stage)
+    if addr(st) == 0:
+        return GPU_OOM
+    let g = gpu()
+    let base = load_u64(g, G_BUF)
+    let k = load_ptr(p, GP_K)
+    memcpy(st, ctx, u64(load_i64(k, K_CTX_SIZE)))
+    let ptrs = load_ptr(k, K_PTRS)
+    let nodes = load_ptr(p, GP_NODES)
+    for f in 0..load_i64(ptrs, 0):
+        let off = load_i64(ptrs, (1 + 3 * f) * 8)
+        let i = gplan_index(p, load_ptr(ctx, off))
+        let d = base + u64(load_i64(pl_arr(p, i), GA_HOFF)) if i >= 0 else u64(0)
+        store_u64(st, off, d)
+    let na = load_i64(p, GP_NA)
+    for i in 0..na:
+        let ga = pl_arr(p, i)
+        let host = load_ptr(ga, GA_HOST)
+        let hoff = load_i64(ga, GA_HOFF)
+        let doff = load_i64(ga, GA_DOFF)
+        let bytes = load_i64(ga, GA_BYTES)
+        memcpy(st + hoff, host, u64(ARR_SIZE))
+        store_u64(st, hoff + ARR_DATA, base + u64(doff))
+        if load_i64(ga, GA_STAGED) == 0 or bytes == 0:
+            continue
+        let nd = nodes + load_i64(ga, GA_NODE) * 8
+        let esz = load_i64(nd, 0)
+        let nsub = load_i64(nd, 8)
+        if load_i64(ga, GA_READ) != 0 or nsub > 0:
+            memcpy(st + doff, load_ptr(host, ARR_DATA), u64(bytes))
+        if nsub > 0:
+            for e in 0..load_i64(host, ARR_LEN):
+                for s in 0..nsub:
+                    let at = st + doff + e * esz + load_i64(nd, (2 + 2 * s) * 8)
+                    let j = gplan_index(p, load_ptr(at, 0))
+                    let cd = base + u64(load_i64(pl_arr(p, j), GA_HOFF)) if j >= 0 else u64(0)
+                    store_u64(at, 0, cd)
+    var r = dev_htod(base, st, stage)
+    var i = 0
+    while i < na and r == 0:
+        let ga = pl_arr(p, i)
+        let bytes = load_i64(ga, GA_BYTES)
+        if load_i64(ga, GA_STAGED) == 0 and load_i64(ga, GA_READ) != 0 and bytes > 0:
+            r = dev_htod(
+                base + u64(load_i64(ga, GA_DOFF)),
+                load_ptr(load_ptr(ga, GA_HOST), ARR_DATA),
+                bytes
+            )
+        i += 1
+    if r == 0:
+        r = dev_zero(load_u64(g, G_ERR), 4)
+    return r
+
+# Copies the arrays the body wrote back.
+fn gpu_copy_out(p: ptr) -> i32:
+    let base = load_u64(gpu(), G_BUF)
+    let o = stack_mem(16)
+    var r = i32(0)
+    var i = 0
+    while i < load_i64(p, GP_NA) and r == 0:
+        let ga = pl_arr(p, i)
+        garr_out(p, ga, o)
+        let off = load_i64(o, 0)
+        let n = load_i64(o, 8)
+        if load_i64(ga, GA_WRITTEN) != 0 and n > 0:
+            let h = load_ptr(load_ptr(ga, GA_HOST), ARR_DATA) + off
+            r = dev_dtoh(h, base + u64(load_i64(ga, GA_DOFF) + off), n)
+        i += 1
+    return r
+
+# whether a kernel set the error flag, to the 8 bytes at flag
+fn gpu_errflag(flag: ptr) -> i32:
+    let v = stack_mem(8)
+    store_i64(v, 0, 0)
+    let r = dev_dtoh(v, load_u64(gpu(), G_ERR), 4)
+    store_i64(flag, 0, 1 if load_u32(v, 0) != 0 else 0)
+    return r
+
+# ---- policy
+
+fn gpu_kind(k: ptr) -> str:
+    let kind = load_i64(k, K_KIND)
+    return "par reduction" if kind == 2 else ("par map" if kind == 1 else "par for")
+
+# Device time per element, before it has been measured: the CPU's, scaled
+# by how much faster the device runs this kind of code (f64 is slow on most
+# GeForce cards).
+fn gpu_guess_ns(k: ptr, seq_ns: float) -> float:
+    let g = gpu()
+    let cost = load_i64(k, K_COST)
+    var f = float(load_i64(k, K_COST64)) / float(cost) if cost > 0 else 0.0
+    if f > 1.0:
+        f = 1.0
+    return seq_ns * ((1.0 - f) / load_f64(g, G_SPEED) + f / load_f64(g, G_F64))
+
+# what gpu_choose decided: run (the rest) on the GPU, the two estimates,
+# and why not
+const CH_USE = 0
+const CH_CPU_S = 8
+const CH_GPU_S = 16
+const CH_WHY = 24
+
+fn gpu_dev_ns(k: ptr, st: ptr) -> float:
+    let ns = load_f64(st, KS_GPU)
+    return ns if ns > 0.0 else gpu_guess_ns(k, load_f64(st, KS_SEQ))
+
+# Should the `rest` elements still to do run on the device? Holds the lock.
+fn gpu_choose(k: ptr, st: ptr, rest: int, bytes: int, launches: int, c: ptr):
+    let g = gpu()
+    store_i64(c, CH_USE, 0)
+    store_ptr(c, CH_WHY, null_ptr())
+    let gpu_ns = gpu_dev_ns(k, st)
+    let cpu_s = load_f64(st, KS_CPU) * 1.0e-9 * float(rest)
+    let gpu_s = (
+        gpu_ns * 1.0e-9 * float(rest) + float(bytes) / load_f64(g, G_BW) + 3.0e-5 * float(launches)
+    )
+    store_f64(c, CH_CPU_S, cpu_s)
+    store_f64(c, CH_GPU_S, gpu_s)
+    let code = load_ptr(k, K_PTX)
+    if gpu_mode() == GPU_ON:
+        let on_gpu = gpu_wait(code)
+        store_i64(c, CH_USE, 1 if on_gpu else 0)
+        if not on_gpu:
+            store_ptr(c, CH_WHY, g + G_WHY)
+        return
+    if gpu_state() == GS_FAILED:
+        store_ptr(c, CH_WHY, g + G_WHY)
+        return
+    let ready = gpu_state() == GS_READY
+    let init = 0.0 if ready else load_f64(g, G_INIT_S)
+    if gpu_s + init < 0.75 * cpu_s:
+        let on_gpu = gpu_wait(code)
+        store_i64(c, CH_USE, 1 if on_gpu else 0)
+        if not on_gpu:
+            store_ptr(c, CH_WHY, g + G_WHY)
+        return
+    # not now, but maybe soon: get the device ready in the background
+    let soon = not ready and gpu_s < 0.75 * cpu_s
+    if soon and cpu_s > 2.0e-3:
+        gpu_start(code)
+    store_ptr(c, CH_WHY, cz("starting the GPU") if soon else cz("faster on the CPU"))
+
+# Runs elements [lo, n) of a `par for` sequentially on this thread until
+# about `secs` have passed; returns where it stopped (the time per element
+# to ns).
+fn probe_for(f: ptr, ctx: ptr, lo: int, n: int, secs: float, ns: ptr) -> int:
+    let t0 = brine_clock()
+    var i = lo
+    var step = 16
+    let saved = brine_x_in_par_get()
+    brine_x_in_par_set(1)
+    while i < n:
+        let j = i + step if i + step < n else n
+        call_void(f, ctx, 0, i, j)
+        i = j
+        if brine_clock() - t0 >= secs:
+            break
+        step *= 2
+    brine_x_in_par_set(saved)
+    let dt = brine_clock() - t0
+    store_f64(ns, 0, dt * 1.0e9 / float(i - lo) if i > lo else 0.0)
+    return i
+
+fn gpu_note_cpu(st: ptr, count: int, secs: float):
+    if count <= 0 or addr(st) == 0:
+        return
+    let g = gpu()
+    lock(g + G_MU)
+    let ns = secs * 1.0e9 / float(count)
+    # a measurement replaces the probe's estimate: the first elements may
+    # not be typical
+    let cpu_ns = 0.5 * (load_f64(st, KS_CPU) + ns) if load_i64(st, KS_SEEN) != 0 else ns
+    store_f64(st, KS_CPU, cpu_ns)
+    store_i64(st, KS_SEEN, 1)
+    store_f64(st, KS_SEQ, cpu_ns * float(brine_x_threads()) * CPU_EFF)
+    unlock(g + G_MU)
+
+# Launches the kernel for elements [lo, n) in slices of about GPU_SLICE;
+# the error flag to `flag`, the kernels' time to `kern`.
+fn gpu_run_for(st: ptr, lo: int, n: int, flag: ptr, kern: ptr) -> i32:
+    let g = gpu()
+    var ns = load_f64(st, KS_GPU)
+    var i = lo
+    store_i64(flag, 0, 0)
+    store_f64(kern, 0, 0.0)
+    let args = stack_mem(32)
+    while i < n:
+        var cnt = 65536
+        if ns > 0.0:
+            let q = GPU_SLICE * 1.0e9 / ns
+            cnt = 1 << 30 if q >= 1073741824.0 else int(q)
+        if cnt < 65536:
+            cnt = 65536
+        if cnt > 1 << 30:
+            cnt = 1 << 30
+        if cnt > n - i:
+            cnt = n - i
+        store_u64(args, 0, load_u64(g, G_BUF))
+        store_i64(args, 8, n)
+        store_i64(args, 16, i)
+        store_i64(args, 24, cnt)
+        let t0 = brine_clock()
+        var r = dev_run(load_ptr(st, KS_FN), cnt, args, 4)
+        if r != 0:
+            return r
+        let dt = brine_clock() - t0
+        store_f64(kern, 0, load_f64(kern, 0) + dt)
+        ns = dt * 1.0e9 / float(cnt)
+        i += cnt
+        r = gpu_errflag(flag)
+        if r != 0 or load_i64(flag, 0) != 0:
+            return r
+    if n > lo:
+        store_f64(st, KS_GPU, load_f64(kern, 0) * 1.0e9 / float(n - lo))
+    return i32(0)
+
+fn gpu_func(st: ptr, k: ptr) -> i32:
+    var r = i32(0)
+    if addr(load_ptr(st, KS_FN)) == 0:
+        r = dev_func(st + KS_FN, load_ptr(k, K_ENTRY))
+        if r != 0:
+            return r
+    if load_i64(k, K_KIND) == 2 and addr(load_ptr(st, KS_COMB)) == 0:
+        r = dev_func(st + KS_COMB, load_ptr(k, K_COMB))
+    return r
+
+fn gpu_log_cpu(k: ptr, n: int, why: ptr, secs: float):
+    if not gpu_logging():
+        return
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    sb_c(sb, load_ptr(k, K_WHERE))
+    sb_lit(sb, f" {gpu_kind(k)} n={n} -> cpu {secs * 1.0e3:.3f} ms (")
+    if addr(load_ptr(k, K_PTX)) == 0:
+        sb_lit(sb, "not GPU-eligible: ")
+    sb_c(sb, why)
+    sb_lit(sb, ")")
+    gpu_log(sb)
+
+fn gpu_log_check(k: ptr, n: int):
+    if not gpu_logging():
+        return
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    sb_c(sb, load_ptr(k, K_WHERE))
+    sb_lit(sb, f" {gpu_kind(k)} n={n}: a check failed on the GPU, running it on the CPU")
+    gpu_log(sb)
+
+fn gpu_log_gpu(
+    k: ptr,
+    n: int,
+    what: str,
+    total: float,
+    kern: float,
+    copy: float,
+    bytes: int,
+    cpu_s: float
+):
+    let sb = stack_mem(24)
+    brine_sb_init(sb)
+    sb_c(sb, load_ptr(k, K_WHERE))
+    let mb = float(bytes) / 1.0e6
+    sb_lit(
+        sb,
+        f" {gpu_kind(k)} n={n} -> gpu {total * 1.0e3:.3f} ms ({what} {kern * 1.0e3:.3f} ms, copies {copy * 1.0e3:.3f} ms, {mb:.1f} MB"
+    )
+    sb_cpu_est(sb, cpu_s)
+    sb_lit(sb, ")")
+    gpu_log(sb)
+
+# Why a construct of n elements stays on the CPU without a look at the
+# device (a C string), or null. (Checked before nesting, which is a call:
+# a nested construct's reason is never logged.)
+fn gpu_skip(k: ptr, n: int) -> ptr:
+    let code = load_ptr(k, K_PTX)
+    if addr(code) == 0:
+        return load_ptr(k, K_WHY)
+    let mode = gpu_mode()
+    if mode == GPU_OFF:
+        return cz("BRINE_GPU=off")
+    if n < GPU_MIN_N and mode != GPU_ON:
+        return cz("small")
+    return null_ptr()
+
+# The start of a construct's GPU part after gpu_skip, shared by `par for`
+# and the reductions: its state, or null with the reason in `why` when it
+# stays on the CPU; `known`: its CPU time was measured.
+fn gpu_begin(k: ptr, why: ptr, known: ptr) -> ptr:
+    let g = gpu()
+    store_ptr(why, 0, cz("nested in a parallel construct"))
+    if brine_x_in_par_get() != 0:
+        return null_ptr()
+    lock(g + G_MU)
+    let st = kstate(k)
+    let failed = gpu_state() == GS_FAILED
+    store_i64(known, 0, 1 if addr(st) != 0 and load_f64(st, KS_CPU) > 0.0 else 0)
+    unlock(g + G_MU)
+    store_ptr(why, 0, g + G_WHY if failed else cz("out of memory"))
+    if addr(st) == 0 or failed:
+        return null_ptr()
+    return st
+
+# The probe's time per element: one thread's, and the pool's estimate.
+fn gpu_note_probe(st: ptr, ns: float):
+    let g = gpu()
+    lock(g + G_MU)
+    store_f64(st, KS_SEQ, ns)
+    store_f64(st, KS_CPU, ns / (float(brine_x_threads()) * CPU_EFF))
+    unlock(g + G_MU)
+
+# The GPU part of a `par for`: returns how many leading elements are done
+# (all n when the device ran them, fewer when the CPU should run the rest).
+# Every element below the returned count has run exactly once.
+fn gpu_for(k: ptr, ctx: ptr, n: int, f: ptr, why: ptr) -> int:
+    let g = gpu()
+    let known = stack_mem(8)
+    let st = gpu_begin(k, why, known)
+    if addr(st) == 0:
+        return 0
+    var done = 0
+    if load_i64(known, 0) == 0 and gpu_mode() != GPU_ON:
+        let ns = stack_mem(8)
+        done = probe_for(f, ctx, 0, n, 1.0e-4, ns)
+        gpu_note_probe(st, load_f64(ns, 0))
+        if done >= n:
+            store_ptr(why, 0, cz("done while measuring"))
+            return done
+    let p = stack_mem(96)
+    if not gplan_make(p, k, ctx):
+        gplan_free(p)
+        store_ptr(why, 0, cz("out of memory"))
+        return done
+    # arrays that go back whole need the elements the probe wrote on the
+    # device too
+    store_i64(p, GP_LO, done)
+    store_i64(p, GP_HI, n)
+    if done > 0:
+        for i in 0..load_i64(p, GP_NA):
+            let ga = pl_arr(p, i)
+            if load_i64(ga, GA_WRITTEN) != 0 and load_i64(ga, GA_DENSE) == 0:
+                store_i64(ga, GA_READ, 1)
+    let c = stack_mem(32)
+    lock(g + G_MU)
+    gpu_choose(k, st, n - done, gplan_bytes(p), 1 + (n - done) / (1 << 22), c)
+    unlock(g + G_MU)
+    if load_i64(c, CH_USE) == 0:
+        gplan_free(p)
+        store_ptr(why, 0, load_ptr(c, CH_WHY))
+        return done
+    store_ptr(why, 0, cz("the GPU is busy"))
+    if not try_lock(g + G_RUN):
+        gplan_free(p)
+        return done
+    let t0 = brine_clock()
+    let rr = stack_mem(8)
+    var r = dev_bind()
+    let flag = stack_mem(8)
+    store_i64(flag, 0, 0)
+    let kern = stack_mem(8)
+    store_f64(kern, 0, 0.0)
+    var oom = false
+    var t1 = t0
+    var t2 = t0
+    if r == 0:
+        r = gpu_func(st, k)
+    if r == 0 and not gpu_reserve(gplan_size(p), rr):
+        r = load_i32(rr, 0)
+        oom = r == GPU_OOM
+    if r == 0:
+        r = gpu_copy_in(p, ctx)
+    t1 = brine_clock()
+    if r == 0:
+        r = gpu_run_for(st, done, n, flag, kern)
+    t2 = brine_clock()
+    if r == 0 and load_i64(flag, 0) == 0:
+        r = gpu_copy_out(p)
+    let t3 = brine_clock()
+    let bytes = gplan_bytes(p)
+    unlock(g + G_RUN)
+    gplan_free(p)
+    if oom:
+        store_ptr(why, 0, cz("too big for the GPU's memory"))
+        return done
+    if r != 0:
+        gpu_fail("running a kernel", r)
+        store_ptr(why, 0, g + G_WHY)
+        return done
+    if load_i64(flag, 0) != 0:
+        store_ptr(why, 0, cz("a check failed on the GPU"))
+        gpu_log_check(k, n)
+        return done
+    let copy = (t1 - t0) + (t3 - t2)
+    if bytes > 1 << 20 and copy > 0.0:
+        lock(g + G_MU)
+        store_f64(g, G_BW, 0.5 * (load_f64(g, G_BW) + float(bytes) / copy))
+        unlock(g + G_MU)
+    if gpu_logging():
+        gpu_log_gpu(k, n, "kernel", t3 - t0, load_f64(kern, 0), copy, bytes, load_f64(c, CH_CPU_S))
+    return n
+
+# brine_par_plan (brine_rt.h)
+fn par_plan(n: int) -> int:
+    if n <= 0:
+        return 0
+    return n if n < 256 else 256
+
+fn brine_par_for(k: ptr, ctx: ptr, n: int, f: ptr):
+    if n <= 0:
+        return
+    var why = gpu_skip(k, n)
+    var done = 0
+    if addr(why) == 0:
+        let w = stack_mem(8)
+        done = gpu_for(k, ctx, n, f, w)
+        if done >= n:
+            return
+        why = load_ptr(w, 0)
+    let t0 = brine_clock()
+    brine_par_run(done, n, par_plan(n - done), f, ctx)
+    let dt = brine_clock() - t0
+    if addr(load_ptr(k, K_PTX)) != 0 and n - done >= GPU_MIN_N and brine_x_in_par_get() == 0:
+        gpu_note_cpu(kstate(k), n - done, dt)
+    if gpu_logging() and brine_x_in_par_get() == 0:
+        gpu_log_cpu(k, n, why, dt)
+
+# ---- reductions on the GPU
+
+# br_vk_size: the bytes of each BRINE_VK_*
+fn vk_size(vk: int) -> int:
+    if vk < 10:
+        return 1 << (vk % 5)
+    if vk == 10:
+        return 4
+    if vk == 13:
+        return 1
+    return 8
+
+# Folds leaves [l0, l1) on this thread, pushing each at height 0.
+fn fold_leaves(fo: ptr, f: ptr, ctx: ptr, n: int, l0: int, l1: int):
+    let v = stack_mem(16)
+    let h = stack_mem(8)
+    let saved = brine_x_in_par_get()
+    brine_x_in_par_set(1)
+    for l in l0..l1:
+        let a = l * LEAF
+        let b = a + LEAF if a + LEAF < n else n
+        store_u8(h, 0, u8(0))
+        call_void(f, ctx, l, a, b, v, h)
+        brine_x_fold_push(fo, 0, v, int(load_u8(h, 0)))
+    brine_x_in_par_set(saved)
+
+# One aligned subtree of cnt (up to 2^h) leaves starting at leaf l0 on the
+# device; its root to v, has. bufa and bufb: room for `room` values and
+# flags each.
+fn gpu_subtree(
+    k: ptr,
+    st: ptr,
+    n: int,
+    l0: int,
+    cnt: int,
+    bufa: u64,
+    bufb: u64,
+    room: int,
+    v: ptr,
+    has: ptr
+) -> i32:
+    let sz = vk_size(load_i64(k, K_VK))
+    var va = bufa
+    var ha = bufa + u64(room * sz)
+    var vb = bufb
+    var hb = bufb + u64(room * sz)
+    var count = cnt
+    let args = stack_mem(48)
+    store_u64(args, 0, load_u64(gpu(), G_BUF))
+    store_i64(args, 8, n)
+    store_i64(args, 16, l0)
+    store_i64(args, 24, cnt)
+    store_u64(args, 32, va)
+    store_u64(args, 40, ha)
+    var r = dev_run(load_ptr(st, KS_FN), cnt, args, 6)
+    let cargs = stack_mem(40)
+    while r == 0 and count > 1:
+        let blocks = (count + GPU_BLOCK - 1) / GPU_BLOCK
+        store_u64(cargs, 0, va)
+        store_u64(cargs, 8, ha)
+        store_i64(cargs, 16, count)
+        store_u64(cargs, 24, vb)
+        store_u64(cargs, 32, hb)
+        r = dev_comb(load_ptr(st, KS_COMB), blocks, cargs, 5)
+        let t = va
+        va = vb
+        vb = t
+        let u = ha
+        ha = hb
+        hb = u
+        count = blocks
+    if r == 0:
+        r = dev_dtoh(v, va, sz)
+    if r == 0:
+        r = dev_dtoh(has, ha, 1)
+    return r
+
+# The GPU part of a reduction: true when the device (with the CPU's first
+# leaves, if it measured them) folded every leaf into fo (made here).
+fn gpu_reduce(k: ptr, n: int, f: ptr, ctx: ptr, fo: ptr, loc: ptr, why: ptr, cpu_est: ptr) -> bool:
+    let g = gpu()
+    let known = stack_mem(8)
+    let st = gpu_begin(k, why, known)
+    if addr(st) == 0:
+        return false
+    # (only now: the CPU's reduction has a fold of its own)
+    brine_x_fold_init(fo, load_i64(k, K_OP), load_i64(k, K_VK), loc)
+    let nleaves = (n + LEAF - 1) / LEAF
+    # measure: leaves [0, p), p a power of two, on this thread
+    var p = 0
+    if load_i64(known, 0) == 0 and gpu_mode() != GPU_ON:
+        let t0 = brine_clock()
+        p = 1
+        fold_leaves(fo, f, ctx, n, 0, 1)
+        while p < nleaves and p * 8 < nleaves and brine_clock() - t0 < 1.0e-4:
+            fold_leaves(fo, f, ctx, n, p, 2 * p)
+            p *= 2
+        gpu_note_probe(st, (brine_clock() - t0) * 1.0e9 / float(p * LEAF))
+    let pl = stack_mem(96)
+    if not gplan_make(pl, k, ctx):
+        gplan_free(pl)
+        store_ptr(why, 0, cz("out of memory"))
+        return false
+    let rest = n - p * LEAF
+    let c = stack_mem(32)
+    lock(g + G_MU)
+    gpu_choose(k, st, rest, gplan_bytes(pl), 2 + rest / (1 << 22), c)
+    let gpu_ns = gpu_dev_ns(k, st)
+    unlock(g + G_MU)
+    store_f64(cpu_est, 0, load_f64(c, CH_CPU_S))
+    if load_i64(c, CH_USE) == 0:
+        gplan_free(pl)
+        store_ptr(why, 0, load_ptr(c, CH_WHY))
+        return false
+    store_ptr(why, 0, cz("the GPU is busy"))
+    if not try_lock(g + G_RUN):
+        gplan_free(pl)
+        return false
+    # subtrees of up to 2^h leaves, about GPU_SLICE each
+    var h = 12
+    while (
+        h < 24 and (1 << h) < nleaves and gpu_ns * 16.0 * float(1 << (h + 1)) < GPU_SLICE * 1.0e9
+    ):
+        h += 1
+    let room = 1 << h
+    let sz = vk_size(load_i64(k, K_VK))
+    let half = align_up(room * (sz + 1), 256)
+    let at = align_up(gplan_size(pl), 256)
+    let t0 = brine_clock()
+    let rr = stack_mem(8)
+    var r = dev_bind()
+    let flag = stack_mem(8)
+    store_i64(flag, 0, 0)
+    var oom = false
+    if r == 0:
+        r = gpu_func(st, k)
+    if r == 0 and not gpu_reserve(at + 2 * half, rr):
+        r = load_i32(rr, 0)
+        oom = r == GPU_OOM
+    if r == 0:
+        r = gpu_copy_in(pl, ctx)
+    let t1 = brine_clock()
+    var l = p
+    var seg = p if p > 0 else room
+    let v = stack_mem(16)
+    let hv = stack_mem(8)
+    while r == 0 and l < nleaves:
+        if seg > room:
+            seg = room
+        let cnt = nleaves - l if nleaves - l < seg else seg
+        store_u8(hv, 0, u8(0))
+        let buf = load_u64(g, G_BUF)
+        r = gpu_subtree(k, st, n, l, cnt, buf + u64(at), buf + u64(at + half), room, v, hv)
+        if r == 0:
+            r = gpu_errflag(flag)
+        if r != 0 or load_i64(flag, 0) != 0:
+            break
+        var sh = 0
+        while (1 << sh) < seg:
+            sh += 1
+        brine_x_fold_push(fo, sh, v, int(load_u8(hv, 0)))
+        l += seg
+        # aligned: the next subtree is as big as everything before it, up
+        # to `room`
+        seg = l if p > 0 and l < room else room
+    let t2 = brine_clock()
+    let bytes = gplan_bytes(pl)
+    unlock(g + G_RUN)
+    gplan_free(pl)
+    if oom:
+        store_ptr(why, 0, cz("too big for the GPU's memory"))
+        return false
+    if r != 0:
+        gpu_fail("running a kernel", r)
+        store_ptr(why, 0, g + G_WHY)
+        return false
+    if load_i64(flag, 0) != 0:
+        store_ptr(why, 0, cz("a check failed on the GPU"))
+        gpu_log_check(k, n)
+        return false
+    if rest > 0:
+        lock(g + G_MU)
+        store_f64(st, KS_GPU, (t2 - t1) * 1.0e9 / float(rest))
+        if bytes > 1 << 20 and t1 > t0:
+            store_f64(g, G_BW, 0.5 * (load_f64(g, G_BW) + float(bytes) / (t1 - t0)))
+        unlock(g + G_MU)
+    if gpu_logging():
+        gpu_log_gpu(k, n, "kernels", t2 - t0, t2 - t1, t1 - t0, bytes, load_f64(c, CH_CPU_S))
+    return true
+
+fn brine_par_reduce(k: ptr, n: int, f: ptr, ef: ptr, ctx: ptr, val: ptr, has: ptr, loc: ptr):
+    if n <= 0:
+        return
+    var why = gpu_skip(k, n)
+    if addr(why) == 0:
+        let fo = stack_mem(FOLD_SIZE)
+        let w = stack_mem(8)
+        let est = stack_mem(8)
+        store_f64(est, 0, 0.0)
+        if gpu_reduce(k, n, f, ctx, fo, loc, w, est):
+            if brine_x_fold_finish(fo, val) != 0:
+                store_u8(has, 0, u8(1))
+            return
+        why = load_ptr(w, 0)
+    let t0 = brine_clock()
+    brine_x_reduce_cpu(n, f, ef, ctx, load_i64(k, K_OP), load_i64(k, K_VK), val, has, loc)
+    let dt = brine_clock() - t0
+    if addr(load_ptr(k, K_PTX)) != 0 and n >= GPU_MIN_N and brine_x_in_par_get() == 0:
+        gpu_note_cpu(kstate(k), n, dt)
+    if gpu_logging() and brine_x_in_par_get() == 0:
+        gpu_log_cpu(k, n, why, dt)
