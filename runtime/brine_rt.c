@@ -3143,6 +3143,27 @@ static void br_reduce_cpu(int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *
  * it for every construct it can run. BRINE_GPU_LOG=1 prints where each
  * construct ran, and how long it took, to stderr. */
 
+#ifdef BRINE_RT_BR /* runtime/rt.br has the GPU code */
+/* what it needs of the C that stays: the stderr lock, the rank's place on
+ * its machine, and the reductions' fold */
+void brine_x_io_lock(void) { br_lock(&br_io_mu); }
+void brine_x_io_unlock(void) { br_unlock(&br_io_mu); }
+int64_t brine_x_local_rank(void) { return br_local_rank; }
+_Static_assert(sizeof(br_fold) <= 1600 && _Alignof(br_fold) <= 16, "rt.br's FOLD_SIZE");
+void brine_x_fold_init(void *f, int64_t op, int64_t vk, const char *loc) {
+    br_fold_init((br_fold *)f, br_comb_pick(op, vk), br_vk_size[vk], loc);
+}
+void brine_x_fold_push(void *f, int64_t h, const void *v, int64_t has) { br_fold_push((br_fold *)f, (int)h, v, has != 0); }
+int64_t brine_x_fold_finish(void *f, void *out) { return br_fold_finish((br_fold *)f, out); }
+void brine_x_reduce_cpu(int64_t n, brine_leaf_fn fn, brine_leaf_fn efn, void *ctx, int64_t op, int64_t vk, void *val, bool *has,
+                        const char *loc) {
+    br_reduce_cpu(n, fn, efn, ctx, op, vk, val, has, loc);
+}
+void brine_x_gpu_setup(void);
+void brine_x_gpu_settle(void);
+static void br_gpu_setup(void) { brine_x_gpu_setup(); }
+static void br_gpu_settle(void) { brine_x_gpu_settle(); }
+#else
 typedef int br_gpu_res;
 typedef unsigned long long br_gpu_ptr;
 
@@ -4506,6 +4527,7 @@ void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, brine_leaf_f
     if (k->ptx && !br_in_par_get() && n >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n, dt);
     if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt);
 }
+#endif
 
 /* ============================================================ world: transport */
 enum { BR_K_EMPTY = 0, BR_K_I64 = 1, BR_K_F64 = 2, BR_K_MSG = 7 };
