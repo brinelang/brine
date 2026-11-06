@@ -41,6 +41,25 @@ fn find_sym(o: ObjFile, name: str) -> Result[int, str]:
 fn fits32(v: int) -> bool:
     return v >= -2147483648 and v < 2147483648
 
+# The debug sections (DWARF) with their relocations applied: addresses in
+# code as linked (`base` plus the symbol's address in `addr`), offsets
+# into other debug sections as they are.
+fn debug_secs(o: ObjFile, addr: [int], base: int) -> Result[[[u8]], str]:
+    var out: [[u8]] = []
+    for d in o.dsecs:
+        var b = d.bytes
+        for r in d.rels:
+            if r.kind == R_ABS64:
+                if addr[r.sym] < 0:
+                    return Err("debug info refers to a symbol outside the executable")
+                set64(ref b, r.off, base + addr[r.sym] + r.add)
+            elif r.kind == R_SECREL:
+                set32(ref b, r.off, o.syms[r.sym].off + r.add)
+            else:
+                return Err(f"relocation kind {r.kind} is not supported in debug info")
+        out.push(b)
+    return Ok(out)
+
 # ================================================================ PE (Windows)
 
 # 0x140000000, where 64-bit images usually go (ASLR moves it)
@@ -231,6 +250,7 @@ fn link_pe(o0: ObjFile, entry: str, dlls: [str]) -> Result[[u8], str]:
             nsec += 1
     if has_reloc:
         nsec += 1
+    nsec += len(o.dsecs)
     let hdr_size = align_up(64 + 4 + 20 + 240 + 40 * nsec, FILE_ALIGN)
     var rva = align_up(hdr_size, PAGE)
     let text_rva = rva
@@ -267,6 +287,7 @@ fn link_pe(o0: ObjFile, entry: str, dlls: [str]) -> Result[[u8], str]:
     pe_apply(ref o.rodata, o.rrel, rdata_rva, addr, ref fix)?
     pe_apply(ref o.unwind, o.urel, rdata_rva + xdata, addr, ref fix)?
     pe_apply(ref o.pdata, o.prel, pdata_rva, addr, ref fix)?
+    let dbg = debug_secs(o, addr, IMAGE_BASE)?
     # .text: the code, then `jmp [rip + slot]` per import
     var text = o.text
     pad_with(ref text, thunks, 204)
@@ -315,10 +336,28 @@ fn link_pe(o0: ObjFile, entry: str, dlls: [str]) -> Result[[u8], str]:
         secs.push(PeSec(name=".idata", bytes=idata, flags=3221225536, rva=idata_rva, raw=0))
     if len(o.pdata) > 0:
         secs.push(PeSec(name=".pdata", bytes=o.pdata, flags=1073741888, rva=pdata_rva, raw=0))
+    var reloc_size = 0
     if has_reloc:
         # discardable
+        let rb = pe_base_relocs(fix)
+        reloc_size = len(rb)
+        secs.push(PeSec(name=".reloc", bytes=rb, flags=1107296320, rva=reloc_rva, raw=0))
+    # the debug info, as the C toolchain's linker places it: discardable
+    # sections at the end, named in the COFF string table (names over 8 bytes)
+    var strs: [u8] = [0, 0, 0, 0]
+    for i, d in enumerate(o.dsecs):
+        let prev = secs[len(secs) - 1]
+        let at = len(strs)
+        str_bytes(ref strs, d.name)
+        strs.push(0)
         secs.push(
-            PeSec(name=".reloc", bytes=pe_base_relocs(fix), flags=1107296320, rva=reloc_rva, raw=0)
+            PeSec(
+                name=f"/{at}",
+                bytes=dbg[i],
+                flags=1107296320,
+                rva=align_up(prev.rva + len(prev.bytes), PAGE),
+                raw=0
+            )
         )
     var raw = hdr_size
     var code_size = 0
@@ -336,7 +375,6 @@ fn link_pe(o0: ObjFile, entry: str, dlls: [str]) -> Result[[u8], str]:
     # a COFF symbol table of the functions after the sections, for debuggers
     # and profilers (the loader ignores it)
     var syms: [u8] = []
-    var strs: [u8] = [0, 0, 0, 0]
     var nsyms = 0
     for sy in o.syms:
         if sy.sec != SEC_TEXT or not sy.func:
@@ -365,7 +403,8 @@ fn link_pe(o0: ObjFile, entry: str, dlls: [str]) -> Result[[u8], str]:
     put16(ref out, 34404)
     put16(ref out, len(secs))
     put32(ref out, 0)
-    put32(ref out, raw if nsyms > 0 else 0)
+    let has_tab = nsyms > 0 or len(dbg) > 0
+    put32(ref out, raw if has_tab else 0)
     put32(ref out, nsyms)
     put16(ref out, 240)
     put16(ref out, 34)
@@ -406,7 +445,7 @@ fn link_pe(o0: ObjFile, entry: str, dlls: [str]) -> Result[[u8], str]:
             put32(ref out, len(o.pdata))
         elif d == 5 and has_reloc:
             put32(ref out, reloc_rva)
-            put32(ref out, len(secs[len(secs) - 1].bytes))
+            put32(ref out, reloc_size)
         elif d == 12 and nd > 0:
             put32(ref out, idata_rva + iat_start)
             put32(ref out, iat_size)
@@ -426,7 +465,7 @@ fn link_pe(o0: ObjFile, entry: str, dlls: [str]) -> Result[[u8], str]:
         pad_with(ref out, s.raw, 0)
         out.extend(s.bytes)
     pad_with(ref out, align_up(len(out), FILE_ALIGN), 0)
-    if nsyms > 0:
+    if has_tab:
         out.extend(syms)
         out.extend(strs)
     return Ok(out)
@@ -874,6 +913,7 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     elf_apply(ref o.text, o.trel, text_at, addr, got, dyn, ea, ref relas)?
     elf_apply(ref o.data, o.drel, data_at, addr, got, dyn, ea, ref relas)?
     elf_apply(ref o.unwind, o.urel, eh_at, addr, got, dyn, ea, ref relas)?
+    let dbg = debug_secs(o, addr, 0)?
     for i, nm in enumerate(imps):
         relas.push(Rela(off=got_at + 8 * got_of[nm], typ=ea.r_glob, sym=i + 1, add=0))
     for si in got_local:
@@ -1011,7 +1051,7 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
         put64(ref symtab, end - off)
     var shstr: [u8] = []
     var name_at: [int] = []
-    for nm in [
+    var sec_names = [
         "",
         ".dynsym",
         ".dynstr",
@@ -1025,7 +1065,10 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
         ".shstrtab",
         ".gnu.version",
         ".gnu.version_r"
-    ]:
+    ]
+    for d in o.dsecs:
+        sec_names.push(d.name)
+    for nm in sec_names:
         name_at.push(len(shstr))
         str_bytes(ref shstr, nm)
         shstr.push(0)
@@ -1036,6 +1079,11 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
     out.extend(strtab)
     let shstr_at = len(out)
     out.extend(shstr)
+    # the debug info: in the file, not loaded
+    var dbg_at: [int] = []
+    for b in dbg:
+        dbg_at.push(len(out))
+        out.extend(b)
     pad_to(ref out, 8)
     let shoff = len(out)
     let n = name_at
@@ -1080,6 +1128,9 @@ fn link_elf(o0: ObjFile, main: str, libs: [str]) -> Result[[u8], str]:
             0
         )
         nsh = 13
+    for i, b in enumerate(dbg):
+        put_shdr(ref out, n[13 + i], 1, 0, 0, dbg_at[i], len(b), 0, 0, 1, 0)
+        nsh += 1
     set64(ref out, shoff_at, shoff)
     set32(ref out, shnum_at, nsh | (10 << 16))
     return Ok(out)
