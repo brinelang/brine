@@ -941,7 +941,9 @@ bool brine_str_contains(brine_str *s, brine_str *sub) {
 #define BR_B4(i) BR_B1(i), BR_B1((i) + 1), BR_B1((i) + 2), BR_B1((i) + 3)
 #define BR_B16(i) BR_B4(i), BR_B4((i) + 4), BR_B4((i) + 8), BR_B4((i) + 12)
 #define BR_B64(i) BR_B16(i), BR_B16((i) + 16), BR_B16((i) + 32), BR_B16((i) + 48)
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_str1 brine_bytes[256] = {BR_B64(0), BR_B64(64), BR_B64(128), BR_B64(192)};
+#endif
 
 static brine_str *br_sub(brine_str *s, int64_t lo, int64_t hi) {
     if (lo == 0 && hi == s->len) {
@@ -2697,7 +2699,9 @@ static int br_in_par_get(void) {
 static void br_in_par_set(int v) { br_th_get()->in_par = v; }
 #endif
 /* see brine_rt.h */
+#ifndef BRINE_RT_BR /* runtime/rt.br has it */
 int64_t brine_mt = 0;
+#endif
 #ifdef BRINE_RT_BR
 int64_t brine_x_threads(void);
 void brine_x_pool_init(void);
