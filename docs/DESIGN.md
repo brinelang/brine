@@ -24,7 +24,7 @@
    through brine's own IR to native x86-64 and AArch64 backends, linked by
    brine itself (every build on x86-64 Windows, Linux and macOS and on AArch64
    Linux and macOS), or to portable C11 for whatever C compiler is present
-   (every other platform; clang or gcc).
+   (other platforms and WebAssembly; clang, gcc or wasi-sdk).
 6. **Clean and easy to understand.** Small language surface. No hidden control
    flow, no implicit conversions, no aliasing surprises.
 
@@ -311,7 +311,7 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
       ─► lowering to brine IR (lower.br)
       ─► x86-64 machine code (x64.br) ─► link.br            every build on x86-64 Windows/Linux/macOS
        └► AArch64 machine code (a64.br) ─► link.br          every build on AArch64 Linux/macOS
-       └► C11 (ir_c.br) ─► system C compiler + brine_rt.c  other platforms, wasm (wasi-sdk)
+       └► C11 (ir_c.br) ─► system C compiler + brine_rt.c  other platforms, wasm (wasi-sdk), BRINE_BACKEND=c
       ─► native binary
 ```
 
@@ -324,7 +324,7 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
 * **Memory:** values are refcounted with atomic counts; generated code releases
   every temporary and local at scope exit. `BRINE_LEAKCHECK=1` prints the number of
   live strings/arrays at exit (the test suite requires 0).
-* **Debugging:** on x86-64 Windows and Linux and on AArch64 Linux, `brine build --debug` is native with
+* **Debugging:** on x86-64 (Windows, Linux, macOS) and AArch64 (Linux, macOS), `brine build --debug` is native with
   DWARF (`dwarf.br`): lines, brine function names (`Point.norm`), and every local
   and parameter by its brine name and type, in its scope. Debug code keeps each
   value in its stack slot (no register allocation, no value caching), so `print`
@@ -379,8 +379,8 @@ reads it:
   launch.
   `BRINE_DUMP_PTX=file` writes the module (PTX or MSL) when building.
 * **C** (`ir_c.br`): one statement per IR instruction. gcc/clang at `-O2`/`-O3`
-  make it as fast as hand-written C, so it serves every platform without a
-  native backend (with `#line` for `--debug` there).
+  make it as fast as hand-written C, so it serves WebAssembly and every platform
+  without a native backend (with `#line` for `--debug` there).
 
 Rules that keep this working:
 * Nothing above the IR may depend on a backend: no C-only semantics leak into the
@@ -413,7 +413,7 @@ from what brine knows that C doesn't (no aliasing, proven-away checks, race-free
 | `brine debug` | Debug build + launch gdb/lldb. |
 | `brine explain E0601` | Long-form explanation of any diagnostic. |
 | `brine guide` | Print the language quick reference (great for agents). |
-| `brine doctor` | Diagnose the toolchain (C compiler, threads, sockets). |
+| `brine doctor` | Diagnose the toolchain (C compiler where one is needed, threads, sockets). |
 
 Global flags: `--json` (machine-readable diagnostics, one JSON object per line),
 `--color auto|always|never`, `--quiet`.
@@ -464,6 +464,10 @@ lot to do before then. The order below is a plan, not a promise.
 
 **Done (0.2):** brine IR; native x86-64 backend (COFF and ELF); C from the IR, in
 parallel translation units with per-unit caching.
+
+**Done (0.9):** no C compiler needed on x86-64 and AArch64: optimizing native
+backends for both, brine's own linker (PE, ELF, Mach-O) and the runtime's hot
+paths in brine (`runtime/rt.br`).
 
 **Backends:** CodeView debug info (for Visual Studio/WinDbg);
 MSVC support for the C backend. GPUs (§2.3): arrays kept on the device between constructs, `par(...)`

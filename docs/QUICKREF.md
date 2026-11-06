@@ -364,7 +364,7 @@ evaluation order never matters. A call in another call's arguments runs first
 In release builds, a `for j in lo..hi` loop that indexes arrays at `j`, `j + x`,
 `x + j` or `j - x` (`x` a literal or a variable the loop doesn't change), calls
 no functions of the program and doesn't change those arrays' lengths checks the first and last index once,
-before the loop, and then runs without per-element checks, so the C compiler can
+before the loop, and then runs without per-element checks, so the compiler can
 vectorize it. If that test fails the loop runs checked as written, panicking at
 the same element it always would.
 

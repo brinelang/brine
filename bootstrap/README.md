@@ -23,4 +23,4 @@ A correct compiler reaches a fixed point: rebuilding `brine` with itself again
 gives the same compiler (`tests/integration.br` checks this).
 
 Stage 0 is 0.8.0, which links through the system C compiler (`cc`, `gcc` or
-`clang`; MinGW on Windows). Releases from 0.9.0 on need none.
+`clang`; MinGW on Windows). Releases from 0.9.0 on need none on x86-64 and ARM64.
