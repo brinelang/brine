@@ -173,7 +173,9 @@ fn clear_bit(ref bits: [int], j: int):
 
 # ok[v]: may v live in a register? (Not folded into its uses, not 128 bits,
 # not a compare fused into its branch.)
-fn allocate(f: Func, ok: [bool], cold: {str: bool}) -> RA64:
+# remat[v]: v can be made again at each use as cheaply as at its definition
+# (a global's address), so it gets a register only when its uses outweigh it.
+fn allocate(f: Func, ok: [bool], remat: [bool], cold: {str: bool}) -> RA64:
     let nv = len(f.vk)
     let ncode = len(f.code)
     var out = RA64(
@@ -260,6 +262,7 @@ fn allocate(f: Func, ok: [bool], cold: {str: bool}) -> RA64:
     let bd = loop_depth(succ)
     let loops = any(d > 0 for d in bd)
     var w = [0] * nc
+    var dw = [0] * nc
     var iw = [0] * ncode
     for i in 0..ncode:
         let x = f.code[i]
@@ -267,8 +270,11 @@ fn allocate(f: Func, ok: [bool], cold: {str: bool}) -> RA64:
         iw[i] = u
         if x.d >= 0 and ci[x.d] >= 0:
             w[ci[x.d]] += u
+            dw[ci[x.d]] += u
+        # (a check's location is only read on its way to panic)
+        let chk = x.op == Op.AddO or x.op == Op.SubO or x.op == Op.MulO or x.op == Op.IdxChk
         for v in reads(x, nv):
-            if ci[v] >= 0:
+            if ci[v] >= 0 and not (chk and v == x.c and v != x.a and v != x.b):
                 w[ci[v]] += u
     # the interference graph, walking each block backward from its live-out
     var mat = [0] * (nc * wn)
@@ -393,6 +399,7 @@ fn allocate(f: Func, ok: [bool], cold: {str: bool}) -> RA64:
     for r in 16..32:
         fcaller.push(32 + r)
     # merging copies
+    var rm = [remat[cv[j]] for j in 0..nc]
     var rep = [j for j in 0..nc]
     copies.sort()
     for (_, c, d) in copies:
@@ -403,6 +410,8 @@ fn allocate(f: Func, ok: [bool], cold: {str: bool}) -> RA64:
         rep[b] = a
         w[a] += w[b]
         w[b] = 0
+        dw[a] += dw[b]
+        rm[a] = rm[a] and rm[b]
         cross[a] = cross[a] or cross[b]
         noarg[a] = noarg[a] or noarg[b]
         no17[a] = no17[a] or no17[b]
@@ -421,6 +430,8 @@ fn allocate(f: Func, ok: [bool], cold: {str: bool}) -> RA64:
     var color = [-1] * nc
     var used = [false] * 64
     for (_, j) in order:
+        if rm[j] and w[j] <= 2 * dw[j]:
+            continue
         var forbid = [false] * 64
         for k0 in adj[j]:
             let k = find(rep, k0)
