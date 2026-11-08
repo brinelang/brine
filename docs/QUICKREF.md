@@ -51,7 +51,15 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
 * Integer overflow, out-of-range conversions, division by zero and
   out-of-bounds indexing stop the program with a clear message (a *panic*),
   unless the compiler proved they can't happen, in which case the check is removed.
-  Only the first panic is reported, even when many `par` threads fail at once.
+  The message has the values involved (`integer overflow in addition:
+  9223372036854775807 + 1`, `integer conversion out of range for u8: 300`) and
+  the source location. On x86-64, the functions the panic came through follow,
+  innermost first (`in at (app.br:7)`, `called from main (app.br:11)`); a
+  small function the compiler inlined is part of its caller there. A chain
+  ends at a `par` body or task, since the thread that ran it varies.
+  Only the first panic is reported, even when many `par` threads fail at once:
+  that is the first one to fail in time, not necessarily the lowest index, so
+  which failing iteration a `par` loop reports can change from run to run.
 * Every thread, `main` included, has a 64 MB stack; recursion deeper than that
   panics with "stack overflow (recursion too deep)". `brine run` gives
   WebAssembly the same; in a browser the engine allows less (about 10,000 to

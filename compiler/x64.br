@@ -303,6 +303,8 @@ struct X:
     xdata_sym: int
     # symbols of the overflow panic texts ("addition", ...), -1 until used
     ovf: [int]
+    # where each function starts in .text and how a panic names it
+    ftab: [(int, str)]
     # .rodata symbols of float constants, by their bits (and 1 << 64 for f32)
     fpool: {i128: int}
     # 16-byte constants (vector kernels), by "lo,hi"
@@ -1943,6 +1945,7 @@ struct X:
         while len(self.o.text) % 16 != 0:
             self.o.text.push(204)
         self.sym_def(f.name, SEC_TEXT, self.pos(), f.public or f.export, true)
+        self.ftab.push((self.pos(), f.trace))
         self.u = Unw(
             start=self.pos(),
             pushes=[],
@@ -2205,6 +2208,7 @@ struct X:
             self.o.text.push(204)
         let start = self.pos()
         self.sym_def(name, SEC_TEXT, start, false, true)
+        self.ftab.push((start, ""))
         self.u = Unw(
             start=self.pos(),
             pushes=[],
@@ -2698,6 +2702,45 @@ struct X:
         self.rva(self.text_sym, s)
         self.rva(self.text_sym, self.pos())
         self.rva(self.xdata_sym, at)
+
+    # What a panic needs to print its call chain (runtime/rt.br, `call_chain`):
+    # `brine_frame_ptr`, which returns its caller's rbp (it has no frame of its
+    # own, so needs no unwind entry), and `brine_fn_table`: the address of
+    # .text, the number of functions, the size of .text, then for each
+    # function its offset in .text and where its name starts in the NUL-ended
+    # names after the table ("" at 0 for the runtime and generated code).
+    fn frame_table(ref self):
+        while len(self.o.text) % 16 != 0:
+            self.o.text.push(204)
+        self.sym_def("brine_frame_ptr", SEC_TEXT, self.pos(), true, true)
+        self.ftab.push((self.pos(), ""))
+        # mov rax, rbp; ret
+        self.o.text.extend([72, 137, 232, 195])
+        while len(self.o.data) % 8 != 0:
+            self.o.data.push(0)
+        self.o.data_align = max(self.o.data_align, 8)
+        let base = len(self.o.data)
+        self.sym_def("brine_fn_table", SEC_DATA, base, true, false)
+        self.o.drel.push(ORel(off=base, sym=self.text_sym, kind=R_ABS64, add=0))
+        put64(ref self.o.data, 0)
+        put64(ref self.o.data, len(self.ftab))
+        put64(ref self.o.data, len(self.o.text))
+        var names: [u8] = [0]
+        var at: {str: int} = {}
+        for (off, t) in self.ftab:
+            put32(ref self.o.data, off)
+            if t == "":
+                put32(ref self.o.data, 0)
+            else:
+                match at.get(t):
+                    case Some(n):
+                        put32(ref self.o.data, n)
+                    case None:
+                        at[t] = len(names)
+                        put32(ref self.o.data, len(names))
+                        names.extend(t.bytes())
+                        names.push(0)
+        self.o.data.extend(names)
 
     # an image-relative address in .pdata
     fn rva(ref self, sym: int, add: int):
@@ -4540,6 +4583,7 @@ fn emit(
         text_sym=0,
         xdata_sym=0,
         ovf=[-1, -1, -1],
+        ftab=[],
         fpool={},
         vpool={},
         cpu_sym=-1,
@@ -4644,6 +4688,7 @@ fn emit(
             ks.extend(fks)
     for k in ks:
         x.kernel(k)
+    x.frame_table()
     # references inside .text need no relocation
     var keep: [ORel] = []
     for r in x.o.trel:

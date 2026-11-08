@@ -14972,10 +14972,111 @@ fn panic_text_cold(loc: ptr, msg: str):
         stderr_text(f"\npanic (rank {brine_world_rank()}): {msg}\n  --> {c_text(loc)}\n")
     else:
         stderr_text(f"\npanic: {msg}\n  --> {c_text(loc)}\n")
+    call_chain(frame_ptr(), u64(0))
     fflush(os_stdio(2))
     unlock(io_mu())
     brine_x_gpu_settle()
     exit(i32(101))
+
+# ------------------------------------------------------------ call chains
+# x86-64 code keeps rbp chained through every frame (the saved rbp at [rbp],
+# the return address above it), and the backend writes a table of where each
+# function starts (x64.br, `frame_table`), so a panic can name the functions
+# it came through. Nothing of this runs until a panic.
+
+extern fn brine_frame_ptr() -> ptr
+
+# this function's rbp (0 where there is no table: other CPUs)
+fn frame_ptr() -> ptr:
+    if os_is("x86_64"):
+        return brine_frame_ptr()
+    return null_ptr()
+
+# The function the code at address a is in: the address of its name in the
+# table, 0 for the runtime's and generated code, -1 outside the program.
+fn frame_at(a: u64) -> int:
+    # (only x86-64 code has the table)
+    if os_is("x86_64"):
+        let t = symbol("brine_fn_table")
+        let text = load_u64(t, 0)
+        let n = load_i64(t, 8)
+        if a <= text or a > text + load_u64(t, 16) or n == 0:
+            return -1
+        # (a return address is just after its call)
+        let off = int(a - text - u64(1))
+        var lo = 0
+        var hi = n - 1
+        while lo < hi:
+            let mid = (lo + hi + 1) / 2
+            if int(load_u32(t, 24 + 8 * mid)) <= off:
+                lo = mid
+            else:
+                hi = mid - 1
+        let at = int(load_u32(t, 28 + 8 * lo))
+        if at == 0:
+            return 0
+        return int(addr(t)) + 24 + 8 * n + at
+    return -1
+
+# Prints the functions a panic came through, innermost first: from the frame
+# at fp (and, when pc isn't 0, the function at pc, which may not have set up
+# its frame yet). A `par` body or task ends it, since which thread ran it, and
+# so what called it, varies from run to run.
+fn call_chain(fp0: ptr, pc: u64):
+    if addr(fp0) == u64(0):
+        return
+    var lines = 0
+    var last = 0
+    var same = 0
+    var fp = addr(fp0)
+    var a = pc
+    var steps = 0
+    while steps < 10000000:
+        steps += 1
+        if a == u64(0):
+            # a frame: the saved rbp, then the return address
+            a = load_u64(null_ptr() + int(fp), 8)
+            let next = load_u64(null_ptr() + int(fp), 0)
+            if next <= fp or next - fp > u64(1073741824) or (next & u64(7)) != u64(0):
+                # the last frame: what it returns to isn't ours
+                fp = u64(0)
+            else:
+                fp = next
+        let at = frame_at(a)
+        a = u64(0)
+        if at < 0:
+            break
+        if at > 0 and at == last:
+            same += 1
+        elif at > 0:
+            if same > 0:
+                chain_again(last, same)
+                lines += 1
+                same = 0
+            if lines >= 20:
+                stderr_text("  ...\n")
+                return
+            let name = c_text(null_ptr() + at)
+            if lines == 0:
+                stderr_text(f"  in {name}\n")
+            else:
+                stderr_text(f"  called from {name}\n")
+            lines += 1
+            last = at
+            if name.starts_with("a `par` body in ") or name.starts_with("a task in "):
+                break
+        if fp == u64(0):
+            break
+    if same > 0:
+        chain_again(last, same)
+
+# the function at `at` called itself n more times
+fn chain_again(at: int, n: int):
+    let name = c_text(null_ptr() + at)
+    if n == 1:
+        stderr_text(f"  called from {name}, 1 more time\n")
+    else:
+        stderr_text(f"  called from {name}, {n} more times\n")
 
 fn brine_panic_at(loc: ptr, msg: ptr):
     panic_text_cold(loc, c_text(msg))
@@ -15031,20 +15132,26 @@ fn brine_exit(code: int):
 # silently (and losing what is still buffered for stdout), report it like
 # a panic. The handler runs on a reserve: on Windows the stack guarantee,
 # on POSIX an alternate signal stack, both set up for each thread.
-fn stack_overflow():
+fn stack_overflow(fp: u64, pc: u64):
     panic_claim()
     fflush(os_stdio(1))
     if brine_world_size() > 1:
         stderr_text(f"\npanic (rank {brine_world_rank()}): stack overflow (recursion too deep)\n")
     else:
         stderr_text("\npanic: stack overflow (recursion too deep)\n")
+    # (pc + 1: the fault may be at a function's first byte)
+    call_chain(null_ptr() + int(fp), pc + u64(1))
     fflush(os_stdio(2))
     _exit(i32(101))
 
 fn brine_x_on_exception(e: ptr) -> i32:
     # (EXCEPTION_STACK_OVERFLOW)
     if load_u32(load_ptr(e, 0), 0) == u32(3221225725):
-        stack_overflow()
+        if os_is("x86_64"):
+            # the CONTEXT's rbp and rip
+            let c = load_ptr(e, 8)
+            stack_overflow(load_u64(c, 160), load_u64(c, 248))
+        stack_overflow(u64(0), u64(0))
     # (EXCEPTION_CONTINUE_SEARCH)
     return i32(0)
 
@@ -15058,7 +15165,10 @@ fn brine_x_on_segv(sig: i32, si: ptr, uc: ptr):
     # the stack's own pages are mapped: a fault in its range (or just under
     # it, from a big frame that skipped the guard page) is an overflow
     if top != 0 and a < top and a >= top - u64(THREAD_STACK + 1048576):
-        stack_overflow()
+        # Linux x86-64: rbp and rip in the ucontext's registers
+        if os_is("linux") and os_is("x86_64"):
+            stack_overflow(load_u64(uc, 120), load_u64(uc, 168))
+        stack_overflow(u64(0), u64(0))
     # anything else crashes as it would without the handler (SIG_DFL)
     signal(sig, null_ptr())
 
