@@ -16,6 +16,7 @@ from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, NumM, StrM, Reducer
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import children, stmt_exprs, stmt_blocks, lvalue_root, local_of
 from info import ProgramInfo, ConstVal, PRELUDE, RT
+from rules import builtin_effect, os_effect
 from solver import Lin, F, AtomSet, prove_work, near_facts, local_facts, counterexample, PROVED, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
 from checks import Check, Stop, builtin_stops, reduce_stops, convert_stops, world_stops, os_stops
 
@@ -175,6 +176,7 @@ fn verify_program(
                     tests.push(true)
                     covers.push("")
     let fps = footprints(prog, info)
+    let pure = pure_fns(prog, info)
     let done = par [
         verify_fn(
             info,
@@ -185,7 +187,8 @@ fn verify_program(
             tests[i],
             (must_prove and not tests[i]) or covers[i] != "",
             covers[i],
-            stops
+            stops,
+            pure
         )
         for i in 0..len(fns)
     ]
@@ -286,7 +289,8 @@ fn verify_fn(
     test: bool,
     must_prove: bool,
     rule: str,
-    stops: [bool]
+    stops: [bool],
+    pure: [bool]
 ) -> FnResult:
     let t0 = clock()
     if f.is_extern:
@@ -308,6 +312,7 @@ fn verify_fn(
     v.rule = rule
     v.in_rule = f.rule.is_some()
     v.stops = stops
+    v.pure = pure
     v.run(f)
     if v.given_up > 0:
         let n = v.given_up
@@ -1141,7 +1146,9 @@ fn new_vf(
         hidden={},
         aliases={},
         chars={},
-        one_char={}
+        one_char={},
+        pure=[],
+        memo={}
     )
 
 struct Vf:
@@ -1223,6 +1230,11 @@ struct Vf:
     # elements: each is one character, whatever its length in bytes
     chars: {int: bool}
     one_char: {str: bool}
+    # functions whose result depends on their arguments alone (`pure_fns`),
+    # and the results of the calls to them so far, by callee and arguments:
+    # `while ok(x): ... ok(x)` knows in the body what the condition said
+    pure: [bool]
+    memo: {str: V}
 
     # The state, leaving none behind.
     fn take(ref self) -> Option[St]:
@@ -1314,6 +1326,32 @@ struct Vf:
 
     fn fresh_nonneg(ref self, name: str) -> Lin:
         return Lin.atom(self.new_atom(name, nonneg_range()))
+
+    # A value equal to `v`, of new atoms: a branch keeps the facts it learns
+    # about it (`join` keeps only the facts about atoms made in the branch).
+    fn copy_val(ref self, v: V, name: str) -> V:
+        if self.spec:
+            return v
+        match v:
+            case V.Int(l):
+                let a = Lin.atom(self.new_atom(name, None))
+                self.assume(F.equal(a, l))
+                return V.Int(a)
+            case V.Bool(f):
+                let b = self.fresh_bool(name)
+                self.assume(bool_eq(b, f))
+                return V.Bool(b)
+            case V.Arr(c, l):
+                let n = Lin.atom(self.new_atom("len(" + name + ")", None))
+                self.assume(F.equal(n, l))
+                return V.Arr(c, n)
+            case V.Agg(vs):
+                var out: [V] = []
+                for x in vs:
+                    out.push(self.copy_val(x, name))
+                return V.Agg(out)
+            case _:
+                return v
 
     fn fresh_len(ref self, name: str) -> Lin:
         let z: i128 = 0
@@ -4910,7 +4948,29 @@ struct Vf:
                     case None:
                         pass
         let nm = self.name_of(e)
-        let result = self.fresh_val(ret, nm)
+        var key: Option[str] = None
+        if 0 <= id < len(self.pure) and self.pure[id]:
+            var k = f"{id}:" + self.info.ty_name(ret)
+            for i, x in enumerate(exprs):
+                match val_key(vals[i]):
+                    case Some(vk):
+                        k += "|" + self.info.ty_name(x.ty) + "=" + vk
+                    case None:
+                        k = ""
+                        break
+            if k != "":
+                key = Some(k)
+        var result = V.Opaque
+        match key:
+            case Some(k):
+                match self.memo.get(k):
+                    case Some(r):
+                        result = self.copy_val(r, nm)
+                    case None:
+                        result = self.fresh_val(ret, nm)
+                        self.memo[k] = result
+            case None:
+                result = self.fresh_val(ret, nm)
         match spec:
             case Some(sp):
                 # after a failed precondition the postcondition may be contradictory;
@@ -4935,6 +4995,118 @@ struct Vf:
             case None:
                 pass
         return result
+
+# The functions whose result depends only on their arguments: nothing they
+# reach has effects (files, the console, the clock, `world`, extern code...),
+# and they have no `ref` parameters. There are no globals to change and no
+# function values, so the call graph is all there is.
+fn pure_fns(prog: Program, info: ProgramInfo) -> [bool]:
+    let n = len(info.fns)
+    var fns: [FnDecl] = []
+    for m in prog.modules:
+        # the runtime's memory operations are effects too
+        if m.name != RT:
+            fns.extend(m.fns)
+    let scans = par [scan_pure(fns[i], info) for i in 0..len(fns)]
+    # no body seen: not pure
+    var bad: [bool] = [true] * n
+    var callers: [[int]] = [[]] * n
+    for i, f in enumerate(fns):
+        if not (0 <= f.id < n):
+            continue
+        let (ok, calls) = scans[i]
+        bad[f.id] = not ok
+        for c in calls:
+            if 0 <= c < n:
+                callers[c].push(f.id)
+            else:
+                bad[f.id] = true
+    # whatever calls one that isn't pure isn't either
+    var todo: [int] = []
+    for id in 0..n:
+        if bad[id]:
+            todo.push(id)
+    var i = 0
+    while i < len(todo):
+        let c = todo[i]
+        i += 1
+        for id in callers[c]:
+            if not bad[id]:
+                bad[id] = true
+                todo.push(id)
+    var out: [bool] = [false] * n
+    for id in 0..n:
+        var by_ref = false
+        for q in info.fns[id].params:
+            by_ref = by_ref or q.by_ref
+        out[id] = not bad[id] and not by_ref
+    return out
+
+# Whether `f` itself has no effects, and the functions it calls.
+fn scan_pure(f: FnDecl, info: ProgramInfo) -> (bool, [int]):
+    var calls: [int] = []
+    if f.is_extern:
+        return (false, calls)
+    var ok = true
+    effs_free_block(f.body, ref ok, ref calls)
+    return (ok, calls)
+
+fn effs_free_block(b: Block, ref ok: bool, ref calls: [int]):
+    for s in b.stmts:
+        for e in stmt_exprs(s):
+            effs_free_expr(e, ref ok, ref calls)
+        for sb in stmt_blocks(s):
+            effs_free_block(sb, ref ok, ref calls)
+
+fn effs_free_expr(e: Expr, ref ok: bool, ref calls: [int]):
+    match e.cres:
+        case CallRes.Builtin(b):
+            if builtin_effect(b) != "":
+                ok = false
+        case CallRes.Os(op):
+            if os_effect(op) != "":
+                ok = false
+        case CallRes.World(_) | CallRes.Prim(_):
+            ok = false
+        case CallRes.Fn(id) | CallRes.Method(id):
+            calls.push(id)
+        case _:
+            pass
+    for c in children(e):
+        effs_free_expr(c, ref ok, ref calls)
+
+# A key that is the same only for values that are surely the same (a string
+# is known only by its length, a float only roughly: none).
+fn val_key(v: V) -> Option[str]:
+    match v:
+        case V.Int(l):
+            return Some("i" + lin_key(l))
+        case V.Bool(f):
+            return f_key(f)
+        case V.Arr(c, l):
+            return Some(f"a{c}," + lin_key(l))
+        case V.Agg(vs):
+            var k = "("
+            for x in vs:
+                match val_key(x):
+                    case Some(xk):
+                        k += xk + ","
+                    case None:
+                        return None
+            return Some(k + ")")
+        case _:
+            return None
+
+fn f_key(f: F) -> Option[str]:
+    match f:
+        case F.True:
+            return Some("T")
+        case F.False:
+            return Some("F")
+        case F.B(a, p):
+            return Some(f"b{a}" + ("+" if p else "-"))
+        case _:
+            return None
 
 # `a / b` and `a % b` don't fail: no division by zero, nor `MIN / -1`.
 fn div_goal(op: BinOp, a: Lin, b: Lin, k: IntTy) -> F:
