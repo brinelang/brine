@@ -1200,6 +1200,190 @@ fn prune(obj_dir: str, keep: [str]):
                 case _:
                     pass
 
+# ---------------------------------------------------------------- the cache
+
+# A cache directory (brine-cache in the temp directory for files outside a
+# project, a project's target/cache) keeps what every build made, so it is
+# pruned (v09#25). Each build adds lines to its `uses.log`: `<entry> -` when
+# it starts using an entry and `<entry> <bytes>` when it is done. When the
+# entries listed add up to more than BRINE_CACHE_SIZE, the least recently used
+# lose their files (brine can't remove folders; empty ones cost nothing).
+# What the log doesn't list, such as what an older brine made, stays.
+const CACHE_LOG = "uses.log"
+
+const CACHE_DEFAULT = 2 * 1024 * 1024 * 1024
+
+# lines added between rewrites of the log, which keep one line per entry
+const CACHE_SLACK = 256
+
+# BRINE_CACHE_SIZE in bytes: `500M`, `2G`, `1T` or a number of bytes; 0 (or
+# `off`) for no limit. Unset or unreadable: 2G.
+fn cache_cap() -> int:
+    match getenv("BRINE_CACHE_SIZE"):
+        case Some(v):
+            return parse_size(v).unwrap_or(CACHE_DEFAULT)
+        case None:
+            return CACHE_DEFAULT
+
+fn parse_size(v: str) -> Option[int]:
+    var s = v.strip().upper()
+    if s == "OFF":
+        return Some(0)
+    if s.ends_with("B"):
+        s = s[:len(s) - 1]
+    var mult = 1
+    for suffix, m in [("K", 1 << 10), ("M", 1 << 20), ("G", 1 << 30), ("T", 1 << 40)]:
+        if s.ends_with(suffix):
+            mult = m
+            s = s[:len(s) - 1]
+    match s.to_int():
+        case Some(n):
+            if n >= 0 and n <= (1 << 62) / mult:
+                return Some(n * mult)
+            return None
+        case None:
+            return None
+
+# The entries of `dir` a build of `exe` uses: its output folder when that is
+# in the cache (`<hash>/dev`), and its C objects (`obj-<hash>`).
+fn cache_entries(dir: str, exe: str) -> [str]:
+    var es: [str] = []
+    match project.parent(exe):
+        case Some(p):
+            let pre = dir + "/"
+            let q = p.replace("\\", "/")
+            if q.starts_with(pre.replace("\\", "/")):
+                es.push(q[len(pre):])
+        case None:
+            pass
+    # (a web build's objects are named after its .wasm)
+    es.push("obj-" + hex16(fnv(exe)))
+    es.push("obj-" + hex16(fnv(project.join(exe, "program.wasm"))))
+    return es
+
+fn tree_size(p: str) -> int:
+    if os.is_file(p):
+        return len(os.read_bytes(p).unwrap_or([]))
+    var n = 0
+    for f in os.list_dir(p).unwrap_or([]):
+        n += tree_size(project.join(p, f))
+    return n
+
+fn tree_clear(p: str):
+    if os.is_file(p):
+        match os.remove_file(p):
+            case _:
+                pass
+        return
+    for f in os.list_dir(p).unwrap_or([]):
+        tree_clear(project.join(p, f))
+
+fn log_lines(dir: str, lines: [str]):
+    match make_dirs(dir):
+        case _:
+            pass
+    match os.append_bytes(project.join(dir, CACHE_LOG), ("\n".join(lines) + "\n").bytes()):
+        case _:
+            pass
+
+# Before a build: its entries are in use, so a prune doesn't take them.
+# (objects only once they exist: a native build has none)
+fn cache_start(dir: str, exe: str):
+    var lines: [str] = []
+    for e in cache_entries(dir, exe):
+        if not e.starts_with("obj-") or os.is_dir(project.join(dir, e)):
+            lines.push(e + " -")
+    if len(lines) > 0:
+        log_lines(dir, lines)
+
+# After a build: record the sizes of its entries, then prune if needed.
+fn cache_done(dir: str, exe: str):
+    var lines: [str] = []
+    let mine = cache_entries(dir, exe)
+    for e in mine:
+        let p = project.join(dir, e)
+        if os.is_dir(p):
+            lines.push(f"{e} {tree_size(p)}")
+    if len(lines) > 0:
+        log_lines(dir, lines)
+    prune_cache(dir, mine, cache_cap())
+
+# The log is a header line `# <n>` (the entries when it was last rewritten)
+# then `<entry> <bytes or ->` lines, oldest first.
+fn prune_cache(dir: str, mine: [str], cap: int):
+    let log = project.join(dir, CACHE_LOG)
+    var text = ""
+    match read_file(log):
+        case Ok(t):
+            text = t
+        case Err(_):
+            return
+    let ls = text.lines()
+    var base = 0
+    if len(ls) > 0 and ls[0].starts_with("# "):
+        base = ls[0][2:].to_int().unwrap_or(0)
+    # newest first: each entry's latest size, and whether a build is still
+    # using it (its latest line is `-`, and recent)
+    var order: [str] = []
+    var size: {str: int} = {}
+    var busy: {str: bool} = {}
+    var i = len(ls) - 1
+    while i >= 0:
+        let parts = ls[i].split(" ")
+        i -= 1
+        if len(parts) != 2 or parts[0] == "#" or ".." in parts[0]:
+            continue
+        let name = parts[0]
+        let first = name not in busy
+        if first:
+            order.push(name)
+            busy[name] = parts[1] == "-" and i >= len(ls) - 1 - 2 * CACHE_SLACK
+        if name not in size:
+            match parts[1].to_int():
+                case Some(n):
+                    size[name] = n
+                case None:
+                    pass
+    var total = 0
+    for name in order:
+        total += size.get(name).unwrap_or(0)
+    let over = cap > 0 and total > cap
+    if not over and len(ls) <= base + CACHE_SLACK:
+        return
+    # oldest first, until what is left fits
+    var gone: {str: bool} = {}
+    var j = len(order) - 1
+    while over and j >= 0 and total > cap:
+        let name = order[j]
+        j -= 1
+        if busy[name] or name in mine:
+            continue
+        tree_clear(project.join(dir, name))
+        total -= size.get(name).unwrap_or(0)
+        gone[name] = true
+    # rewrite the log with one line per entry left, oldest first
+    var out = [""]
+    var k = len(order) - 1
+    while k >= 0:
+        let name = order[k]
+        k -= 1
+        if name in gone or not os.is_dir(project.join(dir, name)):
+            continue
+        match size.get(name):
+            case Some(n):
+                out.push(f"{name} {n}")
+            case None:
+                pass
+        # (a build that is still using it keeps it)
+        if busy[name] or name not in size:
+            out.push(f"{name} -")
+    out[0] = f"# {len(out) - 1}"
+    let tmp = f"{log}.{os.pid()}.tmp"
+    if write_file(tmp, "\n".join(out) + "\n").is_ok():
+        match os.rename(tmp, log):
+            case _:
+                pass
+
 # How many C translation units for a build: several for quick parallel dev
 # builds, one when the optimizer should see the whole program.
 fn unit_count(profile: Profile) -> int:

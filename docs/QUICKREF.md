@@ -26,6 +26,9 @@ also reports a panic that way, with the fields of a build error (`code` is
 `null`, the call chain is in `notes`). `brine fmt` leaves
 lines between `# fmt: off` and `# fmt: on` comments, and number tables written
 in rows that don't fit on one line, as they are.
+Builds are cached (`target/cache`; for files outside a project, brine-cache in
+the temp directory); `BRINE_CACHE_SIZE=500M` caps the cache (default `2G`, `0`:
+no limit), deleting what was used least recently.
 WebAssembly runs on one thread (`par` runs in order, same results) and as one
 `world` rank; in a browser there are no files or processes.
 

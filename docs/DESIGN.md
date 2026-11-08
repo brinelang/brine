@@ -368,8 +368,14 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
 * **Caching:** objects are named by a hash of what they're made from. C output is
   split into one translation unit per core (by a hash of each function's name, each
   unit declaring only what it uses), compiled in parallel; an edit recompiles only
-  the units it touches. An unchanged program skips the link (a `.brine-hash` stamp in the
-  cache, never next to the `-o` output).
+  the units it touches. An unchanged program isn't written again (a native link
+  compares its bytes with the file; through C, a `.brine-hash` stamp in the cache,
+  never next to the `-o` output, skips the link). The cache (brine-cache in the
+  temp directory for files outside a project, `target/cache` in one) is pruned:
+  past `BRINE_CACHE_SIZE` (default `2G`; `500M`, `0` for no limit) the least
+  recently used outputs and objects are deleted, after each build, from the use
+  log `uses.log` there. What an older brine left in it isn't listed, so it stays
+  until the folder is deleted.
 * **CPU levels:** native x86-64 `--release` code checks the CPU once and runs its
   vector loops as SSE2, AVX2 or AVX-512 code. Through C, an x86-64 `--release`
   build compiles the program three times, for plain x86-64, x86-64-v3 (AVX2)
