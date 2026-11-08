@@ -62,7 +62,7 @@ upgrade. `brine doctor` checks your setup.
 
 | Variable | Effect |
 |---|---|
-| `BRINE_VERSION=0.9.0` | install a given version (default: the latest) |
+| `BRINE_VERSION=0.9.1` | install a given version (default: the latest) |
 | `BRINE_INSTALL=~/.brine` | where to install (the binary goes in `$BRINE_INSTALL/bin`) |
 | `BRINE_NO_MODIFY_PATH=1` | don't add brine to your `PATH` |
 
