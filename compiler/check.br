@@ -379,6 +379,19 @@ struct Checker:
     fn tn(self, t: Ty) -> str:
         return "`" + self.info.ty_name(t) + "`"
 
+    fn is_opt(self, t: Ty) -> bool:
+        return self.info.ty_name(t).starts_with("Option[")
+
+    # The help for `let a, b = x` (or `for a, b in xs`) when `x` has type `t`.
+    fn unpack_help(self, t: Ty, n: int) -> str:
+        match t:
+            case Ty.Tuple(ts):
+                return f"it has {len(ts)} parts: write {len(ts)} names, with `_` for the ones you don't need"
+            case Ty.Str:
+                return "if this loops over a map, `for k, v in m.items():` gives keys and values (a map alone gives its keys)"
+            case _:
+                return "only a tuple can be unpacked into several names"
+
     fn item(self, name: str) -> Option[Item]:
         return self.items[self.cur_mod].get(name)
 
@@ -898,8 +911,12 @@ struct Checker:
                     )
                     .label(sp, "imported here")
                     .label(prev, "also defined here")
-                    .with_help(f"rename one of them, or use `import {p}` and write `{last}.{name}`")
+                    .with_help(
+                        f"keep one of them: with `import {p}` alone, write `{last}.{name}`; with `from {p} import {name}` alone, write `{name}`"
+                    )
                 )
+                # later uses of the name would only repeat this error
+                self.failed_imports[f"{mi} {name}"] = true
             case None:
                 spans[mi][name] = sp
                 self.items[mi][name] = it
@@ -1021,8 +1038,26 @@ struct Checker:
                         d = d.with_help(f"did you mean `{h}`?").fix(span, h, f"replace with `{h}`")
                     case None:
                         pass
-                if name == "list" or name == "List" or name == "Vec":
-                    d = d.with_help("arrays are written `[T]`, e.g. `[int]`")
+                match name:
+                    case "list" | "List" | "Vec" | "Array":
+                        d = d.with_help("arrays are written `[T]`, e.g. `[int]`")
+                    case "dict" | "Dict" | "HashMap" | "Map":
+                        d = d.with_help("maps are written `{K: V}`, e.g. `{str: int}`")
+                    case "Box" | "Rc" | "Arc" | "RefCell":
+                        d = d.with_help(
+                            "brine needs no box: a struct or enum can contain itself through an array or an enum variant, e.g. `children: [Tree]`, or use the type itself"
+                        )
+                    case "number":
+                        d = d.with_help(
+                            "use `int` for whole numbers and `float` for others"
+                        ).fix(span, "int", "replace with `int`")
+                    case "void" | "None" | "unit":
+                        d = d.with_help("a function that returns nothing has no `->` part")
+                    case _:
+                        if hint.is_none():
+                            d = d.with_help(
+                                "the built-in types are `int`, `float`, `bool`, `str`, sized ones like `u8` and `i64`, `[T]`, `{K: V}`, `Option[T]` and `Result[T, E]`; define others with `struct` or `enum`"
+                            )
                 self.err(d)
                 return Ty.Error
 
@@ -1443,7 +1478,7 @@ struct Checker:
         ).label(span, label)
         d = d.note(
             "this project asks for a type on every variable (`typed = true` in brine.toml, or `--typed`)"
-        )
+        ).with_help("write the type after the name, as in `let n: int = 0`")
         match fix:
             case Some(fx):
                 d = d.fix(Span(file=span.file, lo=span.hi, hi=span.hi), fx, "add the type")
@@ -1559,8 +1594,20 @@ struct Checker:
                 )
             case "println" | "printf" | "puts" | "console":
                 d = d.with_help("use `print(...)`").fix(span, "print", "replace with `print`")
-            case "length" | "size" | "count":
+            case "length" | "size" | "count" | "lenght" | "lengh" | "lentgh":
                 d = d.with_help("use `len(x)`").fix(span, "len", "replace with `len`")
+            case "sorted":
+                d = d.with_help(
+                    "copy the array and sort the copy in place: `var ys = xs`, then `ys.sort()`"
+                )
+            case "map" | "filter" | "reduce":
+                d = d.with_help(
+                    "use a comprehension: `[f(x) for x in xs]`, `[x for x in xs if p(x)]`; to combine values, `sum(...)` or a loop"
+                )
+            case "input" | "readline" | "read_line":
+                d = d.with_help(
+                    "read standard input with `read_line()`, which gives an `Option[str]`"
+                )
             case _:
                 match best_match(name, self.all_names()):
                     case Some(m):
@@ -1820,10 +1867,11 @@ struct Checker:
                     case Res.Const(_):
                         is_const = true
                         self.err(
-                            diag.error(
-                                "E0401",
-                                f"cannot assign to constant `{n}`"
-                            ).label(target.span, "constants never change")
+                            diag.error("E0401", f"cannot assign to constant `{n}`")
+                            .label(target.span, "constants never change")
+                            .with_help(
+                                f"for a value that changes, declare a variable in the function: `var {n.lower()} = {n}`"
+                            )
                         )
                     case _:
                         pass
@@ -2041,7 +2089,9 @@ struct Checker:
                                     diag.error(
                                         "E0301",
                                         f"cannot unpack {tn} into {len(names)} variables"
-                                    ).label(init2.span, f"has type {tn}")
+                                    )
+                                    .label(init2.span, f"has type {tn}")
+                                    .with_help(self.unpack_help(t, len(names)))
                                 )
                         for i, x in enumerate(names):
                             locals.push(self.declare(x.0, x.1, tys[i], kind))
@@ -3332,11 +3382,13 @@ struct Checker:
                     case None:
                         pass
                 if not e.ty.is_error():
+                    var help = f"store the value in a variable first (`var v = ...`), then {what} `v`"
+                    if what == "sort":
+                        help = "`sort` sorts a variable in place and returns nothing: store the value first (`var ks = m.keys()`), then call `ks.sort()`"
                     self.err(
-                        diag.error(
-                            "E0404",
-                            f"cannot {what} this expression"
-                        ).label(e.span, "not a variable, field or array element")
+                        diag.error("E0404", f"cannot {what} this expression")
+                        .label(e.span, "not a variable, field or array element")
+                        .with_help(help)
                     )
                 return None
         if not self.inv_fields_ok(e):
@@ -3357,6 +3409,21 @@ struct Checker:
                 )
                 return None
             case LocalKind.Param:
+                if info.name == "self":
+                    self.err(
+                        diag.error("E0403", f"cannot {what} `self` in a method that takes `self`")
+                        .label(e.span, "`self` is read-only here")
+                        .label(info.span, "declared here")
+                        .with_help(
+                            "a method that changes its value takes `ref self`: `fn name(ref self, ...)`"
+                        )
+                        .fix(
+                            Span(file=info.span.file, lo=info.span.lo, hi=info.span.lo),
+                            "ref ",
+                            "take `ref self`"
+                        )
+                    )
+                    return None
                 self.err(
                     diag.error("E0403", f"cannot {what} parameter `{info.name}`")
                     .label(e.span, "parameters are read-only")
@@ -3368,10 +3435,11 @@ struct Checker:
                 return None
             case LocalKind.ForVar | LocalKind.ForElem | LocalKind.Result:
                 self.err(
-                    diag.error(
-                        "E0401",
-                        f"cannot {what} loop variable `{info.name}`"
-                    ).label(e.span, "loop variables are read-only")
+                    diag.error("E0401", f"cannot {what} loop variable `{info.name}`")
+                    .label(e.span, "loop variables are read-only")
+                    .with_help(
+                        f"to change the array's elements, loop over the indexes: `for i in 0..len(xs):` and write `xs[i]`; for a changed copy, `var t = {info.name}`"
+                    )
                 )
                 return None
         if info.par_level < self.cur_level():
@@ -3421,6 +3489,34 @@ struct Checker:
                         match base.kind:
                             case ExprKind.Field(_, f, _):
                                 help = f"a `par for` writes elements of a variable, not of a field: move the array out first (`var a = {info.name}.{f}` then `{info.name}.{f} = []`), write `a[{lv}]` in the loop, and put it back after (`{info.name}.{f} = a`); moving doesn't copy"
+                            case _:
+                                pass
+                    case _:
+                        pass
+                match e.kind:
+                    case ExprKind.Ident(_):
+                        # the whole variable, not one of its elements
+                        if what == "push to" or what == "extend":
+                            help = f"iterations can't add to one array; build it in one expression, `{info.name} = par [f({lv}) for {lv} in ...]`, and keep some values with a sequential loop after it (`if` filters in `par [...]` aren't supported yet)"
+                        elif info.ty.is_numeric():
+                            help = f"`{info.name}` is one variable shared by every iteration; combine the values in one expression instead, such as `{info.name} += par sum(f({lv}) for {lv} in ...)`, or use a sequential `for`"
+                        else:
+                            help = f"`{info.name}` is one variable shared by every iteration; change it in a sequential `for` loop, or compute the parts with `par [...]` first"
+                    case ExprKind.Index(_, idx):
+                        var scatter = false
+                        match idx.kind:
+                            case ExprKind.Index(
+                                _,
+                                _
+                            ) | ExprKind.Call(_, _) | ExprKind.MethodCall(_, _, _, _):
+                                scatter = true
+                            case ExprKind.Ident(n):
+                                scatter = n != lv
+                            case _:
+                                pass
+                        match idx.kind:
+                            case _ if scatter:
+                                help = f"a `par for` may only write `{info.name}[{lv}]` or `{info.name}[k * {lv} + c]`; writing at a computed position could hit the same element twice, so scatter in a sequential `for` loop"
                             case _:
                                 pass
                     case _:
@@ -3693,7 +3789,16 @@ struct Checker:
         let ft = self.tn(e.ty)
         var d = diag.error("E0301", "mismatched types").label(e.span, f"expected {et}, found {ft}")
         if expected.is_float() and e.ty.is_int():
-            d = d.with_help("convert explicitly with `float(...)`")
+            var help = "convert explicitly with `float(...)`"
+            match e.kind:
+                case ExprKind.Binary(BinOp.Div, l, r):
+                    # `float(a / b)` would convert the already rounded quotient
+                    let a = expr_text(l).unwrap_or("a")
+                    let b = expr_text(r).unwrap_or("b")
+                    help = f"`/` on two integers rounds down; for a float result, convert both first: `float({a}) / float({b})`"
+                case _:
+                    pass
+            d = d.with_help(help)
         elif expected.is_int() and e.ty.is_float():
             d = d.with_help("convert explicitly with `int(...)` (truncates toward zero)")
         elif expected.is_int() and e.ty.is_int():
@@ -4657,6 +4762,10 @@ struct Checker:
                 ).label(name_span, "use `match` to read the data in a variant")
                 if name in en.methods:
                     d = d.with_help(f"`{name}` is a method; call it with `.{name}()`")
+                else:
+                    d = d.with_help(
+                        f"the data belongs to a variant: `match` on the value, and a `case Variant(..., {name}, ...):` line names it"
+                    )
                 self.err(d)
                 return Ty.Error
             case Ty.Tuple(ts):
@@ -4715,10 +4824,9 @@ struct Checker:
                     if x.name == u.parent:
                         sp = x.span
                 self.err(
-                    diag.error(
-                        "E0301",
-                        f"cannot unpack {tn} into {count} variables"
-                    ).label(sp, f"this has type {tn}")
+                    diag.error("E0301", f"cannot unpack {tn} into {count} variables")
+                    .label(sp, f"this has type {tn}")
+                    .with_help(self.unpack_help(pt, count))
                 )
             held[u.name] = t
             if u.name == "_":
@@ -4849,7 +4957,9 @@ struct Checker:
         ).label(span, f"both operands are {tn}")
         match t:
             case Ty.Str:
-                return d.note("`+` joins two strings; strings have no other arithmetic")
+                return d.note("`+` joins two strings; strings have no other arithmetic").with_help(
+                    "to do arithmetic on the number a string spells, convert it first: `s.to_int()` or `s.to_float()` give an `Option`"
+                )
             case Ty.Bool:
                 return d.with_help("use `and`, `or` and `not` on booleans, or `int(b)` for 0 or 1")
             case Ty.Array(_):
@@ -4909,8 +5019,33 @@ struct Checker:
                     f"cannot {verb} " + self.tn(lt) + " and " + self.tn(rt)
                 ).label(span, f"`{op.sym()}` with mismatched operands")
                 if lt.is_numeric() and rt.is_numeric():
+                    if lt.is_float() != rt.is_float():
+                        let side = "left" if lt.is_int() else "right"
+                        let ft = self.tn(rt if lt.is_int() else lt)
+                        d = d.with_help(
+                            f"brine never converts numbers implicitly: convert the {side} side, the integer, with `float(...)` (or the other with `int(...)`, which truncates)"
+                        )
+                        if ft != "`float`":
+                            d = d.with_help(
+                                f"the float side is {ft}: convert with that type, e.g. `f32(n)`"
+                            )
+                    else:
+                        d = d.with_help(
+                            "brine never converts numbers implicitly: convert one side to the other's type, e.g. `i64(x)` or `u8(x)` (checked at runtime)"
+                        )
+                elif self.is_opt(lt) or self.is_opt(rt):
                     d = d.with_help(
-                        "brine never converts numbers implicitly; use `float(x)` or `int(x)`"
+                        "one side is an `Option`, which may hold no value: take the value out first with `match`, `x.unwrap_or(default)` or `?`; a map gives a default with `m.get(k, default)`"
+                    )
+                elif lt == Ty.Str and op == BinOp.Mod:
+                    d = d.with_help(
+                        "brine has no `%` formatting; use an f-string: `f\"{n} items\"`"
+                    )
+                elif lt == Ty.Str and op == BinOp.Mul:
+                    d = d.with_help("`s * n` repeats a string, with an integer `n`: `s * int(x)`")
+                elif (lt == Ty.Str or rt == Ty.Str) and op == BinOp.Sub:
+                    d = d.with_help(
+                        "a string isn't a number: `s.to_int()` gives the number it spells (an `Option[int]`), and `s.bytes()[0]` the code of its first byte"
                     )
                 elif (lt == Ty.Str or rt == Ty.Str) and op == BinOp.Add:
                     d = d.with_help("convert with `str(x)`, or use an f-string: f\"{a}{b}\"")
@@ -5107,9 +5242,21 @@ struct Checker:
             case Some(Item.GenVariant(t, vi)):
                 return self.variant_generic(t, vi, ref args, ref res, span, cspan, exp)
             case Some(Item.Const(_)) | Some(Item.Module(_)):
-                self.err(
-                    diag.error("E0303", f"`{name}` is not a function").label(cspan, "not callable")
-                )
+                if f"{self.cur_mod} {name}" not in self.failed_imports:
+                    var d = diag.error(
+                        "E0303",
+                        f"`{name}` is not a function"
+                    ).label(cspan, "not callable")
+                    match self.item(name):
+                        case Some(Item.Module(_)):
+                            d = d.with_help(
+                                f"`{name}` is a module: call a function in it, `{name}.f(...)`"
+                            )
+                        case _:
+                            d = d.with_help(
+                                f"`{name}` is a constant; use its value without `(...)`"
+                            )
+                    self.err(d)
                 return Ty.Error
             case None:
                 pass
@@ -5177,6 +5324,18 @@ struct Checker:
                     ).label(args[0].expr.span, "unsupported conversion")
                     if target == Ty.Bool:
                         d = d.with_help("compare explicitly instead, e.g. `x != 0`")
+                    elif self.is_opt(at):
+                        d = d.with_help(
+                            "an `Option` may hold no value: take the value out first with `match` (`case Some(v):`), `x.unwrap_or(default)` or `?`"
+                        )
+                    elif at == Ty.Str and target.is_numeric():
+                        d = d.with_help(
+                            "text to a number is `s.to_int()` or `s.to_float()`, which give an `Option`"
+                        )
+                    else:
+                        d = d.with_help(
+                            "conversions work between numbers, and to `str` with `str(x)`"
+                        )
                     self.err(d)
                 return target
             case None:
@@ -5324,8 +5483,42 @@ struct Checker:
             )
             return Ty.Error
         self.check_all(ref args)
-        self.undefined(name, cspan, "function")
+        if not self.method_as_function(name, ref args, cspan):
+            self.undefined(name, cspan, "function")
         return Ty.Error
+
+    # `area(r)` or `area()` where `area` is a method: say how to call it.
+    fn method_as_function(ref self, name: str, ref args: [Arg], span: Span) -> bool:
+        var owner = ""
+        for sid, st in enumerate(self.info.structs):
+            if name in st.methods:
+                owner = self.info.struct_names[sid]
+                break
+        if owner == "":
+            return false
+        var d = diag.error(
+            "E0201",
+            f"cannot find function `{name}`"
+        ).label(span, f"`{name}` is a method of `{owner}`")
+        var on_self = false
+        match self.lookup_local("self"):
+            case Some(_):
+                on_self = len(args) == 0
+            case None:
+                pass
+        if on_self:
+            d = d.with_help(
+                f"call it on the value: `self.{name}()`"
+            ).fix(Span(file=span.file, lo=span.lo, hi=span.lo), "self.", "add `self.`")
+        elif len(args) > 0:
+            let recv = expr_text(args[0].expr).unwrap_or("x")
+            d = d.with_help(
+                f"call it on the value: `{recv}.{name}(...)`, without that value among the arguments"
+            )
+        else:
+            d = d.with_help(f"call it on a value: `x.{name}()`")
+        self.err(d)
+        return true
 
     fn check_args(ref self, sig: FnSig, ref args: [Arg], span: Span, skip: int) -> Ty:
         let params = sig.params[min(skip, len(sig.params)):]
@@ -5344,6 +5537,11 @@ struct Checker:
                 )
                 .label(span, "wrong number of arguments")
                 .note(f"signature: fn {sig.name}(" + ", ".join(ps) + ")")
+                .with_help(
+                    "pass one value per parameter, in order"
+                    if skip == 0
+                    else "pass one value per parameter after `self`; the value before the `.` is `self`"
+                )
             )
             self.check_all(ref args)
             return sig.ret
@@ -5574,12 +5772,23 @@ struct Checker:
 
     fn nargs(ref self, name: str, ref args: [Arg], n: int, span: Span) -> bool:
         if len(args) != n:
-            self.err(
-                diag.error(
-                    "E0302",
-                    f"`{name}` takes {n} argument{plural(n)} but {len(args)} were given"
-                ).label(span, "wrong number of arguments")
-            )
+            var d = diag.error(
+                "E0302",
+                f"`{name}` takes {n} argument{plural(n)} but {len(args)} "
+                + ("was" if len(args) == 1 else "were")
+                + " given"
+            ).label(span, "wrong number of arguments")
+            if name == "sort":
+                # `xs.sort(key=len)`: the key would only add errors of its own
+                d = d.with_help(
+                    "`sort` takes no key; to sort by something else, sort pairs: `var ps = [(len(w), w) for w in words]`, then `ps.sort()`"
+                )
+                args.clear()
+            elif name == "len":
+                d = d.with_help("`len(x)` takes one value; add the lengths: `len(a) + len(b)`")
+            else:
+                d = d.with_help(f"pass exactly {n} argument{plural(n)}")
+            self.err(d)
             self.check_all(ref args)
             return false
         return true
@@ -5623,10 +5832,13 @@ struct Checker:
             let t = self.check_expr(ref args[i].expr, None)
             if not printable(t) and not t.is_error():
                 self.err(
-                    diag.error(
-                        "E0301",
-                        "cannot print a value of type " + self.tn(t)
-                    ).label(args[i].expr.span, "not printable")
+                    diag.error("E0301", "cannot print a value of type " + self.tn(t))
+                    .label(args[i].expr.span, "not printable")
+                    .with_help(
+                        "this call returns nothing (`()`), so there is no value to print; call it on its own line"
+                        if t == Ty.Unit
+                        else "print the fields one by one, or write a function that formats the value as a `str`"
+                    )
                 )
 
     # `pow(x, y)`, `atan2(y, x)`, `hypot(x, y)`: two floats of one type, which is the result's.
@@ -5710,7 +5922,13 @@ struct Checker:
                         diag.error(
                             "E0301",
                             "`len` needs an array, string or map, found " + self.tn(t)
-                        ).label(args[0].expr.span, "no length")
+                        )
+                        .label(args[0].expr.span, "no length")
+                        .with_help(
+                            "for the number of digits of an integer, use `len(str(n))`"
+                            if t.is_int()
+                            else "`len` counts the elements of an array, the bytes of a string or the keys of a map"
+                        )
                     )
                 return int_ty()
             case Builtin.Abs:
@@ -5763,10 +5981,13 @@ struct Checker:
                 let t = self.check_expr(ref args[0].expr, Some(float_ty()))
                 if not t.is_error() and not t.is_float():
                     self.err(
-                        diag.error(
-                            "E0301",
-                            f"`{name}` needs a float, found " + self.tn(t)
-                        ).label(args[0].expr.span, "convert with `float(...)`")
+                        diag.error("E0301", f"`{name}` needs a float, found " + self.tn(t))
+                        .label(args[0].expr.span, "convert with `float(...)`")
+                        .with_help(
+                            "text to a number is `s.to_float()`, which gives an `Option[float]`"
+                            if t == Ty.Str
+                            else f"write `{name}(float(x))`"
+                        )
                     )
                     return float_ty()
                 if t.is_error():
@@ -5784,10 +6005,13 @@ struct Checker:
                 let t = self.check_expr(ref args[0].expr, Some(guide))
                 if not t.is_error() and not t.is_float():
                     self.err(
-                        diag.error(
-                            "E0301",
-                            f"`{name}` needs a float, found " + self.tn(t)
-                        ).label(args[0].expr.span, "convert with `float(...)`")
+                        diag.error("E0301", f"`{name}` needs a float, found " + self.tn(t))
+                        .label(args[0].expr.span, "convert with `float(...)`")
+                        .with_help(
+                            "text to a number is `s.to_float()`, which gives an `Option[float]`"
+                            if t == Ty.Str
+                            else f"write `{name}(float(x))`"
+                        )
                     )
                     return float_ty()
                 if t.is_error():
@@ -5818,10 +6042,11 @@ struct Checker:
                         )
                 if len(self.par_stack) > 0:
                     self.err(
-                        diag.error(
-                            "E0503",
-                            "`exit` can't be called inside a `par` body"
-                        ).label(span, "not allowed here")
+                        diag.error("E0503", "`exit` can't be called inside a `par` body")
+                        .label(span, "not allowed here")
+                        .with_help(
+                            "check the input before the `par`, or have each iteration return a status (`par [check(x) for x in xs]`) and exit after it"
+                        )
                     )
                 return Ty.Unit
             case Builtin.Panic:
@@ -6219,7 +6444,11 @@ struct Checker:
                                 diag.error(
                                     "E0206",
                                     f"`{name}` is a static method; call it as `{tname}.{name}(...)`"
-                                ).label(name_span, "no `self` parameter")
+                                )
+                                .label(name_span, "no `self` parameter")
+                                .with_help(
+                                    f"to call it on a value, make `self` its first parameter: `fn {name}(self, ...)`"
+                                )
                             )
                             return sig.ret
                         if self.in_spec:
@@ -6268,7 +6497,13 @@ struct Checker:
                                         f"did you mean `{b}`?"
                                     ).fix(name_span, b, "replace")
                                 case None:
-                                    pass
+                                    if name in self.items[self.cur_mod]:
+                                        let r = expr_text(recv).unwrap_or("x")
+                                        d = d.with_help(
+                                            f"`{name}` is a function, not a method: call it as `{name}({r})`, or move it into `{tname}` with `self` as its first parameter"
+                                        )
+                                    elif len(cands) > 0:
+                                        d = d.note(f"`{tname}` methods: " + ", ".join(cands))
                         self.err(d)
                         self.check_all(ref args)
                         return Ty.Error
@@ -6797,6 +7032,13 @@ struct Checker:
                         case "format":
                             d = d.with_help("use an f-string: f\"x = {x}\"")
                         case _:
+                            match best_match(name, str_method_names()):
+                                case Some(b):
+                                    d = d.with_help(
+                                        f"did you mean `{b}`?"
+                                    ).fix(name_span, b, f"replace with `{b}`")
+                                case None:
+                                    pass
                             d = d.note(
                                 "string methods: find, contains, split, join, starts_with, ends_with, strip, lstrip, rstrip, replace, upper, lower, lines, is_digit, is_alpha, is_space, is_alnum, count, bytes, chars, repeat, to_int, to_float"
                             )
@@ -7059,6 +7301,33 @@ struct Checker:
                     case "sorted" | "sort_by":
                         d = d.with_help("use `xs.sort()` on a `var` copy")
                     case _:
+                        let typo = best_match(
+                            name,
+                            [
+                                "push",
+                                "pop",
+                                "insert",
+                                "extend",
+                                "index",
+                                "contains",
+                                "sort",
+                                "reverse",
+                                "clear",
+                                "append",
+                                "length"
+                            ]
+                        )
+                        match typo:
+                            case Some(near):
+                                let to = "push" if near == "append" else near
+                                if near == "length":
+                                    d = d.with_help("use `len(xs)`")
+                                else:
+                                    d = d.with_help(
+                                        f"did you mean `{to}`?"
+                                    ).fix(name_span, to, f"replace with `{to}`")
+                            case None:
+                                pass
                         d = d.note(
                             "array methods: push(x), pop(), pop(i), insert(i, x), extend(ys), index(x), index(x, start), contains(x), sort(), reverse(), clear()"
                         )
@@ -7066,8 +7335,9 @@ struct Checker:
                 self.check_all(ref args)
                 return Ty.Error
         res = CallRes.Builtin(b)
+        var bad_target = false
         if verb != "":
-            self.check_mutation_target(recv, verb)
+            bad_target = self.check_mutation_target(recv, verb).is_none()
         self.typed_args(name, ref args, params, span)
         if b == Builtin.Sort and not el.is_error() and not orderable(self.info, el):
             self.not_orderable(el, span, "arrays of " + self.tn(el) + " can't be sorted")
@@ -7078,6 +7348,9 @@ struct Checker:
                     "values of type " + self.tn(el) + " can't be compared"
                 ).label(span, "not comparable")
             )
+        # `d.keys().sort()` is already an error; using its `()` would add more
+        if bad_target and ret == Ty.Unit:
+            return Ty.Error
         return ret
 
     # ============================================================ generics
@@ -8026,11 +8299,27 @@ struct Checker:
                 case None:
                     map.push(Some(i))
         let sub = self.infer(g.tparams, g.module, seed, params, None, ref args, map, None)
-        let help = (
+        var help = (
             f"give the types explicitly, e.g. `{g.name}["
             + int_names(g.tparams)
             + "]`, or add a type annotation to the variable"
         )
+        # `return Ok(x)` from a function that returns an `Option`
+        match exp:
+            case Some(e):
+                match self.origin(e):
+                    case Some((t, _)):
+                        if t != tid:
+                            let en = self.tn(e)
+                            help = f"a value of type {en} is expected here, not a `{g.name}`"
+                            if self.gtypes[t].name == "Option":
+                                help += ": an `Option` is `Some(x)` or `None`"
+                            elif self.gtypes[t].name == "Result":
+                                help += ": a `Result` is `Ok(x)` or `Err(e)`"
+                    case None:
+                        pass
+            case None:
+                pass
         return self.need_all(what, g.tparams, sub, span, help)
 
     # `Pair(a=1, b="x")` or `Pair[int, str](...)`.
@@ -8168,11 +8457,33 @@ struct Checker:
                 else:
                     let l = self.variant_label_g(tid, vi)
                     let tp = int_names(g.tparams)
-                    self.err(
-                        diag.error("E0332", f"can't infer which `{gname}` type `{l}` belongs to")
-                        .label(span, "type unknown here")
-                        .with_help(f"add a type annotation, e.g. `let x: {gname}[{tp}] = {l}`")
-                    )
+                    var want = ""
+                    match exp:
+                        case Some(t):
+                            if not t.is_error() and t != Ty.Unknown:
+                                want = self.tn(t)
+                        case None:
+                            pass
+                    if want != "" and gname == "Option":
+                        let w = want[1:len(want) - 1]
+                        self.err(
+                            diag.error("E0301", "mismatched types")
+                            .label(span, f"expected {want}, found `{l}`")
+                            .with_help(
+                                f"to allow no value, declare the type `Option[{w}]` (for a function, `-> Option[{w}]`) and wrap the other values in `Some(...)`"
+                            )
+                        )
+                    else:
+                        self.err(
+                            diag.error(
+                                "E0332",
+                                f"can't infer which `{gname}` type `{l}` belongs to"
+                            )
+                            .label(span, "type unknown here")
+                            .with_help(
+                                f"write the type where the variable is declared, e.g. `var x: {gname}[{tp}] = {l}`"
+                            )
+                        )
                 return Ty.Error
 
     # `Option.Some(x)`, `Option.none_helper()`: names looked up on a generic type without type arguments.
@@ -8779,6 +9090,53 @@ fn block_has_break(b: Block) -> bool:
     return false
 
 # Python spellings we don't use, and what to write instead.
+# Source-like text for a simple expression, to quote in a help line.
+fn expr_text(e: Expr) -> Option[str]:
+    match e.kind:
+        case ExprKind.Ident(n):
+            # the checker's own names (`x'1`) aren't the program's
+            if "'" in n or "$" in n:
+                return None
+            return Some(n)
+        case ExprKind.Int(v):
+            return Some(str(v))
+        case ExprKind.Field(b, n, _):
+            let t = expr_text(b)?
+            return Some(f"{t}.{n}")
+        case ExprKind.Index(b, i):
+            let t = expr_text(b)?
+            let k = expr_text(i)?
+            return Some(f"{t}[{k}]")
+        case _:
+            return None
+
+fn str_method_names() -> [str]:
+    return [
+        "find",
+        "contains",
+        "split",
+        "join",
+        "starts_with",
+        "ends_with",
+        "strip",
+        "lstrip",
+        "rstrip",
+        "replace",
+        "upper",
+        "lower",
+        "lines",
+        "is_digit",
+        "is_alpha",
+        "is_space",
+        "is_alnum",
+        "count",
+        "bytes",
+        "chars",
+        "repeat",
+        "to_int",
+        "to_float"
+    ]
+
 fn str_renames() -> [(str, str)]:
     return [
         ("startswith", "starts_with"),

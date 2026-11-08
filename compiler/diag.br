@@ -241,6 +241,48 @@ struct Colors:
     fn reset(self) -> str:
         return self.s("\u{1b}[0m")
 
+# Terminal columns of one character: a tab is shown as 4 spaces, East Asian wide
+# characters and emoji take 2, combining marks and zero-width characters none.
+fn char_width(c: str) -> int:
+    let b = c.bytes()
+    if len(b) == 1:
+        return 4 if b[0] == 9 else 1
+    if len(b) == 2:
+        let cp = ((int(b[0]) & 0x1f) << 6) | (int(b[1]) & 0x3f)
+        return 0 if 0x300 <= cp and cp <= 0x36f else 1
+    if len(b) == 3:
+        let cp = ((int(b[0]) & 0x0f) << 12) | ((int(b[1]) & 0x3f) << 6) | (int(b[2]) & 0x3f)
+        if (0x200b <= cp and cp <= 0x200f) or cp == 0xfeff:
+            return 0
+        if (
+            (0x1100 <= cp and cp <= 0x115f)
+            or (0x2e80 <= cp and cp <= 0xa4cf and cp != 0x303f)
+            or (0xac00 <= cp and cp <= 0xd7a3)
+            or (0xf900 <= cp and cp <= 0xfaff)
+            or (0xfe30 <= cp and cp <= 0xfe4f)
+            or (0xff00 <= cp and cp <= 0xff60)
+            or (0xffe0 <= cp and cp <= 0xffe6)
+        ):
+            return 2
+        return 1
+    if len(b) == 4:
+        let cp = (
+            ((int(b[0]) & 0x07) << 18)
+            | ((int(b[1]) & 0x3f) << 12)
+            | ((int(b[2]) & 0x3f) << 6)
+            | (int(b[3]) & 0x3f)
+        )
+        if (0x1f300 <= cp and cp <= 0x1faff) or (0x20000 <= cp and cp <= 0x3fffd):
+            return 2
+    return 1
+
+# Terminal columns of the first `n` characters of `cs`.
+fn width_of(cs: [str], n: int) -> int:
+    var w = 0
+    for i in 0..min(n, len(cs)):
+        w += char_width(cs[i])
+    return w
+
 # `s` right-aligned in `w` columns
 fn pad_left(s: str, w: int) -> str:
     let n = len(s.chars())
@@ -339,15 +381,18 @@ fn render(d: Diag, sm: SourceMap, color: bool) -> str:
         let text = f.line_text(ln)
         # labels on the same line share one copy of it
         if last_line_file != l.span.file or last_line != ln:
-            out.push(c.blue() + pad_left(str(ln), w) + " |" + c.reset() + " " + text + "\n")
+            # tabs as spaces, so the marks below line up in any terminal
+            let shown = text.replace("\t", "    ")
+            out.push(c.blue() + pad_left(str(ln), w) + " |" + c.reset() + " " + shown + "\n")
             last_line_file = l.span.file
             last_line = ln
         let (eln, ecol) = f.line_col(l.span.hi)
-        let line_chars = len(text.chars())
-        let start = col - 1
-        var end = max(line_chars, col)
+        # columns count characters; the marks count terminal cells
+        let cs = text.chars()
+        let start = width_of(cs, col - 1)
+        var end = width_of(cs, len(cs))
         if eln == ln:
-            end = max(ecol - 1, col)
+            end = width_of(cs, ecol - 1)
         let n = max(end - start, 1)
         var mark = "-"
         var mcol = c.blue()
@@ -464,7 +509,15 @@ fn edit_distance(a: str, b: str) -> int:
             d[p * w + q] = v
     return d[n * w + m]
 
-# The candidate closest to `name` (other than `name` itself), if it's close enough:
+fn no_digits(s: str) -> str:
+    var out: [str] = []
+    for c in s:
+        if not c.is_digit():
+            out.push(c)
+    return "".join(out)
+
+# The candidate closest to `name` (other than `name` itself, and other than names
+# that differ from it only in digits), if it's close enough:
 # within a third of the name's length in bytes (at least 1). A candidate that differs
 # only in ASCII case counts as distance 0. Ties go to the earliest candidate.
 fn best_match(name: str, candidates: [str]) -> Option[str]:
@@ -473,8 +526,10 @@ fn best_match(name: str, candidates: [str]) -> Option[str]:
     var best = ""
     let limit = max(len(name) / 3, 1)
     let lname = name.lower()
+    let bare = no_digits(name)
     for c in candidates:
-        if c == name:
+        # `value_09` for `value_39` is another variable, not a typo
+        if c == name or no_digits(c) == bare:
             continue
         var dist = edit_distance(name, c)
         if c.lower() == lname:
