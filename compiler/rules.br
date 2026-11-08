@@ -6,7 +6,8 @@
 #   must not be able to stop the program; `verify.br` proves that (E0607, E0611);
 # - `effects m: ...` lines, decided over the whole call graph (E0612);
 # - RULES.lock: a rule or vocabulary file that changed or went away since an
-#   owner approved it blocks the build until they approve again (E0613).
+#   owner approved it stops release builds and CI until they approve again,
+#   and warns in dev builds (E0613).
 from diag import Span, Diag, SourceMap, best_match, json_str
 import diag
 from types import CallRes, Builtin, OsOp
@@ -341,14 +342,15 @@ fn unknown_target(prog: Program, path: [str], span: Span, what: str) -> Diag:
 
 # Everything a build needs to know about the rules. `dir`: where RULES.br is;
 # `main_dir`: the main file's; `lock`: compare with RULES.lock (not for a git
-# revision).
+# revision); `strict`: changes nobody approved are errors, not warnings.
 fn analyze(
     prog: Program,
     info: ProgramInfo,
     sm: SourceMap,
     dir: str,
     main_dir: str,
-    lock: bool
+    lock: bool,
+    strict: bool
 ) -> Rules:
     let n = len(info.fns)
     var out = none_rules(n)
@@ -387,7 +389,7 @@ fn analyze(
                 )
     if rmi < 0:
         if dir != "" and lock:
-            lock_without_rules(ref out, dir)
+            lock_without_rules(ref out, dir, strict)
         return out
     let here = main_dir if main_dir != "" else "."
     if here != dir and file_exists(project.join(here, FILE)):
@@ -499,7 +501,7 @@ fn analyze(
     if len(lines) > 0:
         out.diags.extend(check_effects(prog, info, g, rmi, lines))
     if lock:
-        lock_check(ref out, prog, sm)
+        lock_check(ref out, prog, sm, strict)
     return out
 
 fn check_effects(
@@ -698,9 +700,19 @@ fn find_entry(es: [Entry], kind: str, name: str) -> Option[Entry]:
             return Some(e)
     return None
 
+# E0613: an error in release builds, in CI and for `brine rules`; a warning in
+# dev builds, so the owner can draft rules without approving every step.
+fn unapproved(strict: bool, msg: str) -> Diag:
+    if strict:
+        return diag.error("E0613", msg)
+    return diag.warning(
+        "E0613",
+        msg
+    ).note("a warning in dev builds; `--release` builds, `brine rules` and CI (`CI` set) stop here")
+
 # Compare with RULES.lock: what's approved, new, changed and removed.
 # RULES.lock without RULES.br: every approved rule is gone.
-fn lock_without_rules(ref out: Rules, dir: str):
+fn lock_without_rules(ref out: Rules, dir: str, strict: bool):
     var approved: [Entry] = []
     match read_file(project.join(dir, LOCK)):
         case Ok(t):
@@ -715,7 +727,7 @@ fn lock_without_rules(ref out: Rules, dir: str):
     let n = len(out.removed)
     let what = "1 rule" if n == 1 else f"{n} rules"
     out.diags.push(
-        diag.error("E0613", f"RULES.br is gone, and RULES.lock approves {what} it had")
+        unapproved(strict, f"RULES.br is gone, and RULES.lock approves {what} it had")
         .note(
             f"{project.join(dir, LOCK)} records what an owner approved; without RULES.br none of it is proven"
         )
@@ -724,7 +736,7 @@ fn lock_without_rules(ref out: Rules, dir: str):
         )
     )
 
-fn lock_check(ref out: Rules, prog: Program, sm: SourceMap):
+fn lock_check(ref out: Rules, prog: Program, sm: SourceMap, strict: bool):
     let rmi = module_index(prog, MODULE)
     let src = sm.file(out.file).text
     let now = entries(src, prog.modules[rmi], out.dir)
@@ -749,7 +761,7 @@ fn lock_check(ref out: Rules, prog: Program, sm: SourceMap):
                 else:
                     out.rules[ri].approval = "changed"
                     out.diags.push(
-                        diag.error("E0613", f"rule \"{name}\" changed since it was approved")
+                        unapproved(strict, f"rule \"{name}\" changed since it was approved")
                         .label(out.rules[ri].head, "not the approved version")
                         .note(why)
                         .with_help(fix)
@@ -760,7 +772,7 @@ fn lock_check(ref out: Rules, prog: Program, sm: SourceMap):
         if a.kind == "rule" and find_entry(now, "rule", a.name).is_none():
             out.removed.push(a.name)
             out.diags.push(
-                diag.error("E0613", f"approved rule \"{a.name}\" is gone from RULES.br")
+                unapproved(strict, f"approved rule \"{a.name}\" is gone from RULES.br")
                 .label(top, "RULES.br")
                 .note(why)
                 .with_help(fix)
@@ -784,7 +796,7 @@ fn lock_check(ref out: Rules, prog: Program, sm: SourceMap):
                         else f"`{e.name}` changed"
                     )
                     out.diags.push(
-                        diag.error("E0613", f"{what} since the rules were approved")
+                        unapproved(strict, f"{what} since the rules were approved")
                         .label(at, "the rules' vocabulary")
                         .note(
                             "what rules say depends on these definitions, so they're locked with the rules"
@@ -798,7 +810,7 @@ fn lock_check(ref out: Rules, prog: Program, sm: SourceMap):
         if a.kind == "file" and find_entry(now, "file", a.name).is_none():
             out.vocab.push((a.name, "removed"))
             out.diags.push(
-                diag.error("E0613", f"`{a.name}` is gone since the rules were approved")
+                unapproved(strict, f"`{a.name}` is gone since the rules were approved")
                 .label(top, "RULES.br")
                 .note(why)
                 .with_help(fix)

@@ -174,8 +174,9 @@ $ brine run
 
 ### 5. Nobody gets around a rule
 
-Say someone, or an agent, weakens the rule to make the code pass. The build
-stops until the owner approves the change:
+Say someone, or an agent, weakens the rule to make the code pass. CI and
+release builds stop until the owner approves the change (a dev build only
+warns, so the owner can draft rules):
 
 ```text
 error[E0613]: rule "a withdrawal never overdraws" changed since it was approved

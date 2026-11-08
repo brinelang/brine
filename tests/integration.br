@@ -1353,6 +1353,8 @@ test "rules are proven on every build":
     assert "Proven 4 rules from RULES.br; the 2 functions they cover can't stop the program" in ok.err, ok.err
     assert "4 rules not approved yet" in ok.err, ok.err
     # approval: then no warning, and every change to what was approved stops the build
+    let ci = {"CI": "true"}
+    let dev = {"CI": "false"}
     let a = brine(["rules", "approve", d])
     assert a.code == 0 and file_exists(d + "/RULES.lock"), a.all()
     let lock = text(d + "/RULES.lock")
@@ -1371,13 +1373,23 @@ test "rules are proven on every build":
         )
     )
     assert brine(["check", d]).code == 0
-    # weakening a rule, or the definitions it uses
+    # weakening a rule, or the definitions it uses: CI and release builds stop,
+    # dev builds warn, so the owner can draft
     write(d + "/RULES.br", PUMP_RULES.replace("0 <= d <= p.settings.max_bolus", "0 <= d"))
-    let weak = brine(["check", d, "--json"])
-    assert diag_codes(weak) == ["E0613@RULES.br:4"], weak.out
+    let weak = brine_env(["check", d, "--json"], ci)
+    assert weak.code == 1 and diag_codes(weak) == ["E0613@RULES.br:4"], weak.out
+    let draft = brine_env(["check", d, "--json"], dev)
+    assert draft.code == 0 and diag_codes(draft) == ["E0613@RULES.br:4"], draft.out
+    assert "\"severity\":\"warning\"" in draft.out, draft.out
+    let rel = brine_env(["build", "--release", d], dev)
+    assert rel.code == 1 and "error[E0613]" in rel.err, rel.all()
+    let dev_run = brine_env(["run", d], dev)
+    assert dev_run.code == 0 and "warning[E0613]" in dev_run.err, dev_run.all()
+    let rep = brine_env(["rules", d], dev)
+    assert rep.code == 1 and "release builds and CI fail" in rep.out, rep.all()
     write(d + "/RULES.br", PUMP_RULES)
     write(d + "/rules/dosing.br", PUMP_SETTINGS.replace("<= 25_000", "<= 250_000"))
-    let vocab = brine(["check", d, "--json"])
+    let vocab = brine_env(["check", d, "--json"], ci)
     assert diag_codes(vocab) == ["E0613@dosing.br:1"], vocab.out
     write(d + "/rules/dosing.br", PUMP_SETTINGS)
     # a removed rule; a new one only warns
@@ -1385,7 +1397,7 @@ test "rules are proven on every build":
         d + "/RULES.br",
         PUMP_RULES.replace("\nrule \"dosing has no effects\":\n    effects pump: none\n", "")
     )
-    let gone = brine(["check", d])
+    let gone = brine_env(["check", d], ci)
     assert (
         gone.code == 1 and "approved rule \"dosing has no effects\" is gone" in gone.err
     ), gone.all()
@@ -1393,7 +1405,7 @@ test "rules are proven on every build":
     match os.remove_file(d + "/RULES.br"):
         case _:
             pass
-    let none = brine(["check", d])
+    let none = brine_env(["check", d], ci)
     assert none.code == 1 and "E0613" in none.err and "approves 4 rules" in none.err, none.all()
     write(d + "/RULES.br", PUMP_RULES)
     write(d + "/src/RULES.br", "rule \"nothing\":\n    prove 1 == 1\n")
@@ -1446,6 +1458,27 @@ test "rules are proven on every build":
     ), js.all()
     # `brine test` doesn't run rules
     assert brine(["test", d]).code == 0
+
+test "rules next to a main file, outside a project":
+    let d = scratch("folder-rules")
+    write(
+        d + "/lib.br",
+        "fn twice(x: int) -> int:\n    if x > 1000 or x < -1000:\n        return 0\n    return 2 * x\n"
+    )
+    write(d + "/main.br", "import lib\n\nfn main():\n    print(lib.twice(2))\n")
+    write(d + "/RULES.br", "rule \"lib is pure\":\n    effects lib: none\n")
+    match os.set_cwd(d):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+    # `brine check main.br` applies them, so `brine rules approve` finds them too
+    assert "W0003" in brine(["check", "main.br"]).err
+    let a = brine(["rules", "approve"])
+    assert a.code == 0 and file_exists("RULES.lock"), a.all()
+    assert "W0003" not in brine(["check", "main.br"]).err
+    let r = brine(["rules"])
+    assert r.code == 0 and "done: yes" in r.out, r.all()
 
 test "malformed rules":
     let d = scratch("bad-rules")

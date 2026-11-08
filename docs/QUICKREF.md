@@ -751,9 +751,12 @@ rule "a sensor glitch can never crash the controller":
   and `extern` (C code); `none` allows none of them.
 * `brine rules approve` records the owner's approval in RULES.lock: a hash of
   each rule, of RULES.br's own definitions and of each file in `rules/`. An
-  approved rule or file that changes or goes away stops the build (E0613) until
-  it's approved again; a new rule only warns (W0003). Put RULES.br, `rules/` and
-  RULES.lock under CODEOWNERS, so only the owner can approve.
+  approved rule or file that changes or goes away (E0613) stops `--release`
+  builds, `brine rules` and CI (the `CI` environment variable is set, as GitHub
+  Actions and GitLab do) until it's approved again; dev builds, `check` and
+  `test` only warn, so the owner can draft rules. A new rule only warns (W0003).
+  Put RULES.br, `rules/` and RULES.lock under CODEOWNERS, so only the owner can
+  approve.
 * Imports of `rules.x` load `rules/x.br` next to RULES.br, from every module, so
   the code can use the owner's types (`Settings`) too.
 * `brine rules` lists every rule as proven or not and approved or not (`--json`

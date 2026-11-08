@@ -163,8 +163,11 @@ Right and wrong are what it says; the agent's job is code that keeps it.
 * **Approval.** `brine rules approve` writes RULES.lock: a hash (of the tokens, so
   comments and layout don't count) of each rule, of RULES.br's other definitions,
   and of each file in `rules/`, where definitions that decide what's right live.
-  An approved rule or file that changed stops the build (E0613); a new one warns
-  (W0003). The lock is what a CODEOWNERS entry protects; agents never run approve.
+  An approved rule or file that changed (E0613) stops release builds,
+  `brine rules` and CI (detected by the `CI` environment variable); dev builds,
+  `check` and `test` warn, so drafting a rule doesn't take an approval per
+  edit. A new rule warns (W0003). The lock is what a CODEOWNERS entry protects;
+  agents run approve only when the owner asked for the rule change.
   Any change counts, even one that makes a rule stronger: deciding that a change
   only strengthens a rule needs spec-diff over whole rule bodies (planned).
 * What it can't promise: termination (a rule holds whenever its code returns),
@@ -173,6 +176,13 @@ Right and wrong are what it says; the agent's job is code that keeps it.
 **[DECISION]** New rules only warn (W0003), even with no lock yet, so a project
 builds while its owner is still writing rules. Approval protects what was agreed,
 not what is being drafted.
+
+**[DECISION]** An approved rule that changed (E0613) is an error where it guards
+what ships: `--release` builds, `brine rules` (and `--receipt`) and CI, detected by
+the `CI` environment variable (anything but `""`, `0` or `false`). Dev builds,
+`check` and `test` warn, since there the owner is often the one editing the rules,
+and an approval per edit while drafting makes approving routine. CI is where
+CODEOWNERS and the lock meet, so a weakened rule still can't be merged.
 
 ### 2.3 Parallelism
 
