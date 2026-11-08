@@ -416,8 +416,11 @@ void brine_unreachable(void) {
 #define BR_NCLASS 12
 #define BR_CHUNK ((uintptr_t)1 << 16)
 #ifdef BR_WASM
-/* no address space to reserve: every block comes from malloc */
-#define BR_RESERVE BR_CHUNK
+/* no address space to reserve: chunks come from aligned_alloc, wherever it
+   puts them in linear memory, so the class table covers all of it, from
+   the first chunk up (BR_NOT_OURS: a part that isn't a chunk of ours) */
+#define BR_RESERVE ((uintptr_t)0xFFFE0000)
+#define BR_NOT_OURS 255
 #else
 #define BR_RESERVE ((uintptr_t)1 << 36)
 #endif
@@ -475,7 +478,14 @@ static void br_th_done(br_heap_th *h) { (void)h; }
 
 static int br_class_of(size_t n) { return n <= 128 ? (int)((n + 15) / 16) - 1 : 8 + (int)((n - 129) / 32); }
 static size_t br_class_size(int c) { return c < 8 ? (size_t)(c + 1) * 16 : 128 + (size_t)(c - 7) * 32; }
+#ifdef BR_WASM
+static int br_in_heap(const void *p) {
+    uintptr_t o = (uintptr_t)p - br_heap_base;
+    return o < br_heap_end - br_heap_base && br_chunk_class[o / BR_CHUNK] != BR_NOT_OURS;
+}
+#else
 static int br_in_heap(const void *p) { return (uintptr_t)p - br_heap_base < br_heap_end - br_heap_base; }
+#endif
 
 /* once, before any thread starts; without the reservation everything is malloc */
 static void br_heap_init(void) {
@@ -489,7 +499,8 @@ static void br_heap_init(void) {
     /* reservations are 64 KiB aligned */
     uintptr_t b = (uintptr_t)VirtualAlloc(NULL, BR_RESERVE, MEM_RESERVE, PAGE_NOACCESS);
 #elif defined(BR_WASM)
-    uintptr_t b = 0;
+    memset(br_chunk_class, BR_NOT_OURS, sizeof br_chunk_class);
+    uintptr_t b = BR_CHUNK;
 #else
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_NORESERVE
@@ -504,13 +515,42 @@ static void br_heap_init(void) {
     br_heap_base = b;
 }
 
+#ifdef BR_WASM
+/* Chunks are cut from regions a quarter of the heap so far: memory grown a
+   few pages at a time gets slower as it grows (an engine may copy all of
+   it each time). One thread: nothing races for these or the table. */
+static uintptr_t br_region_next, br_region_end, br_region_total;
+#endif
 static char *br_chunk_new(int c) {
+#ifdef BR_WASM
+    if (br_region_next == br_region_end) {
+        uintptr_t n = (br_region_total / 4) & ~(BR_CHUNK - 1);
+        if (n < ((uintptr_t)1 << 20)) n = (uintptr_t)1 << 20;
+        if (n > ((uintptr_t)1 << 28)) n = (uintptr_t)1 << 28;
+        void *m = aligned_alloc(BR_CHUNK, n);
+        if (!m) {
+            n = BR_CHUNK;
+            m = aligned_alloc(BR_CHUNK, n);
+        }
+        if (!m) return NULL;
+        uintptr_t r = (uintptr_t)m;
+        if (r < br_heap_base || r >= br_heap_end || n > br_heap_end - r) {
+            free(m);
+            return NULL;
+        }
+        br_region_next = r;
+        br_region_end = r + n;
+        br_region_total += n;
+    }
+    uintptr_t ch = br_region_next;
+    br_region_next += BR_CHUNK;
+#else
     uintptr_t ch = __atomic_fetch_add(&br_heap_next, BR_CHUNK, __ATOMIC_RELAXED);
     if (ch + BR_CHUNK > br_heap_end) return NULL;
+#endif
 #ifdef _WIN32
     if (!VirtualAlloc((void *)ch, BR_CHUNK, MEM_COMMIT, PAGE_READWRITE)) return NULL;
 #elif defined(BR_WASM)
-    return NULL;
 #else
     if (mprotect((void *)ch, BR_CHUNK, PROT_READ | PROT_WRITE) != 0) return NULL;
 #endif
@@ -5752,9 +5792,28 @@ static FILE *br_open(const char *path, const char *mode) {
 #endif
 }
 
-/* All of the file at `path` (malloc'd, in *buf and *len), or false with the
- * message in *err. */
-static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) {
+/* The length of the file f is open on, back at its start; -1 when seeking
+ * doesn't tell (a pipe), -2 when it can't get back to the start. */
+static int64_t br_flen(FILE *f) {
+    int64_t n = -1;
+    int back = 0;
+#ifdef _WIN32
+    if (_fseeki64(f, 0, SEEK_END) == 0) {
+        n = _ftelli64(f);
+        back = _fseeki64(f, 0, SEEK_SET);
+    }
+#else
+    if (fseeko(f, 0, SEEK_END) == 0) {
+        n = (int64_t)ftello(f);
+        back = fseeko(f, 0, SEEK_SET);
+    }
+#endif
+    return back != 0 ? -2 : n;
+}
+
+/* All of the file at `path` (malloc'd, in *buf and *len, the block's size
+ * in *capp), or false with the message in *err. */
+static bool br_slurp(brine_str *path, char **buf, size_t *len, size_t *capp, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
         *err = br_strf("cannot read a path containing a NUL byte");
@@ -5768,7 +5827,16 @@ static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) 
     }
     char *b = NULL;
     size_t n = 0, cap = 0;
-    for (;;) {
+    /* a file of known length: read into one block of that size (and a byte
+       more, for the read that finds the end), not a growing one copied
+       each time it grows. (Its length is only a hint: /proc files say 0.) */
+    int64_t flen = br_flen(f);
+    int bad = flen == -2;
+    if (flen > 0) {
+        cap = (size_t)flen + 1;
+        b = (char *)br_grow(b, cap);
+    }
+    while (!bad) {
         if (n == cap) {
             cap = cap ? cap * 2 : 65536;
             b = (char *)br_grow(b, cap);
@@ -5777,7 +5845,7 @@ static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) 
         n += got;
         if (got == 0) break;
     }
-    int bad = ferror(f);
+    if (ferror(f)) bad = 1;
     fclose(f);
     if (bad) {
         *err = br_strf("cannot read %s: read error", p);
@@ -5785,6 +5853,7 @@ static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) 
     } else {
         *buf = b;
         *len = n;
+        *capp = cap;
     }
     free(p);
     return !bad;
@@ -5792,8 +5861,8 @@ static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) 
 
 bool brine_read_file(brine_str *path, brine_str **out) {
     char *buf;
-    size_t len;
-    if (!br_slurp(path, &buf, &len, out)) return false;
+    size_t len, cap;
+    if (!br_slurp(path, &buf, &len, &cap, out)) return false;
     bool ok = br_valid_utf8((const unsigned char *)buf, (int64_t)len);
     if (ok) {
         *out = brine_str_new(buf, (int64_t)len);
@@ -5808,11 +5877,18 @@ bool brine_read_file(brine_str *path, brine_str **out) {
 
 bool brine_os_read_bytes(brine_str *path, brine_arr **out, brine_str **err) {
     char *buf;
-    size_t len;
-    if (!br_slurp(path, &buf, &len, err)) return false;
-    brine_arr *a = brine_arr_new((int64_t)len, 1, NULL, NULL, "");
-    if (len) memcpy(a->data, buf, len);
-    free(buf);
+    size_t len, cap;
+    if (!br_slurp(path, &buf, &len, &cap, err)) return false;
+    /* the array takes the block the bytes were read into: no copy, so a big
+       file is in memory once */
+    brine_arr *a = brine_arr_new(0, 1, NULL, NULL, "");
+    if (len) {
+        a->data = buf;
+        a->len = (int64_t)len;
+        a->cap = (int64_t)cap;
+    } else {
+        free(buf);
+    }
     *out = a;
     return true;
 }

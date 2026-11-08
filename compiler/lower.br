@@ -5695,7 +5695,11 @@ struct Lower:
                         if checked:
                             let loc = self.loc(span)
                             let b64 = self.cx.fb.conv(K.I64, b)
-                            return self.cx.fb.rt(kk, f"brine_{n}_{s}", [a, b64, loc])
+                            # 0 <= b < bits, unsigned
+                            let bu = self.cx.fb.conv(K.U64, b64)
+                            let ok = self.cx.fb.cmp(Op.Lt, bu, self.cx.fb.konst(K.U64, k.bits()))
+                            self.guard(ok, kk, f"brine_{n}_{s}", [a, b64, loc])
+                            return self.cx.fb.bin(Op.Shl if op == BinOp.Shl else Op.Shr, kk, a, b64)
                         return self.cx.fb.bin(Op.Shl if op == BinOp.Shl else Op.Shr, kk, a, b)
                     case _:
                         return self.cx.fb.konst(kk, 0)
@@ -6690,18 +6694,35 @@ struct Lower:
                 if k == j:
                     return v
                 let kk = int_kind(k)
-                # (the runtime module's conversions wrap, like C's)
-                if widens(j, k) or self.rt_body:
+                # (the runtime module's conversions wrap, like C's; a proven
+                # one is in range)
+                if widens(j, k) or self.rt_body or not e.checked:
                     return self.cx.fb.conv(kk, v)
                 let loc = self.loc(e.span)
                 let ks = k.suffix()
                 if j.bits() == 128:
                     return self.cx.fb.rt(kk, f"brine_conv_{ks}_from_{j.suffix()}", [v, loc])
-                if j.signed():
-                    let x = self.cx.fb.conv(K.I64, v)
-                    return self.cx.fb.rt(kk, f"brine_conv_{ks}_from_i64", [x, loc])
-                let x = self.cx.fb.conv(K.U64, v)
-                return self.cx.fb.rt(kk, f"brine_conv_{ks}_from_u64", [x, loc])
+                let sx = j.signed()
+                let x = self.cx.fb.conv(K.I64 if sx else K.U64, v)
+                if k.bits() == 128:
+                    return self.cx.fb.rt(
+                        kk,
+                        f"brine_conv_{ks}_from_{'i64' if sx else 'u64'}",
+                        [x, loc]
+                    )
+                var ok = -1
+                if sx and k.min() < 0:
+                    # lo <= x <= hi is x - lo <= hi - lo, unsigned
+                    let lo = self.cx.fb.konst(K.I64, int(k.min()))
+                    let t = self.cx.fb.conv(K.U64, self.cx.fb.bin(Op.Sub, K.I64, x, lo))
+                    ok = self.cx.fb.cmp(Op.Le, t, self.cx.fb.konst(K.U64, int(k.max() - k.min())))
+                elif sx and k.bits() == 64:
+                    ok = self.cx.fb.cmp(Op.Ge, x, self.cx.fb.konst(K.I64, 0))
+                else:
+                    let u = self.cx.fb.conv(K.U64, x) if sx else x
+                    ok = self.cx.fb.cmp(Op.Le, u, self.cx.fb.konst(K.U64, int(k.max())))
+                self.guard(ok, kk, f"brine_conv_{ks}_from_{'i64' if sx else 'u64'}", [x, loc])
+                return self.cx.fb.conv(kk, x)
             case (Ty.Int(k), Ty.Float(_)):
                 # (the runtime module's truncate, as C's do in range: its
                 # brine_x_conv_*_from_f64 are the checked ones)
@@ -7040,6 +7061,16 @@ struct Lower:
         else:
             self.register(v, ty)
         return Dom.Arr(v, ty.elem())
+
+    # A runtime check as a compare and a branch: unless `ok`, the runtime's
+    # checked form `sym(args)` (of kind k), which panics, since the check
+    # fails there.
+    fn guard(ref self, ok: int, k: K, sym: str, args: [int]):
+        let fast = self.cx.fb.label()
+        self.cx.fb.br(ok, fast)
+        self.cx.fb.rt(k, sym, args)
+        self.cx.fb.unreachable()
+        self.cx.fb.place(fast)
 
     fn panic_at(ref self, span: Span, msg: str):
         let loc = self.loc(span)

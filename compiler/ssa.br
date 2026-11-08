@@ -1151,6 +1151,76 @@ fn simplify(ref sf: SF):
         entry.extend(sf.bs[0].code)
         sf.bs[0].code = entry
 
+# `(u << s) | (u >> (w - s))`, the shifts `rotate_left` and `rotate_right`
+# lower to (or the same written out) is one rotate: `Rotl` (rol / ror).
+# Unsigned 32- and 64-bit kinds. With constant counts that add up to w, `^`
+# and `+` combine them the same way (no bits overlap); with a variable count
+# (rotate_left's `s = n & (w - 1)` and `(w - s) & (w - 1)`) only `|` does,
+# since s can be 0.
+fn rotates(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var is_c = [false] * nv
+    var cv = [0] * nv
+    var db = [-1] * nv
+    var di = [-1] * nv
+    for bi, b in enumerate(sf.bs):
+        for i, x in enumerate(b.code):
+            if x.d < 0:
+                continue
+            db[x.d] = bi
+            di[x.d] = i
+            if x.op == Op.Const and tracked(sf.f.vk[x.d]):
+                is_c[x.d] = true
+                cv[x.d] = x.n
+    for bi in 0..len(sf.bs):
+        for i in 0..len(sf.bs[bi].code):
+            let x = sf.bs[bi].code[i]
+            if x.op != Op.Or and x.op != Op.Xor and x.op != Op.Add:
+                continue
+            let k = sf.f.vk[x.d]
+            if k != K.U32 and k != K.U64:
+                continue
+            let w = k.size() * 8
+            for flip in [false, true]:
+                let p = x.b if flip else x.a
+                let q = x.a if flip else x.b
+                if db[p] < 0 or db[q] < 0:
+                    continue
+                let l = sf.bs[db[p]].code[di[p]]
+                let r = sf.bs[db[q]].code[di[q]]
+                if l.op != Op.Shl or r.op != Op.Shr or l.a != r.a or sf.f.vk[l.a] != k:
+                    continue
+                if sf.f.vk[p] != k or sf.f.vk[q] != k:
+                    continue
+                var ok = false
+                if is_c[l.b] and is_c[r.b]:
+                    ok = cv[l.b] > 0 and cv[l.b] < w and cv[l.b] + cv[r.b] == w
+                elif x.op == Op.Or:
+                    ok = (
+                        rot_pair(sf, db, di, is_c, cv, l.b, r.b, w)
+                        or rot_pair(sf, db, di, is_c, cv, r.b, l.b, w)
+                    )
+                if ok:
+                    sf.bs[bi].code[i] = mk(Op.Rotl, x.d, l.a, l.b, -1, 0)
+                    break
+
+# Is t `(w - s) & (w - 1)`?
+fn rot_pair(sf: SF, db: [int], di: [int], is_c: [bool], cv: [int], s: int, t: int, w: int) -> bool:
+    if db[t] < 0:
+        return false
+    let m = sf.bs[db[t]].code[di[t]]
+    if m.op != Op.And:
+        return false
+    var sub = -1
+    if is_c[m.b] and cv[m.b] == w - 1:
+        sub = m.a
+    elif is_c[m.a] and cv[m.a] == w - 1:
+        sub = m.b
+    if sub < 0 or db[sub] < 0:
+        return false
+    let y = sf.bs[db[sub]].code[di[sub]]
+    return y.op == Op.Sub and is_c[y.a] and cv[y.a] == w and y.b == s
+
 # Loads and stores through `p = elem q + c * n` with a constant c (field and
 # fixed-index addresses) use q and an offset instead, so the address needs no
 # register and alias analysis sees the base.
@@ -1463,6 +1533,80 @@ fn wide_halves(ref sf: SF):
                 code.push(y)
         sf.bs[b].code = code
 
+# A product of two 64-bit integers made 128-bit and only cut back to 64 bits
+# or less, as it is (the low half) or after a shift right by 64 (and maybe an
+# `& (2^64 - 1)`: the high half): a 64-bit multiplication, or a `MulHi`. Both
+# operands zero-extended (unsigned) or both sign-extended (signed).
+fn wide_muls(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var db = [-1] * nv
+    var di = [-1] * nv
+    for bi, b in enumerate(sf.bs):
+        for i, x in enumerate(b.code):
+            if x.d >= 0:
+                db[x.d] = bi
+                di[x.d] = i
+    for bi in 0..len(sf.bs):
+        var code: [Inst] = []
+        var changed = false
+        for x in sf.bs[bi].code:
+            if x.op != Op.Conv or not narrow_int(sf.f.vk[x.d]) or not sf.f.vk[x.a].is_wide():
+                code.push(x)
+                continue
+            var s = x.a
+            var hi = false
+            let y = def_of(sf, db, di, s)
+            if y.op == Op.And and y.d >= 0:
+                if wide_k(sf, db, di, y.b, -1, -1):
+                    s = y.a
+                elif wide_k(sf, db, di, y.a, -1, -1):
+                    s = y.b
+            let z = def_of(sf, db, di, s)
+            if z.op == Op.Shr and z.d >= 0 and wide_k(sf, db, di, z.b, 64, 0):
+                s = z.a
+                hi = true
+            let m = def_of(sf, db, di, s)
+            if m.op != Op.Mul or m.d < 0 or not sf.f.vk[m.d].is_wide():
+                code.push(x)
+                continue
+            let ca = def_of(sf, db, di, m.a)
+            let cb = def_of(sf, db, di, m.b)
+            if ca.op != Op.Conv or cb.op != Op.Conv or ca.d < 0 or cb.d < 0:
+                code.push(x)
+                continue
+            let ka = sf.f.vk[ca.a]
+            let kb = sf.f.vk[cb.a]
+            let k64 = K.I64 if ka.is_signed() else K.U64
+            if (ka != K.U64 and ka != K.I64) or kb != ka:
+                code.push(x)
+                continue
+            let h = len(sf.f.vk)
+            sf.f.vk.push(k64)
+            code.push(mk(Op.MulHi if hi else Op.Mul, h, ca.a, cb.a, -1, 0))
+            if sf.f.vk[x.d] == k64:
+                code.push(mk(Op.Mov, x.d, h, -1, -1, 0))
+            else:
+                code.push(mk(Op.Conv, x.d, h, -1, -1, 0))
+            changed = true
+        if changed:
+            sf.bs[bi].code = code
+
+# The instruction setting v (a `Label` for none).
+fn def_of(sf: SF, db: [int], di: [int], v: int) -> Inst:
+    if v < 0 or v >= len(db) or db[v] < 0:
+        return mk(Op.Label, -1, -1, -1, -1, 0)
+    return sf.bs[db[v]].code[di[v]]
+
+# Is v a 128-bit constant with low word lo and high word hi (-1 and -1: one
+# whose low 64 bits are all ones)?
+fn wide_k(sf: SF, db: [int], di: [int], v: int, lo: int, hi: int) -> bool:
+    let c = def_of(sf, db, di, v)
+    if c.op != Op.Const or c.d < 0 or not sf.f.vk[c.d].is_wide():
+        return false
+    if lo == -1 and hi == -1:
+        return c.n == -1
+    return c.n == lo and c.c == hi
+
 # ================================================================ memory
 
 # The slots whose address only ever serves as the address of a load, a store,
@@ -1522,11 +1666,11 @@ fn gvn_key(x: Inst, vk: [K], consts: bool) -> str:
                 let hi = x.c if vk[x.d].is_wide() else 0
                 return f"{x.op.name()}|{vk[x.d].name()}|{hi}|{x.n}"
             return ""
-        case Op.Add | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Eq | Op.Ne:
+        case Op.Add | Op.Mul | Op.MulHi | Op.And | Op.Or | Op.Xor | Op.Eq | Op.Ne:
             let a = min(x.a, x.b)
             let b = max(x.a, x.b)
             return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{a}|{b}"
-        case Op.Sub | Op.Div | Op.Rem | Op.Shl | Op.Shr | Op.Lt | Op.Le | Op.Gt | Op.Ge:
+        case Op.Sub | Op.Div | Op.Rem | Op.Shl | Op.Shr | Op.Rotl | Op.Lt | Op.Le | Op.Gt | Op.Ge:
             return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{x.a}|{x.b}"
         case Op.Neg | Op.Not | Op.Conv | Op.Bits:
             return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{x.a}"
@@ -2280,9 +2424,9 @@ fn speculatable(x: Inst, sf: SF, def_b: [int], def_i: [int]) -> bool:
     match x.op:
         case Op.Const | Op.FConst | Op.Mov | Op.Global | Op.SlotAddr | Op.Elem:
             return true
-        case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
+        case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr | Op.Rotl:
             return true
-        case Op.Neg | Op.Not | Op.Conv | Op.Bits:
+        case Op.MulHi | Op.Neg | Op.Not | Op.Conv | Op.Bits:
             return true
         # (not comparisons: a branch on one compares in place, and a hoisted
         # one is a byte kept in a register or spilled across the loop)
@@ -2430,6 +2574,211 @@ fn licm(ref sf: SF):
             pc.extend(hoisted)
             pc.push(t)
             sf.bs[pre].code = pc
+
+# ================================================================ copy on write
+
+# `brine_arr_unique(p)` (before a write into the array *p) copies the array
+# when it is shared. After it the array has one reference, *p, until
+# something could share or replace it: a call (a retain, or a function that
+# has the reference too) or a store of a pointer. A check of the same p
+# before then finds it unique: it goes. A loop with neither checks a p it
+# doesn't change once, before it, when a check runs on every trip.
+fn uniques(ref sf: SF):
+    if not any(any(is_unique(x) for x in b.code) for b in sf.bs):
+        return
+    preheaders(ref sf)
+    let key = addr_keys(sf)
+    hoist_uniques(ref sf, key)
+    drop_uniques(ref sf, key)
+
+# The same number for addresses that are the same: a copy, or a constant
+# offset from the same address. (Constants aren't shared on x86-64, so two
+# `elem p + 8` are different vregs.)
+fn addr_keys(sf: SF) -> [int]:
+    let nv = len(sf.f.vk)
+    var key = [0] * nv
+    var konst = [false] * nv
+    var kval = [0] * nv
+    for v in 0..nv:
+        key[v] = v
+    for b in sf.bs:
+        for x in b.code:
+            if x.op == Op.Const and x.d >= 0 and not sf.f.vk[x.d].is_wide():
+                konst[x.d] = true
+                kval[x.d] = x.n
+    var seen: {str: int} = {}
+    let po = postorder(sf.bs)
+    var j = len(po) - 1
+    while j >= 0:
+        for x in sf.bs[po[j]].code:
+            if x.d < 0:
+                continue
+            if x.op == Op.Mov and sf.f.vk[x.d] == K.Ptr:
+                key[x.d] = key[x.a]
+            elif x.op == Op.Elem and konst[x.b]:
+                let k = f"{key[x.a]}+{kval[x.b] * x.n}"
+                match seen.get(k):
+                    case Some(v):
+                        key[x.d] = v
+                    case None:
+                        seen[k] = x.d
+        j -= 1
+    return key
+
+fn is_unique(x: Inst) -> bool:
+    return x.op == Op.Call and x.b == 0 and x.s == "brine_arr_unique" and len(x.args) == 1
+
+# Could x share or replace an array a check made unique?
+fn shares(x: Inst, vk: [K]) -> bool:
+    match x.op:
+        case Op.Call:
+            return not is_unique(x)
+        case Op.CallInd | Op.Copy | Op.Zero:
+            return true
+        case Op.Store:
+            return vk[x.b] == K.Ptr
+        case _:
+            return false
+
+fn hoist_uniques(ref sf: SF, key: [int]):
+    var loops = find_loops(sf)
+    if len(loops) == 0:
+        return
+    let n = len(sf.bs)
+    let nv = len(sf.f.vk)
+    var def_b = [-1] * nv
+    var def_i = [-1] * nv
+    for b in 0..n:
+        for i, x in enumerate(sf.bs[b].code):
+            if x.d >= 0:
+                def_b[x.d] = b
+                def_i[x.d] = i
+    # addresses that can be read anywhere in the function: a parameter (a
+    # `ref` one, as checks only take slot addresses) or a field of one. (Not
+    # a stack slot: lower.br does the local arrays, and a slot may not be
+    # set yet where a loop starts.)
+    var root = [false] * nv
+    for v in 0..sf.f.nparams:
+        root[v] = sf.f.vk[v] == K.Ptr
+    let po = postorder(sf.bs)
+    var j = len(po) - 1
+    while j >= 0:
+        for x in sf.bs[po[j]].code:
+            if x.d < 0 or x.op == Op.Phi:
+                continue
+            if x.op == Op.Mov and root[x.a]:
+                root[x.d] = true
+            if x.op == Op.Elem and root[x.a] and def_b[x.b] >= 0:
+                if sf.bs[def_b[x.b]].code[def_i[x.b]].op == Op.Const:
+                    root[x.d] = true
+        j -= 1
+    let idom = idoms(sf.bs, po)
+    let (tin, tout) = dom_numbers(dom_children(idom))
+    # innermost first: what moves out of one can move again with the outer
+    var order: [(int, int)] = []
+    for i, lp in enumerate(loops):
+        order.push((len(lp.body), i))
+    order.sort()
+    for (_, li) in order:
+        let lp = loops[li]
+        let h = lp.header
+        var inb = [false] * n
+        for b in lp.body:
+            inb[b] = true
+        var pre = -1
+        var latches: [int] = []
+        for p in sf.bs[h].pred:
+            if inb[p]:
+                latches.push(p)
+            else:
+                pre = p
+        if pre < 0:
+            continue
+        var ok = true
+        for b in lp.body:
+            for x in sf.bs[b].code:
+                if shares(x, sf.f.vk):
+                    ok = false
+        if not ok:
+            continue
+        var ps: [int] = []
+        var ks: [int] = []
+        for b in lp.body:
+            # (a block every trip runs)
+            if not all(tin[b] <= tin[l] and tin[l] < tout[b] for l in latches):
+                continue
+            for x in sf.bs[b].code:
+                if not is_unique(x):
+                    continue
+                let p = x.args[0]
+                if root[p] and not (def_b[p] >= 0 and inb[def_b[p]]) and key[p] not in ks:
+                    ps.push(p)
+                    ks.push(key[p])
+        if len(ps) == 0:
+            continue
+        var pc = sf.bs[pre].code
+        let t = pc.pop()
+        for p in ps:
+            var c = mk(Op.Call, -1, -1, 0, -1, 0)
+            c.s = "brine_arr_unique"
+            c.args = [p]
+            pc.push(c)
+        pc.push(t)
+        sf.bs[pre].code = pc
+
+# The checks one on every path here already did.
+fn drop_uniques(ref sf: SF, key: [int]):
+    let n = len(sf.bs)
+    let po = postorder(sf.bs)
+    # the addresses (keys) whose arrays are unique at the end of each block (none:
+    # not reached yet)
+    var out: [Option[[int]]] = [None] * n
+    var changed = true
+    while changed:
+        changed = false
+        var j = len(po) - 1
+        while j >= 0:
+            let b = po[j]
+            j -= 1
+            var s = unique_in(sf, out, b)
+            for x in sf.bs[b].code:
+                if is_unique(x):
+                    if key[x.args[0]] not in s:
+                        s.push(key[x.args[0]])
+                elif shares(x, sf.f.vk):
+                    s = []
+            if out[b] != Some(s):
+                out[b] = Some(s)
+                changed = true
+    for b in 0..n:
+        var s = unique_in(sf, out, b)
+        var code: [Inst] = []
+        for x in sf.bs[b].code:
+            if is_unique(x):
+                if key[x.args[0]] in s:
+                    continue
+                s.push(key[x.args[0]])
+            elif shares(x, sf.f.vk):
+                s = []
+            code.push(x)
+        sf.bs[b].code = code
+
+# The pointers unique on entry to block b: on every path that reaches it.
+fn unique_in(sf: SF, out: [Option[[int]]], b: int) -> [int]:
+    if b == 0:
+        return []
+    var s: Option[[int]] = None
+    for p in sf.bs[b].pred:
+        match out[p]:
+            case Some(o):
+                match s:
+                    case Some(t):
+                        s = Some([v for v in t if v in o])
+                    case None:
+                        s = Some(o)
+            case None:
+                pass
+    return s.unwrap_or([])
 
 # ================================================================ out of SSA
 
@@ -2593,6 +2942,14 @@ fn from_ssa(sf0: SF) -> Func:
             while order[at] != latch[h]:
                 at += 1
             order.insert(at + 1, h)
+    # Blocks that only panic (they end in `unreachable`) go last, out of the
+    # way of the code that runs.
+    var cold = [false] * n
+    for b in 1..n:
+        cold[b] = sf.bs[b].code[len(sf.bs[b].code) - 1].op == Op.Unreachable
+    var warm = [b for b in order if not cold[b]]
+    warm.extend([b for b in order if cold[b]])
+    order = warm
     # Then chains: a block is followed by where it jumps, or by the block a
     # branch falls through to, if not placed yet, so the copies on an edge
     # (split blocks, made last) sit on the way instead of out of line. A
@@ -2611,6 +2968,8 @@ fn from_ssa(sf0: SF) -> Func:
             elif t.op == Op.Br or t.op == Op.BrNot:
                 nb = sf.lab[t.c]
             if nb >= 0 and latch[nb] >= 0 and latch[nb] != b:
+                nb = -1
+            if nb >= 0 and cold[nb] and not cold[b]:
                 nb = -1
             b = nb
     order = chained
@@ -3918,6 +4277,8 @@ fn optimize(f: Func, vw: int, a64: bool) -> (Func, [KFunc]):
     copies(ref sf)
     sccp(ref sf)
     check_ranges(ref sf)
+    # (before simplify drops the `& 63` of 64-bit shift counts)
+    rotates(ref sf)
     simplify(ref sf)
     ffold(ref sf)
     rewrites(ref sf)
@@ -3926,11 +4287,13 @@ fn optimize(f: Func, vw: int, a64: bool) -> (Func, [KFunc]):
     addressing(ref sf)
     gvn(ref sf, a64)
     copies(ref sf)
+    uniques(ref sf)
     licm(ref sf)
     gvn(ref sf, a64)
     copies(ref sf)
     bit_loads(ref sf)
     wide_halves(ref sf)
+    wide_muls(ref sf)
     # dead phis (of inlined calls' results) would hide loops' shapes
     dce(ref sf)
     # (a64.br: loop kernels of two lanes, which it makes NEON code)
