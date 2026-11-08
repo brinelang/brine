@@ -380,6 +380,35 @@ test "gdb debugs brine source":
     for w in want:
         assert w in o.out, f"gdb's output lacks {w}:\n{o.all()}"
 
+# `brine debug` breaks at `panic_stop`: a panic stops there once it is printed,
+# with the frames that led to it still on the stack.
+test "gdb stops at a panic":
+    if not gdb_ok(["--version"]):
+        return
+    let d = scratch("gdb-panic")
+    let x = exe(d + "/chain")
+    let b = brine(["build", "--debug", "tests/programs/panic_chain.br", "-q", "-o", x])
+    assert b.code == 0, b.all()
+    let o = exec(
+        [
+            "gdb",
+            "-nx",
+            "-batch",
+            "-ex",
+            "break panic_stop",
+            "-ex",
+            "run",
+            "-ex",
+            "bt",
+            "--args",
+            x,
+            "seq"
+        ],
+        {}
+    )
+    assert "panic: index 2 is out of bounds" in o.all(), o.all()
+    assert "Breakpoint 1, " in o.out and "panic_stop" in o.out, o.all()
+
 # The same under lldb on macOS, where the debug info stays in the
 # executable's __DWARF segment.
 test "lldb debugs brine source":
@@ -484,7 +513,8 @@ test "par constructs give the same results on a GPU":
         assert cpu == (["109", "113", "135"] if metal else ["109", "111", "113", "135"]), o.err
         # and says why
         for why in ["its results are strings", "it reads `m`, a map", "its results are arrays"]:
-            assert f"(not GPU-eligible: {why})" in o.err, o.err
+            # (the log may add "; deciding took ..." before the parenthesis closes)
+            assert f"(not GPU-eligible: {why}" in o.err, o.err
         if gpu_ready(o.err):
             assert gpu == (27 if metal else 59), o.err
 
@@ -500,7 +530,7 @@ test "128-bit integers give the same results on a GPU":
         # everything but the reduction can run on a GPU (on Apple's, nothing)
         let metal = os.name() == "macos"
         let why = "uses 128-bit integers" if metal else "reduces 128-bit integers"
-        assert f"(not GPU-eligible: {why})" in o.err, o.err
+        assert f"(not GPU-eligible: {why}" in o.err, o.err
         if gpu_ready(o.err) and not metal:
             assert o.err.count(" -> gpu ") == 25, o.err
 
@@ -525,6 +555,20 @@ test "a check that fails on a GPU panics as on the CPU":
         assert on.code == 101 and without_gpu_log(on.err) == off.err, f"{which}: {on.all()}"
         if gpu_ready(on.err):
             assert "a check failed on the GPU, running it on the CPU" in on.err, on.err
+
+test "GPU auto doesn't copy arrays of arrays that cost more than the work":
+    # planning the copies visits every inner array: auto mode gives up on it
+    # once it costs more than the CPU needs, and says so (v09#21)
+    let f = "tests/programs/gpu_nested.br"
+    for backend in ["native", "c"]:
+        let o = brine_env(["run", f, "-q"], {"BRINE_GPU_LOG": "1", "BRINE_BACKEND": backend})
+        assert o.code == 0 and o.out == expected(f), o.all()
+        let lines = [
+            l for l in o.err.lines() if l.starts_with("brine gpu: tests/programs/gpu_nested.br:")
+        ]
+        assert len(lines) == 4, o.err
+        let why = "copying its arrays of arrays to the GPU takes longer than running it on the CPU"
+        assert why in lines[3], o.err
 
 test "ranks take one GPU each":
     # with BRINE_GPU=auto, a second rank on a one-GPU machine stays on the CPU
@@ -581,6 +625,104 @@ test "panics are clear":
             assert (
                 msg in o.err and f"--> {f}:2:12" in o.err
             ), f"{f} {extra}: wrong panic in:\n{o.err}"
+
+test "a panic names the functions it came through":
+    # (x86-64 code only: AArch64 and the C backend print the location alone)
+    if os.arch() == "x86_64" and os.name() != "macos":
+        let f = "tests/programs/panic_chain.br"
+        let chain = (
+            "  --> tests/programs/panic_chain.br:9:12\n"
+            + "  in at (tests/programs/panic_chain.br:7)\n"
+            + "  called from fib (tests/programs/panic_chain.br:2)\n"
+            + "  called from fib (tests/programs/panic_chain.br:2), 2 more times\n"
+            + "  called from main (tests/programs/panic_chain.br:11)\n"
+        )
+        # a `par` body ends the chain: the thread that ran it varies
+        let in_par = (
+            "  in at (tests/programs/panic_chain.br:7)\n"
+            + "  called from a `par` body in main (tests/programs/panic_chain.br:11)\n"
+        )
+        for mode in ["-q", "--release"]:
+            let o = brine(["run", f, mode, "-q", "--", "seq"])
+            assert o.code == 101 and o.err.ends_with(chain), f"{mode}: {o.all()}"
+            let p = brine(["run", f, mode, "-q", "--", "par"])
+            assert p.code == 101 and p.err.ends_with(in_par), f"{mode}: {p.all()}"
+        # a stack overflow names the function that overflowed
+        let s = brine(["run", "tests/programs/panic_stack.br", "-q", "--", "100000000"])
+        let deep = "  in depth (tests/programs/panic_stack.br:3)\n  called from depth (tests/programs/panic_stack.br:3), "
+        assert s.code == 101 and deep in s.err, s.all()
+        assert s.err.ends_with(
+            " more times\n  called from main (tests/programs/panic_stack.br:8)\n"
+        ), s.all()
+
+test "brine run --json reports a panic like a build error":
+    let f = "tests/programs/panic_chain.br"
+    for backend in ["native", "c"]:
+        let o = brine_env(["run", "--json", f, "-q", "--", "seq"], {"BRINE_BACKEND": backend})
+        assert o.code == 101, o.all()
+        let ls = [l for l in o.out.lines() if l.starts_with("{")]
+        assert len(ls) == 1, o.all()
+        let j = ls[0]
+        assert j.starts_with(
+            "{\"severity\":\"error\",\"code\":null,\"message\":\"index 2 is out of bounds for an array of length 2\",\"file\":\"tests/programs/panic_chain.br\",\"line\":9,\"column\":12,"
+        ), j
+        if backend == "native" and os.arch() == "x86_64" and os.name() != "macos":
+            assert "\"notes\":[\"in at (tests/programs/panic_chain.br:7)\"," in j, j
+        # the human-readable report is still on stderr
+        assert "panic: index 2 is out of bounds" in o.err, o.all()
+    # the same fields as a build error, in the same order
+    let d = scratch("panic-json")
+    write(f"{d}/bad.br", "fn main():\n    let x: int = \"a\"\n")
+    let b = brine(["build", "--json", f"{d}/bad.br", "-q"])
+    let e = [l for l in b.out.lines() if l.starts_with("{")][0]
+    let keys = [
+        "\"severity\":",
+        "\"code\":",
+        "\"message\":",
+        "\"file\":",
+        "\"line\":",
+        "\"column\":",
+        "\"end_line\":",
+        "\"end_column\":",
+        "\"label\":",
+        "\"related\":",
+        "\"notes\":",
+        "\"help\":",
+        "\"fixes\":"
+    ]
+    let p = brine(["run", "--json", f, "-q", "--", "seq"])
+    let j = [l for l in p.out.lines() if l.starts_with("{")][0]
+    for line in [e, j]:
+        var at = 0
+        for k in keys:
+            match line.find(k, at):
+                case Some(i):
+                    at = i
+                case None:
+                    assert false, f"no {k} after byte {at} in {line}"
+
+test "an overflow shows its operands and a failed conversion its value":
+    let f = "tests/programs/panic_values.br"
+    let cases = [
+        ("add", "integer overflow in addition: 9223372036854775807 + 1"),
+        ("sub", "integer overflow in subtraction: -2147483647 - 2"),
+        ("mul", "integer overflow in multiplication: 4294967296 * 4294967296"),
+        ("small", "integer overflow in addition: 100 + 28"),
+        ("conv", "integer conversion out of range for u8: 300"),
+        ("neg", "integer conversion out of range for u64: -8"),
+        ("float", "float to integer conversion out of range (or NaN) for i32: 15000000000.0"),
+        ("wide", "integer conversion out of range for i64: 1267650600228229401496703205377")
+    ]
+    # AArch64 code still reports an overflow without its operands
+    let native = os.arch() == "x86_64"
+    for backend in ["native", "c"]:
+        for mode in ["-q", "--release"]:
+            for which, msg in cases:
+                let o = brine_env(["run", f, mode, "-q", "--", which], {"BRINE_BACKEND": backend})
+                assert o.code == 101, f"{backend} {mode} {which}: {o.all()}"
+                let ovf = msg.starts_with("integer overflow")
+                if backend == "c" or native or not ovf:
+                    assert f"panic: {msg}\n" in o.err, f"{backend} {mode} {which}: {o.all()}"
 
 test "a stack overflow is a panic":
     let f = "tests/programs/panic_stack.br"
@@ -1988,7 +2130,7 @@ test "proofs remove compound assignment checks":
     let c = d + "/count.c"
     let o = brine(["emit-c", "--release", f, "-o", c])
     assert o.code == 0, o.all()
-    assert text(c).count("brine_panic_ovf(\"addition\"") == 1, text(c)
+    assert text(c).count("brine_panic_ovf_ab(\"addition\"") == 1, text(c)
     run_ok(f, "10 70\n", [])
     # a counter goes up by at most 1 per iteration: `hits` can't overflow,
     # `big` (which starts near the top) can
@@ -2000,7 +2142,7 @@ test "proofs remove compound assignment checks":
     let gc = d + "/counter.c"
     let o2 = brine(["emit-c", "--release", g, "-o", gc])
     assert o2.code == 0, o2.all()
-    assert text(gc).count("brine_panic_ovf(\"addition\"") == 1, text(gc)
+    assert text(gc).count("brine_panic_ovf_ab(\"addition\"") == 1, text(gc)
     run_ok(g, "2 9223372036854775805\n", [])
 
 test "release builds interleave independent iterations":

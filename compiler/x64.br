@@ -144,6 +144,10 @@ struct Stub:
     a: int
     b: int
     c: int
+    # overflow: the register holding the (wrapped) result when it took a's
+    # place (a is then worked out from it and b), else -1; unsigned operands
+    r: int
+    uns: bool
 
 # What the unwind tables say about a function: where (offsets in .text) each
 # step of its prologue ends, and its epilogues.
@@ -300,6 +304,8 @@ struct X:
     xdata_sym: int
     # symbols of the overflow panic texts ("addition", ...), -1 until used
     ovf: [int]
+    # where each function starts in .text and how a panic names it
+    ftab: [(int, str)]
     # .rodata symbols of float constants, by their bits (and 1 << 64 for f32)
     fpool: {i128: int}
     # 16-byte constants (vector kernels), by "lo,hi"
@@ -891,9 +897,12 @@ struct X:
             self.b32(0)
 
     fn jcc_stub(ref self, cc: int, kind: int, a: int, b: int, c: int):
+        self.jcc_ovf(cc, kind, a, b, c, -1, false)
+
+    fn jcc_ovf(ref self, cc: int, kind: int, a: int, b: int, c: int, r: int, uns: bool):
         self.b(15)
         self.b(128 + cc)
-        self.stubs.push(Stub(at=self.pos(), kind=kind, a=a, b=b, c=c))
+        self.stubs.push(Stub(at=self.pos(), kind=kind, a=a, b=b, c=c, r=r, uns=uns))
         self.b32(0)
 
     # ------------------------------------------------------------ vregs
@@ -1827,6 +1836,9 @@ struct X:
                 self.once[x.b] = false
                 self.once[x.c] = false
             elif x.op == Op.AddO or x.op == Op.SubO or x.op == Op.MulO:
+                # (the operands, for the message)
+                self.once[x.a] = false
+                self.once[x.b] = false
                 self.once[x.c] = false
             elif x.op == Op.Call and x.b == 1 and slow_call(x.s):
                 # so does the runtime call the inline code falls back to
@@ -1949,6 +1961,7 @@ struct X:
         while len(self.o.text) % 16 != 0:
             self.o.text.push(204)
         self.sym_def(f.name, SEC_TEXT, self.pos(), f.public or f.export, true)
+        self.ftab.push((self.pos(), f.trace))
         self.u = Unw(
             start=self.pos(),
             pushes=[],
@@ -2033,18 +2046,7 @@ struct X:
             self.cpos = -1
             if s.kind == S_IDX:
                 self.ld(RAX, s.a)
-                # (b or c may be in r10 or r11 themselves)
-                let bi = self.fold[s.b] == F_NONE and self.reg[s.b] == R11
-                let cj = self.fold[s.c] == F_NONE and self.reg[s.c] == R10
-                if bi and cj:
-                    # xchg r10, r11
-                    self.rr(0, 1, 135, R10, R11)
-                elif cj:
-                    self.ld(R11, s.c)
-                    self.ld(R10, s.b)
-                else:
-                    self.ld(R10, s.b)
-                    self.ld(R11, s.c)
+                self.stub_bc(s)
                 self.call_rt(
                     "brine_panic_idx",
                     [
@@ -2054,11 +2056,23 @@ struct X:
                     ]
                 )
             else:
+                # the operands, for the message
                 let msg = self.ovf_sym(s.kind)
-                self.ld(R11, s.c)
+                if s.r >= 0:
+                    # a = r - b after an add, r + b after a subtract
+                    self.mov_rr(RAX, s.r)
+                    self.alu_v(SUB if s.kind == S_ADD else ADD, RAX, s.b)
+                else:
+                    self.ld(RAX, s.a)
+                self.stub_bc(s)
                 self.call_rt(
-                    "brine_panic_ovf",
-                    [CArg(how=A_SYM, v=msg, fl=0), CArg(how=A_REG, v=R11, fl=0)]
+                    "brine_panic_ovf_u" if s.uns else "brine_panic_ovf_ab",
+                    [
+                        CArg(how=A_SYM, v=msg, fl=0),
+                        CArg(how=A_REG, v=RAX, fl=0),
+                        CArg(how=A_REG, v=R10, fl=0),
+                        CArg(how=A_REG, v=R11, fl=0)
+                    ]
                 )
         for j in 0..len(self.jat):
             set32(ref self.o.text, self.jat[j], self.lpos[self.jlab[j]] - (self.jat[j] + 4))
@@ -2070,6 +2084,20 @@ struct X:
             self.unwind_elf()
         if self.dbg:
             self.debug_func(f)
+
+    # A stub's b to r10 and c to r11 (b or c may be in r10 or r11 themselves)
+    fn stub_bc(ref self, s: Stub):
+        let bi = self.fold[s.b] == F_NONE and self.reg[s.b] == R11
+        let cj = self.fold[s.c] == F_NONE and self.reg[s.c] == R10
+        if bi and cj:
+            # xchg r10, r11
+            self.rr(0, 1, 135, R10, R11)
+        elif cj:
+            self.ld(R11, s.c)
+            self.ld(R10, s.b)
+        else:
+            self.ld(R10, s.b)
+            self.ld(R11, s.c)
 
     # push r (op 80) / pop r (op 88)
     fn push_pop(ref self, op: int, r: int):
@@ -2196,6 +2224,7 @@ struct X:
             self.o.text.push(204)
         let start = self.pos()
         self.sym_def(name, SEC_TEXT, start, false, true)
+        self.ftab.push((start, ""))
         self.u = Unw(
             start=self.pos(),
             pushes=[],
@@ -2689,6 +2718,45 @@ struct X:
         self.rva(self.text_sym, s)
         self.rva(self.text_sym, self.pos())
         self.rva(self.xdata_sym, at)
+
+    # What a panic needs to print its call chain (runtime/rt.br, `call_chain`):
+    # `brine_frame_ptr`, which returns its caller's rbp (it has no frame of its
+    # own, so needs no unwind entry), and `brine_fn_table`: the address of
+    # .text, the number of functions, the size of .text, then for each
+    # function its offset in .text and where its name starts in the NUL-ended
+    # names after the table ("" at 0 for the runtime and generated code).
+    fn frame_table(ref self):
+        while len(self.o.text) % 16 != 0:
+            self.o.text.push(204)
+        self.sym_def("brine_frame_ptr", SEC_TEXT, self.pos(), true, true)
+        self.ftab.push((self.pos(), ""))
+        # mov rax, rbp; ret
+        self.o.text.extend([72, 137, 232, 195])
+        while len(self.o.data) % 8 != 0:
+            self.o.data.push(0)
+        self.o.data_align = max(self.o.data_align, 8)
+        let base = len(self.o.data)
+        self.sym_def("brine_fn_table", SEC_DATA, base, true, false)
+        self.o.drel.push(ORel(off=base, sym=self.text_sym, kind=R_ABS64, add=0))
+        put64(ref self.o.data, 0)
+        put64(ref self.o.data, len(self.ftab))
+        put64(ref self.o.data, len(self.o.text))
+        var names: [u8] = [0]
+        var at: {str: int} = {}
+        for (off, t) in self.ftab:
+            put32(ref self.o.data, off)
+            if t == "":
+                put32(ref self.o.data, 0)
+            else:
+                match at.get(t):
+                    case Some(n):
+                        put32(ref self.o.data, n)
+                    case None:
+                        at[t] = len(names)
+                        put32(ref self.o.data, len(names))
+                        names.extend(t.bytes())
+                        names.push(0)
+        self.o.data.extend(names)
 
     # an image-relative address in .pdata
     fn rva(ref self, sym: int, add: int):
@@ -3770,12 +3838,16 @@ struct X:
         let signed = k.is_signed()
         # in d's register, when that isn't b's or the panic's location's
         var r = self.dst(x.d)
+        # (and, for a multiply, a's: the panic message shows it)
+        let a_in_r = self.fold[x.a] == F_NONE and self.reg[x.a] == r
         if (
             (self.fold[x.b] == F_NONE and self.reg[x.b] == r)
             or (self.fold[x.c] == F_NONE and self.reg[x.c] == r)
             or x.b == x.d
+            or (kind == S_MUL and a_in_r)
         ):
             r = RAX
+        let uns = not signed and k.size() == 8
         if k.size() == 8 and signed and (kind != S_MUL or self.imm(x.b)):
             if kind == S_MUL:
                 if self.inmem(x.a):
@@ -3787,7 +3859,10 @@ struct X:
             else:
                 self.ld(r, x.a)
                 self.alu_v(ADD if kind == S_ADD else SUB, r, x.b)
-            self.jcc_stub(CC_O, kind, x.a, x.b, x.c)
+            let lost = kind != S_MUL and (
+                x.a == x.d or (self.fold[x.a] == F_NONE and self.reg[x.a] == r)
+            )
+            self.jcc_ovf(CC_O, kind, x.a, x.b, x.c, r if lost else -1, false)
             self.st(r, x.d)
             return
         if k.size() == 8:
@@ -3798,14 +3873,14 @@ struct X:
                 else:
                     let s = self.use(RCX, x.b)
                     self.rr(0, 1, 247, 4, s)
-                self.jcc_stub(CC_O, kind, x.a, x.b, x.c)
+                self.jcc_ovf(CC_O, kind, x.a, x.b, x.c, -1, uns)
             elif kind == S_MUL:
                 self.mul_rax(x.a, x.b)
-                self.jcc_stub(CC_O, kind, x.a, x.b, x.c)
+                self.jcc_ovf(CC_O, kind, x.a, x.b, x.c, -1, uns)
             else:
                 self.ld(RAX, x.a)
                 self.alu_v(ADD if kind == S_ADD else SUB, RAX, x.b)
-                self.jcc_stub(CC_O if signed else CC_B, kind, x.a, x.b, x.c)
+                self.jcc_ovf(CC_O if signed else CC_B, kind, x.a, x.b, x.c, -1, uns)
         else:
             # exact in 64 bits; overflow iff the result isn't canonical
             if kind == S_MUL:
@@ -4545,6 +4620,7 @@ fn emit(
         text_sym=0,
         xdata_sym=0,
         ovf=[-1, -1, -1],
+        ftab=[],
         fpool={},
         vpool={},
         cpu_sym=-1,
@@ -4649,6 +4725,7 @@ fn emit(
             ks.extend(fks)
     for k in ks:
         x.kernel(k)
+    x.frame_table()
     # references inside .text need no relocation
     var keep: [ORel] = []
     for r in x.o.trel:

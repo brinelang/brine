@@ -16,11 +16,14 @@ brine fmt                      # format               brine fmt --check
 brine spec-diff --base main    # which specs got weaker since a git revision
 brine run --ranks 4            # 4 cooperating processes (world module)
 brine debug file.br            # debug build in gdb/lldb: break file.br:12, step, print x
+                               # (it also stops at a panic, once it is printed)
 brine explain E0601            # explain any error code
 brine run --target wasm        # WebAssembly, run with Node.js (needs wasi-sdk, $WASI_SDK_PATH)
 brine build --target web -o d  # d/: index.html + brine.js + program.wasm, for a browser
 ```
-Add `--json` to any command for one JSON object per line. `brine fmt` leaves
+Add `--json` to any command for one JSON object per line; `brine run --json`
+also reports a panic that way, with the fields of a build error (`code` is
+`null`, the call chain is in `notes`). `brine fmt` leaves
 lines between `# fmt: off` and `# fmt: on` comments, and number tables written
 in rows that don't fit on one line, as they are.
 WebAssembly runs on one thread (`par` runs in order, same results) and as one
@@ -51,7 +54,15 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
 * Integer overflow, out-of-range conversions, division by zero and
   out-of-bounds indexing stop the program with a clear message (a *panic*),
   unless the compiler proved they can't happen, in which case the check is removed.
-  Only the first panic is reported, even when many `par` threads fail at once.
+  The message has the values involved (`integer overflow in addition:
+  9223372036854775807 + 1`, `integer conversion out of range for u8: 300`) and
+  the source location. On x86-64, the functions the panic came through follow,
+  innermost first (`in at (app.br:7)`, `called from main (app.br:11)`); a
+  small function the compiler inlined is part of its caller there. A chain
+  ends at a `par` body or task, since the thread that ran it varies.
+  Only the first panic is reported, even when many `par` threads fail at once:
+  that is the first one to fail in time, not necessarily the lowest index, so
+  which failing iteration a `par` loop reports can change from run to run.
 * Every thread, `main` included, has a 64 MB stack; recursion deeper than that
   panics with "stack overflow (recursion too deep)". `brine run` gives
   WebAssembly the same; in a browser the engine allows less (about 10,000 to
@@ -601,7 +612,8 @@ is running; the rest of the program updates them with plain ones. In `par for i`
 
 **GPUs.** `par for`, `par [...]` and `par` reductions also run on a GPU (NVIDIA
 through CUDA, Apple silicon through Metal) when the runtime expects that to be
-faster (big constructs with much work per byte copied); the results are the same
+faster (big constructs with much work per byte copied; every inner array of a
+`[[T]]` is a copy of its own, so loops over many small ones stay on the CPU); the results are the same
 bits, and a failing check panics as on the CPU. On Apple GPUs, f64 code stays on
 the CPU (they have no f64).
 Nothing to write or install beyond the driver: the compiler makes a kernel of every
@@ -613,7 +625,7 @@ use local arrays kept in the stack frame, see Arrays); on NVIDIA GPUs also
 floats, and passing them to functions). Strings, maps, other new arrays, printing,
 `sin`/`exp`/`log`/`pow` and the like keep a body on the CPU.
 `BRINE_GPU=off|on|auto` (default `auto`; `on` uses the GPU whenever it can),
-`BRINE_GPU_LOG=1` prints where each construct ran and why. With `--ranks`, the
+`BRINE_GPU_LOG=1` prints where each construct ran, why, and how long deciding took. With `--ranks`, the
 k-th rank on a machine uses its k-th GPU and the ranks beyond its GPUs stay on the
 CPU (ranks sharing a GPU queue for it); `on` shares the GPUs out instead.
 
@@ -641,6 +653,24 @@ values in a fixed tree: the same result on every rank and every run.
 Run with `brine run --ranks N` (each rank gets cores / N `par` threads unless
 `--threads` says otherwise). Without it, `world.size() == 1`. If a rank fails,
 `brine run` stops the others and exits with that rank's exit code.
+
+Across machines, start the built program once per rank yourself, with three
+environment variables (what `--ranks` sets for local ranks):
+`BRINE_RANK` (this process's rank, 0 to N - 1), `BRINE_WORLD_SIZE` (N) and
+`BRINE_PEERS`, the same comma-separated `host:port` list on every rank, entry
+`r` being where rank `r` listens:
+```sh
+brine build --release sim.br -o sim
+# on host a and host b (the same list on both):
+BRINE_RANK=0 BRINE_WORLD_SIZE=2 BRINE_PEERS=a:7000,b:7000 ./sim
+BRINE_RANK=1 BRINE_WORLD_SIZE=2 BRINE_PEERS=a:7000,b:7000 ./sim
+```
+Each rank listens on its own port (on all interfaces, unless every entry is a
+loopback address), connects to the lower ranks, retrying for 30 s while they
+start, and accepts the higher ones. The connections are plain TCP, with no
+encryption or authentication: use a trusted network. Without `brine run`
+around them, a rank that fails doesn't stop the others; they panic at their
+next `world` call with that rank, saying it stopped.
 
 **No deadlocks, by construction.** Every rank takes part in every `world` call,
 and the compiler checks that all ranks make the same calls in the same order:

@@ -125,8 +125,14 @@ struct brine_sb {
 
 /* ------------------------------------------------------------ panics */
 BR_NORETURN void brine_panic_at(const char *loc, const char *msg);
+void panic_stop(void);
+BR_NORETURN void brine_panic_conv_i(const char *msg, brine_i128 x, const char *loc);
+BR_NORETURN void brine_panic_conv_u(const char *msg, brine_u128 x, const char *loc);
+BR_NORETURN void brine_panic_conv_f(const char *msg, double x, const char *loc);
 BR_NORETURN void brine_panic_idx(int64_t i, int64_t len, const char *loc);
 BR_NORETURN void brine_panic_ovf(const char *op, const char *loc);
+BR_NORETURN void brine_panic_ovf_ab(const char *op, int64_t a, int64_t b, const char *loc);
+BR_NORETURN void brine_panic_ovf_u(const char *op, int64_t a, int64_t b, const char *loc);
 BR_NORETURN void brine_panic_str(const char *loc, brine_str *msg);
 BR_NORETURN void brine_assert_fail(const char *loc, const char *src, brine_str *msg);
 BR_NORETURN void brine_exit(int64_t code);
@@ -874,22 +880,22 @@ BR_MULO(brine_i128, i128)
     }                                                                                          \
     static inline T brine_conv_##S##_from_i64(int64_t x, const char *loc) {                    \
         T r;                                                                                   \
-        if (BR_UNLIKELY(__builtin_add_overflow(x, (int64_t)0, &r))) brine_panic_at(loc, "integer conversion out of range for " #S); \
+        if (BR_UNLIKELY(__builtin_add_overflow(x, (int64_t)0, &r))) brine_panic_conv_i("integer conversion out of range for " #S, x, loc); \
         return r;                                                                              \
     }                                                                                          \
     static inline T brine_conv_##S##_from_u64(uint64_t x, const char *loc) {                   \
         T r;                                                                                   \
-        if (BR_UNLIKELY(__builtin_add_overflow(x, (uint64_t)0, &r))) brine_panic_at(loc, "integer conversion out of range for " #S); \
+        if (BR_UNLIKELY(__builtin_add_overflow(x, (uint64_t)0, &r))) brine_panic_conv_u("integer conversion out of range for " #S, x, loc); \
         return r;                                                                              \
     }                                                                                          \
     static inline T brine_conv_##S##_from_i128(brine_i128 x, const char *loc) {                \
         T r;                                                                                   \
-        if (BR_UNLIKELY(__builtin_add_overflow(x, (brine_i128)0, &r))) brine_panic_at(loc, "integer conversion out of range for " #S); \
+        if (BR_UNLIKELY(__builtin_add_overflow(x, (brine_i128)0, &r))) brine_panic_conv_i("integer conversion out of range for " #S, x, loc); \
         return r;                                                                              \
     }                                                                                          \
     static inline T brine_conv_##S##_from_u128(brine_u128 x, const char *loc) {                \
         T r;                                                                                   \
-        if (BR_UNLIKELY(__builtin_add_overflow(x, (brine_u128)0, &r))) brine_panic_at(loc, "integer conversion out of range for " #S); \
+        if (BR_UNLIKELY(__builtin_add_overflow(x, (brine_u128)0, &r))) brine_panic_conv_u("integer conversion out of range for " #S, x, loc); \
         return r;                                                                              \
     }
 
@@ -924,7 +930,7 @@ BR_MULO(brine_i128, i128)
     }                                                                                          \
     static inline T brine_conv_##S##_from_f64(double x, const char *loc) {                     \
         if (BR_UNLIKELY(!(x >= (double)MIN && x < (double)MAX + 1.0)))                         \
-            brine_panic_at(loc, "float to integer conversion out of range (or NaN) for " #S);   \
+            brine_panic_conv_f("float to integer conversion out of range (or NaN) for " #S, x, loc); \
         return (T)x;                                                                           \
     }
 
@@ -946,7 +952,7 @@ BR_MULO(brine_i128, i128)
     }                                                                                          \
     static inline T brine_conv_##S##_from_f64(double x, const char *loc) {                     \
         if (BR_UNLIKELY(!(x >= 0.0 && x < (double)MAX + 1.0)))                                 \
-            brine_panic_at(loc, "float to integer conversion out of range (or NaN) for " #S);   \
+            brine_panic_conv_f("float to integer conversion out of range (or NaN) for " #S, x, loc); \
         return (T)x;                                                                           \
     }
 

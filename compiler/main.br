@@ -821,11 +821,21 @@ fn spawn_env(threads: Option[str]) -> {str: str}:
     return env
 
 # `launch` is the program (or the WebAssembly runner and the module).
-fn run_exe(launch: [str], argv: [str], threads: Option[str], ranks: int) -> Result[int, str]:
+# `panics`, if not "": where a rank writes its panic (`panic_file`).
+fn run_exe(
+    launch: [str],
+    argv: [str],
+    threads: Option[str],
+    ranks: int,
+    panics: str
+) -> Result[int, str]:
     var cmd = launch
     cmd.extend(argv)
     if ranks <= 1:
-        match os.spawn(cmd, spawn_env(threads), false, true):
+        var env = spawn_env(threads)
+        if panics != "":
+            env["BRINE_PANIC_FILE"] = panic_file(panics, 0, 1)
+        match os.spawn(cmd, env, false, true):
             case Ok(p):
                 return Ok(os.wait(p))
             case Err(e):
@@ -847,6 +857,8 @@ fn run_exe(launch: [str], argv: [str], threads: Option[str], ranks: int) -> Resu
         env["BRINE_RANK"] = f"{r}"
         env["BRINE_WORLD_SIZE"] = f"{ranks}"
         env["BRINE_PEERS"] = peers
+        if panics != "":
+            env["BRINE_PANIC_FILE"] = panic_file(panics, r, ranks)
         match os.spawn(cmd, env, false, r == 0):
             case Ok(p):
                 kids.push(p)
@@ -941,13 +953,65 @@ fn cmd_run(g: G, a: Args) -> Result[int, str]:
         let extra = f" ({ranks} ranks)" if ranks > 1 else ""
         let verb = "Running"
         eprint(f"{c.bold()}{c.green()}{verb:>10}{c.reset()} {display_path(exe)}{extra}")
-    let code = run_exe(launch, argv, a.val("--threads"), ranks)?
+    # with --json, a panic is reported as a diagnostic too
+    var panics = ""
+    if g.json and not plat.is_wasm():
+        # (the build made the cache folder)
+        panics = project.join(t.cache_dir(), f"panic-{os.pid()}")
+    let code = run_exe(launch, argv, a.val("--threads"), ranks, panics)?
+    if panics != "":
+        for r in 0..ranks:
+            let f = panic_file(panics, r, ranks)
+            match read_file(f):
+                case Ok(rec):
+                    let (d, sm) = panic_diag(rec, r if ranks > 1 else -1)
+                    print(diag.to_json(d, sm))
+                    match os.remove_file(f):
+                        case _:
+                            pass
+                case Err(_):
+                    pass
     match crash_reason(code):
         case Some(why):
             g.error(f"the program crashed ({why})")
         case None:
             pass
     return Ok(code)
+
+fn panic_file(base: str, rank: int, ranks: int) -> str:
+    return base if ranks <= 1 else f"{base}.{rank}"
+
+# The panic a program wrote (runtime/rt.br, `panic_record`: the location, a
+# NUL, the message, a NUL, then the call chain) as a diagnostic, its primary
+# span where it happened when that file can be read.
+fn panic_diag(rec: str, rank: int) -> (Diag, SourceMap):
+    let parts = rec.split("\0")
+    let loc = parts[0] if len(parts) > 0 else ""
+    # an assertion's own message is on the lines after the first
+    let msg = (parts[1] if len(parts) > 1 else "the program panicked").lines()
+    var d = diag.error("", msg[0] if len(msg) > 0 else "the program panicked")
+    for m in msg[1:]:
+        d = d.note(m.strip())
+    var sm = SourceMap.new()
+    # `file:line:column` (the file may have colons too)
+    let bits = loc.split(":")
+    let n = len(bits)
+    if n >= 3:
+        let path = ":".join(bits[:n - 2])
+        match (parse_int(bits[n - 2]), parse_int(bits[n - 1]), read_file(path)):
+            case (Some(line), Some(col), Ok(text)):
+                let fi = sm.add(path, text)
+                let off = sm.files[fi].offset_of(line, col)
+                d = d.label(diag.Span(file=fi, lo=off, hi=off), "panicked here")
+            case _:
+                pass
+    if rank >= 0:
+        d = d.note(f"on rank {rank}")
+    if len(parts) > 2:
+        for l in parts[2].lines():
+            if l.strip() != "":
+                d = d.note(l.strip())
+    return (d, sm)
 
 # A plain unsigned decimal number (no sign, no spaces).
 fn parse_int(s: str) -> Option[int]:
@@ -1000,11 +1064,12 @@ fn cmd_debug(g: G, a: Args) -> Result[int, str]:
             cmd.extend(["-x", py])
         else:
             cmd.extend(["-ex", "skip -gfi */brine_rt.c", "-ex", "skip -gfi */brine_rt.h"])
-        cmd.extend(["--args", exe])
+        # stop at a panic, once it is printed, with the frames that led to it
+        cmd.extend(["-ex", "break panic_stop", "--args", exe])
     else:
         # don't step into the C runtime
         let avoid = "settings set target.process.thread.step-avoid-regexp ^(brine_|br_)"
-        cmd.extend(["-O", avoid, "--", exe])
+        cmd.extend(["-O", avoid, "-O", "breakpoint set -n panic_stop", "--", exe])
     cmd.extend(a.rest)
     match os.spawn(cmd, {}, false, true):
         case Ok(p):
