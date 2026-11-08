@@ -125,6 +125,7 @@ struct brine_sb {
 
 /* ------------------------------------------------------------ panics */
 BR_NORETURN void brine_panic_at(const char *loc, const char *msg);
+void panic_stop(void);
 BR_NORETURN void brine_panic_conv_i(const char *msg, brine_i128 x, const char *loc);
 BR_NORETURN void brine_panic_conv_u(const char *msg, brine_u128 x, const char *loc);
 BR_NORETURN void brine_panic_conv_f(const char *msg, double x, const char *loc);

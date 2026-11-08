@@ -14972,9 +14972,12 @@ fn panic_text_cold(loc: ptr, msg: str):
         stderr_text(f"\npanic (rank {brine_world_rank()}): {msg}\n  --> {c_text(loc)}\n")
     else:
         stderr_text(f"\npanic: {msg}\n  --> {c_text(loc)}\n")
-    call_chain(frame_ptr(), u64(0))
+    let fp = frame_ptr()
+    call_chain(fp, u64(0), os_stdio(2))
     fflush(os_stdio(2))
     unlock(io_mu())
+    panic_record(c_text(loc), msg, fp, u64(0))
+    panic_stop()
     brine_x_gpu_settle()
     exit(i32(101))
 
@@ -15022,7 +15025,7 @@ fn frame_at(a: u64) -> int:
 # at fp (and, when pc isn't 0, the function at pc, which may not have set up
 # its frame yet). A `par` body or task ends it, since which thread ran it, and
 # so what called it, varies from run to run.
-fn call_chain(fp0: ptr, pc: u64):
+fn call_chain(fp0: ptr, pc: u64, out: ptr):
     if addr(fp0) == u64(0):
         return
     var lines = 0
@@ -15050,17 +15053,17 @@ fn call_chain(fp0: ptr, pc: u64):
             same += 1
         elif at > 0:
             if same > 0:
-                chain_again(last, same)
+                chain_again(last, same, out)
                 lines += 1
                 same = 0
             if lines >= 20:
-                stderr_text("  ...\n")
+                file_text(out, "  ...\n")
                 return
             let name = c_text(null_ptr() + at)
             if lines == 0:
-                stderr_text(f"  in {name}\n")
+                file_text(out, f"  in {name}\n")
             else:
-                stderr_text(f"  called from {name}\n")
+                file_text(out, f"  called from {name}\n")
             lines += 1
             last = at
             if name.starts_with("a `par` body in ") or name.starts_with("a task in "):
@@ -15068,15 +15071,42 @@ fn call_chain(fp0: ptr, pc: u64):
         if fp == u64(0):
             break
     if same > 0:
-        chain_again(last, same)
+        chain_again(last, same, out)
 
 # the function at `at` called itself n more times
-fn chain_again(at: int, n: int):
+fn chain_again(at: int, n: int, out: ptr):
     let name = c_text(null_ptr() + at)
     if n == 1:
-        stderr_text(f"  called from {name}, 1 more time\n")
+        file_text(out, f"  called from {name}, 1 more time\n")
     else:
-        stderr_text(f"  called from {name}, {n} more times\n")
+        file_text(out, f"  called from {name}, {n} more times\n")
+
+fn file_text(f: ptr, s: str):
+    let p = ptr_of(s)
+    fwrite(p + STR_DATA, u64(1), load_u64(p, STR_LEN), f)
+
+# `brine run --json` reads the panic from the file BRINE_PANIC_FILE names:
+# its location, a NUL, its message, a NUL, then its call chain's lines.
+fn panic_record(loc: str, msg: str, fp: ptr, pc: u64):
+    let path = getenv(lit("BRINE_PANIC_FILE"))
+    if addr(path) == u64(0):
+        return
+    let f = os_fopen(path, "wb")
+    if addr(f) == u64(0):
+        return
+    let nul = stack_mem(8)
+    store_u8(nul, 0, u8(0))
+    file_text(f, loc)
+    fwrite(nul, u64(1), u64(1), f)
+    file_text(f, msg)
+    fwrite(nul, u64(1), u64(1), f)
+    call_chain(fp, pc, f)
+    fclose(f)
+
+# `brine debug` stops here: the panic is printed, and the stack still has
+# the frames that led to it
+fn panic_stop():
+    pass
 
 fn brine_panic_at(loc: ptr, msg: ptr):
     panic_text_cold(loc, c_text(msg))
@@ -15140,8 +15170,10 @@ fn stack_overflow(fp: u64, pc: u64):
     else:
         stderr_text("\npanic: stack overflow (recursion too deep)\n")
     # (pc + 1: the fault may be at a function's first byte)
-    call_chain(null_ptr() + int(fp), pc + u64(1))
+    call_chain(null_ptr() + int(fp), pc + u64(1), os_stdio(2))
     fflush(os_stdio(2))
+    panic_record("", "stack overflow (recursion too deep)", null_ptr() + int(fp), pc + u64(1))
+    panic_stop()
     _exit(i32(101))
 
 fn brine_x_on_exception(e: ptr) -> i32:

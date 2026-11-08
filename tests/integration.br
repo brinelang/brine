@@ -376,6 +376,35 @@ test "gdb debugs brine source":
     for w in want:
         assert w in o.out, f"gdb's output lacks {w}:\n{o.all()}"
 
+# `brine debug` breaks at `panic_stop`: a panic stops there once it is printed,
+# with the frames that led to it still on the stack.
+test "gdb stops at a panic":
+    if not gdb_ok(["--version"]):
+        return
+    let d = scratch("gdb-panic")
+    let x = exe(d + "/chain")
+    let b = brine(["build", "--debug", "tests/programs/panic_chain.br", "-q", "-o", x])
+    assert b.code == 0, b.all()
+    let o = exec(
+        [
+            "gdb",
+            "-nx",
+            "-batch",
+            "-ex",
+            "break panic_stop",
+            "-ex",
+            "run",
+            "-ex",
+            "bt",
+            "--args",
+            x,
+            "seq"
+        ],
+        {}
+    )
+    assert "panic: index 2 is out of bounds" in o.all(), o.all()
+    assert "Breakpoint 1, " in o.out and "panic_stop" in o.out, o.all()
+
 # The same under lldb on macOS, where the debug info stays in the
 # executable's __DWARF segment.
 test "lldb debugs brine source":
@@ -606,6 +635,52 @@ test "a panic names the functions it came through":
         assert s.err.ends_with(
             " more times\n  called from main (tests/programs/panic_stack.br:8)\n"
         ), s.all()
+
+test "brine run --json reports a panic like a build error":
+    let f = "tests/programs/panic_chain.br"
+    for backend in ["native", "c"]:
+        let o = brine_env(["run", "--json", f, "-q", "--", "seq"], {"BRINE_BACKEND": backend})
+        assert o.code == 101, o.all()
+        let ls = [l for l in o.out.lines() if l.starts_with("{")]
+        assert len(ls) == 1, o.all()
+        let j = ls[0]
+        assert j.starts_with(
+            "{\"severity\":\"error\",\"code\":null,\"message\":\"index 2 is out of bounds for an array of length 2\",\"file\":\"tests/programs/panic_chain.br\",\"line\":9,\"column\":12,"
+        ), j
+        if backend == "native" and os.arch() == "x86_64" and os.name() != "macos":
+            assert "\"notes\":[\"in at (tests/programs/panic_chain.br:7)\"," in j, j
+        # the human-readable report is still on stderr
+        assert "panic: index 2 is out of bounds" in o.err, o.all()
+    # the same fields as a build error, in the same order
+    let d = scratch("panic-json")
+    write(f"{d}/bad.br", "fn main():\n    let x: int = \"a\"\n")
+    let b = brine(["build", "--json", f"{d}/bad.br", "-q"])
+    let e = [l for l in b.out.lines() if l.starts_with("{")][0]
+    let keys = [
+        "\"severity\":",
+        "\"code\":",
+        "\"message\":",
+        "\"file\":",
+        "\"line\":",
+        "\"column\":",
+        "\"end_line\":",
+        "\"end_column\":",
+        "\"label\":",
+        "\"related\":",
+        "\"notes\":",
+        "\"help\":",
+        "\"fixes\":"
+    ]
+    let p = brine(["run", "--json", f, "-q", "--", "seq"])
+    let j = [l for l in p.out.lines() if l.starts_with("{")][0]
+    for line in [e, j]:
+        var at = 0
+        for k in keys:
+            match line.find(k, at):
+                case Some(i):
+                    at = i
+                case None:
+                    assert false, f"no {k} after byte {at} in {line}"
 
 test "an overflow shows its operands and a failed conversion its value":
     let f = "tests/programs/panic_values.br"

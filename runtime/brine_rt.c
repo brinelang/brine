@@ -270,6 +270,10 @@ static void br_panic_claim(void) {
 }
 
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
+/* `brine debug` stops here: the panic is printed, the frames that led to it
+ * are still there */
+__attribute__((noinline)) void panic_stop(void) { __asm__ volatile(""); }
+
 void brine_panic_at(const char *loc, const char *msg) {
     br_panic_claim();
     /* under the output lock, so other threads' output (the GPU log) can't
@@ -282,6 +286,15 @@ void brine_panic_at(const char *loc, const char *msg) {
         fprintf(stderr, "\npanic: %s\n  --> %s\n", msg, loc);
     fflush(stderr);
     BR_IO_UNLOCK();
+    /* for `brine run --json`: the location, a NUL, the message, a NUL */
+    const char *rec = getenv("BRINE_PANIC_FILE");
+    FILE *rf = rec ? fopen(rec, "wb") : NULL;
+    if (rf) {
+        fwrite(loc, 1, strlen(loc) + 1, rf);
+        fwrite(msg, 1, strlen(msg) + 1, rf);
+        fclose(rf);
+    }
+    panic_stop();
     br_gpu_settle();
     exit(101);
 }

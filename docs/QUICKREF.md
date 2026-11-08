@@ -16,11 +16,14 @@ brine fmt                      # format               brine fmt --check
 brine spec-diff --base main    # which specs got weaker since a git revision
 brine run --ranks 4            # 4 cooperating processes (world module)
 brine debug file.br            # debug build in gdb/lldb: break file.br:12, step, print x
+                               # (it also stops at a panic, once it is printed)
 brine explain E0601            # explain any error code
 brine run --target wasm        # WebAssembly, run with Node.js (needs wasi-sdk, $WASI_SDK_PATH)
 brine build --target web -o d  # d/: index.html + brine.js + program.wasm, for a browser
 ```
-Add `--json` to any command for one JSON object per line. `brine fmt` leaves
+Add `--json` to any command for one JSON object per line; `brine run --json`
+also reports a panic that way, with the fields of a build error (`code` is
+`null`, the call chain is in `notes`). `brine fmt` leaves
 lines between `# fmt: off` and `# fmt: on` comments, and number tables written
 in rows that don't fit on one line, as they are.
 WebAssembly runs on one thread (`par` runs in order, same results) and as one
