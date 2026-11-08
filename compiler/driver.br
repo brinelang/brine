@@ -53,25 +53,32 @@ struct Frontend:
 fn has_errors(ds: [Diag]) -> bool:
     return any(d.is_error() for d in ds)
 
-# Reads a source file with line endings normalized, so spans and output are
-# the same on every OS.
+# Reads a source file with line endings normalized and without a byte order
+# mark, so spans and output are the same on every OS and in every editor.
 fn read_source(path: str) -> Result[str, str]:
     match read_file(path):
         case Ok(text):
-            return Ok(text.replace("\r\n", "\n"))
+            return Ok(strip_bom(text.replace("\r\n", "\n")))
         case Err(e):
             # read_file's message already names the file
             return Err(e)
 
+# Notepad and others may start a UTF-8 file with a byte order mark
+fn strip_bom(text: str) -> str:
+    return text[3:] if text.starts_with("\u{FEFF}") else text
+
 # Where `load` reads a program from: the files on disk, or (`rev`) the files
 # as they are in a git revision. `extra` is more source for a module, by module
-# name: `brine spec-diff` adds functions to a program this way.
+# name: `brine spec-diff` adds functions to a program this way. `also` are
+# more modules (import paths) to load as if the main file imported them:
+# `brine check` checks a project's every file this way.
 struct Source:
     rev: Option[str]
     extra: {str: str}
+    also: [[str]]
 
 fn on_disk() -> Source:
-    return Source(rev=None, extra={})
+    return Source(rev=None, extra={}, also=[])
 
 fn read_at(path: str, rev: Option[str]) -> Result[str, str]:
     match rev:
@@ -96,7 +103,7 @@ fn read_at(path: str, rev: Option[str]) -> Result[str, str]:
                         return Err(
                             f"could not read `{display_path(path)}` from git revision `{r}`: {why}"
                         )
-                    return Ok(out.replace("\r\n", "\n"))
+                    return Ok(strip_bom(out.replace("\r\n", "\n")))
                 case Err(e):
                     return Err(f"could not run git: {e}")
 
@@ -310,6 +317,21 @@ fn load_from(entry: str, at: Source, ref sm: SourceMap, ref diags: [Diag]) -> Op
                         found.push(Found(name=name, src=None, file=prog.modules[i].file))
             prog.import_targets.push(targets)
             i += 1
+            if i == 1:
+                # after the main file's own imports, so they keep their numbers
+                for path in at.also:
+                    let name = module_name(path)
+                    if name in by_name:
+                        continue
+                    let p = module_file(root, path)
+                    match read_at(p, at.rev):
+                        case Ok(src):
+                            by_name[name] = first_new + len(found)
+                            found.push(
+                                Found(name=name, src=Some(src), file=sm.add(display_path(p), src))
+                            )
+                        case Err(e):
+                            diags.push(diag.error("E0701", e))
         let parsed = par [parse_found(f) for f in found]
         for pm in parsed:
             diags.extend(pm.1)
@@ -362,7 +384,10 @@ fn not_found(name: str, path: [str], span: Span, root: str, p: str) -> Diag:
 
 struct FrontOpts:
     verify: bool
+    # E0703 without a `main`
     need_main: bool
+    # E0706 for a `main` that can't start a program
+    check_main: bool
     # require a written type on every variable
     typed: bool
     # every runtime check must be proven away (E0607)
@@ -429,20 +454,20 @@ fn frontend_at(entry: str, opts: FrontOpts, at: Source) -> Frontend:
     diags.extend(ck.diags)
     t = phase_time(t, "check")
     let info = ck.info
-    if opts.need_main and not has_errors(diags):
+    if (opts.need_main or opts.check_main) and not has_errors(diags):
         let m = prog.modules[prog.main_module]
         var found = -1
         for i, f in enumerate(m.fns):
             if f.name == "main" and f.method_of.is_none():
                 found = i
                 break
-        if found < 0:
+        if found < 0 and opts.need_main:
             diags.push(
                 diag.error("E0703", "this program has no `main` function")
                 .label(Span(file=m.file, lo=0, hi=0), "add `fn main():` here")
                 .with_help("every program starts at `fn main():` in its main file")
             )
-        else:
+        elif found >= 0:
             let f = m.fns[found]
             if len(f.tparams) > 0 or not main_ok(info, f.id):
                 diags.push(
@@ -657,10 +682,20 @@ fn no_cc_diag() -> Diag:
         hint = "install one with `winget install LLVM.LLVM` or `scoop install mingw-winlibs`, or set BRINE_CC"
     elif os.name() == "macos":
         hint = "install one with `xcode-select --install`, or set BRINE_CC"
+    if getenv("BRINE_BACKEND").unwrap_or("") == "c" and native_host():
+        # the C backend was asked for: brine needs no C compiler without it
+        return (
+            diag.error("E0702", "no C compiler found")
+            .note("`BRINE_BACKEND=c` builds through C, with the system C compiler")
+            .with_help(
+                "unset BRINE_BACKEND to build native code, which needs no C compiler here; or "
+                + hint
+            )
+        )
     return (
-        diag.error("E0702", "no C compiler found")
-        .note("brine generates C and uses the system C compiler to produce native code")
-        .with_help(hint)
+        diag.error("E0702", "no C compiler found").note(
+            f"brine makes native code itself only on x86-64 and arm64; on {os.name()} {os.arch()} it builds through C"
+        ).with_help(hint)
     )
 
 # 64-bit FNV-1a.
@@ -750,29 +785,28 @@ fn make_dirs(d: str) -> Result[(), Diag]:
         case Err(e):
             return Err(diag.error("E0704", f"cannot create `{d}`: {e}"))
 
-# Windows can't overwrite a running executable, but it can rename one, so
-# `brine build compiler/main.br -o brine` moves the running brine aside first.
-fn move_self_aside(out: str):
+# Windows can't overwrite a running executable, but it can rename one, so an
+# old build (a program still running, or brine rebuilding itself) is moved to
+# `<out>.old` first. True if it was moved.
+fn move_aside(out: str) -> bool:
     if os.name() != "windows" or not file_exists(out):
-        return
-    match os.abs_path(out):
-        case Ok(p):
-            if same_path(p, os.exe_path()):
-                let old = out + ".old"
-                # (a brine.exe.old that is still running stays; then so does this one)
-                match os.remove_file(old):
-                    case _:
-                        pass
-                match os.rename(out, old):
-                    case _:
-                        pass
-        case Err(_):
+        return false
+    let old = out + ".old"
+    # (an older one that is still running stays; then so does this one, and
+    # writing it fails as before)
+    match os.remove_file(old):
+        case _:
             pass
+    return os.rename(out, old).is_ok()
+
+# A link that failed puts the old build back.
+fn move_back(out: str, moved: bool):
+    if moved and not file_exists(out):
+        match os.rename(out + ".old", out):
+            case _:
+                pass
 
 # (abs_path's Windows paths start with `\\?\`)
-fn same_path(a: str, b: str) -> bool:
-    return plain_path(a) == plain_path(b)
-
 fn plain_path(p: str) -> str:
     let s = p.replace("/", "\\").lower()
     return s[4:] if s.starts_with("\\\\?\\") else s
@@ -974,14 +1008,11 @@ fn compile_levels(
         case Code.Native(_):
             panic("compile links native objects itself")
     let prog_hash = fnv(" ".join(hashes) + rt_obj)
-    # a web folder is what gets deployed: keep the stamp out of it
-    var stamp = with_extension(out_exe, "brine-hash")
-    if plat == Platform.Web:
-        stamp = project.join(dir, f"web-{hex16(fnv(out_exe))}.brine-hash")
+    let stamp = stamp_path(out_exe, dir)
     if file_exists(out_exe):
         match read_file(stamp):
             case Ok(st):
-                if st.strip() == hex16(prog_hash):
+                if st.strip() == f"{hex16(prog_hash)} {file_hash(out_exe)}":
                     if plat == Platform.Web:
                         web_files(dest)?
                     return Ok(false)
@@ -1044,19 +1075,35 @@ fn compile_levels(
     link.extend(objs)
     link.extend([rt_obj, "-o", out_exe])
     link.extend(libs)
-    move_self_aside(out_exe)
+    let moved = move_aside(out_exe)
     match run_cc(link):
         case Ok(_):
             pass
         case Err(e):
+            move_back(out_exe, moved)
             return Err(cc_failed("linking the program failed", e, out_exe))
     phase_time(t, "link")
     if plat == Platform.Web:
         web_files(dest)?
-    match write_file(stamp, hex16(prog_hash)):
+    match write_file(stamp, f"{hex16(prog_hash)} {file_hash(out_exe)}"):
         case _:
             pass
     return Ok(true)
+
+# Where the hash of what an executable was built from is kept, to skip an
+# unchanged link: in the cache directory, not next to the executable, which
+# `-o` can put anywhere (and a web folder is what gets deployed). It holds the
+# hash of the executable too, since another brine may have replaced it since.
+fn stamp_path(out_exe: str, dir: str) -> str:
+    let abs = os.abs_path(out_exe).unwrap_or(out_exe)
+    return project.join(dir, f"out-{hex16(fnv(abs))}.brine-hash")
+
+fn file_hash(p: str) -> str:
+    match os.read_bytes(p):
+        case Ok(b):
+            return hex16(fnv_bytes(b))
+        case Err(_):
+            return "none"
 
 # Links a native object into an executable with brine's own linker: no C
 # compiler involved. Ok(true) if the executable changed.
@@ -1075,15 +1122,10 @@ fn link_native(o: ObjFile, out_exe: str) -> Result[bool, Diag]:
             b = x
         case Err(e):
             return Err(cc_failed("linking the program failed", e, ""))
-    let h = hex16(fnv_bytes(b))
-    let stamp = with_extension(out_exe, "brine-hash")
-    if file_exists(out_exe):
-        match read_file(stamp):
-            case Ok(st):
-                if st.strip() == h:
-                    return Ok(false)
-            case Err(_):
-                pass
+    # an executable that already has these bytes is left alone (and keeps its
+    # time), whoever wrote it
+    if file_exists(out_exe) and file_hash(out_exe) == hex16(fnv_bytes(b)):
+        return Ok(false)
     match project.parent(out_exe):
         case Some(d):
             if d != "":
@@ -1100,7 +1142,7 @@ fn link_native(o: ObjFile, out_exe: str) -> Result[bool, Diag]:
             return Err(io_diag(e))
     if os.name() != "windows" and not runs_ok(["chmod", "+x", tmp]):
         return Err(diag.error("E0704", f"cannot make `{display_path(out_exe)}` executable"))
-    move_self_aside(out_exe)
+    let moved = move_aside(out_exe)
     match os.rename(tmp, out_exe):
         case Ok(_):
             pass
@@ -1108,15 +1150,13 @@ fn link_native(o: ObjFile, out_exe: str) -> Result[bool, Diag]:
             match os.remove_file(tmp):
                 case _:
                     pass
+            move_back(out_exe, moved)
             return Err(
                 diag.error("E0704", f"cannot write `{display_path(out_exe)}`").note(e).with_help(
                     "is the program still running? Stop it and build again, or build somewhere else with `-o`"
                 )
             )
     phase_time(t, "link")
-    match write_file(stamp, h):
-        case _:
-            pass
     return Ok(true)
 
 # The loader is ours and always current; the page is a starting point that
@@ -1159,6 +1199,190 @@ fn prune(obj_dir: str, keep: [str]):
             match os.remove_file(p):
                 case _:
                     pass
+
+# ---------------------------------------------------------------- the cache
+
+# A cache directory (brine-cache in the temp directory for files outside a
+# project, a project's target/cache) keeps what every build made, so it is
+# pruned (v09#25). Each build adds lines to its `uses.log`: `<entry> -` when
+# it starts using an entry and `<entry> <bytes>` when it is done. When the
+# entries listed add up to more than BRINE_CACHE_SIZE, the least recently used
+# lose their files (brine can't remove folders; empty ones cost nothing).
+# What the log doesn't list, such as what an older brine made, stays.
+const CACHE_LOG = "uses.log"
+
+const CACHE_DEFAULT = 2 * 1024 * 1024 * 1024
+
+# lines added between rewrites of the log, which keep one line per entry
+const CACHE_SLACK = 256
+
+# BRINE_CACHE_SIZE in bytes: `500M`, `2G`, `1T` or a number of bytes; 0 (or
+# `off`) for no limit. Unset or unreadable: 2G.
+fn cache_cap() -> int:
+    match getenv("BRINE_CACHE_SIZE"):
+        case Some(v):
+            return parse_size(v).unwrap_or(CACHE_DEFAULT)
+        case None:
+            return CACHE_DEFAULT
+
+fn parse_size(v: str) -> Option[int]:
+    var s = v.strip().upper()
+    if s == "OFF":
+        return Some(0)
+    if s.ends_with("B"):
+        s = s[:len(s) - 1]
+    var mult = 1
+    for suffix, m in [("K", 1 << 10), ("M", 1 << 20), ("G", 1 << 30), ("T", 1 << 40)]:
+        if s.ends_with(suffix):
+            mult = m
+            s = s[:len(s) - 1]
+    match s.to_int():
+        case Some(n):
+            if n >= 0 and n <= (1 << 62) / mult:
+                return Some(n * mult)
+            return None
+        case None:
+            return None
+
+# The entries of `dir` a build of `exe` uses: its output folder when that is
+# in the cache (`<hash>/dev`), and its C objects (`obj-<hash>`).
+fn cache_entries(dir: str, exe: str) -> [str]:
+    var es: [str] = []
+    match project.parent(exe):
+        case Some(p):
+            let pre = dir + "/"
+            let q = p.replace("\\", "/")
+            if q.starts_with(pre.replace("\\", "/")):
+                es.push(q[len(pre):])
+        case None:
+            pass
+    # (a web build's objects are named after its .wasm)
+    es.push("obj-" + hex16(fnv(exe)))
+    es.push("obj-" + hex16(fnv(project.join(exe, "program.wasm"))))
+    return es
+
+fn tree_size(p: str) -> int:
+    if os.is_file(p):
+        return len(os.read_bytes(p).unwrap_or([]))
+    var n = 0
+    for f in os.list_dir(p).unwrap_or([]):
+        n += tree_size(project.join(p, f))
+    return n
+
+fn tree_clear(p: str):
+    if os.is_file(p):
+        match os.remove_file(p):
+            case _:
+                pass
+        return
+    for f in os.list_dir(p).unwrap_or([]):
+        tree_clear(project.join(p, f))
+
+fn log_lines(dir: str, lines: [str]):
+    match make_dirs(dir):
+        case _:
+            pass
+    match os.append_bytes(project.join(dir, CACHE_LOG), ("\n".join(lines) + "\n").bytes()):
+        case _:
+            pass
+
+# Before a build: its entries are in use, so a prune doesn't take them.
+# (objects only once they exist: a native build has none)
+fn cache_start(dir: str, exe: str):
+    var lines: [str] = []
+    for e in cache_entries(dir, exe):
+        if not e.starts_with("obj-") or os.is_dir(project.join(dir, e)):
+            lines.push(e + " -")
+    if len(lines) > 0:
+        log_lines(dir, lines)
+
+# After a build: record the sizes of its entries, then prune if needed.
+fn cache_done(dir: str, exe: str):
+    var lines: [str] = []
+    let mine = cache_entries(dir, exe)
+    for e in mine:
+        let p = project.join(dir, e)
+        if os.is_dir(p):
+            lines.push(f"{e} {tree_size(p)}")
+    if len(lines) > 0:
+        log_lines(dir, lines)
+    prune_cache(dir, mine, cache_cap())
+
+# The log is a header line `# <n>` (the entries when it was last rewritten)
+# then `<entry> <bytes or ->` lines, oldest first.
+fn prune_cache(dir: str, mine: [str], cap: int):
+    let log = project.join(dir, CACHE_LOG)
+    var text = ""
+    match read_file(log):
+        case Ok(t):
+            text = t
+        case Err(_):
+            return
+    let ls = text.lines()
+    var base = 0
+    if len(ls) > 0 and ls[0].starts_with("# "):
+        base = ls[0][2:].to_int().unwrap_or(0)
+    # newest first: each entry's latest size, and whether a build is still
+    # using it (its latest line is `-`, and recent)
+    var order: [str] = []
+    var size: {str: int} = {}
+    var busy: {str: bool} = {}
+    var i = len(ls) - 1
+    while i >= 0:
+        let parts = ls[i].split(" ")
+        i -= 1
+        if len(parts) != 2 or parts[0] == "#" or ".." in parts[0]:
+            continue
+        let name = parts[0]
+        let first = name not in busy
+        if first:
+            order.push(name)
+            busy[name] = parts[1] == "-" and i >= len(ls) - 1 - 2 * CACHE_SLACK
+        if name not in size:
+            match parts[1].to_int():
+                case Some(n):
+                    size[name] = n
+                case None:
+                    pass
+    var total = 0
+    for name in order:
+        total += size.get(name).unwrap_or(0)
+    let over = cap > 0 and total > cap
+    if not over and len(ls) <= base + CACHE_SLACK:
+        return
+    # oldest first, until what is left fits
+    var gone: {str: bool} = {}
+    var j = len(order) - 1
+    while over and j >= 0 and total > cap:
+        let name = order[j]
+        j -= 1
+        if busy[name] or name in mine:
+            continue
+        tree_clear(project.join(dir, name))
+        total -= size.get(name).unwrap_or(0)
+        gone[name] = true
+    # rewrite the log with one line per entry left, oldest first
+    var out = [""]
+    var k = len(order) - 1
+    while k >= 0:
+        let name = order[k]
+        k -= 1
+        if name in gone or not os.is_dir(project.join(dir, name)):
+            continue
+        match size.get(name):
+            case Some(n):
+                out.push(f"{name} {n}")
+            case None:
+                pass
+        # (a build that is still using it keeps it)
+        if busy[name] or name not in size:
+            out.push(f"{name} -")
+    out[0] = f"# {len(out) - 1}"
+    let tmp = f"{log}.{os.pid()}.tmp"
+    if write_file(tmp, "\n".join(out) + "\n").is_ok():
+        match os.rename(tmp, log):
+            case _:
+                pass
 
 # How many C translation units for a build: several for quick parallel dev
 # builds, one when the optimizer should see the whole program.

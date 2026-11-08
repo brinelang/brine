@@ -368,7 +368,14 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
 * **Caching:** objects are named by a hash of what they're made from. C output is
   split into one translation unit per core (by a hash of each function's name, each
   unit declaring only what it uses), compiled in parallel; an edit recompiles only
-  the units it touches. An unchanged program skips the link (`.brine-hash` stamp).
+  the units it touches. An unchanged program isn't written again (a native link
+  compares its bytes with the file; through C, a `.brine-hash` stamp in the cache,
+  never next to the `-o` output, skips the link). The cache (brine-cache in the
+  temp directory for files outside a project, `target/cache` in one) is pruned:
+  past `BRINE_CACHE_SIZE` (default `2G`; `500M`, `0` for no limit) the least
+  recently used outputs and objects are deleted, after each build, from the use
+  log `uses.log` there. What an older brine left in it isn't listed, so it stays
+  until the folder is deleted.
 * **CPU levels:** native x86-64 `--release` code checks the CPU once and runs its
   vector loops as SSE2, AVX2 or AVX-512 code. Through C, an x86-64 `--release`
   build compiles the program three times, for plain x86-64, x86-64-v3 (AVX2)
@@ -482,7 +489,28 @@ read is a warning (W0004), so a typo like `provn = true` doesn't go unnoticed.
 | `E0612` | code a rule covers has an effect the rule doesn't allow |
 | `E0613` | an approved rule or rules file changed since it was approved |
 | `E0614` | a runtime check fails every time it runs |
-| `E07xx` | driver: missing module, no C compiler, no `main`, C compile/link failures |
+| `E07xx` | driver: missing module, no C compiler, no `main`, compile/link failures, a bad command line (`E0708`), a program that couldn't be run (`E0709`) |
+
+### JSON errors
+
+With `--json`, every error and warning brine reports is one line in one shape,
+whatever the command (`report_json` in `compiler/diag.br` writes it; a runtime
+panic under `brine run --json` goes through it too):
+
+```json
+{"severity": "error", "code": "E0301", "message": "mismatched types",
+ "spans": [{"file": "src/a.br", "line": 2, "column": 18, "end_line": 2,
+            "end_column": 21, "label": "expected `int`, found `str`", "primary": true}],
+ "help": ["..."], "notes": ["..."]}
+```
+
+`code` is null only for a runtime panic, which has no code yet. Lines and columns count from 1 (columns in characters).
+The primary span comes first; `spans` is empty when nothing in a file is to
+blame (an unknown option), and a span's `file` is null, without the line fields,
+when it has no file. Compiler diagnostics add `fixes` (spans with a
+`replacement`), and for older tools repeat the first span at the top level
+(`file` … `label`) and the others in `related`. Other `--json` output (doctor's
+checks, fmt's files, rules) is one object per line too, with its own fields.
 
 Proof failures list the facts the prover knew at that point and the exact goal,
 so the fix (a stronger `requires`, an `invariant`, or an `assert`) is usually obvious.

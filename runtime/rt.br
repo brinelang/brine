@@ -938,12 +938,17 @@ fn brine_sb_group(sb: ptr, start: int):
 
 fn brine_sb_pad(sb: ptr, start: int, width: int, left: bool, zero: bool):
     let len = load_i64(sb, SB_LEN)
-    let n = len - start
+    var p = load_ptr(sb, SB_P)
+    # the width counts characters, as in Python, not bytes
+    var n = 0
+    for i in start..len:
+        if load_u8(p, i) & 0xC0 != 0x80:
+            n += 1
     if n >= width:
         return
     let pad = width - n
     sb_room(sb, pad)
-    let p = load_ptr(sb, SB_P)
+    p = load_ptr(sb, SB_P)
     if left:
         memset(p + len, 32, u64(pad))
     else:
@@ -5063,7 +5068,7 @@ const ARR_SIZE = 56
 fn brine_x_calloc(n: int) -> ptr:
     let p = calloc(u64(max(n, 1)), u64(1))
     if addr(p) == 0:
-        oom_cold()
+        oom_cold(n)
     return p
 
 extern fn memchr(p: ptr, c: i32, n: u64) -> ptr
@@ -5132,7 +5137,7 @@ fn brine_arr_new(len: int, esz: int, rt: ptr, rl: ptr, loc: ptr) -> ptr:
         if in_heap(d):
             store_i64(a, ARR_CAP, class_size(size_class(bytes)) / esz)
         return a
-    store_ptr(a, ARR_DATA, brine_x_calloc(len * esz))
+    store_ptr(a, ARR_DATA, calloc_at(alloc_bytes(len, esz), loc))
     return a
 
 # An integer array kept as bytes (narrow.br), zeroed, with 16 more bytes
@@ -5142,7 +5147,7 @@ fn brine_bytes_new(len: int, loc: ptr) -> ptr:
     if len < 0:
         neg_len_cold(len, loc)
     let a = arr_header(len, len + 16, 1, null_ptr(), null_ptr())
-    store_ptr(a, ARR_DATA, brine_x_calloc(len + 16))
+    store_ptr(a, ARR_DATA, calloc_at(len + 16, loc))
     return a
 
 # A `[bool]` kept as bits (the compiler's pack.br): `len` elements in 64-bit
@@ -5152,7 +5157,7 @@ fn brine_bits_new(len: int, fill: int, loc: ptr) -> ptr:
         neg_len_cold(len, loc)
     let a = arr_header(len, len, 0, null_ptr(), null_ptr())
     let bytes = (len / 64 + 1) * 8
-    let d = brine_x_calloc(bytes)
+    let d = calloc_at(bytes, loc)
     if fill != 0:
         memset(d, 0xff, u64(bytes))
     store_ptr(a, ARR_DATA, d)
@@ -9009,13 +9014,82 @@ fn heap_batches() -> ptr:
 fn heap_mu() -> ptr:
     return global_mem("heap_mu", 64)
 
-fn oom_cold():
-    let m = ptr_of("out of memory\n") + STR_DATA
-    if os_is("windows"):
-        _write(i32(2), m, u32(14))
+fn oom_cold(n: int):
+    oom_at(n, null_ptr())
+
+# A failed allocation of n bytes is a panic, reported where the program
+# asked for the memory when `loc` says so. It allocates nothing itself: the
+# heap may be exhausted.
+fn oom_at(n: int, loc: ptr):
+    panic_claim()
+    lock(io_mu())
+    fflush(os_stdio(1))
+    if brine_world_size() > 1:
+        stderr_text("\npanic (rank ")
+        stderr_uint(brine_world_rank())
+        stderr_text("): ")
     else:
-        write(i32(2), m, u64(14))
-    abort()
+        stderr_text("\npanic: ")
+    stderr_text("out of memory: could not allocate ")
+    if n < 0:
+        # the size itself overflowed
+        stderr_text("more than 9223372036854775807 bytes")
+    else:
+        stderr_uint(n)
+        stderr_text(" bytes")
+        oom_units(n)
+    if addr(loc) != 0:
+        stderr_text("\n  --> ")
+        fwrite(loc, u64(1), strlen(loc), os_stdio(2))
+    stderr_text("\n")
+    fflush(os_stdio(2))
+    unlock(io_mu())
+    exit(i32(101))
+
+# ` (1.5 GiB)` for n bytes, when that says more than the number
+fn oom_units(n: int):
+    var unit = 1 << 40
+    var name = " TiB)"
+    if n < unit:
+        unit = 1 << 30
+        name = " GiB)"
+    if n < unit:
+        return
+    let tenths = n / (unit / 10)
+    stderr_text(" (")
+    stderr_uint(tenths / 10)
+    if tenths % 10 != 0:
+        stderr_text(".")
+        stderr_uint(tenths % 10)
+    stderr_text(name)
+
+# n >= 0 in decimal, without allocating
+fn stderr_uint(n: int):
+    let b = stack_mem(24)
+    var i = 24
+    var v = n
+    while true:
+        i -= 1
+        store_u8(b, i, u8(48 + v % 10))
+        v /= 10
+        if v == 0:
+            break
+    fwrite(b + i, u64(1), u64(24 - i), os_stdio(2))
+
+# n zero bytes for something the program asked for at `loc`
+fn calloc_at(n: int, loc: ptr) -> ptr:
+    if n < 0:
+        oom_at(n, loc)
+    let p = calloc(u64(max(n, 1)), u64(1))
+    if addr(p) == 0:
+        oom_at(n, loc)
+    return p
+
+# len * esz, or -1 when that overflows (no allocation can be that big)
+fn alloc_bytes(len: int, esz: int) -> int:
+    if esz > 0 and len > 9223372036854775807 / esz:
+        return -1
+    return len * esz
 
 # n zeroed bytes of fresh pages, or 0
 fn os_pages(n: int) -> ptr:
@@ -9061,7 +9135,7 @@ fn th_get() -> ptr:
 fn th_new_cold() -> ptr:
     let h = calloc(u64(1), u64(TH_SIZE))
     if addr(h) == 0:
-        oom_cold()
+        oom_cold(TH_SIZE)
     th_set(h)
     return h
 
@@ -9162,7 +9236,7 @@ fn chunk_new(c: int) -> ptr:
 fn big(n: int) -> ptr:
     let p = malloc(u64(n if n > 0 else 1))
     if addr(p) == 0:
-        oom_cold()
+        oom_cold(n)
     return p
 
 # hands a thread's free list for class c over as one batch
@@ -9242,14 +9316,14 @@ fn brine_free(p: ptr):
     if not push_free(p):
         free_miss_cold(p)
 
-# realloc for either heap's blocks; out of memory aborts
+# realloc for either heap's blocks; out of memory panics
 fn brine_x_realloc(p: ptr, n: int) -> ptr:
     if addr(p) == 0:
         return brine_alloc(n)
     if not in_heap(p):
         let q = realloc(p, u64(n if n > 0 else 1))
         if addr(q) == 0:
-            abort()
+            oom_cold(n)
         return q
     let hi = heap_info()
     let have = class_size(
@@ -9319,7 +9393,7 @@ fn drop_later_cold(h: ptr, p: ptr, f: ptr):
         let nc = cap * 2 if cap != 0 else 256
         let d = realloc(load_ptr(h, TH_DROPS), u64(nc * 8))
         if addr(d) == 0:
-            oom_cold()
+            oom_cold(nc * 8)
         store_ptr(h, TH_DROPS, d)
         store_i64(h, TH_CAPDROPS, nc)
     let d = load_ptr(h, TH_DROPS)
@@ -12739,6 +12813,40 @@ fn os_wide(s: ptr) -> ptr:
         MultiByteToWideChar(CP_UTF8, 0, s, -1, w, i32(n))
     return w
 
+# os_wide for a path given to the file APIs. Those stop at 260 characters
+# (MAX_PATH) unless the path is absolute and starts with `\\?\` (`\\?\UNC\`
+# for `\\server\share`), so a long one is made so.
+fn os_wpath(s: ptr) -> ptr:
+    let w = os_wide(s)
+    let n = int(wcslen(w))
+    if n >= 4 and load_u16(w, 2) == 63 and load_u16(w, 0) == 92:
+        return w
+    # (the length that counts is the absolute one: a short relative path in a
+    # deep directory is long too; CreateDirectoryW's limit is 248, leaving
+    # room for a file name)
+    let m = int(GetFullPathNameW(w, 0, null_ptr(), null_ptr()))
+    if m < 240:
+        return w
+    let full = blk_alloc(2 * m)
+    let got = int(GetFullPathNameW(w, u32(m), full, null_ptr()))
+    if got <= 0 or got >= m:
+        blk_free(full)
+        return w
+    blk_free(w)
+    # `\\?\C:\...`, or `\\?\UNC\server\...` for `\\server\...`
+    let unc = load_u16(full, 0) == 92 and load_u16(full, 2) == 92
+    # (a device path, `\\.\...`, is left as it is)
+    if unc and load_u16(full, 4) == 46:
+        return full
+    let pre = "\\\\?\\UNC" if unc else "\\\\?\\"
+    let skip = 1 if unc else 0
+    let out = blk_alloc(2 * (len(pre) + got + 1))
+    for i in range(len(pre)):
+        store_u16(out, 2 * i, u16(load_u8(ptr_of(pre) + STR_DATA, i)))
+    memcpy(out + 2 * len(pre), full + 2 * skip, u64(2 * (got - skip + 1)))
+    blk_free(full)
+    return out
+
 # n UTF-16 units (n < 0: up to the NUL) as a string; bad surrogates
 # become U+FFFD
 fn os_from_wide(w: ptr, n0: int) -> ptr:
@@ -12808,7 +12916,7 @@ fn os_lossy_str(p: ptr, n: int) -> ptr:
 fn os_fopen(path: ptr, mode: str) -> ptr:
     let m = ptr_of(mode) + STR_DATA
     if os_is("windows"):
-        let wp = os_wide(path)
+        let wp = os_wpath(path)
         let wm = os_wide(m)
         let f = _wfopen(wp, wm)
         # (freeing leaves errno as it is)
@@ -12969,7 +13077,7 @@ fn brine_file_exists(path: ptr) -> bool:
     if addr(p) == 0:
         return false
     if os_is("windows"):
-        let w = os_wide(p)
+        let w = os_wpath(p)
         let a = GetFileAttributesW(w)
         blk_free(w)
         return a != NO_ATTRS
@@ -13424,6 +13532,8 @@ extern fn GetModuleHandleW(name: ptr) -> ptr
 
 extern fn GetTempPathW(n: u32, buf: ptr) -> u32
 
+extern fn GetFullPathNameW(name: ptr, n: u32, buf: ptr, file: ptr) -> u32
+
 extern fn GetFinalPathNameByHandleW(h: ptr, buf: ptr, n: u32, flags: u32) -> u32
 
 extern fn GetFileType(h: ptr) -> u32
@@ -13589,7 +13699,7 @@ fn brine_os_list_dir(path: ptr, out: ptr, err: ptr) -> bool:
             n += 1
         store_u8(pat, n, 42)
         store_u8(pat, n + 1, 0)
-        let w = os_wide(pat)
+        let w = os_wpath(pat)
         blk_free(pat)
         let fd = stack_mem(FD_SIZE)
         # FindExInfoBasic, FindExSearchNameMatch
@@ -13631,7 +13741,7 @@ fn brine_os_list_dir(path: ptr, out: ptr, err: ptr) -> bool:
 # 0: missing, 1: a file, 2: a directory, 3: something else. Follows links.
 fn os_kind(p: ptr) -> int:
     if os_is("windows"):
-        let w = os_wide(p)
+        let w = os_wpath(p)
         let a = GetFileAttributesW(w)
         var k = 0
         if a != NO_ATTRS:
@@ -13711,7 +13821,7 @@ fn os_parent(p: ptr) -> ptr:
 # 0 on success, else the OS error code.
 fn os_mkdir1(p: ptr) -> int:
     if os_is("windows"):
-        let w = os_wide(p)
+        let w = os_wpath(p)
         let e = 0 if CreateDirectoryW(w, null_ptr()) != 0 else int(GetLastError())
         blk_free(w)
         return e
@@ -13762,7 +13872,7 @@ fn brine_os_remove_file(path: ptr, err: ptr) -> bool:
         return false
     var e = 0
     if os_is("windows"):
-        let w = os_wide(p)
+        let w = os_wpath(p)
         e = 0 if DeleteFileW(w) != 0 else int(GetLastError())
         blk_free(w)
     else:
@@ -13779,8 +13889,8 @@ fn brine_os_rename(src: ptr, dst: ptr, err: ptr) -> bool:
         return false
     var e = 0
     if os_is("windows"):
-        let wa = os_wide(a)
-        let wb = os_wide(b)
+        let wa = os_wpath(a)
+        let wb = os_wpath(b)
         # MOVEFILE_REPLACE_EXISTING
         e = 0 if MoveFileExW(wa, wb, 1) != 0 else int(GetLastError())
         blk_free(wa)
@@ -13915,7 +14025,7 @@ fn brine_os_abs_path(path: ptr, out: ptr, err: ptr) -> bool:
     if os_is("windows"):
         # what Rust's fs::canonicalize does: the final path of an open
         # handle, `\\?\C:\...`
-        let w = os_wide(p)
+        let w = os_wpath(p)
         let h = CreateFileW(
             w,
             0,
@@ -14408,11 +14518,13 @@ fn os_find_program(prog: ptr, path_var: ptr) -> ptr:
     memcpy(name, prog, u64(n + 1))
     if addr(memchr(prog + base, 46, u64(n - base))) == 0:
         memcpy(name + n, ptr_of(".exe") + STR_DATA, 5)
-    let wname = os_wide(name)
-    blk_free(name)
     # a path: CreateProcess reports it if it's missing
     if base != 0:
-        return wname
+        let wp = os_wpath(name)
+        blk_free(name)
+        return wp
+    let wname = os_wide(name)
+    blk_free(name)
     # three of DIR_UNITS
     let dirs = stack_mem(1566)
     var nd = 0
@@ -14865,7 +14977,8 @@ fn brine_os_kill(handle: int, loc: ptr):
     let p = os_proc_lock(handle, "os.kill", loc)
     if load_u8(p, PR_DONE) == 0:
         if os_is("windows"):
-            TerminateProcess(load_ptr(p, PR_PROC), 1)
+            # 101, as for a process killed by a signal on Unix
+            TerminateProcess(load_ptr(p, PR_PROC), 101)
         else:
             # SIGKILL
             kill(load_i32(p, PR_PROC), 9)

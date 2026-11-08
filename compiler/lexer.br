@@ -1042,14 +1042,7 @@ struct Lexer:
                     self.pos += 1
                 else:
                     let ch = self.char_here()
-                    self.error(
-                        "E0101",
-                        f"unexpected character `{ch}`",
-                        lo,
-                        lo + len(ch),
-                        "not valid here",
-                        ""
-                    )
+                    self.diags.push(unexpected_char(ch, self.span(lo, lo + len(ch))))
                     self.pos += len(ch)
 
     # true if only spaces come before byte `i` on its line
@@ -1228,6 +1221,59 @@ struct Lexer:
         self.pos += n
         self.push(t, lo, self.pos)
 
+# Characters that can't be seen, or look like an ASCII one, and are pasted in
+# from editors and web pages: (character, name, the ASCII to write, or "" for
+# nothing). A character that can't be seen isn't shown in the message.
+fn lookalikes() -> [(str, str, str)]:
+    return [
+        ("\u{FEFF}", "byte order mark", ""),
+        ("\u{200B}", "zero-width space", ""),
+        ("\u{200C}", "zero-width non-joiner", ""),
+        ("\u{200D}", "zero-width joiner", ""),
+        ("\u{2060}", "word joiner", ""),
+        ("\u{00AD}", "soft hyphen", ""),
+        ("\u{00A0}", "no-break space", " "),
+        ("\u{2002}", "en space", " "),
+        ("\u{2003}", "em space", " "),
+        ("\u{2009}", "thin space", " "),
+        ("\u{202F}", "narrow no-break space", " "),
+        ("\u{3000}", "ideographic space", " "),
+        ("\u{201C}", "left double quotation mark", "\""),
+        ("\u{201D}", "right double quotation mark", "\""),
+        ("\u{2018}", "left single quotation mark", "'"),
+        ("\u{2019}", "right single quotation mark", "'"),
+        ("\u{2013}", "en dash", "-"),
+        ("\u{2014}", "em dash", "-"),
+        ("\u{2212}", "minus sign", "-"),
+        ("\u{00D7}", "multiplication sign", "*"),
+        ("\u{00F7}", "division sign", "/")
+    ]
+
+# `U+00A0` for a character
+fn code_point(ch: str) -> str:
+    return "U+" + f"{ord(ch):04x}".upper()
+
+fn unexpected_char(ch: str, at: Span) -> Diag:
+    for c, name, plain in lookalikes():
+        if c == ch:
+            let seen = plain != "" and plain != " "
+            let shown = (
+                f"`{ch}` ({code_point(ch)} {name})" if seen else f"{code_point(ch)} ({name})"
+            )
+            let d = diag.error("E0101", f"unexpected character {shown}").label(at, "not valid here")
+            if ch == "\u{FEFF}":
+                return d.with_help(
+                    "editors put it at the start of a file to mark it as UTF-8; save the file as UTF-8 without a BOM, or delete it here"
+                )
+            if plain == "":
+                let how = "delete it: it can't be seen, but it is there"
+                return d.fix(at, "", how).with_help(how)
+            let how = "write a plain space instead" if plain == " " else f"write `{plain}` instead"
+            return d.fix(at, plain, how).with_help(how)
+    let plain = 0x20 <= ord(ch) < 0x7f
+    let shown = f"`{ch}`" if plain else f"`{ch}` ({code_point(ch)})"
+    return diag.error("E0101", f"unexpected character {shown}").label(at, "not valid here")
+
 # Lex `text`, the contents of file number `file`. `base` is added to every
 # offset (for f-string expressions); `layout` turns on NEWLINE/INDENT/DEDENT tokens.
 fn lex(text: str, file: int, base: int, keep_comments: bool, layout: bool) -> ([Token], [Diag]):
@@ -1253,6 +1299,9 @@ fn lex(text: str, file: int, base: int, keep_comments: bool, layout: bool) -> ([
         keywords=keywords,
         singles=singles
     )
+    # a byte order mark that starts a file isn't part of the program
+    if base == 0 and text.starts_with("\u{FEFF}"):
+        lx.pos = 3
     lx.run()
     return (lx.toks, lx.diags)
 

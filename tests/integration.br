@@ -2,8 +2,8 @@
 #
 #   brine test tests/integration.br            from the repository root
 #
-# `$BRINE` (set by `brine test`) is the compiler under test. Needs a C compiler,
-# like `brine` itself. Scratch files go to target/it/.
+# `$BRINE` (set by `brine test`) is the compiler under test. The tests of the C
+# backend (`BRINE_BACKEND=c`) need a C compiler. Scratch files go to target/it/.
 
 struct Out:
     code: int
@@ -276,7 +276,8 @@ fn features() -> [str]:
         "tests/programs/native_ops.br",
         "tests/programs/cow_ref.br",
         "tests/programs/push_small.br",
-        "tests/programs/heap_growth.br"
+        "tests/programs/heap_growth.br",
+        "tests/programs/fstring_width.br"
     ]
 
 test "language features":
@@ -595,7 +596,11 @@ test "panics are clear":
         ),
         ("tests/programs/panic_str_byte.br", "index 3 is out of bounds"),
         ("tests/programs/panic_par.br", "out of bounds for an array of length 3"),
-        ("tests/programs/panic_unwrap.br", "unwrap() called on Err: not a number: x")
+        ("tests/programs/panic_unwrap.br", "unwrap() called on Err: not a number: x"),
+        (
+            "tests/programs/panic_oom.br",
+            "out of memory: could not allocate 9007199254740992 bytes (8192 TiB)"
+        )
     ]:
         let o = brine(["run", f, "-q"])
         assert o.code == 101, f"{f}: exit {o.code}\n{o.err}"
@@ -625,6 +630,10 @@ test "panics are clear":
             assert (
                 msg in o.err and f"--> {f}:2:12" in o.err
             ), f"{f} {extra}: wrong panic in:\n{o.err}"
+    # the C runtime says the same about memory
+    let c = brine_env(["run", "tests/programs/panic_oom.br", "-q"], {"BRINE_BACKEND": "c"})
+    assert c.code == 101 and "out of memory: could not allocate" in c.err, c.all()
+    assert "--> tests/programs/panic_oom.br:4:14" in c.err, c.err
 
 test "a panic names the functions it came through":
     # (x86-64 code only: AArch64 and the C backend print the location alone)
@@ -664,7 +673,7 @@ test "brine run --json reports a panic like a build error":
         assert len(ls) == 1, o.all()
         let j = ls[0]
         assert j.starts_with(
-            "{\"severity\":\"error\",\"code\":null,\"message\":\"index 2 is out of bounds for an array of length 2\",\"file\":\"tests/programs/panic_chain.br\",\"line\":9,\"column\":12,"
+            "{\"severity\":\"error\",\"code\":null,\"message\":\"index 2 is out of bounds for an array of length 2\",\"spans\":[{\"file\":\"tests/programs/panic_chain.br\",\"line\":9,\"column\":12,"
         ), j
         if backend == "native" and os.arch() == "x86_64" and os.name() != "macos":
             assert "\"notes\":[\"in at (tests/programs/panic_chain.br:7)\"," in j, j
@@ -679,6 +688,9 @@ test "brine run --json reports a panic like a build error":
         "\"severity\":",
         "\"code\":",
         "\"message\":",
+        "\"spans\":",
+        "\"help\":",
+        "\"notes\":",
         "\"file\":",
         "\"line\":",
         "\"column\":",
@@ -686,8 +698,6 @@ test "brine run --json reports a panic like a build error":
         "\"end_column\":",
         "\"label\":",
         "\"related\":",
-        "\"notes\":",
-        "\"help\":",
         "\"fixes\":"
     ]
     let p = brine(["run", "--json", f, "-q", "--", "seq"])
@@ -922,6 +932,55 @@ test "a source file that isn't UTF-8 is reported once":
     assert o.code != 0, o.all()
     assert f"cannot read {f}: the file is not valid UTF-8 text" in o.err, o.err
     assert o.err.count("cannot read") == 1, o.err
+
+# v09#8: Notepad's "UTF-8 with BOM"
+test "a byte order mark is skipped, and fmt removes it":
+    let d = scratch("bom")
+    let f = d + "/bom.br"
+    write(f, "\u{FEFF}fn main():\n    print(\"hi\")\n")
+    let o = brine(["run", f, "-q"])
+    assert o.code == 0 and o.out == "hi\n", o.all()
+    let c = brine(["fmt", "--check", f])
+    assert c.code == 1 and "would reformat" in c.out, c.all()
+    assert brine(["fmt", f]).code == 0
+    assert text(f) == "fn main():\n    print(\"hi\")\n"
+    assert brine(["fmt", "--check", f]).code == 0
+    # anywhere else, it and other characters that can't be seen are named
+    write(f, "fn main():\n    let x = 1\u{200B}\n    print(x)\u{FEFF}\n")
+    let e = brine(["check", f])
+    assert "unexpected character U+200B (zero-width space)" in e.err, e.err
+    assert "unexpected character U+FEFF (byte order mark)" in e.err, e.err
+    write(f, "fn main():\n    print(\u{201C}hi\u{201D})\n")
+    let q = brine(["check", f])
+    assert "`\u{201C}` (U+201C left double quotation mark)" in q.err, q.err
+    assert "write `\"` instead" in q.err, q.err
+
+# v09#9: what `brine check` accepts, `brine run` starts
+test "check rejects what run would":
+    let d = scratch("check-main")
+    write(d + "/argv.br", "fn main(argv: [str]):\n    print(len(argv))\n")
+    let o = brine(["check", d + "/argv.br"])
+    assert o.code == 1 and "E0706" in o.err, o.all()
+    # a lone file without `main` is a module: checked, and said so
+    write(d + "/lib.br", "fn twice(x: int) -> int:\n    return x * 2\n")
+    let l = brine(["check", d + "/lib.br"])
+    assert l.code == 0 and "has no `main`" in l.err, l.all()
+    let lj = brine(["check", d + "/lib.br", "--json"])
+    assert lj.code == 0 and "\"has_main\":false" in lj.out, lj.all()
+    # a project needs one, and its files nothing imports are checked too
+    let p = d + "/proj"
+    assert os.make_dir(p + "/src/sub").is_ok()
+    write(p + "/brine.toml", "[package]\nname = \"proj\"\nversion = \"0.1.0\"\n")
+    write(p + "/src/main.br", "fn helper() -> int:\n    return 1\n")
+    let e = brine(["check", p])
+    assert e.code == 1 and "E0703" in e.err, e.all()
+    write(p + "/src/main.br", "fn main():\n    print(1)\n")
+    write(p + "/src/sub/util.br", "fn broken() -> int:\n    return \"not an int\"\n")
+    let u = brine(["check", p])
+    assert u.code == 1 and "E0301" in u.err and "util.br" in u.err, u.all()
+    write(p + "/src/sub/util.br", "fn fine() -> int:\n    return 2\n")
+    let ok = brine(["check", p])
+    assert ok.code == 0 and "proj (2 files)" in ok.err, ok.all()
 
 test "main can return a Result":
     let d = scratch("main")
@@ -2534,6 +2593,50 @@ test "the test command":
         let r = brine(["run", d + "/crash.br", "-q"])
         assert r.code == 101 and "stack overflow" in r.err, r.all()
 
+# v09#7: an exit code that isn't a crash is the program's own
+test "exit codes pass through `brine run`":
+    let d = scratch("exit-code")
+    write(
+        d + "/e.br",
+        "fn main():\n    let a = args()\n    exit(a[0].to_int().unwrap_or(0) if len(a) > 0 else 0)\n"
+    )
+    var codes = [0, 7]
+    if os.name() == "windows":
+        # Unix keeps only the low 8 bits
+        codes.push(300)
+    for c in codes:
+        let o = brine(["run", d + "/e.br", "-q", "--", f"{c}"])
+        assert o.code == c and "crashed" not in o.err, f"exit({c}): {o.code}\n{o.err}"
+    # a killed child reports 101 everywhere, as the guide says
+    let s = d + "/sleep.br"
+    write(s, "fn main():\n    os.sleep(20.0)\n")
+    assert brine(["build", s, "-q", "-o", exe(d + "/sleep")]).code == 0
+    var h = 0
+    match os.spawn([exe(d + "/sleep")], {}, true, false):
+        case Ok(p):
+            h = p
+        case Err(e):
+            panic(e)
+    os.kill(h)
+    assert os.wait(h) == 101
+    # an unchanged program isn't linked again, but one that something else
+    # replaced is; and the stamp for that isn't left next to `-o`
+    let x = exe(d + "/x")
+    var sleeper: [u8] = []
+    match os.read_bytes(exe(d + "/sleep")):
+        case Ok(b):
+            sleeper = b
+        case Err(e):
+            panic(e)
+    for backend in ["", "c"]:
+        let env = {"BRINE_BACKEND": backend} if backend != "" else {}
+        for _ in range(2):
+            assert brine_env(["build", d + "/e.br", "-q", "-o", x], env).code == 0
+            assert exec([x, "5"], {}).code == 5, backend
+            assert os.write_bytes(x, sleeper).is_ok()
+    let left = [f for f in os.list_dir(d).unwrap_or([]) if f.ends_with(".brine-hash")]
+    assert len(left) == 0, f"stamps next to the outputs: {left}"
+
 # Windows can't replace a running executable: that's not a compiler bug.
 test "a locked executable is not called a compiler bug":
     if os.name() != "windows":
@@ -2549,12 +2652,27 @@ test "a locked executable is not called a compiler bug":
             h = p
         case Err(e):
             panic(e)
+    # v09 §8: the running one is moved aside, as brine does with itself
     write(f, "fn main():\n    os.sleep(20.0)\n    print(1)\n")
+    let r = brine(["build", f, "-q", "-o", out])
+    assert r.code == 0 and file_exists(out + ".old"), r.all()
+    # with that one still running too, there is nowhere to move it
+    var h2 = 0
+    match os.spawn([out], {}, true, false):
+        case Ok(p):
+            h2 = p
+        case Err(e):
+            panic(e)
+    write(f, "fn main():\n    os.sleep(20.0)\n    print(2)\n")
     let o = brine(["build", f, "-q", "-o", out])
     os.kill(h)
     os.wait(h)
+    os.kill(h2)
+    os.wait(h2)
     assert o.code == 1 and "E0704" in o.err and "still running" in o.err, o.all()
     assert "bug" not in o.err, o.err
+    # and the build that failed left the running one in place
+    assert file_exists(out), "the old build is gone"
     # but brine can replace itself (`brine build compiler/main.br -o brine`)
     let me = exe(d + "/me")
     match os.read_bytes(exe(brine_exe()) if not brine_exe().ends_with(".exe") else brine_exe()):
@@ -2566,6 +2684,88 @@ test "a locked executable is not called a compiler bug":
     let s = exec([me, "build", d + "/hi.br", "-q", "-o", me], {})
     assert s.code == 0, s.all()
     assert exec([me], {}).out == "hi\n"
+
+# v09 §8: Windows file calls stop at 260 characters unless the path is
+# written `\\?\C:\...`; the runtime does that for long ones
+test "paths longer than 260 characters work on Windows":
+    if os.name() != "windows":
+        return
+    let d = scratch("long-path")
+    let deep = d + "/" + "/".join(["d" * 60, "e" * 60, "f" * 60, "g" * 60]) + "/app"
+    assert os.make_dir(deep + "/src").is_ok()
+    write(deep + "/brine.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    write(deep + "/src/main.br", "fn main():\n    print(\"deep\")\n")
+    assert file_exists(deep + "/src/main.br")
+    let o = brine(["run", deep, "-q"])
+    assert o.code == 0 and o.out == "deep\n", o.all()
+    assert file_exists(deep + "/target/dev/app.exe")
+    let b = brine(["build", deep + "/src/main.br", "-q", "-o", deep + "/out.exe"])
+    assert b.code == 0, b.all()
+    assert exec([deep + "/out.exe"], {}).out == "deep\n"
+    assert os.remove_file(deep + "/out.exe").is_ok() and not file_exists(deep + "/out.exe")
+
+# The programs a build cache holds, by name.
+fn programs(cache: str) -> [str]:
+    var ps: [str] = []
+    for h in os.list_dir(cache).unwrap_or([]):
+        for f in os.list_dir(cache + "/" + h + "/dev").unwrap_or([]):
+            ps.push(f.replace(".exe", ""))
+    ps.sort()
+    return ps
+
+# v09#25: the build cache for files outside a project is shared by all of
+# them, so it is pruned, least recently used first
+test "the build cache stays under its size limit":
+    let d = os.abs_path(scratch("cache")).unwrap().replace("\\\\?\\", "")
+    let env = {"TMP": d, "TEMP": d, "TMPDIR": d}
+    for n in ["a", "b", "c"]:
+        write(d + f"/{n}.br", f"fn main():\n    print(\"{n}\")\n")
+    let cache = d + "/brine-cache"
+    for n in ["a", "b"]:
+        let o = brine_env(["run", d + f"/{n}.br", "-q"], env)
+        assert o.code == 0 and o.out == f"{n}\n", o.all()
+    assert programs(cache) == ["a", "b"], f"{programs(cache)}"
+    # with no room, only what the last build made is left
+    var small = env
+    small["BRINE_CACHE_SIZE"] = "1"
+    let o = brine_env(["run", d + "/c.br", "-q"], small)
+    assert o.code == 0 and o.out == "c\n", o.all()
+    assert programs(cache) == ["c"], f"{programs(cache)}"
+    # and a cap of 0 (or a value brine can't read) removes nothing
+    for cap in ["0", "lots"]:
+        var e = env
+        e["BRINE_CACHE_SIZE"] = cap
+        assert brine_env(["run", d + "/a.br", "-q"], e).code == 0
+    assert programs(cache) == ["a", "c"], f"{programs(cache)}"
+
+# v09 §8: one JSON shape for every error, and every command says what it did
+test "--json errors have one shape":
+    let d = scratch("json")
+    write(d + "/bad.br", "fn main():\n    let x: int = \"a\"\n")
+    write(d + "/ok.br", "fn main():\n    print(1)\n")
+    for args in [
+        ["bogus"],
+        ["run", d + "/missing.br"],
+        ["build", "--nope", d + "/ok.br"],
+        ["explain", "E9999"],
+        ["build", d + "/bad.br"],
+        ["check", d + "/bad.br"]
+    ]:
+        var cmd = ["--json"]
+        cmd.extend(args)
+        let o = brine(cmd)
+        assert o.code != 0 and o.out.strip() != "", f"{args}: {o.all()}"
+        for l in o.out.strip().lines():
+            assert l.starts_with("{\"severity\":\"error\",\"code\":\"E"), f"{args}: {l}"
+            assert ",\"spans\":[" in l and ",\"help\":[" in l and ",\"notes\":[" in l, l
+    let b = brine(["--json", "check", d + "/bad.br"]).out
+    assert "\"spans\":[{\"file\":" in b and "\"primary\":true" in b, b
+    assert "\"code\":\"E0708\"" in brine(["--json", "bogus"]).out
+    # optional tools and a formatter that changed nothing are reported too
+    let doc = brine(["--json", "doctor"]).out
+    assert "{\"check\":\"debugger\"" in doc and "{\"check\":\"WebAssembly\"" in doc, doc
+    let f = brine(["--json", "fmt", "--check", d + "/ok.br"])
+    assert f.out == "{\"checked\":1,\"unformatted\":0,\"errors\":0}\n", f.all()
 
 test "every command describes itself":
     let h = brine(["help"])
@@ -2594,6 +2794,21 @@ test "every command describes itself":
         assert o2.code == 0 and o2.out.starts_with(f"Usage: brine {c}"), f"help {c}: {o2.all()}"
     let bad = brine(["help", "nope"])
     assert bad.code == 2 and "unknown command `nope`" in bad.err, bad.all()
+    # and the hidden ones
+    for c in ["lex", "parse", "emit-c", "emit-ir"]:
+        let o = brine([c, "--help"])
+        assert o.code == 0 and o.out.starts_with(f"Usage: brine {c}"), f"{c} --help: {o.all()}"
+
+# where brine makes native code itself, a C compiler is only for BRINE_BACKEND=c
+test "doctor shows a C compiler only where one is used":
+    let o = brine_env(["doctor"], {"BRINE_BACKEND": ""})
+    let d = o.all()
+    if "native code" in d:
+        assert "✓ C compiler" not in d and "✗ C compiler" not in d, d
+        let c = brine_env(["doctor"], {"BRINE_BACKEND": "c"})
+        assert "C compiler " in c.all(), c.all()
+    else:
+        assert "C compiler" in d, d
 
 test "the formatter is stable":
     var files: [str] = []
@@ -2624,6 +2839,24 @@ test "the formatter is stable":
 
 # the repros of #70 and #109: break at operators and in nested brackets,
 # never in the pattern of a `let`; keep tables and `# fmt: off` regions
+# §8 of the 0.9.0 lab: comments lined up in a column stay there, and `brine fmt`
+# leaves alone what isn't the project's own source
+test "the formatter keeps aligned comments and its own project":
+    let d = scratch("fmt-tree")
+    let table = "const EACH = 0       # one append per write\nconst BUFFERED = 1   # in groups\nconst OFF = 2        # no log\n\nfn main():\n    print(EACH + BUFFERED + OFF)  # two spaces\n"
+    write(d + "/main.br", table)
+    write(d + "/brine.toml", "[package]\nname = \"tree\"\nversion = \"0.1.0\"\n")
+    let messy = "fn main( ):\n    print( 1 )\n"
+    for sub in ["node_modules/pkg", "inner", "target"]:
+        assert os.make_dir(d + "/" + sub).is_ok()
+        write(d + "/" + sub + "/x.br", messy)
+    write(d + "/inner/brine.toml", "[package]\nname = \"inner\"\nversion = \"0.1.0\"\n")
+    let o = brine(["fmt", "--check", d])
+    assert o.code == 0 and "1 file checked" in o.err, o.all()
+    assert brine(["fmt", d]).code == 0
+    assert text(d + "/main.br") == table
+    assert text(d + "/inner/x.br") == messy
+
 test "the formatter breaks long lines where they read best":
     let path = scratch("fmt") + "/long.br"
     let before = "\n".join(

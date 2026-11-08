@@ -309,6 +309,36 @@ static BR_NORETURN void br_panicf(const char *loc, const char *fmt, ...) {
     brine_panic_at(loc, buf);
 }
 
+/* A failed allocation of n bytes is a panic (n < 0: the size itself
+ * overflowed), at loc when the program's call says where. It allocates
+ * nothing: the heap may be exhausted. */
+static BR_NORETURN void br_oom(int64_t n, const char *loc) {
+    br_panic_claim();
+    fflush(stdout);
+    if (br_size > 1)
+        fprintf(stderr, "\npanic (rank %lld): ", (long long)br_rank);
+    else
+        fprintf(stderr, "\npanic: ");
+    if (n < 0) {
+        fprintf(stderr, "out of memory: could not allocate more than 9223372036854775807 bytes");
+    } else {
+        fprintf(stderr, "out of memory: could not allocate %lld bytes", (long long)n);
+        int64_t unit = n >= ((int64_t)1 << 40) ? (int64_t)1 << 40 : (int64_t)1 << 30;
+        if (n >= unit) {
+            int64_t tenths = n / (unit / 10);
+            const char *name = unit == ((int64_t)1 << 40) ? "TiB" : "GiB";
+            if (tenths % 10)
+                fprintf(stderr, " (%lld.%lld %s)", (long long)(tenths / 10), (long long)(tenths % 10), name);
+            else
+                fprintf(stderr, " (%lld %s)", (long long)(tenths / 10), name);
+        }
+    }
+    if (loc) fprintf(stderr, "\n  --> %s", loc);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    exit(101);
+}
+
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_panic_idx(int64_t i, int64_t len, const char *loc) {
     br_panicf(loc, "index %lld is out of bounds for an array of length %lld", (long long)i, (long long)len);
@@ -475,10 +505,7 @@ static br_heap_th *br_th_peek(void) {
 }
 static br_heap_th *br_th_new(void) {
     br_heap_th *h = (br_heap_th *)calloc(1, sizeof *h);
-    if (!h) {
-        fprintf(stderr, "out of memory\n");
-        abort();
-    }
+    if (!h) br_oom((int64_t)sizeof *h, NULL);
     TlsSetValue(br_th_key, h);
     return h;
 }
@@ -582,10 +609,7 @@ static char *br_chunk_new(int c) {
 #ifndef BRINE_RT_BR
 static void *br_big(size_t n) {
     void *p = malloc(n ? n : 1);
-    if (!p) {
-        fprintf(stderr, "out of memory\n");
-        abort();
-    }
+    if (!p) br_oom((int64_t)n, NULL);
     return p;
 }
 
@@ -829,10 +853,7 @@ void brine_drop(void *p, void (*fn)(void *)) {
         if (h->ndrops + 2 > h->capdrops) {
             int64_t nc = h->capdrops ? h->capdrops * 2 : 256;
             void **d = (void **)realloc(h->drops, (size_t)nc * sizeof(void *));
-            if (!d) {
-                fprintf(stderr, "out of memory\n");
-                abort();
-            }
+            if (!d) br_oom(nc * (int64_t)sizeof(void *), NULL);
             h->drops = d;
             h->capdrops = nc;
         }
@@ -931,10 +952,7 @@ void brine_str_append(brine_str **ps, brine_str *b) {
     brine_str *s = a;
     if (br_str_size(n) > br_str_size(a->len)) {
         s = (brine_str *)realloc(a, br_str_size(n));
-        if (!s) {
-            fprintf(stderr, "out of memory\n");
-            abort();
-        }
+        if (!s) br_oom((int64_t)br_str_size(n), NULL);
     }
     memcpy(s->data + s->len, self ? s->data : b->data, (size_t)blen);
     s->len = n;
@@ -1969,10 +1987,7 @@ brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_
         return a;
     }
     a->data = (char *)calloc(len > 0 ? (size_t)len : 1, (size_t)esz);
-    if (!a->data) {
-        fprintf(stderr, "out of memory\n");
-        abort();
-    }
+    if (!a->data) br_oom(esz > 0 && len > INT64_MAX / esz ? -1 : len * esz, loc);
     return a;
 }
 /* An integer array kept as bytes (narrow.br), zeroed, with 16 more bytes
@@ -1989,10 +2004,7 @@ brine_arr *brine_bytes_new(int64_t len, const char *loc) {
     a->retain = NULL;
     a->release = NULL;
     a->data = (char *)calloc((size_t)len + 16, 1);
-    if (!a->data) {
-        fprintf(stderr, "out of memory\n");
-        abort();
-    }
+    if (!a->data) br_oom(len + 16, loc);
     return a;
 }
 /* A `[bool]` kept as bits (the compiler's pack.br): `len` elements in 64-bit
@@ -2009,10 +2021,7 @@ brine_arr *brine_bits_new(int64_t len, int64_t fill, const char *loc) {
     a->release = NULL;
     size_t bytes = (size_t)(len / 64 + 1) * 8;
     a->data = (char *)(fill ? malloc(bytes) : calloc(bytes, 1));
-    if (!a->data) {
-        fprintf(stderr, "out of memory\n");
-        abort();
-    }
+    if (!a->data) br_oom((int64_t)bytes, loc);
     if (fill) memset(a->data, 0xff, bytes);
     return a;
 }
@@ -2037,10 +2046,7 @@ static void br_arr_reserve(brine_arr *a, int64_t need) {
     int64_t nc = a->cap ? a->cap * 2 : 4;
     if (nc < need) nc = need;
     char *d = (char *)realloc(a->data, (size_t)(nc * a->esz));
-    if (!d) {
-        fprintf(stderr, "out of memory\n");
-        abort();
-    }
+    if (!d) br_oom(nc * a->esz, NULL);
     a->data = d;
     a->cap = nc;
 }
@@ -2406,7 +2412,7 @@ static void br_sb_reserve(brine_sb *sb, int64_t extra) {
     int64_t nc = sb->cap * 2;
     while (nc < sb->len + extra) nc *= 2;
     sb->p = (char *)realloc(sb->p, (size_t)nc);
-    if (!sb->p) abort();
+    if (!sb->p) br_oom(nc, NULL);
     sb->cap = nc;
 }
 void brine_sb_cat(brine_sb *sb, const char *p, int64_t n) {
@@ -2657,7 +2663,9 @@ void brine_sb_group(brine_sb *sb, int64_t start) {
     }
 }
 void brine_sb_pad(brine_sb *sb, int64_t start, int64_t width, bool left, bool zero) {
-    int64_t n = sb->len - start;
+    /* the width counts characters, as in Python, not bytes */
+    int64_t n = 0;
+    for (int64_t i = start; i < sb->len; i++) n += ((unsigned char)sb->p[i] & 0xC0) != 0x80;
     if (n >= width) return;
     int64_t pad = width - n;
     br_sb_reserve(sb, pad);
@@ -5214,7 +5222,7 @@ static void br_buf_put(br_buf *b, const void *data, int64_t n) {
         int64_t c = b->cap ? b->cap * 2 : 64;
         while (c < b->len + n) c *= 2;
         b->p = (char *)realloc(b->p, (size_t)c);
-        if (!b->p) brine_panic_at("<world>", "out of memory");
+        if (!b->p) br_oom(c, NULL);
         b->cap = c;
     }
     if (n) memcpy(b->p + b->len, data, (size_t)n);
@@ -5791,10 +5799,7 @@ extern char **environ;
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
 static void *br_grow(void *p, size_t n) {
     void *q = realloc(p, n ? n : 1);
-    if (!q) {
-        fprintf(stderr, "out of memory\n");
-        abort();
-    }
+    if (!q) br_oom((int64_t)n, NULL);
     return q;
 }
 
