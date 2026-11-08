@@ -472,7 +472,9 @@ NaN) and order `-0.0` below `0.0`, the same on every target.
 
 The math functions give the same bits on every platform, natively and in
 WebAssembly: brine has its own math library (from musl) rather than the C
-library's, whose last bits differ between systems.
+library's, whose last bits differ between systems. Like musl's, its results
+are not always the nearest float (`atan2`, for example, is 1 ulp from glibc's in
+about one case in five), so compare with another library's with a tolerance.
 
 `print` output to a terminal or a pipe is written at the end of each line; to a
 file it is buffered (and written at exit, or when `eprint`, `run` or `flush()`
