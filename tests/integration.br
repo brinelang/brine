@@ -1350,7 +1350,8 @@ test "rules are proven on every build":
     write(pump, pump_src(true, ""))
     let ok = brine(["run", d])
     assert ok.code == 0 and ok.out == "3000\n", ok.all()
-    assert "Proven 4 rules from RULES.br; the 2 functions they cover can't stop the program" in ok.err, ok.err
+    assert "Proven 4 rules from " in ok.err, ok.err
+    assert "RULES.br; the 2 functions they cover can't stop the program" in ok.err, ok.err
     assert "4 rules not approved yet" in ok.err, ok.err
     # approval: then no warning, and every change to what was approved stops the build
     let ci = {"CI": "true"}
@@ -1479,6 +1480,65 @@ test "rules next to a main file, outside a project":
     assert "W0003" not in brine(["check", "main.br"]).err
     let r = brine(["rules"])
     assert r.code == 0 and "done: yes" in r.out, r.all()
+
+test "rules are for the programs built from what they name":
+    let d = scratch("scoped-rules")
+    for sub in ["/src", "/repros", "/tools", "/tools/deep"]:
+        match os.make_dir(d + sub):
+            case _:
+                pass
+    write(d + "/brine.toml", "[package]\nname = \"scoped\"\n")
+    write(
+        d + "/src/lib.br",
+        "fn twice(x: int) -> int:\n    if x > 1000 or x < -1000:\n        return 0\n    return 2 * x\n"
+    )
+    write(d + "/src/main.br", "import lib\n\nfn main():\n    print(lib.twice(2))\n")
+    write(
+        d + "/RULES.br",
+        "rule \"main only prints\":\n    effects main: console\n\nrule \"lib is pure\":\n    effects lib: none\n"
+    )
+    # reads a file, which `main` may not: but these aren't the project's main file
+    let reads = "fn main():\n    print(file_exists(\"RULES.br\"))\n"
+    write(d + "/src/tool.br", reads)
+    write(d + "/repros/x.br", reads)
+    write(d + "/tools/deep/y.br", reads)
+    let main = brine(["build", d])
+    assert main.code == 0, main.all()
+    assert "Proven 2 rules from " in main.err, main.err
+    let tool = brine(["build", d + "/src/tool.br"])
+    assert tool.code == 0, tool.all()
+    assert (
+        "2 rules from " in tool.err
+        and "not checked: they are about modules this program doesn't use" in tool.err
+    ), tool.err
+    for f in ["/repros/x.br", "/tools/deep/y.br"]:
+        let o = brine(["build", d + f])
+        assert o.code == 0 and "RULES.br" not in o.err, o.all()
+    let report = brine(["rules", d + "/src/tool.br"])
+    assert (
+        "- not used" in report.out and "every rule this program uses is proven" in report.out
+    ), report.all()
+    # the project's main file is still held to them, also from inside src/
+    write(
+        d + "/src/main.br",
+        "import lib\n\nfn main():\n    print(file_exists(\"x\"), lib.twice(2))\n"
+    )
+    assert "E0612@" in " ".join(diag_codes(brine(["check", d, "--json"]))), "main isn't checked"
+    match os.set_cwd(d + "/src"):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+    let inside = brine(["check", "main.br"])
+    assert inside.code == 1 and "E0612" in inside.err, inside.all()
+    # a folder without a project: another main file next to RULES.br is its own program
+    let f = scratch("scoped-folder")
+    write(f + "/main.br", "fn main():\n    print(1)\n")
+    write(f + "/other.br", reads)
+    write(f + "/RULES.br", "rule \"main only prints\":\n    effects main: console\n")
+    assert brine(["build", f + "/main.br"]).code == 0
+    let other = brine(["build", f + "/other.br"])
+    assert other.code == 0 and "not checked" in other.err, other.all()
 
 test "malformed rules":
     let d = scratch("bad-rules")

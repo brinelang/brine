@@ -1209,8 +1209,12 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
 fn rules_line(g: G, fe: Frontend):
     match fe.rules:
         case Some(rl):
-            let n = len(rl.rules)
-            if rl.present and n > 0:
+            var n = 0
+            for r in rl.rules:
+                if r.applies:
+                    n += 1
+            let away = len(rl.rules) - n
+            if rl.present and len(rl.rules) > 0:
                 var fns = 0
                 for id in 0..len(rl.covered):
                     if rl.covered[id] != "":
@@ -1220,7 +1224,16 @@ fn rules_line(g: G, fe: Frontend):
                     more = "; the function they cover can't stop the program"
                 elif fns > 1:
                     more = f"; the {fns} functions they cover can't stop the program"
-                g.status("Proven", f"{n} rule{plural(n)} from {rules.FILE}{more}")
+                let them = "it is" if away == 1 else "they are"
+                let unused = f"not checked: {them} about modules this program doesn't use"
+                # which RULES.br: it can be the project's, above the main file
+                let from = display_path(project.join(rl.dir, rules.FILE))
+                if n == 0:
+                    g.status("Rules", f"{away} rule{plural(away)} from {from} {unused}")
+                    return
+                if away > 0:
+                    more += f" ({away} other{plural(away)} {unused})"
+                g.status("Proven", f"{n} rule{plural(n)} from {from}{more}")
         case None:
             pass
 
@@ -1238,10 +1251,10 @@ fn cmd_rules(g: G, a: Args) -> Result[int, str]:
         if os.is_file("main.br"):
             file = Some(".")
     let t = resolve(g, file)?.typed_if(a)
-    let dir = driver.rules_dir(driver.dir_of(t.entry))
+    let dir = driver.rules_at(t.entry).dir
     if dir == "":
         return Err(
-            "no RULES.br next to the main file or at the project root: write one (see `brine guide`, \"Rules\")"
+            f"no RULES.br applies to `{display_path(t.entry)}`: a project's RULES.br is for the main files in its source folder (`src/`), and otherwise one next to the main file is (see `brine guide`, \"Rules\")"
         )
     let path = project.join(dir, rules.FILE)
     if approve:
@@ -1298,7 +1311,9 @@ fn rules_base(dir: str, rev: Option[str]) -> Result[Option[(str, [rules.Entry])]
 fn rules_done(fe: Frontend) -> bool:
     return fe.report.is_some() and not fe.has_errors()
 
-fn rule_status(fe: Frontend, probs: [int]) -> str:
+fn rule_status(fe: Frontend, r: rules.RuleSummary, probs: [int]) -> str:
+    if not r.applies:
+        return "not used"
     if fe.report.is_none():
         return "unchecked"
     return "proven" if len(probs) == 0 else "not proven"
@@ -1337,7 +1352,7 @@ fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.E
     let probs = rules.problems(rl, fe.diags)
     var proven = 0
     for ri in 0..len(rl.rules):
-        if rule_status(fe, probs[ri]) == "proven":
+        if rule_status(fe, rl.rules[ri], probs[ri]) == "proven":
             proven += 1
     var attributed: {int: bool} = {}
     for ps in probs:
@@ -1357,7 +1372,7 @@ fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.E
                 "{\"name\":"
                 + json_str(r.name)
                 + ",\"status\":"
-                + json_str(rule_status(fe, probs[ri]))
+                + json_str(rule_status(fe, rl.rules[ri], probs[ri]))
                 + ",\"approval\":"
                 + json_str(r.approval)
                 + ",\"location\":"
@@ -1400,12 +1415,14 @@ fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.E
     let n = len(rl.rules)
     print(f"{rules.FILE}: {n} rule{plural(n)}, {proven} proven")
     for ri, r in enumerate(rl.rules):
-        let st = rule_status(fe, probs[ri])
+        let st = rule_status(fe, rl.rules[ri], probs[ri])
         var mark = f"{c.green()}✓ proven     {c.reset()}"
         if st == "not proven":
             mark = f"{c.red()}✗ not proven {c.reset()}"
         elif st == "unchecked":
             mark = f"{c.yellow()}? unchecked  {c.reset()}"
+        elif st == "not used":
+            mark = f"{c.yellow()}- not used   {c.reset()}"
         var tag = ""
         if r.approval == "new":
             tag = f"  {c.yellow()}(not approved yet){c.reset()}"
@@ -1437,7 +1454,9 @@ fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.E
     )
     if other > 0:
         print(f"{other} other error{plural(other)} (above), outside the rules")
-    if done:
+    if done and any(not r.applies for r in rl.rules):
+        print("done: yes, every rule this program uses is proven")
+    elif done:
         print("done: yes, every rule is proven")
     elif fe.report.is_none():
         print("done: no, the program has errors, so the rules weren't proven")
@@ -1454,7 +1473,7 @@ fn receipt(fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.Entry])]) ->
     let probs = rules.problems(rl, fe.diags)
     var proven = 0
     for ri in 0..len(rl.rules):
-        if rule_status(fe, probs[ri]) == "proven":
+        if rule_status(fe, rl.rules[ri], probs[ri]) == "proven":
             proven += 1
     let n = len(rl.rules)
     var o: [str] = []
@@ -1464,7 +1483,7 @@ fn receipt(fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.Entry])]) ->
     o.push("|---|---|---|")
     for ri, r in enumerate(rl.rules):
         let name = r.name.replace("|", "\\|")
-        o.push(f"| {name} | {rule_status(fe, probs[ri])} | {r.approval} |")
+        o.push(f"| {name} | {rule_status(fe, rl.rules[ri], probs[ri])} | {r.approval} |")
     for x in rl.removed:
         o.push(f"| {x} | removed | was approved |")
     o.push("")

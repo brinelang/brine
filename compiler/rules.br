@@ -236,6 +236,10 @@ struct RuleSummary:
     # "approved", "new" or "changed"
     approval: str
     has_body: bool
+    # false when it is only about modules this program doesn't use (a second
+    # main file next to the project's): nothing of it is checked here but its
+    # approval
+    applies: bool
 
 struct Rules:
     # there is a RULES.br
@@ -340,14 +344,84 @@ fn unknown_target(prog: Program, path: [str], span: Span, what: str) -> Diag:
             )
     return d
 
+# The modules the main file imports, directly or not (not counting what only
+# RULES.br imports), and the owner's definitions, by module index.
+fn program_modules(prog: Program, rmi: int) -> [bool]:
+    var seen: [bool] = [false] * len(prog.modules)
+    if len(seen) == 0:
+        return seen
+    seen[0] = true
+    var todo = [0]
+    var i = 0
+    while i < len(todo):
+        let mi = todo[i]
+        i += 1
+        if mi >= len(prog.import_targets):
+            continue
+        for t in prog.import_targets[mi]:
+            if 0 <= t < len(seen) and not seen[t] and t != rmi:
+                seen[t] = true
+                todo.push(t)
+    # and the owner's own definitions
+    for mi, m in enumerate(prog.modules):
+        if mi == rmi or m.name.starts_with(VOCAB + "."):
+            seen[mi] = true
+    return seen
+
+# What a rule's `effects` or `proven` line names, in this program.
+struct Target:
+    # the functions, those of modules this program uses
+    ids: [int]
+    # names a module that exists but this program doesn't use: the line is
+    # about another program in the same folder
+    elsewhere: bool
+
+fn scoped(
+    prog: Program,
+    rmi: int,
+    path: [str],
+    used: [bool],
+    fn_mod: [int],
+    is_main: bool,
+    main_dir: str
+) -> Target:
+    let ids = resolve(prog, rmi, path)
+    var out: [int] = []
+    for id in ids:
+        let mi = fn_mod[id] if 0 <= id < len(fn_mod) else -1
+        # `main` is the rules' main file, which isn't this program's
+        if mi < 0 or (used[mi] and (mi != 0 or is_main)):
+            out.push(id)
+    if len(ids) > 0:
+        return Target(ids=out, elsewhere=len(out) == 0)
+    # not loaded: a module file of this folder that this program doesn't import?
+    if path[0] == "main":
+        return Target(ids=[], elsewhere=not is_main)
+    for k in 0..len(path):
+        let mod = path[:len(path) - k]
+        if len(mod) == 0:
+            break
+        if module_index(prog, ".".join(mod)) >= 0:
+            # the module is here and the function isn't: a typo
+            return Target(ids=[], elsewhere=false)
+        var p = main_dir if main_dir != "" else "."
+        for seg in mod:
+            p = project.join(p, seg)
+        if os.is_file(p + ".br"):
+            return Target(ids=[], elsewhere=true)
+    return Target(ids=[], elsewhere=false)
+
 # Everything a build needs to know about the rules. `dir`: where RULES.br is;
-# `main_dir`: the main file's; `lock`: compare with RULES.lock (not for a git
-# revision); `strict`: changes nobody approved are errors, not warnings.
+# `is_main`: the program's main file is the one the rules call `main`;
+# `main_dir`: the main file's directory; `lock`: compare with RULES.lock (not
+# for a git revision); `strict`: changes nobody approved are errors, not
+# warnings.
 fn analyze(
     prog: Program,
     info: ProgramInfo,
     sm: SourceMap,
     dir: str,
+    is_main: bool,
     main_dir: str,
     lock: bool,
     strict: bool
@@ -374,7 +448,7 @@ fn analyze(
                     diag.error("E0610", "a `rule` outside RULES.br")
                     .label(t.span, "this rule is never proven")
                     .note(
-                        "rules live in RULES.br, next to the main file or at the project root, where their owner reviews them"
+                        "rules live in RULES.br, at the project root or next to the main file, where their owner reviews them"
                     )
                     .with_help("move it to RULES.br")
                 )
@@ -406,8 +480,18 @@ fn analyze(
     out.names = g.names
     let kinds = effect_kinds()
     var seen: {str: Span} = {}
-    # effect lines are checked once the effects of every function are known
-    var lines: [(int, int)] = []
+    # what each function belongs to, and which modules this program uses
+    var fn_mod: [int] = [-1] * n
+    for mi, m in enumerate(prog.modules):
+        for f in m.fns:
+            if 0 <= f.id < n:
+                fn_mod[f.id] = mi
+    # the rules' own program uses what RULES.br imports too; another main file
+    # only what it imports itself
+    let used = [true] * len(prog.modules) if is_main else program_modules(prog, rmi)
+    # effect lines are checked once the effects of every function are known:
+    # (rule, line, the functions it names)
+    var lines: [(int, int, [int])] = []
     for ti, t in enumerate(prog.modules[rmi].tests):
         match t.rule:
             case Some(r):
@@ -443,14 +527,20 @@ fn analyze(
                 var sc = Scan(calls=[], effects=[], stops=false)
                 scan_block(t.body, info, ref sc)
                 var roots = sc.calls
+                # lines about modules this program doesn't use
+                var away = 0
                 for path, span in r.proven:
-                    let ids = resolve(prog, rmi, path)
-                    if len(ids) == 0:
+                    let tg = scoped(prog, rmi, path, used, fn_mod, is_main, main_dir)
+                    if tg.elsewhere:
+                        away += 1
+                    elif len(tg.ids) == 0:
                         out.diags.push(unknown_target(prog, path, span, "proven"))
-                    roots.extend(ids)
+                    roots.extend(tg.ids)
                 for li, e in enumerate(r.effects):
-                    let ids = resolve(prog, rmi, e.module)
-                    if len(ids) == 0:
+                    let tg = scoped(prog, rmi, e.module, used, fn_mod, is_main, main_dir)
+                    if tg.elsewhere:
+                        away += 1
+                    elif len(tg.ids) == 0:
                         out.diags.push(unknown_target(prog, e.module, e.span, "effects"))
                     for a in e.allowed:
                         if a == "none":
@@ -476,7 +566,8 @@ fn analyze(
                                         "the effects are " + ", ".join(kinds) + ", or `none`"
                                     )
                             out.diags.push(d)
-                    lines.push((ti, li))
+                    if len(tg.ids) > 0:
+                        lines.push((ti, li, tg.ids))
                 let covers = reach(g, roots)
                 var externs: [str] = []
                 for id in covers:
@@ -493,7 +584,8 @@ fn analyze(
                         covers=covers,
                         externs=externs,
                         approval="new",
-                        has_body=not empty
+                        has_body=not empty,
+                        applies=not empty or away < len(r.proven) + len(r.effects)
                     )
                 )
             case None:
@@ -509,7 +601,7 @@ fn check_effects(
     info: ProgramInfo,
     g: Graph,
     rmi: int,
-    lines: [(int, int)]
+    lines: [(int, int, [int])]
 ) -> [Diag]:
     let n = len(g.calls)
     # the kinds of effect each function has, itself or through what it calls
@@ -529,11 +621,10 @@ fn check_effects(
                         eff[id].push(k)
                         changed = true
     var diags: [Diag] = []
-    for ti, li in lines:
+    for ti, li, ids in lines:
         let t = prog.modules[rmi].tests[ti]
         let r = t.rule.unwrap_or(empty_info())
         let e = r.effects[li]
-        let ids = resolve(prog, rmi, e.module)
         var reported: [str] = []
         for id in ids:
             if id < 0 or id >= n:

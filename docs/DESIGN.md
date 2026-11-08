@@ -170,6 +170,13 @@ Right and wrong are what it says; the agent's job is code that keeps it.
   agents run approve only when the owner asked for the rule change.
   Any change counts, even one that makes a rule stronger: deciding that a change
   only strengthens a rule needs spec-diff over whole rule bodies (planned).
+* **Which programs a RULES.br is for.** A project's (next to `brine.toml`) is for
+  the main files in its source folder (`src/`); otherwise a RULES.br next to the
+  main file is. A file elsewhere in the project (`repros/`, `tools/`) is a program
+  of its own, with no rules. Within a program, a line about a module it doesn't
+  import (a second main file's `effects main: ...`, a library only another program
+  uses) isn't checked: rules are about the modules a program is built from, not
+  the folder it is in. The build line says which RULES.br it proved.
 * What it can't promise: termination (a rule holds whenever its code returns),
   memory and stack exhaustion, and `extern fn` C code, which is trusted.
 

@@ -716,8 +716,10 @@ fn index_of(xs: [int], target: int) -> int:
 
 ## Rules: RULES.br, what the program promises
 
-`RULES.br` (next to the main file, or at the project root) says what the program
-must do. People write it; agents write the code that keeps it. **Every build,
+`RULES.br` says what the program must do: a project's (next to `brine.toml`) is
+for the main files in `src/`, and otherwise one next to the main file is. A rule
+about modules a program doesn't import isn't checked for that program, and a file
+elsewhere (`repros/`, `tools/`) has no rules. People write it; agents write the code that keeps it. **Every build,
 run, test and check proves every rule, or nothing is built.**
 
 ```python
