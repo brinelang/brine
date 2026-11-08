@@ -1162,7 +1162,8 @@ fn new_vf(
         stored={},
         muls=[],
         mul_keys=[],
-        mul_seen={}
+        mul_seen={},
+        from_call={}
     )
 
 struct Vf:
@@ -1255,6 +1256,9 @@ struct Vf:
     muls: [(Lin, Lin, Lin)]
     mul_keys: [(str, str, str)]
     mul_seen: {str: bool}
+    # atoms made for the result of a call to a function without `ensures`,
+    # and the function
+    from_call: {int: int}
 
     # The state, leaving none behind.
     fn take(ref self) -> Option[St]:
@@ -2106,7 +2110,37 @@ struct Vf:
                     d.help = [
                         "check it with `assert` (at runtime) instead, or move the branches before this point into a function whose `ensures` states just what is needed here"
                     ]
+            d = self.from_call_notes(d, open)
         self.diags.push(d)
+
+    # A value the proof needs is the result of a call to a function without
+    # `ensures`: the prover knows only its type, so the values it can't rule
+    # out may be ones the function never returns. Say so, and where the fact
+    # would go.
+    fn from_call_notes(self, d0: Diag, goal: F) -> Diag:
+        var d = d0
+        var s = AtomSet.new()
+        goal.atoms(ref s)
+        var done: {int: bool} = {}
+        for a in s.xs:
+            match self.from_call.get(a):
+                case Some(id):
+                    if id in done or len(done) >= 2:
+                        continue
+                    done[id] = true
+                    let f = self.info.fns[id].name
+                    d = d.label(self.info.fns[id].span, f"`{f}` has no `ensures`")
+                    d = d.note(
+                        f"`{self.atom_names[a]}` comes from `{f}`, which has no `ensures`, so the prover knows nothing about it but its type"
+                    )
+                    var help = [
+                        f"add an `ensures` to `{f}` that says what it returns (`ensures result >= 0`, ...)"
+                    ]
+                    help.extend(d.help)
+                    d.help = help
+                case None:
+                    pass
+        return d
 
     # Name the values made since atom `na` and content `nc` after `to`
     # instead of the expression `from` (only in messages).
@@ -5271,6 +5305,7 @@ struct Vf:
             if k != "":
                 key = Some(k)
         var result = V.Opaque
+        let na = len(self.atom_names)
         match key:
             case Some(k):
                 match self.memo.get(k):
@@ -5281,6 +5316,16 @@ struct Vf:
                         self.memo[k] = result
             case None:
                 result = self.fresh_val(ret, nm)
+        # what a failed proof about the result should say (see `fail`)
+        var says = false
+        match spec:
+            case Some(sp):
+                says = len(sp.ensures) > 0
+            case None:
+                pass
+        if not says:
+            for a in na..len(self.atom_names):
+                self.from_call[a] = id
         match spec:
             case Some(sp):
                 # after a failed precondition the postcondition may be contradictory;
