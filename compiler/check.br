@@ -611,6 +611,7 @@ struct Checker:
                                 ann = Some(self.resolve_type(te))
                             case None:
                                 pass
+                        let nd = len(self.diags)
                         let t = self.check_expr(ref c.value, ann)
                         var ty = t
                         match ann:
@@ -629,17 +630,11 @@ struct Checker:
                                         self.const_exprs[id] = lit
                                         self.info.consts[id].ty = ty
                                     case None:
-                                        if not t.is_error():
-                                            self.err(
-                                                diag.error(
-                                                    "E0317",
-                                                    "constant value must be computable at compile time"
-                                                )
-                                                .label(c.value.span, "not a constant expression")
-                                                .with_help(
-                                                    "constants can use literals, arithmetic, other constants, and arrays of these"
-                                                )
-                                            )
+                                        # (an error in the value was reported already)
+                                        if not t.is_error() and not any(
+                                            d.is_error() for d in self.diags[nd:]
+                                        ):
+                                            self.const_error(c.value)
                         prog.modules[mi].consts[ci] = c
                     case _:
                         pass
@@ -1043,6 +1038,44 @@ struct Checker:
         r.kind = ExprKind.Array(out)
         return Some(r)
 
+    fn const_error(ref self, e: Expr):
+        match self.const_panic(e):
+            case Some((sp, why)):
+                self.err(diag.error("E0317", "computing this constant would panic").label(sp, why))
+            case None:
+                self.err(
+                    diag.error("E0317", "constant value must be computable at compile time")
+                    .label(e.span, "not a constant expression")
+                    .with_help(
+                        "constants can use literals, arithmetic, conversions, other constants, and arrays of these"
+                    )
+                )
+
+    # Where and why computing a constant (or an element of an array constant)
+    # would panic: `u8(300)`, `LIMIT * 1000` in an `i32`.
+    fn const_panic(self, e: Expr) -> Option[(Span, str)]:
+        match e.kind:
+            case ExprKind.Array(xs):
+                for x in xs:
+                    match self.const_panic(x):
+                        case Some(w):
+                            return Some(w)
+                        case None:
+                            pass
+                return None
+            case ExprKind.Repeat(x, n):
+                match self.const_panic(x):
+                    case Some(w):
+                        return Some(w)
+                    case None:
+                        return self.const_panic(n)
+            case _:
+                match self.fold_const(e):
+                    case Some(Err(w)):
+                        return Some(w)
+                    case _:
+                        return None
+
     fn const_elem(self, x: Expr) -> Option[Expr]:
         match self.eval_const(x):
             case Some(v):
@@ -1064,23 +1097,33 @@ struct Checker:
                 return self.const_array(x)
 
     fn eval_const(self, e: Expr) -> Option[ConstVal]:
+        match self.fold_const(e):
+            case Some(Ok(v)):
+                return Some(v)
+            case _:
+                return None
+
+    # The value of a constant expression, computed as the program would compute
+    # it: in the expression's type, with its checks. None: it can't be computed
+    # now; Err: it would panic (where, and why).
+    fn fold_const(self, e: Expr) -> Option[Result[ConstVal, (Span, str)]]:
         match e.kind:
             case ExprKind.Int(v):
                 if e.ty.is_float():
-                    return Some(ConstVal.Float(float(v)))
-                return Some(ConstVal.Int(v))
+                    return Some(Ok(ConstVal.Float(round_to(float(v), e.ty))))
+                return Some(Ok(ConstVal.Int(v)))
             case ExprKind.UInt(v):
-                return Some(ConstVal.UInt(v))
+                return Some(Ok(ConstVal.UInt(v)))
             case ExprKind.Float(v):
-                return Some(ConstVal.Float(v))
+                return Some(Ok(ConstVal.Float(round_to(v, e.ty))))
             case ExprKind.Bool(b):
-                return Some(ConstVal.Bool(b))
+                return Some(Ok(ConstVal.Bool(b)))
             case ExprKind.Str(s):
-                return Some(ConstVal.Str(s))
+                return Some(Ok(ConstVal.Str(s)))
             case ExprKind.Ident(_) | ExprKind.Field(_, _, _):
                 match e.res:
                     case Res.Const(id):
-                        return Some(self.info.consts[id].value)
+                        return Some(Ok(self.info.consts[id].value))
                     case _:
                         return None
             case ExprKind.Call(_, args):
@@ -1088,7 +1131,7 @@ struct Checker:
                     case CallRes.Builtin(Builtin.Embed):
                         if len(args) == 0:
                             return None
-                        return self.eval_const(args[0].expr)
+                        return self.fold_const(args[0].expr)
                     # `len(TABLE)` of an array constant
                     case CallRes.Builtin(Builtin.Len):
                         if len(args) != 1:
@@ -1097,82 +1140,186 @@ struct Checker:
                             case Res.Const(_):
                                 match args[0].expr.kind:
                                     case ExprKind.Array(xs):
-                                        return Some(ConstVal.Int(i128(len(xs))))
+                                        return Some(Ok(ConstVal.Int(i128(len(xs)))))
                                     case _:
                                         return None
                             case _:
                                 return None
+                    # `u8(3)`, `u64(LIMIT)`, `f32(1)`
+                    case CallRes.Convert(t):
+                        if len(args) != 1:
+                            return None
+                        match self.fold_const(args[0].expr)?:
+                            case Ok(v):
+                                match convert_const(v, t)?:
+                                    case Ok(r):
+                                        return Some(Ok(r))
+                                    case Err(why):
+                                        return Some(Err((e.span, why)))
+                            case Err(x):
+                                return Some(Err(x))
                     case _:
                         return None
             case ExprKind.Unary(op, x):
-                let v = self.eval_const(x)?
+                var v = ConstVal.Int(0)
+                match self.fold_const(x)?:
+                    case Ok(a):
+                        v = a
+                    case Err(w):
+                        return Some(Err(w))
                 match (op, v):
                     case (UnOp.Neg, ConstVal.Int(n)):
-                        return Some(ConstVal.Int(num.checked_neg(n)?))
+                        return self.int_result(num.checked_neg(n), e)
                     case (UnOp.Neg, ConstVal.Float(f)):
-                        return Some(ConstVal.Float(-f))
+                        return Some(Ok(ConstVal.Float(-f)))
                     case (UnOp.Not, ConstVal.Bool(b)):
-                        return Some(ConstVal.Bool(not b))
+                        return Some(Ok(ConstVal.Bool(not b)))
                     case (UnOp.BitNot, ConstVal.Int(n)):
-                        return Some(ConstVal.Int(~n))
+                        match e.ty:
+                            # `~` of an unsigned value flips its bits, not its sign
+                            case Ty.Int(k):
+                                if not k.signed():
+                                    if k.bits() == 128:
+                                        return None
+                                    return Some(Ok(ConstVal.Int(k.max() - n)))
+                            case _:
+                                pass
+                        return Some(Ok(ConstVal.Int(~n)))
                     case _:
                         return None
             case ExprKind.Binary(op, l, r):
-                let a = self.eval_const(l)?
-                let b = self.eval_const(r)?
+                var a = ConstVal.Int(0)
+                var b = ConstVal.Int(0)
+                match self.fold_const(l)?:
+                    case Ok(v):
+                        a = v
+                    case Err(w):
+                        return Some(Err(w))
+                match self.fold_const(r)?:
+                    case Ok(v):
+                        b = v
+                    case Err(w):
+                        return Some(Err(w))
                 match (a, b):
                     case (ConstVal.Int(x), ConstVal.Int(y)):
                         match op:
                             case BinOp.Add:
-                                return Some(ConstVal.Int(num.checked_add(x, y)?))
+                                return self.int_result(num.checked_add(x, y), e)
                             case BinOp.Sub:
-                                return Some(ConstVal.Int(num.checked_sub(x, y)?))
+                                return self.int_result(num.checked_sub(x, y), e)
                             case BinOp.Mul:
-                                return Some(ConstVal.Int(num.checked_mul(x, y)?))
-                            case BinOp.Div:
-                                return Some(ConstVal.Int(num.floor_div(x, y)?))
-                            case BinOp.Mod:
-                                return Some(ConstVal.Int(num.floor_mod(x, y)?))
+                                return self.int_result(num.checked_mul(x, y), e)
+                            case BinOp.Div | BinOp.Mod:
+                                if y == 0:
+                                    return Some(
+                                        Err((r.span, "this is zero, and dividing by zero panics"))
+                                    )
+                                if op == BinOp.Div:
+                                    return self.int_result(num.floor_div(x, y), e)
+                                return self.int_result(num.floor_mod(x, y), e)
                             case BinOp.BitAnd:
-                                return Some(ConstVal.Int(x & y))
+                                return Some(Ok(ConstVal.Int(x & y)))
                             case BinOp.BitOr:
-                                return Some(ConstVal.Int(x | y))
+                                return Some(Ok(ConstVal.Int(x | y)))
                             case BinOp.BitXor:
-                                return Some(ConstVal.Int(x ^ y))
-                            case BinOp.Shl:
-                                return Some(ConstVal.Int(num.checked_shl(x, y)?))
-                            case BinOp.Shr:
-                                return Some(ConstVal.Int(num.checked_shr(x, y)?))
+                                return Some(Ok(ConstVal.Int(x ^ y)))
+                            case BinOp.Shl | BinOp.Shr:
+                                return self.shift_const(op, x, y, e, r.span)
                             case _:
                                 return None
                     case (ConstVal.Float(x), ConstVal.Float(y)):
+                        var v = 0.0
                         match op:
                             case BinOp.Add:
-                                return Some(ConstVal.Float(x + y))
+                                v = x + y
                             case BinOp.Sub:
-                                return Some(ConstVal.Float(x - y))
+                                v = x - y
                             case BinOp.Mul:
-                                return Some(ConstVal.Float(x * y))
+                                v = x * y
                             case BinOp.Div:
-                                return Some(ConstVal.Float(x / y))
+                                v = x / y
                             case _:
                                 return None
+                        return Some(Ok(ConstVal.Float(round_to(v, e.ty))))
                     case (ConstVal.Str(x), ConstVal.Str(y)):
                         if op == BinOp.Add:
-                            return Some(ConstVal.Str(x + y))
+                            return Some(Ok(ConstVal.Str(x + y)))
                         return None
                     case (ConstVal.Bool(x), ConstVal.Bool(y)):
                         match op:
                             case BinOp.And:
-                                return Some(ConstVal.Bool(x and y))
+                                return Some(Ok(ConstVal.Bool(x and y)))
                             case BinOp.Or:
-                                return Some(ConstVal.Bool(x or y))
+                                return Some(Ok(ConstVal.Bool(x or y)))
                             case _:
                                 return None
                     case _:
                         return None
+            case ExprKind.Compare(first, rest):
+                var prev = ConstVal.Int(0)
+                match self.fold_const(first)?:
+                    case Ok(v):
+                        prev = v
+                    case Err(w):
+                        return Some(Err(w))
+                var all = true
+                for op, x in rest:
+                    match self.fold_const(x)?:
+                        case Ok(v):
+                            all = compare_const(op, prev, v)? and all
+                            prev = v
+                        case Err(w):
+                            return Some(Err(w))
+                return Some(Ok(ConstVal.Bool(all)))
             case _:
                 return None
+
+    # An integer result in the type of `e`: outside it, the program would panic.
+    fn int_result(self, v: Option[i128], e: Expr) -> Option[Result[ConstVal, (Span, str)]]:
+        match e.ty:
+            case Ty.Int(k):
+                match v:
+                    case Some(n):
+                        if n >= k.min() and n <= k.max():
+                            return Some(Ok(ConstVal.Int(n)))
+                        return Some(Err((e.span, f"this is {n}, out of range for `{k.name()}`")))
+                    case None:
+                        return Some(Err((e.span, f"this overflows `{k.name()}`")))
+            case _:
+                match v:
+                    case Some(n):
+                        return Some(Ok(ConstVal.Int(n)))
+                    case None:
+                        return None
+
+    # `<<` drops the bits shifted past the type's width; a shift by a negative
+    # amount or by the width or more panics.
+    fn shift_const(
+        self,
+        op: BinOp,
+        x: i128,
+        y: i128,
+        e: Expr,
+        rspan: Span
+    ) -> Option[Result[ConstVal, (Span, str)]]:
+        var bits = 128
+        match e.ty:
+            case Ty.Int(k):
+                bits = k.bits()
+            case _:
+                pass
+        if y < 0 or y >= i128(bits):
+            return Some(Err((rspan, f"a shift by {y} is out of range for a {bits}-bit integer")))
+        if op == BinOp.Shr:
+            return Some(Ok(ConstVal.Int(x >> y)))
+        let v = num.checked_shl(x, y)?
+        match e.ty:
+            case Ty.Int(k):
+                if bits < 128:
+                    return Some(Ok(ConstVal.Int(wrap_int(v, k))))
+            case _:
+                pass
+        return Some(Ok(ConstVal.Int(v)))
 
     # ============================================================ functions
     fn check_struct_invs(ref self, ref s: StructDecl, sid: int):
@@ -8698,3 +8845,90 @@ fn expr_to_type(e: Expr) -> Option[TypeExpr]:
             return Some(TypeExpr.Tuple(exprs_to_types(xs)?, span))
         case _:
             return None
+
+# `v` converted to `t` as at run time: None if it can't be done now, an error if
+# the conversion would panic.
+fn convert_const(v: ConstVal, t: Ty) -> Option[Result[ConstVal, str]]:
+    match t:
+        case Ty.Int(k):
+            let range = f"`{k.name()}` holds {k.min()}..={k.umax()}"
+            match v:
+                case ConstVal.Int(n):
+                    if n < k.min() or n > k.max():
+                        return Some(Err(f"{n} is out of range: {range}"))
+                    return Some(Ok(ConstVal.Int(n)))
+                case ConstVal.UInt(n):
+                    if k == IntTy.U128:
+                        return Some(Ok(ConstVal.UInt(n)))
+                    return Some(Err(f"{n} is out of range: {range}"))
+                case ConstVal.Bool(b):
+                    return Some(Ok(ConstVal.Int(1 if b else 0)))
+                # truncated toward zero; the value itself must be in range (and not NaN)
+                case ConstVal.Float(f):
+                    var hi = 1.0
+                    for _ in 0..(k.bits() - 1 if k.signed() else k.bits()):
+                        hi *= 2.0
+                    let lo = -hi if k.signed() else 0.0
+                    if not (f >= lo and f < hi):
+                        return Some(Err(f"{f} is out of range (or NaN): {range}"))
+                    if f >= -9223372036854775808.0 and f < 9223372036854775808.0:
+                        return Some(Ok(ConstVal.Int(i128(int(f)))))
+                    return None
+                case _:
+                    return None
+        case Ty.Float(_):
+            match v:
+                case ConstVal.Int(n):
+                    return Some(Ok(ConstVal.Float(round_to(float(n), t))))
+                case ConstVal.Float(f):
+                    return Some(Ok(ConstVal.Float(round_to(f, t))))
+                case _:
+                    return None
+        case _:
+            return None
+
+# An `f32` result is rounded to `f32` at every step, as the program does.
+fn round_to(f: float, t: Ty) -> float:
+    if t == Ty.Float(FloatTy.F32):
+        return float(f32(f))
+    return f
+
+# `v` cut to the width of `k` (two's complement); `k` is narrower than 128 bits.
+fn wrap_int(v: i128, k: IntTy) -> i128:
+    let m = i128(1) << i128(k.bits())
+    var u = v % m
+    if k.signed() and u >= m / 2:
+        u -= m
+    return u
+
+fn compare_const(op: CmpOp, a: ConstVal, b: ConstVal) -> Option[bool]:
+    var c = 0
+    match (a, b):
+        case (ConstVal.Int(x), ConstVal.Int(y)):
+            c = -1 if x < y else (1 if x > y else 0)
+        case (ConstVal.Float(x), ConstVal.Float(y)):
+            # NaN is unordered: only `!=` holds
+            if x != x or y != y:
+                return Some(op == CmpOp.Ne)
+            c = -1 if x < y else (1 if x > y else 0)
+        case (ConstVal.Str(x), ConstVal.Str(y)):
+            c = -1 if x < y else (1 if x > y else 0)
+        case (ConstVal.Bool(x), ConstVal.Bool(y)):
+            if op != CmpOp.Eq and op != CmpOp.Ne:
+                return None
+            c = 0 if x == y else 1
+        case _:
+            return None
+    match op:
+        case CmpOp.Eq:
+            return Some(c == 0)
+        case CmpOp.Ne:
+            return Some(c != 0)
+        case CmpOp.Lt:
+            return Some(c < 0)
+        case CmpOp.Le:
+            return Some(c <= 0)
+        case CmpOp.Gt:
+            return Some(c > 0)
+        case CmpOp.Ge:
+            return Some(c >= 0)
