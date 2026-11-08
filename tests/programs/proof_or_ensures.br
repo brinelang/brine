@@ -1,0 +1,181 @@
+# A parser whose helpers have `ensures` with `or` (v09#4, from a log parser):
+# their cases multiplied in every proof of the caller, which took 8 s. The
+# prover now keeps what they say about a fresh result as its range.
+const F_TS = 1
+const F_IP = 2
+const F_METHOD = 3
+const F_PATH = 4
+const F_URL = 6
+const F_PROTO = 7
+const F_STATUS = 8
+const F_BYTES = 9
+const F_REFERER = 10
+const F_UA = 11
+const F_LATENCY = 12
+const F_HOST = 13
+const F_USER = 18
+
+fn is_digit(c: u8) -> bool:
+    return c >= 48 and c <= 57
+
+fn find_byte(b: [u8], lo: int, hi: int, c: u8) -> int:
+    requires 0 <= lo
+    requires hi <= len(b)
+    ensures result <= hi
+    ensures result >= min(lo, hi)
+    if lo >= hi:
+        return hi
+    var i = lo
+    while i < hi:
+        invariant lo <= i <= hi
+        if b[i] == c:
+            return i
+        i += 1
+    return hi
+
+struct Native:
+    lo: [int]
+    hi: [int]
+
+    fn clear(ref self):
+        for i in 0..len(self.lo):
+            self.lo[i] = -1
+            self.hi[i] = -1
+
+    fn set(ref self, id: int, lo: int, hi: int):
+        if 0 <= id < len(self.lo) and id < len(self.hi):
+            self.lo[id] = lo
+            self.hi[id] = hi
+
+    fn has(self, id: int) -> bool:
+        return 0 <= id < len(self.lo) and self.lo[id] >= 0
+
+# the end of a token starting at i (next space)
+fn tok_end(b: [u8], i: int, hi: int) -> int:
+    ensures result >= 0
+    ensures result >= i
+    ensures result <= max(i, 0) or result <= hi
+    ensures result <= max(i, 0) or result <= len(b)
+    var j = max(i, 0)
+    let e = min(hi, len(b))
+    while j < e and b[j] != 32:
+        invariant j >= 0
+        invariant j >= i
+        invariant j <= max(i, 0) or j <= e
+        j += 1
+    return j
+
+# end of a quoted string starting after the opening quote at i: the index of
+# the closing quote (backslash escapes skipped), or -1
+fn quote_end(b: [u8], i: int, hi: int) -> int:
+    ensures result == -1 or (result >= i and result >= 0 and result < len(b) and result < hi)
+    var j = max(i, 0)
+    let e = min(hi, len(b))
+    while j < e:
+        invariant j >= 0
+        invariant j >= i
+        if b[j] == 92:
+            j += 2
+            continue
+        if b[j] == 34:
+            return j
+        j += 1
+    return -1
+
+# host ident user [time] "request" status bytes ["referer" "ua" [extra...]]
+fn parse_combined(b: [u8], lo: int, hi0: int, ref n: Native) -> bool:
+    n.clear()
+    let hi = min(hi0, len(b))
+    var i = max(lo, 0)
+    let e1 = tok_end(b, i, hi)
+    if e1 == i or e1 >= hi:
+        return false
+    n.set(F_IP, i, e1)
+    i = e1 + 1
+    let e2 = tok_end(b, i, hi)
+    if e2 >= hi:
+        return false
+    i = e2 + 1
+    let e3 = tok_end(b, i, hi)
+    if e3 >= hi:
+        return false
+    if e3 > i and not (e3 - i == 1 and b[i] == 45):
+        n.set(F_USER, i, e3)
+    i = e3 + 1
+    if i >= hi or b[i] != 91:
+        return false
+    let tclose = find_byte(b, i, hi, 93)
+    if tclose >= hi:
+        return false
+    n.set(F_TS, i + 1, tclose)
+    i = tclose + 1
+    if i + 1 >= hi or b[i] != 32 or b[i + 1] != 34:
+        return false
+    i += 2
+    let rq = quote_end(b, i, hi)
+    if rq < 0:
+        return false
+    n.set(F_URL, i, rq)
+    # request line: METHOD SP target SP proto
+    let m_end = tok_end(b, i, rq)
+    if m_end < rq and m_end > i:
+        n.set(F_METHOD, i, m_end)
+        let t0 = m_end + 1
+        let t_end = tok_end(b, t0, rq)
+        if t_end > t0:
+            n.set(F_PATH, t0, t_end)
+            if t_end < rq:
+                n.set(F_PROTO, t_end + 1, rq)
+    i = rq + 1
+    if i >= hi or b[i] != 32:
+        return false
+    i += 1
+    let se = tok_end(b, i, hi)
+    if se - i != 3 or not is_digit(b[i]) or not is_digit(b[i + 1]) or not is_digit(b[i + 2]):
+        return false
+    n.set(F_STATUS, i, se)
+    i = se + 1
+    if i >= hi:
+        # common log format without bytes is malformed
+        return false
+    let be = tok_end(b, i, hi)
+    if not (be - i == 1 and b[i] == 45):
+        n.set(F_BYTES, i, be)
+    i = be + 1
+    if i >= hi:
+        return true
+    # combined: "referer" "ua"
+    if b[i] == 34:
+        let re = quote_end(b, i + 1, hi)
+        if re < 0:
+            return false
+        n.set(F_REFERER, i + 1, re)
+        i = re + 1
+        if i + 1 < hi and b[i] == 32 and b[i + 1] == 34:
+            let ue = quote_end(b, i + 2, hi)
+            if ue < 0:
+                return false
+            n.set(F_UA, i + 2, ue)
+            i = ue + 1
+    # extras: the first number is the request time (nginx $request_time),
+    # a `host=` / bare host token is the virtual host
+    while i < hi:
+        while i < hi and b[i] == 32:
+            i += 1
+        if i >= hi:
+            break
+        var te = tok_end(b, i, hi)
+        if b[i] == 34:
+            let qe = quote_end(b, i + 1, hi)
+            te = hi if qe < 0 else qe + 1
+        elif not n.has(F_LATENCY) and is_digit(b[i]):
+            n.set(F_LATENCY, i, te)
+        elif not n.has(F_HOST) and te > i and is_digit(b[i]):
+            n.set(F_HOST, i, te)
+        i = te + 1
+    return true
+
+fn main():
+    var n = Native(lo=[-1] * 21, hi=[-1] * 21)
+    let b = "1.2.3.4 - - [10/Oct/2024:13:55:36 +0000] \"GET / HTTP/1.1\" 200 5 \"-\" \"curl\"".bytes()
+    print(parse_combined(b, 0, len(b), ref n))

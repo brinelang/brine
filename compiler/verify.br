@@ -16,7 +16,7 @@ from types import Ty, IntTy, Res, CallRes, Builtin, NumM, StrM, Reducer, WorldOp
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import children, stmt_exprs, stmt_blocks, lvalue_root, local_of
 from info import ProgramInfo, ConstVal, PRELUDE, RT
-from solver import Lin, F, AtomSet, prove_, prove_full, counterexample, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
+from solver import Lin, F, AtomSet, prove_work, near_facts, local_facts, counterexample, PROVED, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
 from checks import Check, Stop, builtin_stops, reduce_stops, convert_stops, world_stops, os_stops
 
 struct Report:
@@ -82,6 +82,27 @@ struct FnSpec:
     result: Option[int]
 
 const TAG_ARITH = 0
+# Limits for one function, so a long one can't take minutes or all memory to
+# prove. `WORK_MAX`: the solver work (`solver.prove_work`) spent on it; past
+# that, only proofs from the facts about the goal's own values (`near_facts`,
+# when they weigh at most `NEAR_MAX`) are tried. `WEIGHT_MAX`, `ATOMS_MAX`:
+# the size of what it knows (`weight`) and the number of values; past either,
+# nothing more is proven. Either way the checks it gave up on stay at run time,
+# and W0005 says so. Above what real functions need: the compiler's biggest
+# use under 3M, the biggest in the v09 lab programs 44M (a 400-line decoder).
+const WORK_MAX = 60000000
+const NEAR_MAX = 4096
+const WEIGHT_MAX = 5000000
+const ATOMS_MAX = 1000000
+# Below this many facts a proof uses them all at once.
+const NEAR_MIN = 32
+# `local_facts`: values in more facts than this aren't followed, and it gives
+# up past this many facts
+const HUB_MAX = 12
+const LOCAL_MAX = 64
+# Past WORK_MAX, these proofs may still do this much work in all: they are
+# small, and often enough.
+const EXTRA_MAX = 2000000
 # Largest disjunction (in formula nodes) a merge of two branches keeps. Past
 # that the solver spends its time re-reading it; dropping it only loses facts.
 const MERGE_MAX = 256
@@ -172,7 +193,9 @@ fn verify_program(
             let r = done[at]
             at += 1
             if slow_fns and r.time > 0.02:
-                eprint(f"  verify {r.name}: {r.time:.3f}s")
+                eprint(
+                    f"  verify {r.name}: {r.time:.3f}s (work {r.work}, weight {r.weight}, {r.atoms} values)"
+                )
             report.diags.extend(r.diags)
             report.remaining.extend(r.remaining)
             report.kept.extend(r.kept)
@@ -238,6 +261,10 @@ struct FnResult:
     # the checks proven everywhere they're reached
     proven: {(int, int, int, int): bool}
     time: float
+    # what it used of the limits (see `WORK_MAX`)
+    work: int
+    weight: int
+    atoms: int
 
 fn verify_fn(
     info: ProgramInfo,
@@ -259,7 +286,10 @@ fn verify_fn(
             kept=[],
             always=[],
             proven={},
-            time=0.0
+            time=0.0,
+            work=0,
+            weight=0,
+            atoms=0
         )
     var v = new_vf(info, specs, fps, sm, f)
     v.test = test
@@ -268,6 +298,25 @@ fn verify_fn(
     v.in_rule = f.rule.is_some()
     v.stops = stops
     v.run(f)
+    if v.given_up > 0:
+        let n = v.given_up
+        let s = "" if n == 1 else "s"
+        let it = "the check it gave up on" if n == 1 else "the checks it gave up on"
+        let verb = "s" if n == 1 else ""
+        var why = "it does a limited amount of work per function, and ran out"
+        if v.too_big:
+            why = "what it knows about the function's values grew past its memory limit"
+        v.diags.push(
+            diag.warning(
+                "W0005",
+                f"gave up proving {n} runtime check{s} in `{f.name}`: the function is too long or complex for the prover"
+            )
+            .label(f.name_span, "in this function")
+            .note(f"{why}; {it} stay{verb} at run time (`--report` lists the checks that remain)")
+            .with_help(
+                f"split `{f.name}` into smaller functions: each is proven on its own, so they don't share the limit"
+            )
+        )
     var proven: {(int, int, int, int): bool} = {}
     for p in v.proven.keys():
         if p not in v.failed:
@@ -279,7 +328,10 @@ fn verify_fn(
         kept=v.kept_proven,
         always=v.always,
         proven=proven,
-        time=clock() - t0
+        time=clock() - t0,
+        work=v.work,
+        weight=v.weight,
+        atoms=len(v.atom_names)
     )
 
 fn key_lt(a: (int, int, int), b: (int, int, int)) -> bool:
@@ -877,6 +929,28 @@ fn term_key(t: Term) -> str:
         case Term.Size:
             return "size"
 
+# The size of a fact: its nodes and the terms of its linear forms.
+fn weight(f: F) -> int:
+    match f:
+        case F.Ge(l):
+            return 1 + len(l.t)
+        case F.Eq(l):
+            return 1 + len(l.t)
+        case F.Ne(l):
+            return 1 + len(l.t)
+        case F.And(xs):
+            var n = 1
+            for x in xs:
+                n += weight(x)
+            return n
+        case F.Or(ys):
+            var n = 1
+            for y in ys:
+                n += weight(y)
+            return n
+        case _:
+            return 1
+
 # Facts with enormous constants are type-range bookkeeping; not worth showing.
 fn huge(f: F) -> bool:
     let lim: i128 = 1 << 40
@@ -896,6 +970,20 @@ fn huge(f: F) -> bool:
 
 fn bool_eq(a: F, b: F) -> F:
     return F.or_([F.and_([a, b]), F.and_([a.not_(), b.not_()])])
+
+# The longest name (in chars) a value gets in messages. Names are built from
+# the names of their parts: without a cap, each `acc = (acc + x) % m` line
+# would double the name's length.
+const NAME_MAX = 64
+
+fn short_name(s: str) -> str:
+    if len(s) <= NAME_MAX:
+        return s
+    let cs = s.chars()
+    if len(cs) <= NAME_MAX:
+        return s
+    # the start and the end: the end of an expression is usually its operator
+    return "".join(cs[:40]) + " ... " + "".join(cs[len(cs) - 19:])
 
 fn split_ws(s: str) -> str:
     var parts: [str] = []
@@ -968,7 +1056,14 @@ fn new_vf(
         skip_inv=false,
         rule="",
         in_rule=false,
-        stops=[]
+        stops=[],
+        work=0,
+        weight=0,
+        limited=false,
+        too_big=false,
+        given_up=0,
+        extra=0,
+        mods=[]
     )
 
 struct Vf:
@@ -1027,6 +1122,17 @@ struct Vf:
     in_rule: bool
     # functions that can stop the program, which covered code can't call
     stops: [bool]
+    # the limits (see `WORK_MAX`): the work done, the size of what was assumed,
+    # whether the last proof stopped at a limit, whether a size limit was hit,
+    # and the runtime checks given up on
+    work: int
+    weight: int
+    limited: bool
+    too_big: bool
+    given_up: int
+    extra: int
+    # the values `a % c` for a constant `c` (see `const_mod`), with their `a`
+    mods: [(int, Lin)]
 
     # The state, leaving none behind.
     fn take(ref self) -> Option[St]:
@@ -1101,7 +1207,7 @@ struct Vf:
 
     # ------------------------------------------------------------ atoms
     fn new_atom(ref self, name: str, range: Option[(i128, i128)]) -> int:
-        self.atom_names.push(name)
+        self.atom_names.push(short_name(name))
         self.ranges.push(range)
         return len(self.atom_names) - 1
 
@@ -1123,7 +1229,7 @@ struct Vf:
         return F.B(self.new_atom(name, None), true)
 
     fn fresh_content(ref self, name: str) -> int:
-        self.content_names.push(name)
+        self.content_names.push(short_name(name))
         self.content_ranges.push(None)
         return len(self.content_names) - 1
 
@@ -1283,15 +1389,110 @@ struct Vf:
 
     # ------------------------------------------------------------ facts and proofs
     fn assume(ref self, f: F):
-        if self.live and f != F.True:
+        if self.live and f != F.True and not self.too_big:
             self.st.facts.push(f)
+            self.weight += weight(f)
 
-    fn holds(self, goal: F) -> bool:
+    fn holds(ref self, goal: F) -> bool:
+        return self.decide(goal) == PROVED
+
+    # `solver.prove_work` within the function's limits: first from the ranges
+    # of the goal's values, then from the facts about them, then from all the
+    # facts. `limited` says whether a limit made it give up.
+    fn decide(ref self, goal: F) -> int:
+        self.limited = false
         if not self.live:
+            return PROVED
+        if self.weight > WEIGHT_MAX or len(self.atom_names) > ATOMS_MAX:
+            self.too_big = true
+        if self.too_big:
+            self.limited = true
+            return GAVE_UP
+        var all = self.st.facts
+        all.extend(self.defs)
+        let over = self.work > WORK_MAX
+        # the ranges of its values are often enough (and the solver can lose
+        # its way in bounds near the limits of 64-bit types)
+        if self.by_ranges(goal):
+            return PROVED
+        if len(all) > NEAR_MIN:
+            let near = near_facts(all, goal)
+            var nw = 0
+            for f in near:
+                nw += weight(f)
+            # (not when it's most of what is known: that would be the same work twice)
+            if nw <= NEAR_MAX or (not over and 2 * len(near) <= len(all)):
+                if prove_work(near, goal, self.ranges, ref self.work) == PROVED:
+                    return PROVED
+            # then what is linked to them, except through values most facts mention
+            # (past the limit, only up to a small extra amount of work)
+            if not over or self.extra < EXTRA_MAX:
+                let w0 = self.work
+                var r = GAVE_UP
+                match local_facts(all, goal, HUB_MAX, LOCAL_MAX, ref self.work):
+                    case Some(loc):
+                        if len(near) < len(loc) < len(all):
+                            r = prove_work(loc, goal, self.ranges, ref self.work)
+                    case None:
+                        pass
+                if over:
+                    self.extra += self.work - w0
+                if r == PROVED:
+                    return PROVED
+        if over:
+            self.limited = true
+            return GAVE_UP
+        return prove_work(all, goal, self.ranges, ref self.work)
+
+    # `goal` follows from the ranges of its values or the facts about them
+    # (all facts, in a short function): for what is seldom true, like a check
+    # that always fails, whose proof would cost a long function the most.
+    fn holds_near(ref self, goal: F) -> bool:
+        if not self.live:
+            return true
+        if self.too_big:
+            return false
+        if self.by_ranges(goal):
             return true
         var all = self.st.facts
         all.extend(self.defs)
-        return prove_(all, goal, self.ranges)
+        if len(all) > NEAR_MIN:
+            all = near_facts(all, goal)
+        return prove_work(all, goal, self.ranges, ref self.work) == PROVED
+
+    # `f` follows from the ranges of its values alone (interval arithmetic).
+    fn by_ranges(self, f: F) -> bool:
+        match f:
+            case F.True:
+                return true
+            case F.Ge(l):
+                match self.range_of(l).0:
+                    case Some(lo):
+                        return lo >= 0
+                    case None:
+                        return false
+            case F.Eq(l):
+                let r = self.range_of(l)
+                return r.0 == Some(0) and r.1 == Some(0)
+            case F.Ne(l):
+                let r = self.range_of(l)
+                match (r.0, r.1):
+                    case (Some(lo), _):
+                        if lo > 0:
+                            return true
+                    case _:
+                        pass
+                match r.1:
+                    case Some(hi):
+                        return hi < 0
+                    case None:
+                        return false
+            case F.And(xs):
+                return all(self.by_ranges(x) for x in xs)
+            case F.Or(ys):
+                return any(self.by_ranges(y) for y in ys)
+            case _:
+                return false
 
     fn holds_with(ref self, extra: F, goal: F) -> bool:
         let n = len(self.st.facts) if self.live else 0
@@ -1310,8 +1511,12 @@ struct Vf:
         if self.holds(goal):
             self.proven[key(span, tag)] = true
         else:
+            let limited = self.limited
+            if limited:
+                self.given_up += 1
             self.failed[key(span, tag)] = true
-            if self.refuted(span, what, goal):
+            # (not when it gave up: showing it always fails would be harder)
+            if not limited and self.refuted(span, what, goal):
                 return
             self.remain(span, what, Some(goal))
         self.assume(goal)
@@ -1323,7 +1528,7 @@ struct Vf:
     # Nothing is assumed after it, so what follows is still checked as if
     # it passed, instead of being proven from a contradiction.
     fn refuted(ref self, span: Span, what: str, goal: F) -> bool:
-        if self.spec or not self.live or not self.holds(goal.not_()) or self.holds(F.False):
+        if self.spec or not self.live or not self.holds_near(goal.not_()) or self.holds(F.False):
             return false
         var d = diag.error(
             "E0614",
@@ -1526,6 +1731,10 @@ struct Vf:
             return []
         var ga = AtomSet.new()
         goal.atoms(ref ga)
+        # what is known about `x % c` is known about `x`
+        for m, a in self.mods:
+            if any(ga.contains(p.0) for p in a.t):
+                ga.insert(m)
         # the newest value of each name in the goal: facts about older values
         # of the same variable (before a loop changed it) would only confuse
         var newest: {str: int} = {}
@@ -1615,6 +1824,8 @@ struct Vf:
 
     fn fail(ref self, d0: Diag, goal: F):
         var d = d0
+        # the proof just tried stopped at a limit of the function
+        let limited = self.limited
         if goal == F.False:
             d = d.note("with the values used here, this is always false")
         else:
@@ -1623,8 +1834,11 @@ struct Vf:
             var rest_proven = false
             match goal:
                 case F.And(xs):
-                    if self.live:
-                        let left = [x for x in xs if not self.holds(x)]
+                    if self.live and not limited:
+                        var left: [F] = []
+                        for x in xs:
+                            if not self.holds(x):
+                                left.push(x)
                         if 0 < len(left) < len(xs):
                             open = F.and_(left)
                             rest_proven = true
@@ -1636,10 +1850,18 @@ struct Vf:
                 d = d.note("to prove: " + self.show_f(open) + " (the rest of it is proven)")
             else:
                 d = d.note("to prove: " + self.show_f(goal))
-            if self.live:
+            if limited:
+                d = d.note(
+                    f"the prover gave up: `{self.fn_name}` is too long or complex for it (it does a limited amount of work per function), so this may well be true"
+                )
+                d.help = [
+                    f"split `{self.fn_name}` into smaller functions (each is proven on its own), or check this with `assert` instead"
+                ]
+            elif self.live:
                 var all = self.st.facts
                 all.extend(self.defs)
-                let gave_up = prove_full(all, goal, self.ranges) == GAVE_UP
+                var w = 0
+                let gave_up = prove_work(all, goal, self.ranges, ref w) == GAVE_UP
                 if not gave_up:
                     match self.values_note(all, open):
                         case Some(n):
@@ -2065,6 +2287,7 @@ struct Vf:
             case _:
                 pass
         let nv = self.fresh_val(ty, name)
+        self.range_hull(nv, va, vb)
         match val_eq(nv, va):
             case Some(f):
                 ea.push(f)
@@ -2077,6 +2300,57 @@ struct Vf:
                 pass
         hull_facts(nv, va, vb, ref hull)
         return nv
+
+    # `nv` is `va` or `vb`: as an integer, it is between the least and the
+    # greatest value their parts' ranges allow. Kept as its range (which always
+    # holds), this bounds a variable that many `if`s change without a proof
+    # having to go back through all of them.
+    fn range_hull(ref self, nv: V, va: V, vb: V):
+        match (nv, va, vb):
+            case (V.Int(n), V.Int(x), V.Int(y)):
+                if len(n.t) != 1 or n.c != 0 or n.t[0].1 != 1:
+                    return
+                let a = n.t[0].0
+                if a >= len(self.ranges):
+                    return
+                let (rx, ry) = (self.range_of(x), self.range_of(y))
+                match (self.ranges[a], rx.0, rx.1, ry.0, ry.1):
+                    case (Some(r), Some(xl), Some(xh), Some(yl), Some(yh)):
+                        let lo = max(r.0, min(xl, yl))
+                        let hi = min(r.1, max(xh, yh))
+                        if lo <= hi:
+                            self.ranges[a] = Some((lo, hi))
+                    case _:
+                        pass
+            case _:
+                pass
+
+    # The values `l` can have by its atoms' ranges alone.
+    fn range_of(self, l: Lin) -> (Option[i128], Option[i128]):
+        return lin_range(l, self.ranges)
+
+    # Narrow the range of `a`, a value just made, to what `fs` (facts about it
+    # that hold where it is made) imply by the ranges of the other values.
+    # It is a fresh value, so no other path says anything about it: its range
+    # holds everywhere, and proofs about it don't need to go back through `fs`
+    # (a call's `ensures` with an `or`, whose cases would multiply).
+    fn narrow(ref self, a: int, fs: [F]):
+        if a >= len(self.ranges):
+            return
+        var b: (Option[i128], Option[i128]) = (None, None)
+        match self.ranges[a]:
+            case Some(r):
+                b = (Some(r.0), Some(r.1))
+            case None:
+                pass
+        for f in fs:
+            b = meet(b, fact_bounds(f, a, self.ranges))
+        match b:
+            case (Some(lo), Some(hi)):
+                if lo <= hi:
+                    self.ranges[a] = Some((lo, hi))
+            case _:
+                pass
 
     # The name and type of field `k` of a struct or tuple type.
     fn field_of(self, ty: Ty, k: int) -> Option[(str, Ty)]:
@@ -2962,16 +3236,19 @@ struct Vf:
                 match b.is_const():
                     case Some(c):
                         if c > 0:
-                            q = Some(Lin.atom(self.term(Term.Div(a, Lin.konst(c)), None)))
+                            q = Some(
+                                Lin.atom(self.term(Term.Div(a, Lin.konst(c)), self.div_range(a, c)))
+                            )
                         elif c < 0 and wrapping_neg(c) > 0:
                             # floor(a / c) == floor(-a / -c)
                             match a.neg():
                                 case Some(na):
+                                    let nc = wrapping_neg(c)
                                     q = Some(
                                         Lin.atom(
                                             self.term(
-                                                Term.Div(na, Lin.konst(wrapping_neg(c))),
-                                                None
+                                                Term.Div(na, Lin.konst(nc)),
+                                                self.div_range(na, nc)
                                             )
                                         )
                                     )
@@ -2986,7 +3263,7 @@ struct Vf:
                         else:
                             match qq.scale(b.c):
                                 case Some(bq):
-                                    r = a.sub(bq)
+                                    r = self.const_mod(a, b, a.sub(bq))
                                 case None:
                                     r = None
                     case None:
@@ -3091,6 +3368,33 @@ struct Vf:
             case _:
                 return V.Int(self.fresh_int("?", k))
         return V.Int(self.lin(r, "?"))
+
+    # `a % c` for a constant `c`, which is `rest` (`a - c*(a / c)`): a value of
+    # its own, between 0 and c (its range), equal to `rest`. As `rest` itself,
+    # `acc = (acc + x) % m` lines would make each new value a sum over the
+    # quotients of all the lines before, and every proof about it read them all.
+    # The range of `a / c` for a constant `c > 0`, from the range of `a`
+    # (`/` rounds down, so it keeps the order).
+    fn div_range(self, a: Lin, c: i128) -> Option[(i128, i128)]:
+        match self.range_of(a):
+            case (Some(lo), Some(hi)):
+                return Some((lo / c, hi / c))
+            case _:
+                return None
+
+    fn const_mod(ref self, a: Lin, b: Lin, rest: Option[Lin]) -> Option[Lin]:
+        let l = rest?
+        let c = b.is_const()?
+        let z: i128 = 0
+        let one: i128 = 1
+        let range = (z, c - one) if c > 0 else (c + one, z)
+        let t = Term.Mod(a, b)
+        let fresh = term_key(t) not in self.terms
+        let m = Lin.atom(self.term(t, Some(range)))
+        if fresh:
+            self.defs.push(F.equal(m, l))
+            self.mods.push((m.t[0].0, a))
+        return Some(m)
 
     # `a / b` or `a % b` for a `b` that isn't a constant
     fn div_var(ref self, op: BinOp, a: Lin, b: Lin) -> Lin:
@@ -3613,6 +3917,7 @@ struct Vf:
             case _:
                 pass
         let r = self.fresh_val(ty, "?")
+        self.range_hull(r, a, b)
         match (val_eq(r, a), val_eq(r, b)):
             case (Some(fa), Some(fb)):
                 self.defs.push(F.or_([F.and_([c, fa]), F.and_([c.not_(), fb])]))
@@ -3924,7 +4229,18 @@ struct Vf:
                         let c = self.as_int(vals[1], e.ty)
                         let fname = "min" if b == Builtin.Min else "max"
                         let nm = fname + "(" + self.show_lin(a) + ", " + self.show_lin(c) + ")"
-                        let r = Lin.atom(self.new_atom(nm, None))
+                        # between the smaller and the larger argument
+                        let (ra, rc) = (self.range_of(a), self.range_of(c))
+                        var range: Option[(i128, i128)] = None
+                        match (ra.0, ra.1, rc.0, rc.1):
+                            case (Some(al), Some(ah), Some(cl), Some(ch)):
+                                if b == Builtin.Min:
+                                    range = Some((min(al, cl), min(ah, ch)))
+                                else:
+                                    range = Some((max(al, cl), max(ah, ch)))
+                            case _:
+                                pass
+                        let r = Lin.atom(self.new_atom(nm, range))
                         let a_first = F.le(a, c) if b == Builtin.Min else F.le(c, a)
                         self.defs.push(
                             F.or_(
@@ -4237,10 +4553,14 @@ struct Vf:
                             env[r] = result
                         case None:
                             pass
+                    var fs: [F] = []
                     for en in sp.ensures:
                         let f = self.spec_cond_in(env, en)
                         if not self.spec:
                             self.assume(f)
+                            fs.push(f)
+                    for a in fresh_atoms(result):
+                        self.narrow(a, fs)
             case None:
                 pass
         return result
@@ -4349,6 +4669,112 @@ fn tighten(f: F, a: int, b: (Option[i128], Option[i128])) -> (Option[i128], Opti
         case _:
             pass
     return (lo, hi)
+
+# The values `l` can have by its atoms' ranges alone.
+fn lin_range(l: Lin, ranges: [Option[(i128, i128)]]) -> (Option[i128], Option[i128]):
+    var lo: Option[i128] = Some(l.c)
+    var hi: Option[i128] = Some(l.c)
+    for a, k in l.t:
+        var ab: (Option[i128], Option[i128]) = (None, None)
+        if a < len(ranges):
+            match ranges[a]:
+                case Some(r):
+                    ab = (Some(r.0), Some(r.1))
+                case None:
+                    pass
+        if k > 0:
+            lo = add_opt(lo, mul_opt(k, ab.0))
+            hi = add_opt(hi, mul_opt(k, ab.1))
+        else:
+            lo = add_opt(lo, mul_opt(k, ab.1))
+            hi = add_opt(hi, mul_opt(k, ab.0))
+    return (lo, hi)
+
+# Both bounds (None: no bound on that side).
+fn meet(
+    a: (Option[i128], Option[i128]),
+    b: (Option[i128], Option[i128])
+) -> (Option[i128], Option[i128]):
+    var lo = a.0
+    var hi = a.1
+    match b.0:
+        case Some(x):
+            if lo.is_none() or x > lo.unwrap():
+                lo = Some(x)
+        case None:
+            pass
+    match b.1:
+        case Some(y):
+            if hi.is_none() or y < hi.unwrap():
+                hi = Some(y)
+        case None:
+            pass
+    return (lo, hi)
+
+# Either bounds.
+fn join_bounds(
+    a: (Option[i128], Option[i128]),
+    b: (Option[i128], Option[i128])
+) -> (Option[i128], Option[i128]):
+    var lo: Option[i128] = None
+    var hi: Option[i128] = None
+    match (a.0, b.0):
+        case (Some(x), Some(y)):
+            lo = Some(min(x, y))
+        case _:
+            pass
+    match (a.1, b.1):
+        case (Some(x), Some(y)):
+            hi = Some(max(x, y))
+        case _:
+            pass
+    return (lo, hi)
+
+# The bounds of atom `a` that `f` implies, with the other atoms in their ranges.
+fn fact_bounds(f: F, a: int, ranges: [Option[(i128, i128)]]) -> (Option[i128], Option[i128]):
+    match f:
+        case F.Ge(l):
+            return ge_bounds(l, a, ranges)
+        case F.Eq(l):
+            match l.neg():
+                case Some(n):
+                    return meet(ge_bounds(l, a, ranges), ge_bounds(n, a, ranges))
+                case None:
+                    return (None, None)
+        case F.And(xs):
+            var b: (Option[i128], Option[i128]) = (None, None)
+            for x in xs:
+                b = meet(b, fact_bounds(x, a, ranges))
+            return b
+        case F.Or(ys):
+            if len(ys) == 0:
+                return (None, None)
+            var b = fact_bounds(ys[0], a, ranges)
+            for y in ys[1:]:
+                b = join_bounds(b, fact_bounds(y, a, ranges))
+            return b
+        case _:
+            return (None, None)
+
+# The bound of `a` that `l >= 0` implies: k*a + rest >= 0, rest at most its
+# range's top, so k*a >= -top.
+fn ge_bounds(l: Lin, a: int, ranges: [Option[(i128, i128)]]) -> (Option[i128], Option[i128]):
+    let k = l.coef(a)
+    if k == 0:
+        return (None, None)
+    let rest = Lin(c=l.c, t=[p for p in l.t if p.0 != a])
+    match lin_range(rest, ranges).1:
+        case Some(top):
+            # a huge bound helps nobody, and its arithmetic could overflow
+            let lim: i128 = 1 << 100
+            if wrapping_abs(top) > lim or wrapping_abs(k) > lim:
+                return (None, None)
+            if k > 0:
+                # a >= ceil(-top / k); brine's `/` rounds down
+                return (Some(-(top / k)), None)
+            return (None, Some(top / -k))
+        case None:
+            return (None, None)
 
 # The bounds of `x * y` for `x` in `a` and `y` in `b`.
 fn mul_bounds(
@@ -4508,6 +4934,21 @@ fn count_steps(b: Block, info: ProgramInfo, ref dirs: {int: int}, ref other: {in
             mods_expr(e, info, ref other)
         for blk in stmt_blocks(s):
             count_steps(blk, info, ref dirs, ref other)
+
+# The atoms that are the integer parts of `v`, a value just made by `fresh_val`.
+fn fresh_atoms(v: V) -> [int]:
+    match v:
+        case V.Int(l):
+            if len(l.t) == 1 and l.c == 0 and l.t[0].1 == 1:
+                return [l.t[0].0]
+        case V.Agg(vs):
+            var out: [int] = []
+            for x in vs:
+                out.extend(fresh_atoms(x))
+            return out
+        case _:
+            pass
+    return []
 
 # Facts that hold on both paths of a merge, for a value `nv` that is `va` on
 # one and `vb` on the other: when they differ by a constant, `nv` is between

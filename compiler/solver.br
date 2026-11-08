@@ -421,7 +421,14 @@ const NOT_PROVED = 0
 const GAVE_UP = 2
 
 fn prove_full(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> int:
-    match prepare(facts, goal, ranges):
+    var work = 0
+    return prove_work(facts, goal, ranges, ref work)
+
+# `prove_full`, adding the work it took to `work`: the terms it read and wrote
+# (in the facts, the search and Fourier–Motzkin), a measure of time that is
+# the same on every run.
+fn prove_work(facts: [F], goal: F, ranges: [Option[(i128, i128)]], ref work: int) -> int:
+    match prepare(facts, goal, ranges, ref work):
         case Prep.Proved:
             return PROVED
         case Prep.NotProved:
@@ -436,6 +443,7 @@ fn prove_full(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> int:
                 budget = MAX_NODES
                 var b2 = Branch.new()
                 r = refute(ref b2, used, ref budget, true, 0, ref leaf)
+            work += leaf.work
             match r:
                 case Some(true):
                     return PROVED
@@ -450,7 +458,7 @@ enum Prep:
     # the formulas to refute (the negated goal first) and the relevant atoms
     Used(fs: [F], rel: AtomSet)
 
-fn prepare(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> Prep:
+fn prepare(facts: [F], goal: F, ranges: [Option[(i128, i128)]], ref work: int) -> Prep:
     let neg = goal.not_()
     var rel = atoms_of(neg)
     if rel.contains(ATOM_UNKNOWN):
@@ -463,17 +471,13 @@ fn prepare(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> Prep:
             fs.push(f)
     if rel.is_empty():
         # an atom-free goal (e.g. `false`) can only follow from a contradiction somewhere
+        var ignored: [int] = []
         for f2 in fs:
-            add_atoms(f2, ref rel)
+            add_atoms(f2, ref rel, ref ignored)
     # Relevance: grow the set of atoms connected to the goal, then replace every literal
     # outside it by `true`. Formulas are in negation normal form, so that only weakens
     # the facts: it can lose a proof but never make a false claim provable.
-    while true:
-        let before = rel.len()
-        for f3 in fs:
-            grow(f3, ref rel)
-        if rel.len() == before:
-            break
+    relevant(fs, ref rel, ref work)
     var used: [F] = [neg]
     for f4 in fs:
         let w = weaken(f4, rel)
@@ -508,9 +512,11 @@ struct Leaf:
     want: bool
     found: bool
     b: Branch
+    # the work done (see `prove_work`)
+    work: int
 
     fn new(want: bool) -> Leaf:
-        return Leaf(want=want, found=false, b=Branch.new())
+        return Leaf(want=want, found=false, b=Branch.new(), work=0)
 
     fn keep(ref self, b: Branch):
         if self.want and not self.found:
@@ -523,7 +529,8 @@ struct Leaf:
 # prover knows (the program may still rule them out in ways the prover
 # doesn't know). None: proven, out of budget, or no integer solution found.
 fn counterexample(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> Option[Model]:
-    match prepare(facts, goal, ranges):
+    var work = 0
+    match prepare(facts, goal, ranges, ref work):
         case Prep.Used(used, rel):
             var leaf = Leaf.new(true)
             var budget = MAX_NODES
@@ -813,42 +820,157 @@ fn is_def(f: F) -> bool:
         case _:
             return false
 
-fn add_atoms(f: F, ref rel: AtomSet):
+# Grow `rel` until no fact adds an atom to it (see `grow`). A fact is looked at
+# again only when one of its atoms has just become relevant, and not at all
+# once all of them are: what `grow` adds depends only on which of the fact's
+# atoms are relevant, so this reaches the same set as passes over every fact
+# until nothing changes, without the passes (a chain of n facts took n).
+fn relevant(fs: [F], ref rel: AtomSet, ref work: int):
+    # the facts each atom is in, and how many atoms each fact has
+    var slot: {int: int} = {}
+    var users: [[int]] = []
+    var need: [int] = []
+    for i, f in enumerate(fs):
+        let fa = atoms_of(f)
+        work += 1 + len(fa.xs)
+        need.push(len(fa.xs))
+        for a in fa.xs:
+            match slot.get(a):
+                case Some(j):
+                    users[j].push(i)
+                case None:
+                    slot[a] = len(users)
+                    users.push([i])
+    var have: [int] = [0] * len(fs)
+    var todo: [int] = []
+    for a0 in rel.xs:
+        note_new(a0, slot, users, ref have, ref todo)
+    while len(todo) > 0:
+        let a = todo.pop()
+        let j = slot.get(a).unwrap_or(-1)
+        if j < 0:
+            continue
+        for i in users[j]:
+            if have[i] < need[i]:
+                var added: [int] = []
+                grow(fs[i], ref rel, ref added)
+                for b in added:
+                    note_new(b, slot, users, ref have, ref todo)
+
+# The facts that mention an atom of `goal`: often all a proof needs, and far
+# fewer than a long function knows by its end.
+fn near_facts(facts: [F], goal: F) -> [F]:
+    let ga = atoms_of(goal)
+    var out: [F] = []
+    for f in facts:
+        if mentions(f, ga):
+            out.push(f)
+    return out
+
+# The facts connected to `goal` through atoms that few facts mention (at most
+# `hub`): a value that many facts mention (a length, a bound) links facts
+# that have nothing else to do with each other, and their cases would
+# multiply. None if they are more than `cap` facts.
+fn local_facts(facts: [F], goal: F, hub: int, cap: int, ref work: int) -> Option[[F]]:
+    var slot: {int: int} = {}
+    var users: [[int]] = []
+    var fas: [AtomSet] = []
+    for i, f in enumerate(facts):
+        let fa = atoms_of(f)
+        work += 1 + len(fa.xs)
+        for a in fa.xs:
+            match slot.get(a):
+                case Some(j):
+                    users[j].push(i)
+                case None:
+                    slot[a] = len(users)
+                    users.push([i])
+        fas.push(fa)
+    var taken: [bool] = [false] * len(facts)
+    var n = 0
+    let ga = atoms_of(goal)
+    var seen = ga
+    var todo: [int] = ga.xs
+    while len(todo) > 0:
+        let a = todo.pop()
+        let j = slot.get(a).unwrap_or(-1)
+        if j < 0:
+            continue
+        # the goal's own atoms are followed whatever their number of facts
+        if len(users[j]) > hub and not ga.contains(a):
+            continue
+        for i in users[j]:
+            if taken[i]:
+                continue
+            taken[i] = true
+            n += 1
+            if n > cap:
+                return None
+            for b in fas[i].xs:
+                if b != ATOM_UNKNOWN and seen.insert(b):
+                    todo.push(b)
+    var out: [F] = []
+    for i2 in 0..len(facts):
+        if taken[i2]:
+            out.push(facts[i2])
+    return Some(out)
+
+fn mentions(f: F, s: AtomSet) -> bool:
+    match f:
+        case F.True | F.False:
+            return false
+        case F.And(xs):
+            return any(mentions(x, s) for x in xs)
+        case F.Or(ys):
+            return any(mentions(y, s) for y in ys)
+        case _:
+            return touches(f, s)
+
+fn note_new(a: int, slot: {int: int}, users: [[int]], ref have: [int], ref todo: [int]):
+    match slot.get(a):
+        case Some(j):
+            for i in users[j]:
+                have[i] += 1
+            todo.push(a)
+        case None:
+            pass
+
+fn add_atoms(f: F, ref rel: AtomSet, ref added: [int]):
     var s = atoms_of(f)
     for a in s.xs:
-        if a != ATOM_UNKNOWN:
-            rel.insert(a)
+        if a != ATOM_UNKNOWN and rel.insert(a):
+            added.push(a)
 
 # One relevance pass over `f`; true if `f` mentions a relevant atom. A literal that mentions
 # one is relevant. When a branch of a disjunction is relevant, the literals that select
 # each of its branches (everything but definitions) become relevant too.
-fn grow(f: F, ref rel: AtomSet) -> bool:
+fn grow(f: F, ref rel: AtomSet, ref added: [int]) -> bool:
     match f:
         case F.True | F.False:
             return false
         case F.And(xs):
             var hit = false
             for x in xs:
-                if grow(x, ref rel):
+                if grow(x, ref rel, ref added):
                     hit = true
             return hit
         case F.Or(ys):
             var hit2 = false
             for y in ys:
-                if grow(y, ref rel):
+                if grow(y, ref rel, ref added):
                     hit2 = true
             if hit2:
                 for z in ys:
-                    select(z, ref rel)
+                    select(z, ref rel, ref added)
             return hit2
         case _:
             if touches(f, rel):
-                add_atoms(f, ref rel)
+                add_atoms(f, ref rel, ref added)
                 return true
             return false
 
 # Make the literals that select branch `f` of a disjunction relevant.
-fn select(f: F, ref rel: AtomSet):
+fn select(f: F, ref rel: AtomSet, ref added: [int]):
     match f:
         case F.True | F.False | F.Or(_):
             pass
@@ -859,10 +981,10 @@ fn select(f: F, ref rel: AtomSet):
                         pass
                     case _:
                         if not is_def(x):
-                            add_atoms(x, ref rel)
+                            add_atoms(x, ref rel, ref added)
         case _:
             if not is_def(f):
-                add_atoms(f, ref rel)
+                add_atoms(f, ref rel, ref added)
 
 # `f` with every literal that mentions no relevant atom replaced by `true`.
 fn weaken(f: F, rel: AtomSet) -> F:
@@ -901,6 +1023,7 @@ fn refute(
     ref leaf: Leaf
 ) -> Option[bool]:
     budget -= 1
+    leaf.work += 1
     if budget < 0:
         return None
     # flatten conjunctions and literals first; collect disjunctions for later
@@ -940,7 +1063,7 @@ fn refute(
         let la = l.add_c(-1)?
         let lc = l.neg()?.add_c(-1)?
         ors.push([F.Ge(la), F.Ge(lc)])
-    if fm_unsat(b.eqs, b.ges)?:
+    if fm_unsat(b.eqs, b.ges, ref leaf.work)?:
         return Some(true)
     if len(ors) == 0:
         leaf.keep(b)
@@ -984,7 +1107,7 @@ fn refute(
         for alt2 in o2:
             if probes > 0 and len(o2) > 1 and budget > 0 and (thorough or from_goal[n]):
                 probes -= 1
-                if contradicts(b, alt2, ref budget):
+                if contradicts(b, alt2, ref budget, ref leaf.work):
                     continue
             alts2.push(alt2)
         if len(alts2) == 0:
@@ -1132,7 +1255,7 @@ fn eval_known(f: F, known: {int: i128}, b: Branch) -> Option[bool]:
 
 # Does `alt` (a literal or a conjunction of them) contradict the branch's
 # literals? Each test is one search node.
-fn contradicts(b: Branch, alt: F, ref budget: int) -> bool:
+fn contradicts(b: Branch, alt: F, ref budget: int, ref work: int) -> bool:
     var eqs = b.eqs
     var ges = b.ges
     if not literals(alt, b, ref eqs, ref ges):
@@ -1140,7 +1263,7 @@ fn contradicts(b: Branch, alt: F, ref budget: int) -> bool:
     if len(eqs) == len(b.eqs) and len(ges) == len(b.ges):
         return false
     budget -= 1
-    return fm_unsat(eqs, ges) == Some(true)
+    return fm_unsat(eqs, ges, ref work) == Some(true)
 
 # Add `f`'s equalities and inequalities; false if it has anything else (an
 # `or`, a `!=`, or a boolean the branch doesn't decide).
@@ -1164,7 +1287,7 @@ fn literals(f: F, b: Branch, ref eqs: [Lin], ref ges: [Lin]) -> bool:
 
 # Some(true) if the conjunction of `eqs == 0` and `ges >= 0` has no integer
 # solution (definitely), Some(false) if we couldn't show that.
-fn fm_unsat(eqs_in: [Lin], ges_in: [Lin]) -> Option[bool]:
+fn fm_unsat(eqs_in: [Lin], ges_in: [Lin], ref work: int) -> Option[bool]:
     var eqs = eqs_in
     var ges = ges_in
     # eliminate equalities
@@ -1192,9 +1315,11 @@ fn fm_unsat(eqs_in: [Lin], ges_in: [Lin]) -> Option[bool]:
             let val = r.scale(-k)?
             for j in 0..len(eqs):
                 let s1 = eqs[j].subst(x, val)?
+                work += 1 + len(s1.t)
                 eqs[j] = s1
             for j2 in 0..len(ges):
                 let s2 = ges[j2].subst(x, val)?
+                work += 1 + len(s2.t)
                 ges[j2] = s2
         else:
             ges.push(e)
@@ -1218,6 +1343,7 @@ fn fm_unsat(eqs_in: [Lin], ges_in: [Lin]) -> Option[bool]:
         var nps: {int: int} = {}
         var nns: {int: int} = {}
         for l1 in cur:
+            work += 1 + len(l1.t)
             for p1 in l1.t:
                 atoms.insert(p1.0)
                 if p1.1 > 0:
@@ -1256,6 +1382,7 @@ fn fm_unsat(eqs_in: [Lin], ges_in: [Lin]) -> Option[bool]:
                 let nl = neg[ni]
                 let cb = nks[ni]
                 let comb = combine(pl, cb, nl, ca)?
+                work += 1 + len(comb.t)
                 match tighten(comb):
                     case Tight.False:
                         return Some(true)
