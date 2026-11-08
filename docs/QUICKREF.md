@@ -651,6 +651,24 @@ Run with `brine run --ranks N` (each rank gets cores / N `par` threads unless
 `--threads` says otherwise). Without it, `world.size() == 1`. If a rank fails,
 `brine run` stops the others and exits with that rank's exit code.
 
+Across machines, start the built program once per rank yourself, with three
+environment variables (what `--ranks` sets for local ranks):
+`BRINE_RANK` (this process's rank, 0 to N - 1), `BRINE_WORLD_SIZE` (N) and
+`BRINE_PEERS`, the same comma-separated `host:port` list on every rank, entry
+`r` being where rank `r` listens:
+```sh
+brine build --release sim.br -o sim
+# on host a and host b (the same list on both):
+BRINE_RANK=0 BRINE_WORLD_SIZE=2 BRINE_PEERS=a:7000,b:7000 ./sim
+BRINE_RANK=1 BRINE_WORLD_SIZE=2 BRINE_PEERS=a:7000,b:7000 ./sim
+```
+Each rank listens on its own port (on all interfaces, unless every entry is a
+loopback address), connects to the lower ranks, retrying for 30 s while they
+start, and accepts the higher ones. The connections are plain TCP, with no
+encryption or authentication: use a trusted network. Without `brine run`
+around them, a rank that fails doesn't stop the others; they panic at their
+next `world` call with that rank, saying it stopped.
+
 **No deadlocks, by construction.** Every rank takes part in every `world` call,
 and the compiler checks that all ranks make the same calls in the same order:
 a call under a condition that depends on `world.rank()` (or received values,
