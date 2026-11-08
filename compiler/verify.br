@@ -1159,7 +1159,10 @@ fn new_vf(
         one_char={},
         pure=[],
         memo={},
-        stored={}
+        stored={},
+        muls=[],
+        mul_keys=[],
+        mul_seen={}
     )
 
 struct Vf:
@@ -1248,6 +1251,10 @@ struct Vf:
     memo: {str: V}
     # a content made by storing into another one at an index (`n[i] = v`)
     stored: {int: (int, Lin)}
+    # the products made so far: the two factors and the product
+    muls: [(Lin, Lin, Lin)]
+    mul_keys: [(str, str, str)]
+    mul_seen: {str: bool}
 
     # The state, leaving none behind.
     fn take(ref self) -> Option[St]:
@@ -3481,6 +3488,195 @@ struct Vf:
             return b
         return (lo, hi)
 
+    # `b` (the bounds of `l`), tightened by one step through the facts about
+    # several atoms: `x < p.a` with `p.a <= 255`, `c == 4 * b`. For products,
+    # whose factors need constant bounds.
+    fn bounds_deep(self, l: Lin, b: (Option[i128], Option[i128])) -> (Option[i128], Option[i128]):
+        var lo: Option[i128] = Some(l.c)
+        var hi: Option[i128] = Some(l.c)
+        for a, k in l.t:
+            var ab = self.atom_bounds(a)
+            if self.live:
+                for f in self.st.facts:
+                    ab = self.tighten_via(f, a, ab)
+            for f in self.defs:
+                ab = self.tighten_via(f, a, ab)
+            if k > 0:
+                lo = add_opt(lo, mul_opt(k, ab.0))
+                hi = add_opt(hi, mul_opt(k, ab.1))
+            else:
+                lo = add_opt(lo, mul_opt(k, ab.1))
+                hi = add_opt(hi, mul_opt(k, ab.0))
+        return (max_opt(b.0, lo), min_opt(b.1, hi))
+
+    # `f` about `a` and up to two other atoms, with the others' bounds.
+    fn tighten_via(
+        self,
+        f: F,
+        a: int,
+        b: (Option[i128], Option[i128])
+    ) -> (Option[i128], Option[i128]):
+        match f:
+            case F.Ge(l):
+                return self.tighten_rest(l, false, a, b)
+            case F.Eq(l):
+                return self.tighten_rest(l, true, a, b)
+            case F.And(xs):
+                var r = b
+                for x in xs:
+                    r = self.tighten_via(x, a, r)
+                return r
+            case _:
+                return b
+
+    fn tighten_rest(
+        self,
+        l: Lin,
+        eq: bool,
+        a: int,
+        b: (Option[i128], Option[i128])
+    ) -> (Option[i128], Option[i128]):
+        if len(l.t) < 2 or len(l.t) > 3:
+            return b
+        var k: i128 = 0
+        var rest = Lin.konst(l.c)
+        for x, kx in l.t:
+            if x == a:
+                k = kx
+            else:
+                match Lin.atom(x).scale(kx):
+                    case Some(t):
+                        match rest.add(t):
+                            case Some(r):
+                                rest = r
+                            case None:
+                                return b
+                    case None:
+                        return b
+        if k == 0:
+            return b
+        # k*a + rest >= 0 (or == 0)
+        let rb = self.bounds(rest)
+        var lo = b.0
+        var hi = b.1
+        if k > 0:
+            # a >= -rest / k: at least -floor(rest_hi / k)
+            match rb.1:
+                case Some(rh):
+                    match neg_i128(rh / k):
+                        case Some(v):
+                            if lo.is_none() or v > lo.unwrap():
+                                lo = Some(v)
+                        case None:
+                            pass
+                case None:
+                    pass
+            if eq:
+                # a == -rest / k: at most floor(-rest_lo / k)
+                match rb.0:
+                    case Some(rl):
+                        match neg_i128(rl):
+                            case Some(n):
+                                let v = n / k
+                                if hi.is_none() or v < hi.unwrap():
+                                    hi = Some(v)
+                            case None:
+                                pass
+                    case None:
+                        pass
+        else:
+            match neg_i128(k):
+                case Some(m):
+                    # m*a <= rest: at most floor(rest_hi / m)
+                    match rb.1:
+                        case Some(rh):
+                            let v = rh / m
+                            if hi.is_none() or v < hi.unwrap():
+                                hi = Some(v)
+                        case None:
+                            pass
+                    if eq:
+                        # m*a == rest: at least -floor(-rest_lo / m)
+                        match rb.0:
+                            case Some(rl):
+                                match neg_i128(rl):
+                                    case Some(n):
+                                        match neg_i128(n / m):
+                                            case Some(v):
+                                                if lo.is_none() or v > lo.unwrap():
+                                                    lo = Some(v)
+                                            case None:
+                                                pass
+                                    case None:
+                                        pass
+                            case None:
+                                pass
+                case None:
+                    pass
+        return (lo, hi)
+
+    # Products with a factor in common, `y * w` and `h * w`: where `w >= 0`
+    # and `y < h` here, `y * w + w <= h * w` (and the like). Their bounds
+    # alone can't say that (`y * w + x < w * h` for an index into an image).
+    fn relate_muls(ref self, a: Lin, b: Lin, p: Lin):
+        let pk = lin_key(p)
+        let ak = lin_key(a)
+        let bk = lin_key(b)
+        var seen = false
+        var tried = 0
+        var i = len(self.muls) - 1
+        let stop = max(0, len(self.muls) - 32)
+        while i >= stop and tried < 4:
+            let (x, y, q) = self.muls[i]
+            let (xk, yk, qk) = self.mul_keys[i]
+            i -= 1
+            if qk == pk:
+                seen = true
+                continue
+            # p = u * s, q = v * s
+            var shared: Option[(Lin, Lin, Lin)] = None
+            if ak == xk:
+                shared = Some((a, b, y))
+            elif ak == yk:
+                shared = Some((a, b, x))
+            elif bk == xk:
+                shared = Some((b, a, y))
+            elif bk == yk:
+                shared = Some((b, a, x))
+            match shared:
+                case Some((s0, u, v)):
+                    tried += 1
+                    if not nonneg(self.bounds_deep(s0, self.bounds(s0))):
+                        continue
+                    match v.sub(u):
+                        case Some(d):
+                            let db = self.bounds(d)
+                            match db.0:
+                                case Some(lo):
+                                    # v >= u (+ 1): q >= p (+ s)
+                                    if lo >= 1:
+                                        self.assume(F.le(p.add(s0).unwrap_or(p), q))
+                                    elif lo >= 0:
+                                        self.assume(F.le(p, q))
+                                case None:
+                                    pass
+                            match db.1:
+                                case Some(hi):
+                                    if hi <= -1:
+                                        self.assume(F.le(q.add(s0).unwrap_or(q), p))
+                                    elif hi <= 0:
+                                        self.assume(F.le(q, p))
+                                case None:
+                                    pass
+                        case None:
+                            pass
+                case None:
+                    pass
+        if not seen and pk not in self.mul_seen:
+            self.mul_seen[pk] = true
+            self.muls.push((a, b, p))
+            self.mul_keys.push((ak, bk, pk))
+
     fn atom_bounds(self, a: int) -> (Option[i128], Option[i128]):
         var b: (Option[i128], Option[i128]) = (None, None)
         if a < len(self.ranges):
@@ -3527,10 +3723,17 @@ struct Vf:
                             case None:
                                 let t = Term.Mul(a, b) if lin_le(a, b) else Term.Mul(b, a)
                                 let p = Lin.atom(self.term(t, None))
-                                var pb = mul_bounds(self.bounds(a), self.bounds(b))
+                                var ab = self.bounds(a)
+                                var bb = self.bounds(b)
+                                var pb = mul_bounds(ab, bb)
+                                if not fits_bounds(pb, k):
+                                    ab = self.bounds_deep(a, ab)
+                                    bb = self.bounds_deep(b, bb)
+                                    pb = mul_bounds(ab, bb)
                                 if lin_key(a) == lin_key(b) and not nonneg(pb):
                                     pb = (Some(0), pb.1)
                                 self.assume_bounds(p, pb)
+                                self.relate_muls(a, b, p)
                                 r = Some(p)
             case BinOp.Div | BinOp.Mod:
                 var q: Option[Lin] = None
@@ -5458,6 +5661,33 @@ fn mul_bounds(
         case _:
             pass
     return (None, None)
+
+# The tighter of two bounds.
+fn max_opt(a: Option[i128], b: Option[i128]) -> Option[i128]:
+    match (a, b):
+        case (Some(x), Some(y)):
+            return Some(max(x, y))
+        case (Some(_), None):
+            return a
+        case _:
+            return b
+
+fn min_opt(a: Option[i128], b: Option[i128]) -> Option[i128]:
+    match (a, b):
+        case (Some(x), Some(y)):
+            return Some(min(x, y))
+        case (Some(_), None):
+            return a
+        case _:
+            return b
+
+# Bounds within the range of `k`.
+fn fits_bounds(b: (Option[i128], Option[i128]), k: IntTy) -> bool:
+    match (b.0, b.1):
+        case (Some(lo), Some(hi)):
+            return k.min() <= lo and hi <= k.max()
+        case _:
+            return false
 
 fn nonneg(b: (Option[i128], Option[i128])) -> bool:
     match b.0:
