@@ -625,6 +625,15 @@ struct Fa:
             let e = self.loop_poison.get(l, none())
             self.loop_poison[l] = e.join(d)
 
+    # The dependence added by early exits on the way here (`return`, `?`,
+    # `continue`). Branches each start from the value before them.
+    fn poison(self) -> (Dep, Dep):
+        return (self.ret_poison, self.cont_poison)
+
+    fn set_poison(ref self, p: (Dep, Dep)):
+        self.ret_poison = p.0
+        self.cont_poison = p.1
+
     # Some ranks may leave the function here.
     fn leave(ref self, here: Dep):
         self.ret_poison = self.ret_poison.join(here)
@@ -661,6 +670,8 @@ struct Fa:
             case StmtKind.If(branches, els):
                 var c = ctx
                 var out = dead()
+                # an early exit in one branch can't stop a rank that takes another
+                var pout = self.poison()
                 for cond, body in branches:
                     let d = (
                         self.expr(cond, c)
@@ -669,9 +680,13 @@ struct Fa:
                     )
                     c = c.join(d)
                     let before = self.st()
+                    # (the ranks that go on to the next branch evaluated this condition)
+                    let pc = self.poison()
                     self.block(body, c)
                     out = out.join(self.st())
+                    pout = join_poison(pout, self.poison())
                     self.restore(before)
+                    self.set_poison(pc)
                 match els:
                     case Some(b):
                         self.block(b, c)
@@ -679,6 +694,7 @@ struct Fa:
                         pass
                 out = out.join(self.st())
                 self.restore(out)
+                self.set_poison(join_poison(pout, self.poison()))
             case StmtKind.Match(scrut, cases):
                 let sv = self.expr(scrut, ctx)
                 # which case runs depends on what the patterns look at
@@ -690,8 +706,12 @@ struct Fa:
                 var cur = self.st()
                 var out = dead()
                 let bind = self.eff(ctx)
+                # as for `if`: each case starts with the exits seen before the `match`
+                var pcur = self.poison()
+                var pout = pcur
                 for case_ in cases:
                     self.restore(cur)
+                    self.set_poison(pcur)
                     self.bind_pattern(case_.pat, sv.spread(bind))
                     match case_.guard:
                         case Some(g):
@@ -704,9 +724,12 @@ struct Fa:
                         case None:
                             pass
                     cur = self.st()
+                    pcur = self.poison()
                     self.block(case_.body, c)
                     out = out.join(self.st())
+                    pout = join_poison(pout, self.poison())
                 self.restore(out)
+                self.set_poison(pout)
             case StmtKind.While(_, _, _):
                 self.run_loop(s, ctx, none(), atom(none()))
             case StmtKind.For(_, _, _, iter, _, _, _):
@@ -1507,6 +1530,9 @@ fn nparts(info: ProgramInfo, t: Ty) -> int:
             return len(ts)
         case _:
             return 0
+
+fn join_poison(a: (Dep, Dep), b: (Dep, Dep)) -> (Dep, Dep):
+    return (a.0.join(b.0), a.1.join(b.1))
 
 fn same_poison(a: {Span: Dep}, b: {Span: Dep}) -> bool:
     if len(a) != len(b):
