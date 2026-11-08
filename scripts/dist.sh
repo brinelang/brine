@@ -7,8 +7,8 @@
 #
 # Stage 0 is the release named in bootstrap/VERSION, downloaded and checked
 # against bootstrap/SHA256SUMS, or $BRINE0 (a brine executable) when set. Needs
-# curl and sha256sum or shasum, and a C compiler only if stage 0 needs one
-# (0.8.0 links through cc: $CC, cc, gcc or clang).
+# curl and sha256sum or shasum. Releases from 0.9.0 on need no C compiler on
+# x86-64 and ARM64.
 set -eu
 
 case "$(uname -s)" in
