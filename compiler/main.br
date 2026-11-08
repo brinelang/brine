@@ -1057,11 +1057,14 @@ fn cmd_spec_diff(g: G, a: Args) -> Result[int, str]:
                     + json_str(f.loc)
                     + ",\"message\":"
                     + json_str(f.message())
+                    + (",\"note\":" + json_str(f.note) if f.note != "" else "")
                     + "}"
                 )
             else:
                 let col = c.red() if f.bad else (c.green() if what == "stronger" else "")
                 print(f"{f.loc}: {c.bold()}{col}{what}{c.reset()}: {f.message()}")
+                if f.note != "":
+                    print(f"{f.loc}: {c.bold()}note{c.reset()}: {f.note}")
     var before = -1
     var after = -1
     var kinds = ""
@@ -1536,6 +1539,38 @@ fn receipt(fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.Entry])]) ->
     o.push(f"**Sources:** {src_hash}")
     return "\n".join(o) + "\n"
 
+# For the rules (or the vocabulary files) in the lock: how many there are now,
+# and how many are new, changed, removed and unchanged.
+fn approve_counts(now: [rules.Entry], old: [rules.Entry], rule: bool) -> [int]:
+    var c = [0, 0, 0, 0, 0]
+    for e in now:
+        if (e.kind == "rule") != rule:
+            continue
+        c[0] += 1
+        match rules.find_entry(old, e.kind, e.name):
+            case Some(o):
+                if o.hash == e.hash:
+                    c[4] += 1
+                else:
+                    c[2] += 1
+            case None:
+                c[1] += 1
+    for o in old:
+        if (o.kind == "rule") == rule and rules.find_entry(now, o.kind, o.name).is_none():
+            c[3] += 1
+    return c
+
+# "2 rules (1 new, 1 unchanged)", "1 vocabulary file (unchanged)"
+fn approve_part(c: [int], what: str) -> str:
+    var parts: [str] = []
+    for i, w in [(1, "new"), (2, "changed"), (3, "removed")]:
+        if c[i] > 0:
+            parts.push(f"{c[i]} {w}")
+    if c[4] > 0:
+        parts.push("unchanged" if len(parts) == 0 else f"{c[4]} unchanged")
+    let s = f"{c[0]} {what}{plural(c[0])}"
+    return s + " (" + ", ".join(parts) + ")" if len(parts) > 0 else s
+
 fn rules_approve(g: G, dir: str, path: str) -> Result[int, str]:
     let src = read_file(path)?
     let (m, ds) = parser.parse_module(src, 0, rules.MODULE)
@@ -1553,25 +1588,13 @@ fn rules_approve(g: G, dir: str, path: str) -> Result[int, str]:
         case Err(_):
             pass
     write_file(lp, rules.lock_text(now))?
-    var fresh = 0
-    var changed = 0
-    var same = 0
-    var nrules = 0
-    for e in now:
-        if e.kind == "rule":
-            nrules += 1
-        match rules.find_entry(old, e.kind, e.name):
-            case Some(o):
-                if o.hash == e.hash:
-                    same += 1
-                else:
-                    changed += 1
-            case None:
-                fresh += 1
-    var removed = 0
-    for o in old:
-        if rules.find_entry(now, o.kind, o.name).is_none():
-            removed += 1
+    # counted apart: a removed rule isn't a removed file
+    let rc = approve_counts(now, old, true)
+    let fc = approve_counts(now, old, false)
+    let nrules = rc[0]
+    let fresh = rc[1] + fc[1]
+    let changed = rc[2] + fc[2]
+    let removed = rc[3] + fc[3]
     if g.json:
         print(
             "{\"approved\":"
@@ -1580,10 +1603,9 @@ fn rules_approve(g: G, dir: str, path: str) -> Result[int, str]:
             + "}"
         )
     else:
-        let files = len(now) - nrules
         g.status(
             "Approved",
-            f"{nrules} rule{plural(nrules)} and {files} vocabulary file{plural(files)} ({fresh} new, {changed} changed, {removed} removed, {same} unchanged)"
+            approve_part(rc, "rule") + " and " + approve_part(fc, "vocabulary file")
         )
         g.status(
             "Wrote",

@@ -1306,9 +1306,19 @@ test "spec-diff finds specs that promise less":
     assert "\"checks_before\":1,\"checks_after\":2" in o.out, o.out
     let t = brine(["spec-diff", f])
     assert "main.br:6:4: weaker: `clamp` no longer promises `lo <= result <= hi`" in t.out, t.all()
+    # and what it promises now
+    assert "main.br:6:4: note: `clamp` now promises `lo <= result`" in t.out, t.all()
+    assert "note: `bump` now promises `n >= 0` and `n > 0 or n == 0`" in t.out, t.all()
     assert "runtime checks left: 1 → 2 (+1 index bounds check)" in t.out, t.all()
     let bad = brine(["spec-diff", f, "--base", "nope"])
     assert bad.code == 2 and "could not read" in bad.err, bad.all()
+    assert "there is no revision `nope` in this repository" in bad.err, bad.all()
+    # a repository without commits has nothing to compare with yet
+    let e = scratch("specdiff-empty")
+    write(e + "/main.br", main)
+    git(e, ["init", "-q"])
+    let none = brine(["spec-diff", e + "/main.br"])
+    assert none.code == 2 and "the repository has no commits yet" in none.err, none.all()
 
 # `code@file:line` for each error and warning in `--json` output.
 fn diag_codes(o: Out) -> [str]:
@@ -1556,6 +1566,35 @@ test "rules are for the programs built from what they name":
     assert brine(["build", f + "/main.br"]).code == 0
     let other = brine(["build", f + "/other.br"])
     assert other.code == 0 and "not checked" in other.err, other.all()
+
+test "rules read well to their owner":
+    let d = scratch("rules-words")
+    write(
+        d + "/main.br",
+        "fn half(x: u64) -> Option[u64]:\n    if x % 2 == 1:\n        return None\n    return Some(x / 2)\n\nfn main():\n    print(half(u64(4)).is_some())\n"
+    )
+    let header = "rule \"halves are never more than what they halve, for any of these three inputs\" for x: u64, y: f64, z: i32:"
+    write(
+        d + "/RULES.br",
+        "from main import half\n\n"
+        + header
+        + "\n    match half(x):\n        case Some(h):\n            prove h <= x\n        case None:\n            pass\n"
+    )
+    # `fmt` keeps a long header whole: it has no brackets of its own to break in
+    let f = brine(["fmt", d + "/RULES.br"])
+    assert f.code == 0 and header + "\n" in text(d + "/RULES.br"), f.all() + text(d + "/RULES.br")
+    let ex = brine(["rules", d + "/main.br", "--explain"])
+    assert "(a u64) and every y (an f64) and every z (an i32)" in ex.out, ex.all()
+    # an empty branch says so, and the closing sentence is about the whole rule
+    assert (
+        "     when half(x) is None:\n       nothing more is required.\n   Nothing this runs can stop the program." in ex.out
+    ), ex.out
+    # approving counts rules and vocabulary files apart
+    let a = brine(["rules", "approve", d])
+    assert "Approved 1 rule (1 new) and 1 vocabulary file (1 new)" in a.err, a.all()
+    write(d + "/RULES.br", "from main import half\n")
+    let b = brine(["rules", "approve", d])
+    assert "Approved 0 rules (1 removed) and 1 vocabulary file (unchanged)" in b.err, b.all()
 
 test "malformed rules":
     let d = scratch("bad-rules")
