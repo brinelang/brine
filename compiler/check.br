@@ -492,7 +492,8 @@ struct Checker:
                         module=mi,
                         ty=Ty.Error,
                         value=ConstVal.Int(0),
-                        span=c.span
+                        span=c.span,
+                        untyped=false
                     )
                 )
                 self.insert_item(ref items, c.name, Item.Const(id), c.span)
@@ -624,6 +625,15 @@ struct Checker:
                             case Some(v):
                                 self.info.consts[id].value = v
                                 self.info.consts[id].ty = ty
+                                match v:
+                                    case ConstVal.Int(_):
+                                        self.info.consts[id].untyped = (
+                                            ann.is_none()
+                                            and ty == int_ty()
+                                            and not typed_int(c.value)
+                                        )
+                                    case _:
+                                        pass
                             case None:
                                 match self.const_array(c.value):
                                     case Some(lit):
@@ -2484,7 +2494,9 @@ struct Checker:
         let ctn = self.tn(c.ty)
         match kind:
             case Some(k):
-                if not ty.is_error() and c.ty != ty:
+                # an untyped integer constant matches any integer, like its literal
+                let adapts = c.untyped and ty.is_int()
+                if not ty.is_error() and c.ty != ty and not adapts:
                     let tn = self.tn(ty)
                     self.err(
                         diag.error(
@@ -4415,6 +4427,27 @@ struct Checker:
                 pass
         e.res = Res.Const(id)
 
+    # An untyped integer constant stands for its literal, which adapts to the
+    # context: `x | TAG` with `x: u64`, `let b: u8 = TAG`.
+    fn const_ty(ref self, ref e: Expr, id: int, exp: Option[Ty]) -> Ty:
+        let c = self.info.consts[id]
+        if c.untyped:
+            match c.value:
+                case ConstVal.Int(v):
+                    e.kind = ExprKind.Int(v)
+                    match exp:
+                        case Some(Ty.Int(k)):
+                            if v >= k.min() and v <= k.max():
+                                return Ty.Int(k)
+                        case Some(Ty.Float(f)):
+                            e.kind = ExprKind.Float(float(v))
+                            return Ty.Float(f)
+                        case _:
+                            pass
+                case _:
+                    pass
+        return c.ty
+
     fn check_ident(ref self, ref e: Expr, name: str, exp: Option[Ty]) -> Ty:
         let span = e.span
         match self.lookup_local(name):
@@ -4427,7 +4460,7 @@ struct Checker:
         match self.item(name):
             case Some(Item.Const(id)):
                 self.use_const(ref e, id)
-                return self.info.consts[id].ty
+                return self.const_ty(ref e, id, exp)
             case Some(Item.Fn(_)) | Some(Item.GenFn(_)):
                 self.err(
                     diag.error(
@@ -4543,7 +4576,7 @@ struct Checker:
                             match self.items[m].get(name):
                                 case Some(Item.Const(id)):
                                     self.use_const(ref e, id)
-                                    return self.info.consts[id].ty
+                                    return self.const_ty(ref e, id, exp)
                                 case Some(_):
                                     self.err(
                                         diag.error(
@@ -8845,6 +8878,30 @@ fn expr_to_type(e: Expr) -> Option[TypeExpr]:
             return Some(TypeExpr.Tuple(exprs_to_types(xs)?, span))
         case _:
             return None
+
+# An integer constant's value names its type: a conversion (`int(x)`) or a
+# constant declared with one (`const T: int = 5`). The uses of untyped constants
+# were already replaced by their literals.
+fn typed_int(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Ident(_) | ExprKind.Field(_, _, _):
+            match e.res:
+                case Res.Const(_):
+                    return true
+                case _:
+                    return false
+        case ExprKind.Call(_, _):
+            match e.cres:
+                case CallRes.Convert(_):
+                    return true
+                case _:
+                    return false
+        case ExprKind.Unary(_, x):
+            return typed_int(x)
+        case ExprKind.Binary(_, l, r):
+            return typed_int(l) or typed_int(r)
+        case _:
+            return false
 
 # `v` converted to `t` as at run time: None if it can't be done now, an error if
 # the conversion would panic.

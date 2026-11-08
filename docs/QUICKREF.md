@@ -99,7 +99,8 @@ var names: [str] = []   # annotate when the type can't be inferred
 let n: i32 = 7          # ...or whenever you like
 for i: int in 0..3:     # loop variables too: `for k: str, v: int in m.items():`
     total += i
-const LIMIT = 100       # compile-time constant (top level)
+const LIMIT = 100       # compile-time constant (top level); untyped, it adapts
+                        # like the literal: `x | LIMIT` with `x: u64` is fine
 const MASK = u64(0xff)  # conversions are computed (and checked) at compile time
 const BASE = [3, 4, 5, 6]       # read-only arrays too; `len(BASE)` is a constant
 ```
