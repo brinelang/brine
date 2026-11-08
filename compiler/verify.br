@@ -1003,6 +1003,37 @@ fn split_ws(s: str) -> str:
         parts.push(cur)
     return " ".join(parts)
 
+# The longest note: past it a note is cut short (a long one helps no one).
+const NOTE_MAX = 400
+
+fn cap_note(s: str) -> str:
+    if len(s) <= NOTE_MAX:
+        return s
+    let cs = s.chars()
+    if len(cs) <= NOTE_MAX:
+        return s
+    return "".join(cs[:NOTE_MAX - 1]) + "…"
+
+# `s` with every `q` in it replaced by `to`, where `q` is a whole name: `x.1`
+# is not the start of `x.10`.
+fn replace_name(s: str, q: str, to: str) -> str:
+    if q not in s:
+        return s
+    var out = ""
+    var at = 0
+    while at <= len(s):
+        match s.find(q, at):
+            case Some(i):
+                let j = i + len(q)
+                let d = s[j:j + 1] if j < len(s) else ""
+                out += s[at:i]
+                out += q if d != "" and d in "0123456789" else to
+                at = j
+            case None:
+                out += s[at:]
+                return out
+    return out
+
 enum Step:
     Field(k: int)
     Index(i: Lin)
@@ -1068,7 +1099,9 @@ fn new_vf(
         too_big=false,
         given_up=0,
         extra=0,
-        mods=[]
+        mods=[],
+        hidden={},
+        aliases={}
     )
 
 struct Vf:
@@ -1140,6 +1173,12 @@ struct Vf:
     extra: int
     # the values `a % c` for a constant `c` (see `const_mod`), with their `a`
     mods: [(int, Lin)]
+    # a hidden loop variable (`for k, v in ...` loops over `for'12`): the name
+    # its value was given, which the `let` that unpacks it renames
+    hidden: {int: str}
+    # values a `let` named (by `lin_key`): `d0 * e` reads better than the
+    # expression `d0` stands for, which grows with every `let` in a chain
+    aliases: {str: str}
 
     # The state, leaving none behind.
     fn take(ref self) -> Option[St]:
@@ -1161,6 +1200,14 @@ struct Vf:
 
     fn local_name(self, id: int) -> str:
         return self.locals[id].name if 0 <= id < len(self.locals) else ""
+
+    # A local's name in messages: a hidden one (`for'12`, `tup'12`) is shown
+    # as the pattern it stands for.
+    fn shown_local(self, id: int) -> str:
+        let n = self.local_name(id)
+        if "'" in n and 0 <= id < len(self.locals):
+            return split_ws(self.snippet(self.locals[id].span))
+        return n
 
     fn local_ty(self, id: int) -> Ty:
         return self.locals[id].ty if 0 <= id < len(self.locals) else Ty.Unknown
@@ -1681,12 +1728,17 @@ struct Vf:
             s += f" - {wrapping_neg(l.c)}"
         return s
 
+    # `l` as an operand: in parentheses, or by the name a `let` gave it
     fn show_lin_p(self, l: Lin) -> str:
-        let s = self.show_lin(l)
         let n = len(l.t) + (1 if l.c != 0 else 0)
         if n > 1:
-            return "(" + s + ")"
-        return s
+            match self.aliases.get(lin_key(l)):
+                case Some(a):
+                    return a
+                case None:
+                    pass
+            return "(" + self.show_lin(l) + ")"
+        return self.show_lin(l)
 
     # Show `l op 0` as `lhs op rhs` with positive coefficients on both sides.
     fn show_rel(self, l: Lin, op0: str) -> str:
@@ -1864,11 +1916,13 @@ struct Vf:
                 case _:
                     pass
             for n in self.known_facts_note(open):
-                d = d.note(n)
+                d = d.note(cap_note(n))
             if rest_proven:
-                d = d.note("to prove: " + self.show_f(open) + " (the rest of it is proven)")
+                d = d.note(
+                    cap_note("to prove: " + self.show_f(open)) + " (the rest of it is proven)"
+                )
             else:
-                d = d.note("to prove: " + self.show_f(goal))
+                d = d.note(cap_note("to prove: " + self.show_f(goal)))
             if limited:
                 d = d.note(
                     f"the prover gave up: `{self.fn_name}` is too long or complex for it (it does a limited amount of work per function), so this may well be true"
@@ -1884,7 +1938,7 @@ struct Vf:
                 if not gave_up:
                     match self.values_note(all, open):
                         case Some(n):
-                            d = d.note(n)
+                            d = d.note(cap_note(n))
                         case None:
                             pass
                 if gave_up:
@@ -1906,6 +1960,31 @@ struct Vf:
             self.atom_names[a] = self.atom_names[a].replace(from, to)
         for c in nc..len(self.content_names):
             self.content_names[c] = self.content_names[c].replace(from, to)
+
+    # `let (k, v) = for'12`, which unpacks a hidden loop variable: the parts
+    # of its value are named after `k` and `v` from now on.
+    fn unpack_hidden(ref self, init: Expr, ids: [int]):
+        var base = ""
+        match (init.kind, init.res):
+            case (ExprKind.Ident(_), Res.Local(h)):
+                base = self.hidden.get(h).unwrap_or("")
+            case _:
+                pass
+        if base == "":
+            return
+        var j = len(ids)
+        while j > 0:
+            j -= 1
+            let q = f"{base}.{j}"
+            let to = self.local_name(ids[j])
+            if "'" in to:
+                # a nested pattern: unpacked by the next `let`
+                self.hidden[ids[j]] = q
+            elif to != "_" and to != "":
+                for a in 0..len(self.atom_names):
+                    self.atom_names[a] = replace_name(self.atom_names[a], q, to)
+                for c in 0..len(self.content_names):
+                    self.content_names[c] = replace_name(self.content_names[c], q, to)
 
     # Short source text for naming unknown values in messages.
     fn name_of(self, e: Expr) -> str:
@@ -2046,7 +2125,7 @@ struct Vf:
                     case Some(v):
                         return v
                     case None:
-                        return self.fresh_val(ty, "?")
+                        return self.fresh_val(ty, self.local_name(id))
             case None:
                 pass
         if self.live:
@@ -2066,7 +2145,7 @@ struct Vf:
 
     fn stmt(ref self, s: Stmt):
         match s.kind:
-            case StmtKind.Let(_, pat, _, init, _):
+            case StmtKind.Let(mutable, pat, _, init, _):
                 let na = len(self.atom_names)
                 let nc = len(self.content_names)
                 let v = self.eval(init)
@@ -2074,14 +2153,26 @@ struct Vf:
                 let from = self.name_of(init)
                 match pat:
                     case LetPat.Name(_, _):
-                        self.rename_since(na, nc, from, self.local_name(s.locals[0]))
+                        let to = self.local_name(s.locals[0])
+                        self.rename_since(na, nc, from, to)
                         self.bind(s.locals[0], v)
+                        match v:
+                            case V.Int(l):
+                                if (
+                                    not mutable
+                                    and "'" not in to
+                                    and len(l.t) + (1 if l.c != 0 else 0) > 1
+                                ):
+                                    self.aliases[lin_key(l)] = to
+                            case _:
+                                pass
                     case LetPat.Tuple(_):
                         # the last first: `.1` is the start of `.10`
                         var j = len(s.locals)
                         while j > 0:
                             j -= 1
                             self.rename_since(na, nc, f"{from}.{j}", self.local_name(s.locals[j]))
+                        self.unpack_hidden(init, s.locals)
                         for i, id in enumerate(s.locals):
                             var x = V.Opaque
                             var have = false
@@ -2109,9 +2200,12 @@ struct Vf:
                                         let b = self.as_int(rhs, value.ty)
                                         new = self.compound(s.span, o, a, b, k)
                                     case (Ty.Str, V.Str(a), V.Str(b)):
-                                        new = V.Str(self.lin(a.add(b), "len(?)"))
+                                        let nm = "len(" + self.name_of(target) + ")"
+                                        let n = self.lin(a.add(b), nm)
+                                        self.cap_len(n)
+                                        new = V.Str(n)
                                     case _:
-                                        new = self.fresh_val(target.ty, "?")
+                                        new = self.fresh_val(target.ty, self.name_of(target))
                             case None:
                                 pass
                         let old = self.lookup(root, self.local_ty(root))
@@ -2623,7 +2717,7 @@ struct Vf:
                         case _:
                             pass
                     if not have:
-                        x = self.fresh_val(t, "?")
+                        x = self.fresh_val(t, split_ws(self.snippet(q.span)))
                     self.bind_pattern(q, x, t)
             case PatKind.Variant(_, _):
                 match p.vres:
@@ -2909,7 +3003,7 @@ struct Vf:
                 pass
 
     fn for_loop(ref self, iter: Expr, invs: [Expr], body: Block, var_id: int, counted: bool):
-        let vname = self.local_name(var_id)
+        let vname = self.shown_local(var_id)
         let vty = self.local_ty(var_id)
         var dom = D.Other
         var done = false
@@ -3067,6 +3161,12 @@ struct Vf:
             case D.Other:
                 v = self.fresh_val(vty, vname)
         self.bind(var_id, v)
+        if "'" in self.local_name(var_id):
+            match dom:
+                case D.Arr(c, _, _):
+                    self.hidden[var_id] = self.content_names[c] + "[index of " + vname + "]"
+                case _:
+                    self.hidden[var_id] = vname
         for inv in invs:
             let f = self.spec_cond(inv)
             self.assume(f)
@@ -3410,8 +3510,8 @@ struct Vf:
                         pass
                 return V.Int(Lin.atom(self.new_atom(self.op_name(" << ", a, b), int_range(k))))
             case _:
-                return V.Int(self.fresh_int("?", k))
-        return V.Int(self.lin(r, "?"))
+                return V.Int(self.fresh_int(self.op_name(" " + op.sym() + " ", a, b), k))
+        return V.Int(self.lin(r, self.op_name(" " + op.sym() + " ", a, b)))
 
     # `a % c` for a constant `c`, which is `rest` (`a - c*(a / c)`): a value of
     # its own, between 0 and c (its range), equal to `rest`. As `rest` itself,
@@ -3479,6 +3579,18 @@ struct Vf:
         return self.show_lin_p(a) + op + self.show_lin_p(b)
 
     fn eval(ref self, e: Expr) -> V:
+        let v = self.eval_(e)
+        # what isn't modelled is still a number or a truth value, named after
+        # the source in messages
+        if v == V.Opaque:
+            match e.ty:
+                case Ty.Int(_) | Ty.Bool:
+                    return self.fresh_val(e.ty, self.name_of(e))
+                case _:
+                    pass
+        return v
+
+    fn eval_(ref self, e: Expr) -> V:
         match e.kind:
             case ExprKind.Int(v):
                 match e.ty:
@@ -3529,13 +3641,13 @@ struct Vf:
                     self.check_own_inv(e.span)
                     self.check_ensures(None, e.span)
                     self.put(saved)
-                return self.fresh_val(e.ty, "?")
+                return self.fresh_val(e.ty, self.name_of(e))
             case ExprKind.Unary(op, x):
                 let v = self.eval(x)
                 match (op, e.ty):
                     case (UnOp.Neg, Ty.Int(k)):
                         let l = self.as_int(v, x.ty)
-                        let n = self.lin(l.neg(), "?")
+                        let n = self.lin(l.neg(), self.name_of(e))
                         self.kept(e.span, in_range(n, k), "overflow check")
                         return V.Int(n)
                     case (UnOp.Not, _):
@@ -3598,7 +3710,7 @@ struct Vf:
                         case _:
                             pass
                     if not done:
-                        f = self.fresh_bool("?")
+                        f = self.fresh_bool(self.name_of(e))
                     fs.push(f)
                     prev = v
                     pt = x.ty
@@ -3631,7 +3743,7 @@ struct Vf:
                         let s2 = self.take()
                         let joined = self.join(fk, s1, c, s2, nc)
                         self.put(joined)
-                        return self.ite(c, a, b, e.ty)
+                        return self.ite(c, a, b, e.ty, self.name_of(e))
                     case None:
                         let s1 = self.begin_assume(c)
                         let a = self.eval(then)
@@ -3639,7 +3751,7 @@ struct Vf:
                         let s2 = self.begin_assume(nc)
                         let b = self.eval(els)
                         self.end_assume(s2)
-                        return self.ite(c, a, b, e.ty)
+                        return self.ite(c, a, b, e.ty, self.name_of(e))
             case ExprKind.Call(_, args):
                 match e.cres:
                     case CallRes.Fn(id):
@@ -3658,7 +3770,7 @@ struct Vf:
                         for a in args:
                             self.eval(a.expr)
                         self.ref_args(args)
-                        return self.fresh_val(e.ty, "?")
+                        return self.fresh_val(e.ty, self.name_of(e))
             case ExprKind.MethodCall(recv, _, _, args):
                 match e.cres:
                     case CallRes.Ctor(sid):
@@ -3721,7 +3833,7 @@ struct Vf:
                         for a in args:
                             self.eval(a.expr)
                         self.ref_args(args)
-                        return self.fresh_val(e.ty, "?")
+                        return self.fresh_val(e.ty, self.name_of(e))
             case ExprKind.Field(b, _, _):
                 match e.res:
                     case Res.Const(id):
@@ -3742,7 +3854,7 @@ struct Vf:
                             return vs[e.idx]
                     case _:
                         pass
-                return self.fresh_val(e.ty, "?")
+                return self.fresh_val(e.ty, self.name_of(e))
             case ExprKind.Index(b, idx):
                 let bv = self.eval(b)
                 let iv = self.eval(idx)
@@ -3760,7 +3872,7 @@ struct Vf:
                         return V.Str(Lin.konst(1))
                     case _:
                         self.map_key_check(b, e.span)
-                        return self.fresh_val(e.ty, "?")
+                        return self.fresh_val(e.ty, self.name_of(e))
             case ExprKind.Slice(b, lo, hi):
                 return self.slice(e, b, lo, hi)
             case ExprKind.Map(kvs):
@@ -3837,30 +3949,31 @@ struct Vf:
             case Ty.Str:
                 match (av, bv):
                     case (V.Str(x), V.Str(y)):
-                        let n = self.lin(x.add(y), "len(?)")
+                        let n = self.lin(x.add(y), "len(" + self.name_of(e) + ")")
                         self.cap_len(n)
                         return V.Str(n)
                     # `s * n`: the length is a product
                     case (V.Str(x), V.Int(c)):
                         self.kept(e.span, F.ge(c), "repeat count check")
-                        return V.Str(self.repeat_len(x, c))
+                        return V.Str(self.repeat_len(x, c, self.name_of(e)))
                     case _:
-                        return V.Str(self.fresh_len("len(?)"))
+                        return V.Str(self.fresh_len("len(" + self.name_of(e) + ")"))
             # `xs + ys`: new contents, the two lengths added
             case Ty.Array(_):
                 match (av, bv):
                     case (V.Arr(_, x), V.Arr(_, y)):
-                        let n = self.lin(x.add(y), "len(?)")
+                        let nm = self.name_of(e)
+                        let n = self.lin(x.add(y), "len(" + nm + ")")
                         self.cap_len(n)
-                        return V.Arr(self.fresh_content("?"), n)
+                        return V.Arr(self.fresh_content(nm), n)
                     case _:
-                        return self.fresh_val(e.ty, "?")
+                        return self.fresh_val(e.ty, self.name_of(e))
             case _:
                 return V.Opaque
 
     # The length of `n` copies of something `x` long (none when `n` < 0).
-    fn repeat_len(ref self, x: Lin, n: Lin) -> Lin:
-        let r = self.fresh_len("len(?)")
+    fn repeat_len(ref self, x: Lin, n: Lin, name: str) -> Lin:
+        let r = self.fresh_len("len(" + name + ")")
         match n.is_const():
             case Some(c):
                 if c <= 0:
@@ -3938,7 +4051,8 @@ struct Vf:
             case ConstVal.Float(_):
                 return V.Opaque
 
-    fn ite(ref self, c: F, a: V, b: V, ty: Ty) -> V:
+    # `a if c else b`, called `name` in messages
+    fn ite(ref self, c: F, a: V, b: V, ty: Ty, name: str) -> V:
         if a == b:
             return a
         match (a, b):
@@ -3947,20 +4061,22 @@ struct Vf:
             case (V.Agg(xs), V.Agg(ys)):
                 if len(xs) == len(ys):
                     var tys: [Ty] = [Ty.Unknown] * len(xs)
+                    var names: [str] = [f"{name}.{i}" for i in 0..len(xs)]
                     match ty:
                         case Ty.Tuple(ts):
                             tys = ts
                         case Ty.Struct(sid):
                             tys = [f.1 for f in self.info.structs[sid].fields]
+                            names = [name + "." + f.0 for f in self.info.structs[sid].fields]
                         case _:
                             pass
                     var out: [V] = []
                     for i in 0..min(len(xs), len(tys)):
-                        out.push(self.ite(c, xs[i], ys[i], tys[i]))
+                        out.push(self.ite(c, xs[i], ys[i], tys[i], names[i]))
                     return V.Agg(out)
             case _:
                 pass
-        let r = self.fresh_val(ty, "?")
+        let r = self.fresh_val(ty, name)
         self.range_hull(r, a, b)
         match (val_eq(r, a), val_eq(r, b)):
             case (Some(fa), Some(fb)):
@@ -3971,7 +4087,7 @@ struct Vf:
 
     # Analyze a comprehension's body; returns the length of the produced sequence.
     fn comp(ref self, c: Comp, local: int) -> Lin:
-        let vname = self.local_name(local)
+        let vname = self.shown_local(local)
         let vty = self.local_ty(local)
         var ik = IntTy.I64
         match vty:
@@ -4163,7 +4279,7 @@ struct Vf:
             match self.lvalue_path(r, false):
                 case None:
                     self.eval(r)
-                    return self.fresh_val(e.ty, "?")
+                    return self.fresh_val(e.ty, self.name_of(e))
                 case Some((root, steps)):
                     let cur = self.read_path(root, steps)
                     match cur:
@@ -4172,7 +4288,7 @@ struct Vf:
                             var nlen = l
                             var out = V.Opaque
                             if b == Builtin.Push:
-                                nlen = self.lin(l.add_c(1), "len(?)")
+                                nlen = self.lin(l.add_c(1), "len(" + name + ")")
                                 self.cap_len(nlen)
                             else:
                                 self.kept(
@@ -4180,7 +4296,7 @@ struct Vf:
                                     F.ge(l.add_c(-1).unwrap_or(l)),
                                     "empty array check"
                                 )
-                                nlen = self.lin(l.add_c(-1), "len(?)")
+                                nlen = self.lin(l.add_c(-1), "len(" + name + ")")
                                 out = self.sel(c, nlen, e.ty)
                             let nv = V.Arr(self.fresh_content(name), nlen)
                             let old = self.lookup(root, self.local_ty(root))
@@ -4190,7 +4306,7 @@ struct Vf:
                         case _:
                             let nv = self.fresh_val(self.local_ty(root), self.local_name(root))
                             self.bind(root, nv)
-                            return self.fresh_val(e.ty, "?")
+                            return self.fresh_val(e.ty, self.name_of(e))
         if b.mutates_recv() and recv.is_some():
             return self.mutate(b, recv.unwrap(), args, e)
         var rv = V.Opaque
@@ -4240,7 +4356,7 @@ struct Vf:
                             return V.Int(l)
                         case _:
                             pass
-                return V.Int(self.fresh_len("len(?)"))
+                return V.Int(self.fresh_len(self.name_of(e)))
             case Builtin.Abs:
                 match e.ty:
                     case Ty.Int(k):
@@ -4265,7 +4381,7 @@ struct Vf:
                             self.assume(in_range(r, k))
                         return V.Int(r)
                     case _:
-                        return self.fresh_val(e.ty, "?")
+                        return self.fresh_val(e.ty, self.name_of(e))
             case Builtin.Min | Builtin.Max:
                 match e.ty:
                     case Ty.Int(_):
@@ -4296,7 +4412,7 @@ struct Vf:
                         )
                         return V.Int(r)
                     case _:
-                        return self.fresh_val(e.ty, "?")
+                        return self.fresh_val(e.ty, self.name_of(e))
             # the file contents, already in place of the path
             case Builtin.Embed:
                 return vals[0] if len(vals) > 0 else V.Opaque
@@ -4363,7 +4479,7 @@ struct Vf:
                 let z: i128 = 0
                 return V.Int(Lin.atom(self.new_atom(self.name_of(e), Some((z, w)))))
             case _:
-                return self.fresh_val(e.ty, "?")
+                return self.fresh_val(e.ty, self.name_of(e))
 
     # A method that changes its receiver in place (`clear`, `sort`, `pop(i)`, ...).
     fn mutate(ref self, b: Builtin, r: Expr, args: [Arg], e: Expr) -> V:
@@ -4371,7 +4487,7 @@ struct Vf:
         for a in args:
             vals.push(self.eval(a.expr))
         self.ref_args(args)
-        var out = self.fresh_val(e.ty, "?")
+        var out = self.fresh_val(e.ty, self.name_of(e))
         match self.lvalue_path(r, false):
             case None:
                 # a temporary: nothing else sees the change
