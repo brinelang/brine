@@ -301,6 +301,14 @@ void brine_panic_idx(int64_t i, int64_t len, const char *loc) {
     br_panicf(loc, "index %lld is out of bounds for an array of length %lld", (long long)i, (long long)len);
 }
 void brine_panic_ovf(const char *op, const char *loc) { br_panicf(loc, "integer overflow in %s", op); }
+static const char *br_ovf_sign(const char *op) { return op[0] == 'a' ? "+" : op[0] == 's' ? "-" : "*"; }
+void brine_panic_ovf_ab(const char *op, int64_t a, int64_t b, const char *loc) {
+    if (b < 0) br_panicf(loc, "integer overflow in %s: %lld %s (%lld)", op, (long long)a, br_ovf_sign(op), (long long)b);
+    br_panicf(loc, "integer overflow in %s: %lld %s %lld", op, (long long)a, br_ovf_sign(op), (long long)b);
+}
+void brine_panic_ovf_u(const char *op, int64_t a, int64_t b, const char *loc) {
+    br_panicf(loc, "integer overflow in %s: %llu %s %llu", op, (unsigned long long)a, br_ovf_sign(op), (unsigned long long)b);
+}
 void brine_panic_str(const char *loc, brine_str *msg) { br_panicf(loc, "%.*s", (int)msg->len, msg->data); }
 void brine_assert_fail(const char *loc, const char *src, brine_str *msg) {
     if (msg)
@@ -2496,6 +2504,28 @@ static void br_fmt_float(brine_sb *sb, double v, int is_f32) {
     brine_sb_cat(sb, buf, n);
 }
 void brine_sb_f64(brine_sb *sb, double v) { br_fmt_float(sb, v, 0); }
+/* a failed conversion says which value didn't fit */
+static BR_NORETURN void br_panic_conv(const char *msg, brine_sb *sb, const char *loc) {
+    br_panicf(loc, "%s: %.*s", msg, (int)sb->len, sb->p);
+}
+void brine_panic_conv_i(const char *msg, brine_i128 x, const char *loc) {
+    brine_sb sb;
+    brine_sb_init(&sb);
+    brine_sb_i128(&sb, x);
+    br_panic_conv(msg, &sb, loc);
+}
+void brine_panic_conv_u(const char *msg, brine_u128 x, const char *loc) {
+    brine_sb sb;
+    brine_sb_init(&sb);
+    brine_sb_u128(&sb, x);
+    br_panic_conv(msg, &sb, loc);
+}
+void brine_panic_conv_f(const char *msg, double x, const char *loc) {
+    brine_sb sb;
+    brine_sb_init(&sb);
+    brine_sb_f64(&sb, x);
+    br_panic_conv(msg, &sb, loc);
+}
 void brine_sb_f32(brine_sb *sb, float v) { br_fmt_float(sb, (double)v, 1); }
 void brine_sb_bool(brine_sb *sb, bool v) { br_sb_cstr(sb, v ? "true" : "false"); }
 static void br_sb_bin(brine_sb *sb, uint64_t v) {
