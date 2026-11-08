@@ -1511,9 +1511,9 @@ test "the notes of failed proofs":
     assert "to prove: len(t.xs) > i" in e, e
     assert "mk(n)" not in e, e
     assert "to prove: end >= 0" in e, e
-    # only the part that isn't proven; a remainder's quotient in parentheses
+    # only the part that isn't proven; a remainder as it was written
     assert "to prove: i <= 4 and m > 0 (the rest of it is proven)" in e, e
-    assert "m == 4*(m / 4)" in e, e
+    assert "known facts here: i >= 0, m % 4 == 0\n" in e, e
     # an inner loop forgot `bi`: no facts about its old value, and a hint
     assert "known facts here: n == len(xs)\n" in e, e
     assert "`bi` is changed by a loop before this point" in e, e
@@ -1526,6 +1526,96 @@ test "the prover says when it gave up":
     # only the true claim that needs too many cases, not the false one
     assert o.err.count("the prover gave up") == 1, o.all()
     assert o.err.find("gave up").unwrap() < o.err.find("30 |").unwrap(), o.all()
+
+test "proofs about the result of a call whose `ensures` has `or`":
+    # its cases multiplied in every proof of the caller, which took 8 s (v09#4)
+    let o = brine(["check", "tests/programs/proof_or_ensures.br"])
+    assert o.code == 0, o.all()
+    assert "59 runtime checks proven unnecessary" in o.all(), o.all()
+
+test "remainders and quotients by constants near 64-bit limits are proven":
+    # the ranges of `%` and `/` results settle them (v09#4)
+    let o = brine(["check", "tests/programs/proof_const_div.br"])
+    assert o.code == 0, o.all()
+    assert " 0 remain" in o.all(), o.all()
+
+test "the prover says when it dropped what many branches knew":
+    let o = brine(["check", "tests/programs/proof_dropped.br"])
+    assert o.code != 0, o.all()
+    assert "the prover gave up on what the branches before this point say about `i`" in o.err, o.all()
+    assert "nothing is known" not in o.err, o.all()
+
+# A `main` of `n` repeated lines of one shape.
+fn long_main(shape: str, n: int) -> str:
+    var s = "fn h(x: int) -> int:\n    return x\n\nfn main():\n    let k = len(args())\n    var acc = 0\n"
+    for i in 0..n:
+        if shape == "mod":
+            s += f"    acc = (acc + {i}) % 1000003\n"
+        elif shape == "and":
+            s += "    acc = (acc + k) & 65535\n"
+        elif shape == "lets":
+            s += f"    let v{i} = acc * 3 + {i}\n    acc = (acc + v{i}) % 1000003\n"
+        elif shape == "ifs":
+            s += f"    if acc > {i}:\n        acc -= 1\n"
+        elif shape == "mixed":
+            s += f"    acc += (k + {i}) % 7\n    if acc > {i * 3}:\n        acc -= 1\n"
+        else:
+            s += f"    acc += h({i})\n"
+    return s + "    print(acc)\n"
+
+# The time `BRINE_TIMES` reports for the prover.
+fn verify_secs(err: str) -> float:
+    return phase_secs(err, "verify")
+
+# The time `BRINE_TIMES` reports for a phase (-1 if none).
+fn phase_secs(err: str, phase: str) -> float:
+    for l in err.lines():
+        let t = l.strip()
+        if t.starts_with(phase + " ") and t.ends_with("s"):
+            return t[len(phase):len(t) - 1].strip().to_float().unwrap_or(-1.0)
+    return -1.0
+
+test "the prover's time grows about linearly with a function's length":
+    # These took time exponential in the number of lines (`%`, `&`), or about
+    # n^3 to n^4, and the biggest ran out of memory without a word (v09#4).
+    let d = scratch("scaling")
+    for shape in ["mod", "and", "lets", "ifs", "mixed", "calls"]:
+        var t: [float] = []
+        for n in [200, 800]:
+            let f = d + f"/{shape}_{n}.br"
+            write(f, long_main(shape, n))
+            let o = brine_env(["check", f], {"BRINE_TIMES": "1"})
+            assert o.code == 0, o.all()
+            if shape == "calls":
+                # nothing bounds the sum: the prover stops trying, and says so
+                assert "warning[W0005]: gave up proving" in o.err, o.all()
+                assert "in `main`: the function is too long or complex for the prover" in o.err, o.all()
+            else:
+                assert "W0005" not in o.err, o.all()
+                assert " 0 remain" in o.all(), o.all()
+            t.push(verify_secs(o.err))
+        assert t[0] >= 0.0 and t[1] >= 0.0, f"no verify time for {shape}"
+        # 4x the lines: about 4x the time (n^2 would be 16x)
+        assert t[1] < 8.0 * t[0] + 0.5, f"{shape}: {t[0]:.3f}s for 200 lines, {t[1]:.3f}s for 800"
+
+test "a release build's time grows about linearly with a constant array's length":
+    # The code filling the array stored to a new place for each string, and
+    # value numbering compared each store with all before it (v09#4).
+    let d = scratch("const_strs")
+    var t: [float] = []
+    for n in [2000, 8000]:
+        var s = "const NAMES = [\n"
+        for i in 0..n:
+            s += f"    \"entry {i}\",\n"
+        s += "]\n\nfn main():\n    print(len(NAMES), NAMES[len(NAMES) - 1])\n"
+        let f = d + f"/strs_{n}.br"
+        write(f, s)
+        let o = brine_env(["build", "--release", f, "-o", d + f"/strs_{n}"], {"BRINE_TIMES": "1"})
+        assert o.code == 0, o.all()
+        let x = phase_secs(o.err, "x86-64")
+        t.push(x if x >= 0.0 else phase_secs(o.err, "aarch64"))
+    assert t[0] >= 0.0 and t[1] >= 0.0, "no native code time"
+    assert t[1] < 8.0 * t[0] + 0.5, f"{t[0]:.3f}s for 2000 strings, {t[1]:.3f}s for 8000"
 
 test "failed proofs show values the prover can't rule out":
     let d = scratch("values")
@@ -2408,7 +2498,8 @@ test "every error code is explained":
         "E0707",
         "W0002",
         "W0003",
-        "W0004"
+        "W0004",
+        "W0005"
     ]:
         let o = brine(["explain", code])
         assert o.code == 0, f"no explanation for {code}"
