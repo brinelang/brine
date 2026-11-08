@@ -3249,6 +3249,7 @@ typedef struct {
     double cpu_ns; /* the thread pool, per element */
     double gpu_ns; /* the device, per element (0: not measured) */
     int cpu_seen;  /* cpu_ns was measured, not estimated */
+    double plan_ns; /* planning its copies, per element: arrays of arrays visit every inner array */
 } br_kst;
 
 static void br_gpu_setup(void) {
@@ -3903,6 +3904,9 @@ typedef struct {
     /* the iterations the device runs */
     int64_t lo, hi;
     int ok;
+    /* when planning gives up (brine_clock; 0: never), and whether it did */
+    double deadline;
+    int slow;
 } br_gplan;
 
 #define BR_ALIGN(x, a) (((x) + (a) - 1) & ~(uint64_t)((a) - 1))
@@ -3993,18 +3997,25 @@ static void br_gplan_add(br_gplan *p, const brine_arr *a, int64_t node, int writ
         p->direct = BR_ALIGN(p->direct + g->bytes, 256);
     }
     p->tab[slot] = ++p->na;
-    for (int64_t e = 0; e < a->len && nsub > 0; e++)
+    if (p->deadline > 0 && (p->na & 1023) == 0 && brine_clock() > p->deadline) {
+        p->slow = 1;
+        p->ok = 0;
+        return;
+    }
+    for (int64_t e = 0; e < a->len && nsub > 0 && p->ok; e++)
         for (int64_t s = 0; s < nsub; s++) {
             const brine_arr *c = *(brine_arr *const *)(a->data + e * esz + nd[2 + 2 * s]);
             br_gplan_add(p, c, nd[3 + 2 * s], 0, 1, 0, 0, depth + 1);
         }
 }
 
-/* The arrays a construct's context reaches. */
-static int br_gplan_make(br_gplan *p, const brine_kernel *k, const void *ctx) {
+/* The arrays a construct's context reaches; gives up (slow) at `deadline`
+ * unless it is 0. */
+static int br_gplan_make(br_gplan *p, const brine_kernel *k, const void *ctx, double deadline) {
     memset(p, 0, sizeof *p);
     p->k = k;
     p->ok = 1;
+    p->deadline = deadline;
     int64_t nf = k->ptrs[0];
     p->nodes = k->ptrs + 1 + 3 * nf;
     p->stage = BR_ALIGN((uint64_t)k->ctx_size, 64);
@@ -4019,6 +4030,37 @@ static int br_gplan_make(br_gplan *p, const brine_kernel *k, const void *ctx) {
     for (int64_t i = 0; i < p->na; i++)
         if (!p->a[i].staged) p->a[i].doff += BR_ALIGN(p->stage, 256);
     return p->ok;
+}
+
+/* Plans the copies for the `rest` elements still to do; 0, with the reason
+ * in `why`, when that fails. Walking arrays of arrays visits every inner
+ * array, which can cost more than running the construct on the CPU: in
+ * auto mode the walk gives up once it has taken that long, and its cost
+ * per element is kept, so later calls don't walk. */
+static const char *br_plan_slow = "copying its arrays of arrays to the GPU takes longer than running it on the CPU";
+static int br_gpu_plan(br_gplan *p, const brine_kernel *k, br_kst *st, const void *ctx, int64_t rest, const char **why) {
+    int autom = br_gpu.mode != BR_GPU_ON;
+    br_lock(&br_gpu.mu);
+    double cpu_ns = st->cpu_ns, plan_ns = st->plan_ns;
+    br_unlock(&br_gpu.mu);
+    if (autom && plan_ns > 0 && plan_ns >= 0.75 * cpu_ns) {
+        memset(p, 0, sizeof *p);
+        *why = br_plan_slow;
+        return 0;
+    }
+    double t0 = brine_clock();
+    double deadline = autom && cpu_ns > 0 ? t0 + 0.75 * cpu_ns * 1e-9 * (double)rest : 0;
+    int ok = br_gplan_make(p, k, ctx, deadline);
+    double dt = brine_clock() - t0;
+    /* a walk cut short would have taken longer */
+    if (p->slow) dt *= 2;
+    if (rest > 0) {
+        br_lock(&br_gpu.mu);
+        st->plan_ns = dt * 1e9 / (double)rest;
+        br_unlock(&br_gpu.mu);
+    }
+    if (!ok) *why = p->slow ? br_plan_slow : "out of memory";
+    return ok;
 }
 
 static void br_gplan_free(br_gplan *p) {
@@ -4181,7 +4223,8 @@ static br_gpu_choice br_gpu_choose(brine_kernel *k, br_kst *st, int64_t rest, ui
     br_gpu_choice c = {0, 0, 0, NULL};
     double gpu_ns = st->gpu_ns > 0 ? st->gpu_ns : br_gpu_guess_ns(k, st->seq_ns);
     c.cpu_s = st->cpu_ns * 1e-9 * (double)rest;
-    c.gpu_s = gpu_ns * 1e-9 * (double)rest + (double)bytes / br_gpu.bw + 30e-6 * (double)launches;
+    /* (planning the copies is paid again on every call) */
+    c.gpu_s = (gpu_ns + st->plan_ns) * 1e-9 * (double)rest + (double)bytes / br_gpu.bw + 30e-6 * (double)launches;
     if (br_gpu.mode == BR_GPU_ON) {
         c.use = br_gpu_wait(k->ptx);
         if (!c.use) c.why = br_gpu.why;
@@ -4268,8 +4311,11 @@ static br_gpu_res br_gpu_func(br_kst *st, const brine_kernel *k) {
     return r;
 }
 
-static void br_gpu_log_cpu(brine_kernel *k, int64_t n, const char *why, double secs) {
-    if (br_gpu.log) br_gpu_logf("%s %s n=%lld -> cpu %.3f ms (%s%s)", k->where, br_gpu_kind(k), (long long)n, secs * 1e3, k->ptx ? "" : "not GPU-eligible: ", why);
+/* `before`: the time spent measuring and planning before the CPU ran it */
+static void br_gpu_log_cpu(brine_kernel *k, int64_t n, const char *why, double secs, double before) {
+    char dec[64] = "";
+    if (before >= 1e-5) snprintf(dec, sizeof dec, "; deciding took %.3f ms", before * 1e3);
+    if (br_gpu.log) br_gpu_logf("%s %s n=%lld -> cpu %.3f ms (%s%s%s)", k->where, br_gpu_kind(k), (long long)n, secs * 1e3, k->ptx ? "" : "not GPU-eligible: ", why, dec);
 }
 
 /* The GPU part of a `par for`: returns how many leading elements are done
@@ -4305,9 +4351,8 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
         }
     }
     br_gplan p;
-    if (!br_gplan_make(&p, k, ctx)) {
+    if (!br_gpu_plan(&p, k, st, ctx, n - done, why)) {
         br_gplan_free(&p);
-        *why = "out of memory";
         return done;
     }
     /* arrays that go back whole need the elements the probe wrote on the
@@ -4376,13 +4421,15 @@ static int64_t br_gpu_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn 
 void brine_par_for(brine_kernel *k, void *ctx, int64_t n, brine_chunk_fn fn) {
     if (n <= 0) return;
     const char *why = NULL;
+    double tb = brine_clock();
     int64_t done = br_gpu_for(k, ctx, n, fn, &why);
     if (done >= n) return;
     double t0 = brine_clock();
+    double before = t0 - tb;
     brine_par_run(done, n, brine_par_plan(n - done), fn, ctx);
     double dt = brine_clock() - t0;
     if (k->ptx && !br_in_par_get() && n - done >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n - done, dt);
-    if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt);
+    if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt, before);
 }
 
 /* ------------------------------------------------------------ reductions on the GPU */
@@ -4464,13 +4511,12 @@ static int br_gpu_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, void *ctx
         st->cpu_ns = ns / (br_threads() * BR_CPU_EFF);
         br_unlock(&br_gpu.mu);
     }
+    int64_t rest = n - p * BRINE_LEAF;
     br_gplan pl;
-    if (!br_gplan_make(&pl, k, ctx)) {
+    if (!br_gpu_plan(&pl, k, st, ctx, rest, why)) {
         br_gplan_free(&pl);
-        *why = "out of memory";
         return 0;
     }
-    int64_t rest = n - p * BRINE_LEAF;
     br_lock(&br_gpu.mu);
     br_gpu_choice c = br_gpu_choose(k, st, rest, br_gplan_bytes(&pl), 2 + rest / ((int64_t)1 << 22));
     double gpu_ns = st->gpu_ns > 0 ? st->gpu_ns : br_gpu_guess_ns(k, st->seq_ns);
@@ -4556,15 +4602,17 @@ void brine_par_reduce(brine_kernel *k, int64_t n, brine_leaf_fn fn, brine_leaf_f
     br_fold_init(&f, br_comb_pick(k->op, k->vk), br_vk_size[k->vk], loc);
     const char *why = NULL;
     double est = 0;
+    double tb = brine_clock();
     if (br_gpu_reduce(k, n, fn, ctx, &f, &why, &est)) {
         if (br_fold_finish(&f, val)) *has = true;
         return;
     }
     double t0 = brine_clock();
+    double before = t0 - tb;
     br_reduce_cpu(n, fn, efn, ctx, k->op, k->vk, val, has, loc);
     double dt = brine_clock() - t0;
     if (k->ptx && !br_in_par_get() && n >= BR_GPU_MIN_N) br_gpu_note_cpu(br_kstate(k), n, dt);
-    if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt);
+    if (br_gpu.log && !br_in_par_get()) br_gpu_log_cpu(k, n, why, dt, before);
 }
 #endif
 

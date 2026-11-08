@@ -10640,7 +10640,10 @@ const KS_SEQ = 16
 const KS_CPU = 24
 const KS_GPU = 32
 const KS_SEEN = 40
-const KS_SIZE = 48
+# planning its copies, per element (ns): walking arrays of arrays visits
+# every inner array
+const KS_PLAN = 48
+const KS_SIZE = 56
 
 # a reduction's partial tree (F_* in "the process")
 const FOLD_SIZE = 1840
@@ -11645,7 +11648,10 @@ const GP_DIRECT = 64
 const GP_LO = 72
 const GP_HI = 80
 const GP_OK = 88
-const GP_SIZE = 96
+# when planning should give up (brine_clock; 0: never), and whether it did
+const GP_DEADLINE = 96
+const GP_SLOW = 104
+const GP_SIZE = 112
 
 # brine_kernel.ptrs' flags (BRINE_GA_*)
 const GA_F_WRITTEN = 1
@@ -11760,18 +11766,27 @@ fn gplan_add(
         store_i64(p, GP_DIRECT, align_up(d + bytes, 256))
     store_i64(load_ptr(p, GP_TAB), load_i64(slot, 0) * 8, na + 1)
     store_i64(p, GP_NA, na + 1)
+    let dl = load_f64(p, GP_DEADLINE)
+    if dl > 0.0 and (na + 1) & 1023 == 0 and brine_clock() > dl:
+        store_i64(p, GP_SLOW, 1)
+        store_i64(p, GP_OK, 0)
+        return
     if nsub > 0:
         let data = load_ptr(a, ARR_DATA)
         for e in 0..len:
             for s in 0..nsub:
                 let c = load_ptr(data, e * esz + load_i64(nd, (2 + 2 * s) * 8))
                 gplan_add(p, c, load_i64(nd, (3 + 2 * s) * 8), 0, 1, 0, 0, depth + 1)
+            if load_i64(p, GP_OK) == 0:
+                return
 
-# The arrays a construct's context reaches (p: GP_SIZE bytes).
-fn gplan_make(p: ptr, k: ptr, ctx: ptr) -> bool:
+# The arrays a construct's context reaches (p: GP_SIZE bytes); gives up
+# (GP_SLOW) at brine_clock() `deadline` unless it is 0.
+fn gplan_make(p: ptr, k: ptr, ctx: ptr, deadline: float) -> bool:
     memset(p, 0, u64(GP_SIZE))
     store_ptr(p, GP_K, k)
     store_i64(p, GP_OK, 1)
+    store_f64(p, GP_DEADLINE, deadline)
     let ptrs = load_ptr(k, K_PTRS)
     let nf = load_i64(ptrs, 0)
     store_ptr(p, GP_NODES, ptrs + (1 + 3 * nf) * 8)
@@ -11792,6 +11807,40 @@ fn gplan_make(p: ptr, k: ptr, ctx: ptr) -> bool:
         if load_i64(g, GA_STAGED) == 0:
             store_i64(g, GA_DOFF, load_i64(g, GA_DOFF) + at)
     return load_i64(p, GP_OK) != 0
+
+# Plans the copies for the `rest` elements still to do (p: GP_SIZE bytes);
+# false, with the reason in `why`, when that fails. Walking arrays of
+# arrays visits every inner array, which can cost more than running the
+# construct on the CPU: in auto mode the walk gives up once it has taken
+# that long, and its cost per element is kept, so later calls don't walk.
+fn gpu_plan(p: ptr, k: ptr, st: ptr, ctx: ptr, rest: int, why: ptr) -> bool:
+    let g = gpu()
+    let auto = gpu_mode() != GPU_ON
+    lock(g + G_MU)
+    let cpu_ns = load_f64(st, KS_CPU)
+    let plan_ns = load_f64(st, KS_PLAN)
+    unlock(g + G_MU)
+    let slow = cz("copying its arrays of arrays to the GPU takes longer than running it on the CPU")
+    if auto and plan_ns > 0.0 and plan_ns >= 0.75 * cpu_ns:
+        memset(p, 0, u64(GP_SIZE))
+        store_ptr(why, 0, slow)
+        return false
+    let t0 = brine_clock()
+    var deadline = 0.0
+    if auto and cpu_ns > 0.0:
+        deadline = t0 + 0.75 * cpu_ns * 1.0e-9 * float(rest)
+    let ok = gplan_make(p, k, ctx, deadline)
+    var dt = brine_clock() - t0
+    if load_i64(p, GP_SLOW) != 0:
+        # a walk cut short would have taken longer
+        dt *= 2.0
+    if rest > 0:
+        lock(g + G_MU)
+        store_f64(st, KS_PLAN, dt * 1.0e9 / float(rest))
+        unlock(g + G_MU)
+    if not ok:
+        store_ptr(why, 0, slow if load_i64(p, GP_SLOW) != 0 else cz("out of memory"))
+    return ok
 
 fn gplan_free(p: ptr):
     free(load_ptr(p, GP_A))
@@ -11993,8 +12042,11 @@ fn gpu_choose(k: ptr, st: ptr, rest: int, bytes: int, launches: int, c: ptr):
     store_ptr(c, CH_WHY, null_ptr())
     let gpu_ns = gpu_dev_ns(k, st)
     let cpu_s = load_f64(st, KS_CPU) * 1.0e-9 * float(rest)
+    # (planning the copies is paid again on every call)
     let gpu_s = (
-        gpu_ns * 1.0e-9 * float(rest) + float(bytes) / load_f64(g, G_BW) + 3.0e-5 * float(launches)
+        (gpu_ns + load_f64(st, KS_PLAN)) * 1.0e-9 * float(rest)
+        + float(bytes) / load_f64(g, G_BW)
+        + 3.0e-5 * float(launches)
     )
     store_f64(c, CH_CPU_S, cpu_s)
     store_f64(c, CH_GPU_S, gpu_s)
@@ -12106,7 +12158,8 @@ fn gpu_func(st: ptr, k: ptr) -> i32:
         r = dev_func(st + KS_COMB, load_ptr(k, K_COMB))
     return r
 
-fn gpu_log_cpu(k: ptr, n: int, why: ptr, secs: float):
+# `before`: the time spent measuring and planning before the CPU ran it
+fn gpu_log_cpu(k: ptr, n: int, why: ptr, secs: float, before: float):
     if not gpu_logging():
         return
     let sb = stack_mem(24)
@@ -12116,6 +12169,8 @@ fn gpu_log_cpu(k: ptr, n: int, why: ptr, secs: float):
     if addr(load_ptr(k, K_PTX)) == 0:
         sb_lit(sb, "not GPU-eligible: ")
     sb_c(sb, why)
+    if before >= 1.0e-5:
+        sb_lit(sb, f"; deciding took {before * 1.0e3:.3f} ms")
     sb_lit(sb, ")")
     gpu_log(sb)
 
@@ -12207,10 +12262,9 @@ fn gpu_for(k: ptr, ctx: ptr, n: int, f: ptr, why: ptr) -> int:
         if done >= n:
             store_ptr(why, 0, cz("done while measuring"))
             return done
-    let p = stack_mem(96)
-    if not gplan_make(p, k, ctx):
+    let p = stack_mem(GP_SIZE)
+    if not gpu_plan(p, k, st, ctx, n - done, why):
         gplan_free(p)
-        store_ptr(why, 0, cz("out of memory"))
         return done
     # arrays that go back whole need the elements the probe wrote on the
     # device too
@@ -12291,19 +12345,22 @@ fn brine_par_for(k: ptr, ctx: ptr, n: int, f: ptr):
         return
     var why = gpu_skip(k, n)
     var done = 0
+    var before = 0.0
     if addr(why) == 0:
         let w = stack_mem(8)
+        let tb = brine_clock()
         done = gpu_for(k, ctx, n, f, w)
         if done >= n:
             return
         why = load_ptr(w, 0)
+        before = brine_clock() - tb
     let t0 = brine_clock()
     brine_par_run(done, n, par_plan(n - done), f, ctx)
     let dt = brine_clock() - t0
     if addr(load_ptr(k, K_PTX)) != 0 and n - done >= GPU_MIN_N and brine_x_in_par_get() == 0:
         gpu_note_cpu(kstate(k), n - done, dt)
     if gpu_logging() and brine_x_in_par_get() == 0:
-        gpu_log_cpu(k, n, why, dt)
+        gpu_log_cpu(k, n, why, dt, before)
 
 # ---- reductions on the GPU
 
@@ -12403,12 +12460,11 @@ fn gpu_reduce(k: ptr, n: int, f: ptr, ctx: ptr, fo: ptr, loc: ptr, why: ptr, cpu
             fold_leaves(fo, f, ctx, n, p, 2 * p)
             p *= 2
         gpu_note_probe(st, (brine_clock() - t0) * 1.0e9 / float(p * LEAF))
-    let pl = stack_mem(96)
-    if not gplan_make(pl, k, ctx):
-        gplan_free(pl)
-        store_ptr(why, 0, cz("out of memory"))
-        return false
     let rest = n - p * LEAF
+    let pl = stack_mem(GP_SIZE)
+    if not gpu_plan(pl, k, st, ctx, rest, why):
+        gplan_free(pl)
+        return false
     let c = stack_mem(32)
     lock(g + G_MU)
     gpu_choose(k, st, rest, gplan_bytes(pl), 2 + rest / (1 << 22), c)
@@ -12499,23 +12555,26 @@ fn brine_par_reduce(k: ptr, n: int, f: ptr, ef: ptr, ctx: ptr, val: ptr, has: pt
     if n <= 0:
         return
     var why = gpu_skip(k, n)
+    var before = 0.0
     if addr(why) == 0:
         let fo = stack_mem(FOLD_SIZE)
         let w = stack_mem(8)
         let est = stack_mem(8)
         store_f64(est, 0, 0.0)
+        let tb = brine_clock()
         if gpu_reduce(k, n, f, ctx, fo, loc, w, est):
             if brine_x_fold_finish(fo, val) != 0:
                 store_u8(has, 0, u8(1))
             return
         why = load_ptr(w, 0)
+        before = brine_clock() - tb
     let t0 = brine_clock()
     brine_x_reduce_cpu(n, f, ef, ctx, load_i64(k, K_OP), load_i64(k, K_VK), val, has, loc)
     let dt = brine_clock() - t0
     if addr(load_ptr(k, K_PTX)) != 0 and n >= GPU_MIN_N and brine_x_in_par_get() == 0:
         gpu_note_cpu(kstate(k), n, dt)
     if gpu_logging() and brine_x_in_par_get() == 0:
-        gpu_log_cpu(k, n, why, dt)
+        gpu_log_cpu(k, n, why, dt, before)
 
 # ------------------------------------------- files, stdin and the os module
 # brine_rt.c's "files and processes", "stdin" and "the os module". Messages

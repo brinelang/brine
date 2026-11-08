@@ -601,7 +601,8 @@ is running; the rest of the program updates them with plain ones. In `par for i`
 
 **GPUs.** `par for`, `par [...]` and `par` reductions also run on a GPU (NVIDIA
 through CUDA, Apple silicon through Metal) when the runtime expects that to be
-faster (big constructs with much work per byte copied); the results are the same
+faster (big constructs with much work per byte copied; every inner array of a
+`[[T]]` is a copy of its own, so loops over many small ones stay on the CPU); the results are the same
 bits, and a failing check panics as on the CPU. On Apple GPUs, f64 code stays on
 the CPU (they have no f64).
 Nothing to write or install beyond the driver: the compiler makes a kernel of every
@@ -613,7 +614,7 @@ use local arrays kept in the stack frame, see Arrays); on NVIDIA GPUs also
 floats, and passing them to functions). Strings, maps, other new arrays, printing,
 `sin`/`exp`/`log`/`pow` and the like keep a body on the CPU.
 `BRINE_GPU=off|on|auto` (default `auto`; `on` uses the GPU whenever it can),
-`BRINE_GPU_LOG=1` prints where each construct ran and why. With `--ranks`, the
+`BRINE_GPU_LOG=1` prints where each construct ran, why, and how long deciding took. With `--ranks`, the
 k-th rank on a machine uses its k-th GPU and the ranks beyond its GPUs stay on the
 CPU (ranks sharing a GPU queue for it); `on` shares the GPUs out instead.
 
