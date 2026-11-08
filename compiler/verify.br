@@ -1034,6 +1034,7 @@ fn new_vf(
         content_names=[],
         content_ranges=[],
         looped={},
+        dropped={},
         defs=[],
         st=St(env={}, facts=[]),
         live=false,
@@ -1085,6 +1086,8 @@ struct Vf:
     content_ranges: [Option[(i128, i128)]]
     # the atoms a loop made for what it changes (for messages)
     looped: {int: bool}
+    # values made at a merge whose facts were too many to keep (MERGE_MAX)
+    dropped: {int: bool}
     defs: [F]
     # the current state; `live` is false where execution can't reach
     st: St
@@ -1770,15 +1773,27 @@ struct Vf:
             if s not in out:
                 out.push(s)
         var notes: [str] = []
-        if len(out) == 0:
+        var lost: [str] = []
+        for a3 in ga.xs:
+            if a3 in self.dropped:
+                let n3 = f"`{self.atom_name(a3)}`"
+                if n3 not in lost:
+                    lost.push(n3)
+        if len(lost) > 0:
+            notes.push(
+                "the prover gave up on what the branches before this point say about "
+                + ", ".join(lost)
+                + ": they have too many paths for it to keep track of"
+            )
+        if len(out) > 0:
+            if len(out) > 6:
+                out = out[len(out) - 6:]
+            notes.push("known facts here: " + ", ".join(out))
+        elif len(lost) == 0:
             if unlisted:
                 notes.push("what is known here about the values involved is too long to list")
             else:
                 notes.push("nothing is known here about the values involved")
-        else:
-            if len(out) > 6:
-                out = out[len(out) - 6:]
-            notes.push("known facts here: " + ", ".join(out))
         for a2 in ga.xs:
             if a2 in self.looped and not mentioned.contains(a2):
                 let n2 = self.atom_name(a2)
@@ -2199,6 +2214,7 @@ struct Vf:
             return a0
         let a = a0.unwrap()
         let b = b0.unwrap()
+        let n0 = len(self.atom_names)
         let (env, ea, eb, hull) = self.merge_env(a.env, b.env)
         let k = min(k0, min(len(a.facts), len(b.facts)))
         var facts = a.facts[:k]
@@ -2214,8 +2230,25 @@ struct Vf:
             for f in fa:
                 if f in fb:
                     facts.push(f)
+            self.drop_from(n0)
         facts.extend(hull)
         return Some(St(env=env, facts=facts))
+
+    fn has_dropped(self, v: V) -> bool:
+        if len(self.dropped) == 0:
+            return false
+        match v:
+            case V.Int(l):
+                return any(p.0 in self.dropped for p in l.t)
+            case V.Agg(vs):
+                return any(self.has_dropped(x) for x in vs)
+            case _:
+                return false
+
+    # The values made since atom `n0` lost what their paths said about them.
+    fn drop_from(ref self, n0: int):
+        for x in n0..len(self.atom_names):
+            self.dropped[x] = true
 
     # The variables of two paths' environments: a fresh value where they
     # differ, with what it equals on each path.
@@ -2288,6 +2321,10 @@ struct Vf:
                 pass
         let nv = self.fresh_val(ty, name)
         self.range_hull(nv, va, vb)
+        # made from a value whose facts were dropped: so are some of its own
+        if self.has_dropped(va) or self.has_dropped(vb):
+            for a in fresh_atoms(nv):
+                self.dropped[a] = true
         match val_eq(nv, va):
             case Some(f):
                 ea.push(f)
@@ -2386,6 +2423,7 @@ struct Vf:
             return a0
         let a = a0.unwrap()
         let b = b0.unwrap()
+        let n0 = len(self.atom_names)
         let (env, ea, eb, hull) = self.merge_env(a.env, b.env)
         var fa = new_facts(a.facts, fk)
         fa.extend(ea)
@@ -2398,6 +2436,8 @@ struct Vf:
             let both = F.or_([F.and_(fa), F.and_(fb)])
             if both.size() <= MERGE_MAX:
                 facts.push(both)
+            else:
+                self.drop_from(n0)
         facts.extend(hull)
         return Some(St(env=env, facts=facts))
 
