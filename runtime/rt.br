@@ -12538,6 +12538,14 @@ extern fn fclose(f: ptr) -> i32
 
 extern fn ferror(f: ptr) -> i32
 
+extern fn _fseeki64(f: ptr, off: i64, origin: i32) -> i32
+
+extern fn _ftelli64(f: ptr) -> i64
+
+extern fn fseeko(f: ptr, off: i64, whence: i32) -> i32
+
+extern fn ftello(f: ptr) -> i64
+
 extern fn wcslen(w: ptr) -> u64
 
 extern fn GetLastError() -> u32
@@ -12714,8 +12722,26 @@ fn os_fopen(path: ptr, mode: str) -> ptr:
     else:
         return fopen(path, m)
 
-# All of the file at `path`: its bytes (brine_alloc's) and their count in
-# out[0] and out[1], or false with the message in *err.
+# The length of the file f is open on, back at its start; -1 when seeking
+# doesn't tell (a pipe), -2 when it can't get back to the start.
+fn os_flen(f: ptr) -> int:
+    var n: i64 = -1
+    var back = 0
+    if os_is("windows"):
+        if _fseeki64(f, 0, 2) == 0:
+            n = _ftelli64(f)
+            back = int(_fseeki64(f, 0, 0))
+    else:
+        if fseeko(f, 0, 2) == 0:
+            n = ftello(f)
+            back = int(fseeko(f, 0, 0))
+    if back != 0:
+        return -2
+    return int(n)
+
+# All of the file at `path`: its bytes (brine_alloc's), their count and the
+# size of the block in out[0], out[1] and out[2], or false with the message
+# in *err.
 fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
     let p = os_cstr(path)
     if addr(p) == 0:
@@ -12730,7 +12756,15 @@ fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
     var b = null_ptr()
     var n = 0
     var cap = 0
-    while true:
+    # a file of known length: read into one block of that size (and a byte
+    # more, for the read that finds the end), not a growing one copied
+    # each time it grows. (Its length is only a hint: /proc files say 0.)
+    let flen = os_flen(f)
+    var bad = flen == -2
+    if flen > 0:
+        cap = flen + 1
+        b = brine_x_realloc(b, cap)
+    while not bad:
         if n == cap:
             cap = cap * 2 if cap != 0 else 65536
             b = brine_x_realloc(b, cap)
@@ -12738,18 +12772,21 @@ fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
         n += got
         if got == 0:
             break
-    let bad = ferror(f) != 0
+    if ferror(f) != 0:
+        bad = true
     fclose(f)
     if bad:
         store_ptr(err, 0, os_msg(f"cannot read {str_of(path)}: read error"))
-        brine_free(b)
+        if addr(b) != 0:
+            brine_free(b)
         return false
     store_ptr(out, 0, b)
     store_i64(out, 8, n)
+    store_i64(out, 16, cap)
     return true
 
 fn brine_read_file(path: ptr, out: ptr) -> bool:
-    let got = stack_mem(16)
+    let got = stack_mem(24)
     if not os_slurp(path, got, out):
         return false
     let b = load_ptr(got, 0)
@@ -12763,15 +12800,20 @@ fn brine_read_file(path: ptr, out: ptr) -> bool:
     return ok
 
 fn brine_os_read_bytes(path: ptr, out: ptr, err: ptr) -> bool:
-    let got = stack_mem(16)
+    let got = stack_mem(24)
     if not os_slurp(path, got, err):
         return false
     let b = load_ptr(got, 0)
     let n = load_i64(got, 8)
-    let a = brine_arr_new(n, 1, null_ptr(), null_ptr(), ptr_of("") + STR_DATA)
+    let a = brine_arr_new(0, 1, null_ptr(), null_ptr(), ptr_of("") + STR_DATA)
+    # the array takes the block the bytes were read into: no copy, so a big
+    # file is in memory once
     if n != 0:
-        memcpy(load_ptr(a, ARR_DATA), b, u64(n))
-    brine_free(b)
+        store_ptr(a, ARR_DATA, b)
+        store_i64(a, ARR_LEN, n)
+        store_i64(a, ARR_CAP, load_i64(got, 16))
+    elif addr(b) != 0:
+        brine_free(b)
     store_ptr(out, 0, a)
     return true
 

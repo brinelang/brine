@@ -5752,9 +5752,28 @@ static FILE *br_open(const char *path, const char *mode) {
 #endif
 }
 
-/* All of the file at `path` (malloc'd, in *buf and *len), or false with the
- * message in *err. */
-static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) {
+/* The length of the file f is open on, back at its start; -1 when seeking
+ * doesn't tell (a pipe), -2 when it can't get back to the start. */
+static int64_t br_flen(FILE *f) {
+    int64_t n = -1;
+    int back = 0;
+#ifdef _WIN32
+    if (_fseeki64(f, 0, SEEK_END) == 0) {
+        n = _ftelli64(f);
+        back = _fseeki64(f, 0, SEEK_SET);
+    }
+#else
+    if (fseeko(f, 0, SEEK_END) == 0) {
+        n = (int64_t)ftello(f);
+        back = fseeko(f, 0, SEEK_SET);
+    }
+#endif
+    return back != 0 ? -2 : n;
+}
+
+/* All of the file at `path` (malloc'd, in *buf and *len, the block's size
+ * in *capp), or false with the message in *err. */
+static bool br_slurp(brine_str *path, char **buf, size_t *len, size_t *capp, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
         *err = br_strf("cannot read a path containing a NUL byte");
@@ -5768,7 +5787,16 @@ static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) 
     }
     char *b = NULL;
     size_t n = 0, cap = 0;
-    for (;;) {
+    /* a file of known length: read into one block of that size (and a byte
+       more, for the read that finds the end), not a growing one copied
+       each time it grows. (Its length is only a hint: /proc files say 0.) */
+    int64_t flen = br_flen(f);
+    int bad = flen == -2;
+    if (flen > 0) {
+        cap = (size_t)flen + 1;
+        b = (char *)br_grow(b, cap);
+    }
+    while (!bad) {
         if (n == cap) {
             cap = cap ? cap * 2 : 65536;
             b = (char *)br_grow(b, cap);
@@ -5777,7 +5805,7 @@ static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) 
         n += got;
         if (got == 0) break;
     }
-    int bad = ferror(f);
+    if (ferror(f)) bad = 1;
     fclose(f);
     if (bad) {
         *err = br_strf("cannot read %s: read error", p);
@@ -5785,6 +5813,7 @@ static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) 
     } else {
         *buf = b;
         *len = n;
+        *capp = cap;
     }
     free(p);
     return !bad;
@@ -5792,8 +5821,8 @@ static bool br_slurp(brine_str *path, char **buf, size_t *len, brine_str **err) 
 
 bool brine_read_file(brine_str *path, brine_str **out) {
     char *buf;
-    size_t len;
-    if (!br_slurp(path, &buf, &len, out)) return false;
+    size_t len, cap;
+    if (!br_slurp(path, &buf, &len, &cap, out)) return false;
     bool ok = br_valid_utf8((const unsigned char *)buf, (int64_t)len);
     if (ok) {
         *out = brine_str_new(buf, (int64_t)len);
@@ -5808,11 +5837,18 @@ bool brine_read_file(brine_str *path, brine_str **out) {
 
 bool brine_os_read_bytes(brine_str *path, brine_arr **out, brine_str **err) {
     char *buf;
-    size_t len;
-    if (!br_slurp(path, &buf, &len, err)) return false;
-    brine_arr *a = brine_arr_new((int64_t)len, 1, NULL, NULL, "");
-    if (len) memcpy(a->data, buf, len);
-    free(buf);
+    size_t len, cap;
+    if (!br_slurp(path, &buf, &len, &cap, err)) return false;
+    /* the array takes the block the bytes were read into: no copy, so a big
+       file is in memory once */
+    brine_arr *a = brine_arr_new(0, 1, NULL, NULL, "");
+    if (len) {
+        a->data = buf;
+        a->len = (int64_t)len;
+        a->cap = (int64_t)cap;
+    } else {
+        free(buf);
+    }
     *out = a;
     return true;
 }
