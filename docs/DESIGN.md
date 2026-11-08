@@ -420,7 +420,7 @@ from what brine knows that C doesn't (no aliasing, proven-away checks, race-free
 
 | Command | Purpose |
 |---|---|
-| `brine new <name>` / `brine init` | Create a project (`brine.toml`, `src/main.br`, `AGENTS.md`, `README.md`, `.gitignore`, a starter `RULES.br` and its `RULES.lock`). |
+| `brine new <name>` / `brine init` | Create a project (`brine.toml`, `src/main.br`, `AGENTS.md`, `README.md`, `.gitignore`, and a `RULES.br` with no rules yet, so nothing is approved), and a git repository unless it is inside one. `init` keeps an existing `main.br` as the main file and adds `/target` to an existing `.gitignore`. |
 | `brine run [file] [--ranks N] [--threads N] [-- args]` | Build and run. |
 | `brine build [--release\|--debug] [--emit-c]` | Build a native binary into `target/`. |
 | `brine check [--report] [--typed] [--proven]` | Type-check + verify, no codegen. Fastest feedback loop. `--typed` (or `typed = true` under `[check]` in brine.toml) requires a written type on every variable; `--proven` (or `proven = true`) requires every runtime check to be proven away. |
@@ -435,6 +435,11 @@ from what brine knows that C doesn't (no aliasing, proven-away checks, race-free
 
 Global flags: `--json` (machine-readable diagnostics, one JSON object per line),
 `--color auto|always|never`, `--quiet`.
+
+`brine.toml` has `[package]` (`name`, which names the executable, so it is
+letters, digits, `_` and `-`, and `version`), `[build]` (`main`, default
+`src/main.br`) and `[check]` (`typed`, `proven`). A key or section brine doesn't
+read is a warning (W0004), so a typo like `provn = true` doesn't go unnoticed.
 
 ### Diagnostic codes
 

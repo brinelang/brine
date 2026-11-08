@@ -6,7 +6,7 @@ Blocks use `:` plus 4-space indentation. Comments start with `#`.
 ## Programs and commands
 
 ```
-brine new hello && cd hello    # create a project (brine.toml, src/main.br, AGENTS.md)
+brine new hello && cd hello    # create a project (brine.toml, src/main.br, RULES.br, AGENTS.md)
 brine run                      # build + run          brine run file.br -- args
 brine check                    # type-check + prove   brine check --report
 brine check --typed            # also require a written type on every variable

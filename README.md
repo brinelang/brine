@@ -82,19 +82,19 @@ brine run
 ```
 
 ```text
-    Proven 1 rule from RULES.br
      Built bank v0.1.0 [dev] in 0.27s
    Running target/dev/bank
 Hello, brine!
 [0, 1, 4, 9, 16, 25, 36, 49, 64, 81]
 ```
 
-`brine new` creates `src/main.br`, a starter `RULES.br`, and an `AGENTS.md`
-that tells coding agents how to work in the project.
+`brine new` creates `src/main.br`, a `RULES.br` with no rules yet (its comments
+show how they look), and an `AGENTS.md` that tells coding agents how to work in
+the project.
 
 ### 2. Write a rule
 
-A rule says what must always be true. Replace `RULES.br` with this one:
+A rule says what must always be true. Add this one to `RULES.br`:
 
 ```python
 from bank import withdraw

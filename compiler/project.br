@@ -1,5 +1,6 @@
 # Projects: `brine.toml`, `brine new`, `brine init`, and paths (as strings,
 # with the platform's separators).
+from diag import best_match
 
 struct Project:
     root: str
@@ -10,6 +11,10 @@ struct Project:
     typed: bool
     # `[check] proven = true`: every runtime check must be proven away
     proven: bool
+    # brine.toml's text, and its keys and sections brine doesn't know:
+    # (lo, hi, message, help), for W0004
+    toml: str
+    unknown: [(int, int, str, str)]
 
 # ---------------------------------------------------------------- paths
 
@@ -105,13 +110,15 @@ fn parse_toml(text: str) -> Result[[(str, str, str)], str]:
         let at = eq.unwrap()
         let key = line[0:at].strip()
         var val = line[at + 1:len(line)].strip()
-        if val.starts_with("\""):
-            let v = val[1:len(val)]
-            match v.find("\""):
-                case Some(end):
-                    val = v[0:end]
-                case None:
-                    return Err(f"line {i + 1}: unterminated string")
+        for q in ["\"", "'"]:
+            if val.starts_with(q):
+                let v = val[1:len(val)]
+                match v.find(q):
+                    case Some(end):
+                        val = v[0:end]
+                    case None:
+                        return Err(f"line {i + 1}: unterminated string")
+                break
         out.push((section, key, val))
     return Ok(out)
 
@@ -149,6 +156,9 @@ fn load(root: str) -> Result[Project, str]:
     let name = toml_get(kv, "package", "name")
     if name.is_none():
         return Err("brine.toml: missing `name` in [package]")
+    # the name names the executable, so it can't be a path
+    if not valid_name(name.unwrap()):
+        return Err(f"brine.toml: `name = \"{name.unwrap()}\"` in [package] {NAME_RULE}")
     let version = toml_get(kv, "package", "version").unwrap_or("0.1.0")
     let main = join(root, toml_get(kv, "build", "main").unwrap_or("src/main.br"))
     var typed = false
@@ -176,9 +186,87 @@ fn load(root: str) -> Result[Project, str]:
             version=version,
             main=main,
             typed=typed,
-            proven=proven
+            proven=proven,
+            toml=text,
+            unknown=unknown_keys(text)
         )
     )
+
+# The sections and keys brine reads.
+fn toml_keys() -> [(str, [str])]:
+    return [("package", ["name", "version"]), ("build", ["main"]), ("check", ["typed", "proven"])]
+
+# The keys and sections of brine.toml that brine doesn't read, which are
+# probably typos: (lo, hi, message, help). `text` parsed with `parse_toml`.
+fn unknown_keys(text: str) -> [(int, int, str, str)]:
+    let known = toml_keys()
+    var out: [(int, int, str, str)] = []
+    var section = ""
+    var keys: [str] = []
+    var sec_ok = true
+    var at = 0
+    for raw in text.split("\n"):
+        let lo = at
+        at += len(raw) + 1
+        let line = raw.strip()
+        if line == "" or line.starts_with("#"):
+            continue
+        let start = lo + (len(raw) - len(raw.lstrip()))
+        if line.starts_with("[") and line.ends_with("]"):
+            section = line[1:len(line) - 1].strip()
+            sec_ok = false
+            keys = []
+            var names: [str] = []
+            for sec, ks in known:
+                names.push(sec)
+                if sec == section:
+                    sec_ok = true
+                    keys = ks
+            if not sec_ok:
+                out.push(
+                    (
+                        start,
+                        start + len(line),
+                        f"brine.toml has a section `[{section}]` that brine doesn't read",
+                        suggest(section, names, "the sections are [package], [build] and [check]")
+                    )
+                )
+            continue
+        match line.find("="):
+            case Some(eq):
+                let key = line[:eq].strip()
+                if not sec_ok:
+                    continue
+                if section == "":
+                    out.push(
+                        (
+                            start,
+                            start + len(key),
+                            f"`{key}` in brine.toml is outside any section, so brine doesn't read it",
+                            "put it under the section it belongs to, e.g. `[package]`"
+                        )
+                    )
+                elif key not in keys:
+                    let list = ", ".join([f"`{k}`" for k in keys])
+                    out.push(
+                        (
+                            start,
+                            start + len(key),
+                            f"brine doesn't read `{key}` in [{section}]",
+                            suggest(key, keys, f"[{section}] has {list}")
+                        )
+                    )
+            case None:
+                pass
+    return out
+
+# "did you mean `x`?" for the closest of `names`, else `other`.
+fn suggest(s: str, names: [str], other: str) -> str:
+    match best_match(s, names):
+        case Some(b):
+            return f"did you mean `{b}`?"
+        case None:
+            return other
 
 # ---------------------------------------------------------------- new projects
 
@@ -187,6 +275,8 @@ fn is_ascii_alpha(c: str) -> bool:
 
 fn is_ascii_digit(c: str) -> bool:
     return len(c) == 1 and c >= "0" and c <= "9"
+
+const NAME_RULE = "isn't a valid name: use letters, digits, `_` and `-`, starting with a letter or `_`"
 
 # A letter or `_`, then letters, digits, `_` and `-` (ASCII only).
 fn valid_name(n: str) -> bool:
@@ -228,33 +318,69 @@ fn write_new(dir: str, rel: str, content: str) -> Result[bool, str]:
     write_file(p, content)?
     return Ok(true)
 
+# `/target` added to a `.gitignore`, unless it already ignores it.
+fn ignore_target(text: str) -> Option[str]:
+    for line in text.lines():
+        let l = line.strip()
+        if l == "/target" or l == "/target/" or l == "target" or l == "target/":
+            return None
+    if text == "" or text.ends_with("\n"):
+        return Some(text + "/target\n")
+    return Some(text + "\n/target\n")
+
+# `dir` or a directory above it holds a `.git`: it's in a work tree already
+# (also one that git itself won't open, e.g. owned by another user).
+fn in_repo(dir: str) -> bool:
+    var d = Some(os.abs_path(dir).unwrap_or(dir))
+    while d.is_some():
+        let x = d.unwrap()
+        if file_exists(join(x, ".git")) or os.is_dir(join(x, ".git")):
+            return true
+        d = parent(x)
+    match os.spawn(["git", "-C", dir, "rev-parse", "--is-inside-work-tree"], {}, true, false):
+        case Ok(p):
+            return os.wait(p) == 0
+        case Err(_):
+            # no git: nothing to initialize either
+            return true
+
 # Create the project files in `dir` (which may already exist but must not contain
-# brine.toml). Returns the files it made.
+# brine.toml). A `main.br` already in `dir` (`brine init`) stays the main file.
+# Returns the files it made or changed.
 fn create(dir: str, name: str) -> Result[[str], str]:
     if file_exists(join(dir, "brine.toml")):
         return Err(f"`{dir}` already contains a brine project")
-    os.make_dir(join(dir, "src"))?
+    let own_main = os.is_file(join(dir, "main.br")) and not file_exists(join(dir, "src/main.br"))
+    var conf = toml(name)
+    if own_main:
+        conf += "\n[build]\nmain = \"main.br\"\n"
+    else:
+        os.make_dir(join(dir, "src"))?
     var made: [str] = []
-    let files = [
-        ("brine.toml", toml(name)),
-        ("src/main.br", main_template()),
-        ("RULES.br", rules_template()),
-        (".gitignore", gitignore()),
-        ("AGENTS.md", agents_md(name)),
-        ("README.md", readme(name))
-    ]
+    var files = [("brine.toml", conf)]
+    if not own_main:
+        files.push(("src/main.br", main_template()))
+    files.extend(
+        [
+            ("RULES.br", rules_template()),
+            (".gitignore", gitignore()),
+            ("AGENTS.md", agents_md(name)),
+            ("README.md", readme(name))
+        ]
+    )
     for f in files:
         let (rel, content) = f
         if write_new(dir, rel, content)?:
             made.push(rel)
+        elif rel == ".gitignore":
+            match ignore_target(read_file(join(dir, rel))?):
+                case Some(more):
+                    write_file(join(dir, rel), more)?
+                    made.push(rel)
+                case None:
+                    pass
     # initialize git like most project tools do, unless we're already inside a repo
-    var inside = true
-    match os.spawn(["git", "-C", dir, "rev-parse", "--is-inside-work-tree"], {}, true, false):
-        case Ok(p):
-            inside = os.wait(p) == 0
-        case Err(_):
-            pass
-    if not inside:
+    if not in_repo(dir):
         match os.spawn(["git", "-C", dir, "init", "-q"], {}, false, true):
             case Ok(p):
                 os.wait(p)

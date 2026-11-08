@@ -1899,7 +1899,8 @@ test "every error code is explained":
         "E0706",
         "E0707",
         "W0002",
-        "W0003"
+        "W0003",
+        "W0004"
     ]:
         let o = brine(["explain", code])
         assert o.code == 0, f"no explanation for {code}"
@@ -2124,9 +2125,27 @@ test "a new project works out of the box":
         case Err(e):
             panic(e)
     assert brine(["new", "app"]).code == 0
-    for f in ["brine.toml", "src/main.br", "RULES.br", "RULES.lock", "AGENTS.md", ".gitignore"]:
+    for f in ["brine.toml", "src/main.br", "RULES.br", "AGENTS.md", ".gitignore"]:
         assert file_exists("app/" + f), f"missing {f}"
-    match os.set_cwd("app"):
+    # nobody approved anything yet, and it's inside this repository's work tree
+    assert not file_exists("app/RULES.lock") and not file_exists("app/.git")
+    assert brine(["new", "../x"]).code != 0
+    # inside it, `brine init` takes the existing main.br and .gitignore as they are
+    match os.make_dir("own"):
+        case _:
+            pass
+    write("own/main.br", "fn main():\n    print(\"mine\")\n")
+    write("own/.gitignore", "notes.txt\n")
+    match os.set_cwd("own"):
+        case Ok(_):
+            pass
+        case Err(e1):
+            panic(e1)
+    assert brine(["init"]).code == 0
+    assert not file_exists("src/main.br") and "main = \"main.br\"" in text("brine.toml")
+    assert text(".gitignore") == "notes.txt\n/target\n", text(".gitignore")
+    assert brine(["run", "-q"]).out == "mine\n"
+    match os.set_cwd("../app"):
         case Ok(_):
             pass
         case Err(e2):
@@ -2136,10 +2155,43 @@ test "a new project works out of the box":
     assert brine(["test"]).code == 0
     assert brine(["check"]).code == 0
     assert brine(["fmt", "--check"]).code == 0
-    # its starter rule is proven and approved, with no warnings
+    # it starts with no rules, and no warnings
     let r = brine(["rules"])
-    assert r.code == 0 and "1 rule, 1 proven" in r.out and "done: yes" in r.out, r.all()
+    assert r.code == 0 and "0 rules" in r.out and "done: yes" in r.out, r.all()
     assert "warning" not in brine(["check"]).err
+    # so the first program that reads a file just works
+    write(
+        "src/main.br",
+        "fn main():\n    print(len(read_file(\"brine.toml\").unwrap_or(\"\")) > 0)\n"
+    )
+    let rd = brine(["run", "-q"])
+    assert rd.code == 0 and rd.out == "true\n", rd.all()
+    # a rule that forbids it says how to allow it, and AGENTS.md lets the owner's
+    # agent approve what the owner asked for
+    write("RULES.br", "rule \"the program only uses the console\":\n    effects main: console\n")
+    let fx = brine(["check"])
+    assert (
+        fx.code == 1
+        and "add `files` to this rule in RULES.br (`effects main: console, files`)" in fx.err
+    ), fx.all()
+    assert (
+        "never run" not in text("AGENTS.md")
+        and "only run `brine rules approve` when" in text("AGENTS.md")
+    )
+    # brine.toml keys brine doesn't read are typos, mostly
+    write(
+        "brine.toml",
+        "[package]\nname = \"app\"\n\n[check]\nprovn = true\n\n[chek]\ntyped = true\n"
+    )
+    let tw = brine(["check", "--json"])
+    assert (
+        "\"code\":\"W0004\"" in tw.out
+        and "did you mean `proven`?" in tw.out
+        and "did you mean `check`?" in tw.out
+    ), tw.out
+    write("brine.toml", "[package]\nname = '../evil'\n")
+    let bad = brine(["check"])
+    assert bad.code != 0 and "isn't a valid name" in bad.err, bad.all()
 
 # Each tests/syntax/NAME.br has NAME.lex and NAME.parse: the expected `brine lex`
 # and `brine parse` output (regenerate with `brine run tests/update_syntax.br`).

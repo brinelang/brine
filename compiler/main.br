@@ -83,11 +83,17 @@ fn usage(cmd: str) -> Option[str]:
             "Usage: brine new <name>",
             "",
             "Create a project in ./<name>: brine.toml, src/main.br, RULES.br (what the",
-            "program promises, proven on every build) and RULES.lock, AGENTS.md,",
-            "README.md and .gitignore."
+            "program promises, proven on every build; it starts with no rules),",
+            "AGENTS.md, README.md and .gitignore, and a git repository unless it is",
+            "inside one already."
         ]
     elif cmd == "init":
-        ls = ["Usage: brine init", "", "Create a project in the current directory, named after it."]
+        ls = [
+            "Usage: brine init",
+            "",
+            "Create a project in the current directory, named after it. A main.br",
+            "there stays the main file, and an existing .gitignore gets `/target`."
+        ]
     elif cmd == "run":
         ls = [
             "Usage: brine run [file | folder] [options] [-- program arguments]",
@@ -526,7 +532,23 @@ struct Target:
                     driver.out_name(p, plat)
                 )
 
-fn resolve(file: Option[str]) -> Result[Target, str]:
+# W0004: keys and sections in brine.toml that brine doesn't read (typos, mostly).
+fn toml_warnings(g: G, pr: project.Project):
+    if len(pr.unknown) == 0:
+        return
+    var sm = SourceMap.new()
+    let f = sm.add(display_path(project.join(pr.root, "brine.toml")), pr.toml)
+    var ds: [Diag] = []
+    for lo, hi, msg, help in pr.unknown:
+        ds.push(
+            diag.warning("W0004", msg)
+            .label(diag.Span(file=f, lo=lo, hi=hi), "not read")
+            .note("brine ignores it, so it changes nothing")
+            .with_help(help)
+        )
+    g.diag_list(ds, sm)
+
+fn resolve(g: G, file: Option[str]) -> Result[Target, str]:
     match file:
         case Some(f):
             if os.is_dir(f):
@@ -553,6 +575,7 @@ fn resolve(file: Option[str]) -> Result[Target, str]:
                     )
                 match project.find(f):
                     case Some(Ok(pr)):
+                        toml_warnings(g, pr)
                         return Ok(
                             Target(
                                 entry=pr.main,
@@ -583,6 +606,7 @@ fn resolve(file: Option[str]) -> Result[Target, str]:
     let cwd = os.cwd()
     match project.find(cwd):
         case Some(Ok(pr)):
+            toml_warnings(g, pr)
             if not file_exists(pr.main):
                 return Err("the project's main file `" + display_path(pr.main) + "` does not exist")
             var entry = pr.main
@@ -696,12 +720,10 @@ fn cmd_new(g: G, a: Args) -> Result[int, str]:
         return Err("usage: brine new <name>")
     let name = a.pos[0]
     if not project.valid_name(name):
-        return Err(
-            f"`{name}` is not a valid project name (use letters, digits, `_` and `-`, starting with a letter)"
-        )
+        return Err(f"`{name}` {project.NAME_RULE}")
     if file_exists(name):
         return Err(f"`{name}` already exists")
-    approve_new(name, project.create(name, name)?)?
+    project.create(name, name)?
     if g.json:
         print("{\"created\":" + json_str(name) + "}")
     else:
@@ -709,15 +731,6 @@ fn cmd_new(g: G, a: Args) -> Result[int, str]:
         if not g.quiet:
             eprint(f"\n    cd {name}\n    brine run\n")
     return Ok(0)
-
-# A new project's starter rules are approved by whoever made the project.
-fn approve_new(dir: str, made: [str]) -> Result[bool, str]:
-    if rules.FILE not in made or file_exists(project.join(dir, rules.LOCK)):
-        return Ok(false)
-    let src = read_file(project.join(dir, rules.FILE))?
-    let (m, _) = parser.parse_module(src, 0, rules.MODULE)
-    write_file(project.join(dir, rules.LOCK), rules.lock_text(rules.entries(src, m, dir)))?
-    return Ok(true)
 
 fn cmd_init(g: G, a: Args) -> Result[int, str]:
     a.check_flags([])?
@@ -730,9 +743,7 @@ fn cmd_init(g: G, a: Args) -> Result[int, str]:
         else:
             mapped += "_"
     let name = mapped if project.valid_name(mapped) else "app_" + mapped
-    var made = project.create(cwd, name)?
-    if approve_new(cwd, made)?:
-        made.push(rules.LOCK)
+    let made = project.create(cwd, name)?
     let list = ", ".join(made)
     g.status("Created", f"project `{name}` ({list})")
     return Ok(0)
@@ -740,7 +751,7 @@ fn cmd_init(g: G, a: Args) -> Result[int, str]:
 fn cmd_build(g: G, a: Args) -> Result[int, str]:
     a.check_flags(["--release", "--debug", "-o", "--emit-c", "--typed", "--proven", "--target"])?
     let plat = platform_of(a)?
-    let t = resolve(first_pos(a))?.typed_if(a)
+    let t = resolve(g, first_pos(a))?.typed_if(a)
     var out: Option[str] = None
     match a.val("-o"):
         case Some(o):
@@ -883,7 +894,7 @@ fn cmd_run(g: G, a: Args) -> Result[int, str]:
         return Err(
             "a web build runs in a browser: build it with `brine build --target web` and open its index.html"
         )
-    let t = resolve(first_pos(a))?.typed_if(a)
+    let t = resolve(g, first_pos(a))?.typed_if(a)
     var ranks = 1
     match a.val("--ranks"):
         case Some(v):
@@ -954,7 +965,7 @@ fn find_debugger() -> Option[str]:
 
 fn cmd_debug(g: G, a: Args) -> Result[int, str]:
     a.check_flags([])?
-    let t = resolve(first_pos(a))?
+    let t = resolve(g, first_pos(a))?
     var exe = ""
     match build(g, t, Profile.Debug, false, None, false, Platform.Host)?:
         case Some(x):
@@ -997,7 +1008,7 @@ fn cmd_debug(g: G, a: Args) -> Result[int, str]:
 
 fn cmd_spec_diff(g: G, a: Args) -> Result[int, str]:
     a.check_flags(["--base"])?
-    let t = resolve(first_pos(a))?
+    let t = resolve(g, first_pos(a))?
     let base = a.val("--base").unwrap_or("HEAD")
     let t0 = clock()
     let o = specdiff.run(t.entry, base)?
@@ -1095,7 +1106,7 @@ fn cmd_spec_diff(g: G, a: Args) -> Result[int, str]:
 
 fn cmd_check(g: G, a: Args) -> Result[int, str]:
     a.check_flags(["--report", "--typed", "--proven"])?
-    let t = resolve(first_pos(a))?.typed_if(a)
+    let t = resolve(g, first_pos(a))?.typed_if(a)
     let t0 = clock()
     let fe = driver.frontend(
         t.entry,
@@ -1207,7 +1218,7 @@ fn cmd_rules(g: G, a: Args) -> Result[int, str]:
     let approve = len(pos) > 0 and pos[0] == "approve"
     if approve:
         pos = pos[1:]
-    let t = resolve(Some(pos[0]) if len(pos) > 0 else None)?.typed_if(a)
+    let t = resolve(g, Some(pos[0]) if len(pos) > 0 else None)?.typed_if(a)
     let dir = driver.rules_dir(driver.dir_of(t.entry))
     if dir == "":
         return Err(
@@ -1392,6 +1403,8 @@ fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.E
     for p, s in rl.vocab:
         if s == "changed" or s == "removed":
             print(f"  {c.red()}! vocabulary {c.reset()} {p} {s} since approval")
+    if n == 0:
+        print("  no rules yet: write the first one in RULES.br (`brine guide`, \"Rules\")")
     if not rl.locked and n > 0:
         print(
             f"  no {rules.LOCK} yet: the rules' owner runs `brine rules approve` once they agree with them"
@@ -1599,7 +1612,7 @@ fn cmd_test(g: G, a: Args) -> Result[int, str]:
                 filter = Some(a.pos[1])
         else:
             filter = Some(f)
-    let t = resolve(file)?.typed_if(a)
+    let t = resolve(g, file)?.typed_if(a)
     let profile = Profile.Release if a.has("--release") else Profile.Dev
     var exe = ""
     match build(g, t, profile, true, None, false, plat)?:
