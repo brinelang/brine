@@ -351,6 +351,10 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
 * **Timing:** `BRINE_TIMES=1` prints the time of each phase; `BRINE_TIMES=2` also
   names the functions the prover is slow on. `BRINE_BACKEND=c` or `=native` picks
   the backend (a build with `BRINE_BACKEND` set gets its own output folder).
+* **Checking the IR:** `BRINE_VERIFY_IR=1` checks every function the lowering makes
+  (and, in native release builds, what the SSA optimizer makes of it) with
+  `compiler/irverify.br`: labels and vregs exist, and every vreg is set on every
+  path to each read of it. The integration tests set it for the release builds.
 
 ### Backends
 The **brine IR** (`compiler/ir.br`) sits between the verifier and code generation:
