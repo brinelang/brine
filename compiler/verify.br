@@ -12,7 +12,7 @@
 # when it has been proven or is enforced by a runtime check.
 from diag import Span, Diag, SourceMap
 import diag
-from types import Ty, IntTy, Res, CallRes, Builtin, NumM, StrM, Reducer, WorldOp, LocalInfo, LocalKind, int_ty
+from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, NumM, StrM, Reducer, WorldOp, LocalInfo, LocalKind, int_ty
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
 from ast import children, stmt_exprs, stmt_blocks, lvalue_root, local_of
 from info import ProgramInfo, ConstVal, PRELUDE, RT
@@ -36,6 +36,13 @@ enum V:
     Arr(c: int, len: Lin)
     Str(len: Lin)
     Agg(vs: [V])
+    # a float: whether it's NaN, and what `int` of it would be (rounded toward
+    # zero), between -FLOAT_BIG and FLOAT_BIG (an infinity is one of those).
+    # Of a value less than this one, that is at most `below`; of one greater,
+    # at least `above` (both `t`, but for some constants: `int(y) <= 2` when
+    # `y < 3.0`). Comparisons give facts about `t`, so `int(x)` can be proven
+    # after a range check.
+    Flt(t: Lin, nan: F, below: Lin, above: Lin)
     Opaque
 
 enum Term:
@@ -891,6 +898,33 @@ fn int_range(k: IntTy) -> Option[(i128, i128)]:
 # bit (a `[bool]`; anything else a byte), and no address space has 2^57 bytes.
 const LEN_MAX: i128 = 1152921504606846976
 
+# floats: floors past 2^100 are 2^100 (or -2^100), infinities too
+const FLOAT_BIG: i128 = 1267650600228229401496703205376
+
+fn float_range() -> Option[(i128, i128)]:
+    return Some((-FLOAT_BIG, FLOAT_BIG))
+
+fn float_const(c: float) -> V:
+    let big = 1267650600228229401496703205376.0
+    if c >= big:
+        let k = Lin.konst(FLOAT_BIG)
+        return V.Flt(k, F.False, k, k)
+    if c <= -big:
+        let k = Lin.konst(-FLOAT_BIG)
+        return V.Flt(k, F.False, k, k)
+    # `int(c)`, rounded toward zero
+    let t = i128(floor(c)) if c >= 0.0 else i128(ceil(c))
+    let one: i128 = 1
+    var below = t
+    var above = t
+    if c == floor(c):
+        # `y < 3.0`: int(y) <= 2; `y > -3.0`: int(y) >= -2
+        if c > 0.0:
+            below = t - one
+        elif c < 0.0:
+            above = t + one
+    return V.Flt(Lin.konst(t), F.False, Lin.konst(below), Lin.konst(above))
+
 fn nonneg_range() -> Option[(i128, i128)]:
     let z: i128 = 0
     return Some((z, I64_BOUND))
@@ -1366,6 +1400,9 @@ struct Vf:
                 return V.Int(self.fresh_int(name, k))
             case Ty.Bool:
                 return V.Bool(self.fresh_bool(name))
+            case Ty.Float(_):
+                let t = Lin.atom(self.new_atom("int(" + name + ")", float_range()))
+                return V.Flt(t, self.fresh_bool(name + " is NaN"), t, t)
             case Ty.Array(_):
                 let c = self.fresh_content(name)
                 return V.Arr(c, self.fresh_len("len(" + name + ")"))
@@ -1779,6 +1816,8 @@ struct Vf:
                 return self.show_rel(l, "!=")
             case F.B(a, p):
                 let n = self.atom_name(a)
+                if not p and n.ends_with(" is NaN"):
+                    return n[:len(n) - 3] + "not NaN"
                 return n if p else "not " + n
             case F.And(xs):
                 return " and ".join([self.show_f(x) for x in xs])
@@ -3590,7 +3629,7 @@ struct Vf:
         # the source in messages
         if v == V.Opaque:
             match e.ty:
-                case Ty.Int(_) | Ty.Bool:
+                case Ty.Int(_) | Ty.Bool | Ty.Float(_):
                     return self.fresh_val(e.ty, self.name_of(e))
                 case _:
                     pass
@@ -3607,8 +3646,10 @@ struct Vf:
             # the prover's numbers stop at the i128 range: past it, only the type's range is known
             case ExprKind.UInt(_):
                 return V.Int(self.fresh_int("literal", IntTy.U128))
-            case ExprKind.Float(_):
-                return V.Opaque
+            case ExprKind.Float(x):
+                if e.ty == Ty.Float(FloatTy.F64):
+                    return float_const(x)
+                return self.fresh_val(e.ty, self.name_of(e))
             case ExprKind.Bool(b):
                 return V.Bool(F.from_bool(b))
             case ExprKind.Str(s):
@@ -3656,6 +3697,18 @@ struct Vf:
                         let n = self.lin(l.neg(), self.name_of(e))
                         self.kept(e.span, in_range(n, k), "overflow check")
                         return V.Int(n)
+                    case (UnOp.Neg, Ty.Float(_)):
+                        # exact: `below` and `above` trade places
+                        match v:
+                            case V.Flt(t, nan, below, above):
+                                match (t.neg(), below.neg(), above.neg()):
+                                    case (Some(nt), Some(nb), Some(na)):
+                                        return V.Flt(nt, nan, na, nb)
+                                    case _:
+                                        pass
+                            case _:
+                                pass
+                        return self.fresh_val(e.ty, self.name_of(e))
                     case (UnOp.Not, _):
                         let f = self.as_bool(v)
                         return V.Bool(f.not_())
@@ -3713,6 +3766,9 @@ struct Vf:
                                 let eq = bool_eq(a, b)
                                 f = eq if op == CmpOp.Eq else eq.not_()
                                 done = true
+                        case (V.Flt(_, _, _, _), V.Flt(_, _, _, _)):
+                            f = self.float_cmp(op, prev, v, self.name_of(e))
+                            done = true
                         case _:
                             pass
                     if not done:
@@ -4054,8 +4110,10 @@ struct Vf:
                 return V.Bool(F.from_bool(b))
             case ConstVal.Str(s):
                 return V.Str(Lin.konst(i128(len(s))))
-            case ConstVal.Float(_):
-                return V.Opaque
+            case ConstVal.Float(x):
+                if c.ty == Ty.Float(FloatTy.F64):
+                    return float_const(x)
+                return self.fresh_val(c.ty, c.name)
 
     # `a if c else b`, called `name` in messages
     fn ite(ref self, c: F, a: V, b: V, ty: Ty, name: str) -> V:
@@ -4114,6 +4172,47 @@ struct Vf:
         for f in hull:
             self.assume(f)
         return r
+
+    # `a op b` for floats: a truth value of its own, which says what it can
+    # about `int` of both when it's true and when it's false (rounding toward
+    # zero keeps the order).
+    fn float_cmp(ref self, op: CmpOp, a: V, b: V, name: str) -> F:
+        match (a, b):
+            case (V.Flt(x, na, xb, xa), V.Flt(y, nb, yb, ya)):
+                let r = self.fresh_bool(name)
+                # a NaN makes every comparison false but `!=`
+                let ok = F.and_([na.not_(), nb.not_()])
+                # `a < b`, `b < a`
+                let lt = F.and_([F.le(x, yb), F.le(xa, y)])
+                let gt = F.and_([F.le(y, xb), F.le(ya, x)])
+                var yes = F.True
+                var no = F.True
+                match op:
+                    case CmpOp.Ge:
+                        yes = F.le(y, x)
+                        no = lt
+                    case CmpOp.Gt:
+                        yes = gt
+                        no = F.le(x, y)
+                    case CmpOp.Lt:
+                        yes = lt
+                        no = F.le(y, x)
+                    case CmpOp.Le:
+                        yes = F.le(x, y)
+                        no = gt
+                    case CmpOp.Eq:
+                        yes = F.equal(x, y)
+                    case CmpOp.Ne:
+                        pass
+                if op == CmpOp.Ne:
+                    # not `!=`: equal, and neither is NaN
+                    self.defs.push(F.or_([r, F.and_([ok, F.equal(x, y)])]))
+                    return r
+                self.defs.push(F.or_([r.not_(), F.and_([ok, yes])]))
+                self.defs.push(F.or_([r, ok.not_(), no]))
+                return r
+            case _:
+                return self.fresh_bool(name)
 
     # Analyze a comprehension's body; returns the length of the produced sequence.
     fn comp(ref self, c: Comp, local: int) -> Lin:
@@ -4271,7 +4370,24 @@ struct Vf:
                     return V.Int(l)
                 self.implicit(whole.span, TAG_CONV, in_range(l, k), "conversion check")
                 return V.Int(l)
-            # in range and not NaN: always checked (the table says so)
+            case (Ty.Int(k), Ty.Float(_), V.Flt(t, nan, _, _)):
+                # in range and not NaN: checked (past 64 bits, always at
+                # runtime: the table says so)
+                if k.bits() > 64:
+                    return self.fresh_val(target, self.name_of(whole))
+                let fits = F.and_([nan.not_(), in_range(t, k)])
+                self.kept_h(whole.span, fits, "conversion check", true, Check.FloatToInt.help())
+                return V.Int(t)
+            # exact up to 2^53
+            case (Ty.Float(FloatTy.F64), Ty.Int(_), V.Int(l)):
+                let b = self.bounds(l)
+                let m: i128 = 9007199254740992
+                if b.0.is_some() and b.1.is_some() and -m <= b.0.unwrap() and b.1.unwrap() <= m:
+                    # an integer: `y < float(n)` for n >= 1 means int(y) <= n - 1
+                    let below = l.add_c(-1).unwrap_or(l) if b.0.unwrap() >= 1 else l
+                    let above = l.add_c(1).unwrap_or(l) if b.1.unwrap() <= -1 else l
+                    return V.Flt(l, F.False, below, above)
+                return self.fresh_val(target, self.name_of(whole))
             case (Ty.Int(_), Ty.Float(_), _):
                 return self.fresh_val(target, self.name_of(whole))
             case (Ty.Int(_), Ty.Bool, V.Bool(b)):
@@ -4602,6 +4718,10 @@ struct Vf:
     # `exact`: the goal is just what the check tests (not merely enough for
     # it), so failing it everywhere means the check always fails.
     fn kept_x(ref self, span: Span, goal: F, what: str, exact: bool):
+        self.kept_h(span, goal, what, exact, "")
+
+    # `help`: as for `remain_h`.
+    fn kept_h(ref self, span: Span, goal: F, what: str, exact: bool, help: str):
         if self.spec or not self.live:
             return
         self.nobl += 1
@@ -4610,7 +4730,7 @@ struct Vf:
         else:
             if exact and self.refuted(span, what, goal):
                 return
-            self.remain(span, what, Some(goal))
+            self.remain_h(span, what, Some(goal), help)
         self.assume(goal)
 
     # The checks the table in checks.br lists for an operation, after the
@@ -4781,6 +4901,8 @@ fn val_eq(a: V, b: V) -> Option[F]:
             return Some(F.equal(x, y))
         case (V.Str(x), V.Str(y)):
             return Some(F.equal(x, y))
+        case (V.Flt(x, nx, bx, ax), V.Flt(y, ny, by, ay)):
+            return Some(F.and_([F.equal(x, y), F.equal(bx, by), F.equal(ax, ay), bool_eq(nx, ny)]))
         case (V.Agg(xs), V.Agg(ys)):
             if len(xs) != len(ys):
                 return None
