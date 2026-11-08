@@ -416,8 +416,11 @@ void brine_unreachable(void) {
 #define BR_NCLASS 12
 #define BR_CHUNK ((uintptr_t)1 << 16)
 #ifdef BR_WASM
-/* no address space to reserve: every block comes from malloc */
-#define BR_RESERVE BR_CHUNK
+/* no address space to reserve: chunks come from aligned_alloc, wherever it
+   puts them in linear memory, so the class table covers all of it, from
+   the first chunk up (BR_NOT_OURS: a part that isn't a chunk of ours) */
+#define BR_RESERVE ((uintptr_t)0xFFFE0000)
+#define BR_NOT_OURS 255
 #else
 #define BR_RESERVE ((uintptr_t)1 << 36)
 #endif
@@ -475,7 +478,14 @@ static void br_th_done(br_heap_th *h) { (void)h; }
 
 static int br_class_of(size_t n) { return n <= 128 ? (int)((n + 15) / 16) - 1 : 8 + (int)((n - 129) / 32); }
 static size_t br_class_size(int c) { return c < 8 ? (size_t)(c + 1) * 16 : 128 + (size_t)(c - 7) * 32; }
+#ifdef BR_WASM
+static int br_in_heap(const void *p) {
+    uintptr_t o = (uintptr_t)p - br_heap_base;
+    return o < br_heap_end - br_heap_base && br_chunk_class[o / BR_CHUNK] != BR_NOT_OURS;
+}
+#else
 static int br_in_heap(const void *p) { return (uintptr_t)p - br_heap_base < br_heap_end - br_heap_base; }
+#endif
 
 /* once, before any thread starts; without the reservation everything is malloc */
 static void br_heap_init(void) {
@@ -489,7 +499,8 @@ static void br_heap_init(void) {
     /* reservations are 64 KiB aligned */
     uintptr_t b = (uintptr_t)VirtualAlloc(NULL, BR_RESERVE, MEM_RESERVE, PAGE_NOACCESS);
 #elif defined(BR_WASM)
-    uintptr_t b = 0;
+    memset(br_chunk_class, BR_NOT_OURS, sizeof br_chunk_class);
+    uintptr_t b = BR_CHUNK;
 #else
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_NORESERVE
@@ -504,13 +515,42 @@ static void br_heap_init(void) {
     br_heap_base = b;
 }
 
+#ifdef BR_WASM
+/* Chunks are cut from regions a quarter of the heap so far: memory grown a
+   few pages at a time gets slower as it grows (an engine may copy all of
+   it each time). One thread: nothing races for these or the table. */
+static uintptr_t br_region_next, br_region_end, br_region_total;
+#endif
 static char *br_chunk_new(int c) {
+#ifdef BR_WASM
+    if (br_region_next == br_region_end) {
+        uintptr_t n = (br_region_total / 4) & ~(BR_CHUNK - 1);
+        if (n < ((uintptr_t)1 << 20)) n = (uintptr_t)1 << 20;
+        if (n > ((uintptr_t)1 << 28)) n = (uintptr_t)1 << 28;
+        void *m = aligned_alloc(BR_CHUNK, n);
+        if (!m) {
+            n = BR_CHUNK;
+            m = aligned_alloc(BR_CHUNK, n);
+        }
+        if (!m) return NULL;
+        uintptr_t r = (uintptr_t)m;
+        if (r < br_heap_base || r >= br_heap_end || n > br_heap_end - r) {
+            free(m);
+            return NULL;
+        }
+        br_region_next = r;
+        br_region_end = r + n;
+        br_region_total += n;
+    }
+    uintptr_t ch = br_region_next;
+    br_region_next += BR_CHUNK;
+#else
     uintptr_t ch = __atomic_fetch_add(&br_heap_next, BR_CHUNK, __ATOMIC_RELAXED);
     if (ch + BR_CHUNK > br_heap_end) return NULL;
+#endif
 #ifdef _WIN32
     if (!VirtualAlloc((void *)ch, BR_CHUNK, MEM_COMMIT, PAGE_READWRITE)) return NULL;
 #elif defined(BR_WASM)
-    return NULL;
 #else
     if (mprotect((void *)ch, BR_CHUNK, PROT_READ | PROT_WRITE) != 0) return NULL;
 #endif
