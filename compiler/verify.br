@@ -1135,7 +1135,9 @@ fn new_vf(
         extra=0,
         mods=[],
         hidden={},
-        aliases={}
+        aliases={},
+        chars={},
+        one_char={}
     )
 
 struct Vf:
@@ -1213,6 +1215,10 @@ struct Vf:
     # values a `let` named (by `lin_key`): `d0 * e` reads better than the
     # expression `d0` stands for, which grows with every `let` in a chain
     aliases: {str: str}
+    # the contents of `s.chars()`, and the lengths (by `lin_key`) of their
+    # elements: each is one character, whatever its length in bytes
+    chars: {int: bool}
+    one_char: {str: bool}
 
     # The state, leaving none behind.
     fn take(ref self) -> Option[St]:
@@ -1454,6 +1460,16 @@ struct Vf:
                 return self.fresh_bool("?")
 
     fn sel(ref self, c: int, i: Lin, ety: Ty) -> V:
+        if c in self.chars and ety == Ty.Str:
+            let z: i128 = 1
+            let l = Lin.atom(
+                self.new_atom(
+                    "len(" + self.content_names[c] + "[" + self.show_lin(i) + "])",
+                    Some((z, 4))
+                )
+            )
+            self.one_char[lin_key(l)] = true
+            return V.Str(l)
         match ety:
             case Ty.Int(k):
                 var r = int_range(k)
@@ -4493,6 +4509,40 @@ struct Vf:
                         case _:
                             pass
                 return self.fresh_val(e.ty, self.name_of(e))
+            # one byte per byte
+            case Builtin.Str(StrM.Bytes):
+                match rv:
+                    case V.Str(l):
+                        return V.Arr(self.fresh_content(self.name_of(e)), l)
+                    case _:
+                        return self.fresh_val(e.ty, self.name_of(e))
+            # one to four bytes per character, each a character
+            case Builtin.Str(StrM.Chars):
+                match rv:
+                    case V.Str(l):
+                        let nm = self.name_of(e)
+                        let c = self.fresh_content(nm)
+                        self.chars[c] = true
+                        let n = self.fresh_len("len(" + nm + ")")
+                        self.assume(F.le(n, l))
+                        match n.scale(4):
+                            case Some(n4):
+                                self.assume(F.le(l, n4))
+                            case None:
+                                pass
+                        return V.Arr(c, n)
+                    case _:
+                        return self.fresh_val(e.ty, self.name_of(e))
+            # true: at least as long as the prefix
+            case Builtin.Str(StrM.StartsWith) | Builtin.Str(StrM.EndsWith):
+                let r = self.fresh_bool(self.name_of(e))
+                if len(vals) == 1:
+                    match (rv, vals[0]):
+                        case (V.Str(l), V.Str(p)):
+                            self.defs.push(F.or_([r.not_(), F.le(p, l)]))
+                        case _:
+                            pass
+                return V.Bool(r)
             case Builtin.Len:
                 if len(vals) > 0:
                     match vals[0]:
@@ -4595,7 +4645,7 @@ struct Vf:
                             # enough, not necessary ("é" passes): never refuted
                             if not self.spec and self.live:
                                 self.nobl += 1
-                                if self.holds(one):
+                                if lin_key(l) in self.one_char or self.holds(one):
                                     self.kept_proven.push((e.span, "character check"))
                                 else:
                                     self.remain(e.span, "character check", Some(one))
