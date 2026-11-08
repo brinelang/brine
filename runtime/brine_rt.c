@@ -1841,6 +1841,7 @@ static bool br_parse_float(brine_str *s, double *out) {
         /* decimal only, like int(): strtod's hex floats ("0x1p4") don't read */
         const char *q = p;
         while (q < p + n && (*q == ' ' || (*q >= 9 && *q <= 13))) q++;
+        bool neg = q < p + n && *q == '-';
         if (q < p + n && (*q == '-' || *q == '+')) q++;
         if (q + 1 < p + n && q[0] == '0' && (q[1] | 32) == 'x') {
             free(tmp);
@@ -1850,6 +1851,13 @@ static bool br_parse_float(brine_str *s, double *out) {
         v = strtod(p, &end);
         while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
         ok = n != 0 && end == p + n;
+        /* the canonical quiet NaN with the text's sign, as native code reads
+         * every "nan" (mingw's strtod sets all the mantissa bits, musl's
+         * drops the sign) */
+        if (v != v) {
+            uint64_t b = (neg ? 0x8000000000000000ULL : 0) | 0x7ff8000000000000ULL;
+            memcpy(&v, &b, 8);
+        }
     }
     free(tmp);
     *out = v;
