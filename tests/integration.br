@@ -851,6 +851,132 @@ test "language errors are reported on the marked lines":
                 pass
     assert error_codes(file) == want, str(error_codes(file))
 
+# The number after `key` in a line of JSON.
+fn json_int(s: str, key: str) -> int:
+    let i = s.find(key).unwrap()
+    var n = 0
+    for c in s[i + len(key):].chars():
+        if not c.is_digit():
+            break
+        n = n * 10 + c.to_int().unwrap()
+    return n
+
+# The string after `key` in a line of JSON, unescaped.
+fn json_string(s: str, key: str) -> str:
+    let cs = s[s.find(key).unwrap() + len(key) + 1:].chars()
+    var out = ""
+    var i = 0
+    while cs[i] != "\"":
+        if cs[i] == "\\":
+            i += 1
+            match cs[i]:
+                case "n":
+                    out += "\n"
+                case "t":
+                    out += "\t"
+                case "r":
+                    out += "\r"
+                case "u":
+                    var code = 0
+                    for h in cs[i + 1:i + 5]:
+                        code = code * 16 + "0123456789abcdef".find(h.lower()).unwrap()
+                    out += chr(code)
+                    i += 4
+                case _:
+                    out += cs[i]
+        else:
+            out += cs[i]
+        i += 1
+    return out
+
+# `src` with every edit in the `fixes` of `brine check --json` output applied,
+# last first (lines and columns are 1-based and count characters); an edit
+# that overlaps one already applied is skipped.
+fn apply_fixes(src: str, json: str) -> (str, int):
+    let cs = src.chars()
+    var starts = [0]
+    for i, c in enumerate(cs):
+        if c == "\n":
+            starts.push(i + 1)
+    var edits: [(int, int, str)] = []
+    for l in json.lines():
+        match l.find("\"fixes\":["):
+            case Some(k):
+                for part in l[k:].split("{\"file\":")[1:]:
+                    let lo = (
+                        starts[json_int(part, "\"line\":") - 1] + json_int(part, "\"column\":") - 1
+                    )
+                    let hi = (
+                        starts[json_int(part, "\"end_line\":") - 1]
+                        + json_int(part, "\"end_column\":")
+                        - 1
+                    )
+                    edits.push((lo, hi, json_string(part, "\"replacement\":")))
+            case None:
+                pass
+    edits.sort()
+    var out = cs
+    var limit = len(cs) + 1
+    var n = 0
+    var k = len(edits) - 1
+    while k >= 0:
+        let (lo, hi, r) = edits[k]
+        if hi <= limit:
+            out = out[:lo] + r.chars() + out[hi:]
+            limit = lo
+            n += 1
+        k -= 1
+    return ("".join(out), n)
+
+test "suggested fixes give code that lexes and parses":
+    # programs from the a_dx_errors corpus whose mistakes all come with fixes
+    var names: [str] = []
+    match os.list_dir("tests/fixes"):
+        case Ok(ns):
+            names = ns
+        case Err(e):
+            panic(e)
+    let d = scratch("fixes")
+    var n = 0
+    for name in names:
+        if not name.ends_with(".br"):
+            continue
+        let f = "tests/fixes/" + name
+        let before = brine(["check", f, "--json"])
+        let (fixed, edits) = apply_fixes(text(f), before.out)
+        assert edits > 0, f"{f} has no suggested fixes"
+        let g = d + "/" + name
+        write(g, fixed)
+        for l in brine(["check", g, "--json"]).out.lines():
+            # E01xx are the lexer's and the parser's errors
+            assert "\"code\":\"E01" not in l, f"the fixes of {f} don't parse:\n{fixed}\n{l}"
+        let base = f[:len(f) - 3]
+        match read_file(base + ".fixed"):
+            case Ok(want):
+                assert fixed == want.replace("\r\n", "\n"), f"the fixes of {f} gave:\n{fixed}"
+            case Err(_):
+                pass
+        n += 1
+    assert n > 30
+
+test "errors point at their cause and don't cascade":
+    let d = scratch("cascade")
+    # an unclosed bracket is reported at the bracket, not at the next line
+    write(d + "/unclosed.br", "fn main():\n    print(max(1, 2)\n    let x = 3\n    print(x)\n")
+    assert error_codes(d + "/unclosed.br") == ["E0110@2"]
+    let u = brine(["check", d + "/unclosed.br"]).all()
+    assert "this `(` is never closed" in u, u
+    # after a broken string, later errors are a guess: one error, and a note
+    write(d + "/string.br", "fn main():\n    let s = \"a\n    print(s +)\n    let t = \"b\"\n")
+    assert error_codes(d + "/string.br") == ["E0102@2"]
+    assert "later error" in brine(["check", d + "/string.br"]).all()
+    # `println!(...)` and `a; b` each give one error
+    write(
+        d + "/rust.br",
+        "fn main():\n    println!(\"hi\")\n    let a = 1; let b = 2\n    print(a + b)\n"
+    )
+    assert error_codes(d + "/rust.br") == ["E0115@2", "E0106@3"]
+
 test "the deadlock checker iterates to a fixpoint":
     # a rank-dependent value passed along 120 functions...
     let d = scratch("fixpoint")

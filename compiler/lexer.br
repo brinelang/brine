@@ -704,7 +704,7 @@ struct Lexer:
                     lo,
                     end,
                     "string starts here",
-                    "close the string with a matching quote on the same line"
+                    "close the string with a matching quote on the same line; a line break inside a string is written `\\n`"
                 )
                 # what follows is probably not code: don't count its brackets
                 self.depth = 0
@@ -916,9 +916,38 @@ struct Lexer:
         if three == "..=" or three == "<<=" or three == ">>=":
             self.op(self.singles[three], 3)
             return
+        if three == "===" or three == "!==":
+            let op = two[0:1] + "="
+            let d = self.error_fix(
+                "E0105",
+                f"`{three}` is not an operator in brine",
+                lo,
+                lo + 3,
+                f"use `{op}`",
+                op,
+                f"replace with `{op}`"
+            )
+            self.diags.push(
+                d.with_help(
+                    "`==` never converts between types (comparing an `int` with a `str` is a compile error), so it is already strict"
+                )
+            )
+            self.op(Tok.EqEq if c == "=" else Tok.Ne, 3)
+            return
         match two:
             case ".." | "->" | "==" | "!=" | "<=" | ">=" | "<<" | ">>" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=":
                 self.op(self.singles[two], 2)
+                return
+            case "**":
+                self.error(
+                    "E0105",
+                    "`**` is not an operator in brine",
+                    lo,
+                    lo + 2,
+                    "no power operator",
+                    "write `pow(x, y)` on floats, or multiply: `x * x`"
+                )
+                self.op(Tok.Star, 2)
                 return
             case "//":
                 let d = self.error_fix(
@@ -931,7 +960,7 @@ struct Lexer:
                     "replace with `/`"
                 )
                 self.diags.push(
-                    d.note(
+                    d.with_help(
                         "`/` on integers already rounds down like Python's `//`; comments start with `#`"
                     )
                 )
@@ -984,29 +1013,31 @@ struct Lexer:
                 self.op(t, 1)
             case None:
                 if c == "!":
+                    self.bang(lo)
+                elif c == ";":
+                    self.semicolon(lo)
+                elif c == "@" and self.blank_before(lo):
+                    var e = lo
+                    while e < len(self.bytes) and self.bytes[e] != 10 and self.bytes[e] != 13:
+                        e += 1
+                    let d = diag.error(
+                        "E0115",
+                        "brine has no decorators"
+                    ).label(self.span(lo, e), "a decorator")
                     self.diags.push(
-                        self.error_fix(
-                            "E0105",
-                            "`!` is not an operator in brine",
-                            lo,
-                            lo + 1,
-                            "use `not`",
-                            "not ",
-                            "replace with `not`"
+                        d.with_help(
+                            "remove it and write what it did in the function itself; to cache results, keep them in a map (`var memo: {int: int} = {}`) passed with `ref`"
                         )
                     )
-                    self.op(Tok.Keyword(Kw.Not), 1)
-                elif c == ";":
-                    self.diags.push(
-                        self.error_fix(
-                            "E0106",
-                            "semicolons are not used in brine",
-                            lo,
-                            lo + 1,
-                            "remove this",
-                            "",
-                            "remove the semicolon"
-                        )
+                    self.pos = e
+                elif c == "`" or c == "$":
+                    self.error(
+                        "E0101",
+                        f"unexpected character `{c}`",
+                        lo,
+                        lo + 1,
+                        "not valid here",
+                        "strings are written in `\"...\"`; to put values in one, use an f-string: `f\"hello {name}\"`"
                     )
                     self.pos += 1
                 else:
@@ -1020,6 +1051,169 @@ struct Lexer:
                         ""
                     )
                     self.pos += len(ch)
+
+    # true if only spaces come before byte `i` on its line
+    fn blank_before(self, i: int) -> bool:
+        var j = i
+        while j > 0 and self.bytes[j - 1] != 10:
+            j -= 1
+            if self.bytes[j] != 32 and self.bytes[j] != 9:
+                return false
+        return true
+
+    # true if the current line's first token is keyword `k`
+    fn line_opens_with(self, k: Kw) -> bool:
+        var i = len(self.toks)
+        while i > 0 and not is_layout(self.toks[i - 1].tok):
+            i -= 1
+        return i < len(self.toks) and self.toks[i].tok == Tok.Keyword(k)
+
+    # `!` at `lo`. It isn't brine's `not`, and right after a name it's something
+    # else again: a Rust macro call (`println!(...)`) or an f-string conversion
+    # (`{x!r}`), where rewriting it to `not` would make things worse.
+    fn bang(ref self, lo: int):
+        let after_name = lo > 0 and is_ident_char(self.at(lo - 1))
+        let next = self.peek2()
+        let conv = next == "r" or next == "s" or next == "a"
+        if after_name and not self.layout and conv and lo + 2 == len(self.text):
+            # the text of an f-string field ends here
+            let d = diag.error(
+                "E0115",
+                f"f-strings have no `!{next}` conversion"
+            ).label(self.span(lo, lo + 2), "not supported")
+            self.diags.push(
+                d.with_help(
+                    "write the value itself, as in `{x}`; to show quotes, put them in the text: `f\"'{x}'\"`"
+                ).fix(self.span(lo, lo + 2), "", f"remove `!{next}`")
+            )
+            self.pos += 2
+            return
+        if after_name and (next == "(" or next == "["):
+            self.macro_call(lo)
+            return
+        self.diags.push(
+            self.error_fix(
+                "E0105",
+                "`!` is not an operator in brine",
+                lo,
+                lo + 1,
+                "use `not`",
+                "not ",
+                "replace with `not`"
+            )
+        )
+        self.op(Tok.Keyword(Kw.Not), 1)
+
+    # `name!(` or `name![`: a Rust macro. The name's token is already pushed; it
+    # becomes the brine function that does the same, so the call parses.
+    fn macro_call(ref self, lo: int):
+        var s = lo
+        while s > 0 and is_ident_char(self.at(s - 1)):
+            s -= 1
+        let name = self.text[s:lo]
+        var to = "-"
+        match name:
+            case "println" | "print":
+                to = "print"
+            case "eprintln" | "eprint":
+                to = "eprint"
+            case "panic":
+                to = "panic"
+            case "assert":
+                to = "assert"
+            case "vec":
+                to = ""
+            case _:
+                pass
+        # a Rust format string (`"{}"`) means something else to `print`
+        var j = lo + 2
+        while j < len(self.bytes) and self.bytes[j] == 32:
+            j += 1
+        var fmt_braces = false
+        if j < len(self.bytes) and self.bytes[j] == 34:
+            j += 1
+            while j < len(self.bytes) and self.bytes[j] != 34 and self.bytes[j] != 10:
+                if self.bytes[j] == 123:
+                    fmt_braces = true
+                j += 1
+        var d = diag.error(
+            "E0115",
+            "brine has no macros"
+        ).label(self.span(s, lo + 1), "`!` makes this a Rust macro call")
+        if name == "vec":
+            d = d.with_help(
+                "an array is written `[1, 2, 3]`"
+            ).fix(self.span(s, lo + 1), "", "remove `vec!`")
+        elif to == "-":
+            d = d.with_help(
+                f"call a function instead: `{name}(...)`"
+            ).fix(self.span(lo, lo + 1), "", "remove `!`")
+        elif fmt_braces:
+            d = d.with_help(
+                f"call `{to}(...)`; it takes the values themselves (`{to}(a, b)`), or use an f-string: `{to}(f\"total: {{n}}\")`"
+            )
+        else:
+            d = d.with_help(
+                f"call `{to}(...)`"
+            ).fix(self.span(s, lo + 1), to, f"replace with `{to}`")
+        self.diags.push(d)
+        # parse the call as the brine one, so this is the only error
+        let n = len(self.toks)
+        if to == "" and n > 0:
+            self.toks.pop()
+        elif to != "-" and n > 0:
+            self.toks[n - 1].tok = Tok.Keyword(Kw.Assert) if to == "assert" else Tok.Ident(to)
+        self.pos += 1
+
+    # `;` at `lo`
+    fn semicolon(ref self, lo: int):
+        self.pos += 1
+        if self.layout and self.depth == 0 and self.line_opens_with(Kw.For):
+            # `for i := 0; i < n; i++:`; the rest of the line would only add errors
+            let d = diag.error(
+                "E0115",
+                "brine has no C-style `for` loop"
+            ).label(self.span(lo, lo + 1), "`;` in a `for` line")
+            self.diags.push(
+                d.with_help(
+                    "write `for i in 0..n:` for i = 0, 1, ..., n - 1, `for i in range(a, b, step):` for another step, or use a `while` loop"
+                )
+            )
+            while not self.done() and self.peek() != "\n":
+                self.pos += 1
+            return
+        var e = self.pos
+        while (
+            e < len(self.bytes)
+            and (self.bytes[e] == 32 or self.bytes[e] == 9 or self.bytes[e] == 13)
+        ):
+            e += 1
+        let more = e < len(self.bytes) and self.bytes[e] != 10 and self.bytes[e] != 35
+        let d = diag.error(
+            "E0106",
+            "semicolons are not used in brine"
+        ).label(self.span(lo, lo + 1), "remove this")
+        if more and self.layout and self.depth == 0:
+            # `a; b`: the fix puts `b` on its own line, indented like `a`
+            var ls = lo
+            while ls > 0 and self.bytes[ls - 1] != 10:
+                ls -= 1
+            var ind = ls
+            while ind < lo and self.bytes[ind] == 32:
+                ind += 1
+            self.diags.push(
+                d.with_help(
+                    "a statement ends at the end of its line: put the next one on a line of its own"
+                ).fix(self.span(lo, e), "\n" + " ".repeat(ind - ls), "start a new line")
+            )
+            # and the parser reads what follows as the next statement
+            self.newline(lo)
+            return
+        self.diags.push(
+            d.with_help(
+                "a statement ends at the end of its line; nothing else marks it"
+            ).fix(self.span(lo, lo + 1), "", "remove the semicolon")
+        )
 
     # push an operator `n` bytes long, tracking bracket depth (newlines inside brackets don't count)
     fn op(ref self, t: Tok, n: int):

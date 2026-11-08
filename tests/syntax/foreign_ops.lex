@@ -7,6 +7,7 @@
 15 17 kw or
 18 19 kw not
 19 20 ident d
+20 20 newline
 22 23 ident e
 23 25 punct +=
 26 27 ident f
@@ -20,7 +21,7 @@
 47 47 eof
 error E0105 5 7 `//` is not an operator in brine
   label 5 7 use `/`
-  note `/` on integers already rounds down like Python's `//`; comments start with `#`
+  help `/` on integers already rounds down like Python's `//`; comments start with `#`
   fix 5 7 "/" replace with `/`
 error E0105 10 12 `&&` is not an operator in brine
   label 10 12 use `and`
@@ -33,7 +34,8 @@ error E0105 18 19 `!` is not an operator in brine
   fix 18 19 "not " replace with `not`
 error E0106 20 21 semicolons are not used in brine
   label 20 21 remove this
-  fix 20 21 "" remove the semicolon
+  help a statement ends at the end of its line: put the next one on a line of its own
+  fix 20 22 "\n" start a new line
 error E0105 23 25 brine has no increment/decrement operators
   label 23 25 not supported
   help write `x += 1` instead
@@ -44,5 +46,6 @@ error E0101 30 31 unexpected character `@`
   label 30 31 not valid here
 error E0101 32 33 unexpected character `$`
   label 32 33 not valid here
+  help strings are written in `"..."`; to put values in one, use an f-string: `f"hello {name}"`
 error E0101 34 36 unexpected character `é`
   label 34 36 not valid here

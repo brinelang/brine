@@ -2,7 +2,7 @@
 # the parser skips to the next line and keeps going.
 from diag import Span, Diag
 import diag
-from lexer import Tok, Kw, Token, FPart, lex, describe, kw_name
+from lexer import Tok, Kw, Token, FPart, lex, describe, kw_name, punct_str, is_layout
 from ast import TypeExpr, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Unpack, Expr, ExprKind, mk
 from ast import LetPat, Pattern, PatKind, Case, ContractKind, Stmt, StmtKind, Block, stmt, pattern
 from types import I128_MAX
@@ -52,6 +52,10 @@ struct Parser:
     diags: [Diag]
     # statements to add after the one just parsed (the unpacking of nested tuples)
     pending: [Stmt]
+    # the file's text, for helps that quote it
+    text: str
+    # a `try` was reported: its `except` and `finally` lines are the same mistake
+    after_try: bool
 
     # ------------------------------------------------------------ helpers
     fn peek(self) -> Tok:
@@ -101,9 +105,347 @@ struct Parser:
     fn report(ref self, code: str, msg: str, label: str):
         self.diags.push(self.error_here(code, msg, label))
 
+    # the source text of bytes `lo..hi` ("" if that isn't text of this file)
+    fn src(self, lo: int, hi: int) -> str:
+        if lo < 0 or hi > len(self.text) or lo > hi:
+            return ""
+        let bs = self.text.bytes()
+        if (
+            (lo < len(bs) and (int(bs[lo]) & 0xc0) == 0x80)
+            or (hi < len(bs) and (int(bs[hi]) & 0xc0) == 0x80)
+        ):
+            return ""
+        return self.text[lo:hi]
+
+    # true if token `pos + n` ends exactly where the next one starts (`::`, `:=`, `=>`)
+    fn glued(self, n: int) -> bool:
+        let i = self.pos + n
+        if i < 0 or i + 1 >= len(self.toks):
+            return false
+        return self.toks[i].hi == self.toks[i + 1].lo
+
+    # the index of the first token of the current line
+    fn line_head(self) -> int:
+        var i = self.pos
+        while i > 0 and not is_layout(self.toks[i - 1].tok):
+            i -= 1
+        return i
+
+    # true if the token before the current one starts its line
+    fn prev_starts_line(self) -> bool:
+        return self.pos > 0 and self.line_head() == self.pos - 1
+
+    fn push_foreign(ref self, span: Span, msg: str, label: str, help: str):
+        self.diags.push(diag.error("E0115", msg).label(span, label).with_help(help))
+
+    # A construct from another language at the current token: report it as E0115
+    # with what brine writes instead, and return true. `in_expr` is true where an
+    # expression should start.
+    fn foreign(ref self, in_expr: bool) -> bool:
+        let t = self.peek()
+        let sp = self.span()
+        var prev = Tok.Eof
+        var psp = sp
+        if self.pos > 0:
+            prev = self.toks[self.pos - 1].tok
+            psp = self.prev_span()
+        let lambda_help = "define a named function (`fn double(x: int) -> int:`) and call it, for example in a comprehension: `[double(x) for x in xs]`"
+        match t:
+            case Tok.Ident(w) if w == "is" and not in_expr:
+                var d = diag.error("E0115", "brine has no `is` operator").label(sp, "`is`")
+                if self.peek_at(1) == Tok.Keyword(Kw.Not):
+                    let s2 = Span(file=sp.file, lo=sp.lo, hi=self.toks[self.pos + 1].hi)
+                    d = d.fix(s2, "!=", "replace `is not` with `!=`")
+                else:
+                    d = d.fix(sp, "==", "replace `is` with `==`")
+                self.diags.push(
+                    d.with_help(
+                        "compare with `==` or `!=` (`x != None`); an `Option` also has `x.is_some()` and `x.is_none()`"
+                    )
+                )
+                return true
+            case Tok.Ident(w) if w == "lambda":
+                self.push_foreign(sp, "brine has no lambdas", "`lambda`", lambda_help)
+                return true
+            case Tok.Keyword(Kw.As) if not in_expr:
+                var d = diag.error("E0115", "brine has no `as` casts").label(sp, "`as`")
+                d = d.with_help("convert by calling the type: `u8(x)`, `float(n)`, `int(f)`")
+                match (prev, self.peek_at(1)):
+                    case (Tok.Ident(_), Tok.Ident(ty)) | (Tok.Int(_), Tok.Ident(ty)):
+                        let ps = self.prev_span()
+                        let ts = self.toks[self.pos + 1]
+                        let whole = Span(file=sp.file, lo=ps.lo, hi=ts.hi)
+                        let arg = self.src(ps.lo, ps.hi)
+                        if arg != "" and not (
+                            self.peek_at(2) == Tok.Dot or self.peek_at(2) == Tok.LBracket
+                        ):
+                            d = d.fix(whole, f"{ty}({arg})", f"write `{ty}({arg})`")
+                    case _:
+                        pass
+                self.diags.push(d)
+                return true
+            case Tok.Colon if self.peek_at(1) == Tok.Colon and self.glued(0):
+                let s2 = Span(file=sp.file, lo=sp.lo, hi=self.toks[self.pos + 1].hi)
+                var d = diag.error("E0115", "brine has no `::` paths").label(s2, "`::`")
+                let string_ctor = prev == Tok.Ident("String")
+                if string_ctor:
+                    d = d.with_help(
+                        "a string literal is already a `str`: write `\"hi\"` (or `\"\"`)"
+                    )
+                else:
+                    d = d.with_help(
+                        "use `.`: `Shape.Circle`, `geometry.area(...)`"
+                    ).fix(s2, ".", "replace `::` with `.`")
+                self.diags.push(d)
+                return true
+            case Tok.Colon if self.peek_at(1) == Tok.Assign and self.glued(0):
+                let s2 = Span(file=sp.file, lo=sp.lo, hi=self.toks[self.pos + 1].hi)
+                self.push_foreign(
+                    s2,
+                    "brine has no `:=`",
+                    "`:=`",
+                    "give the value a name on a line of its own first: `let y = f(x)` (`var y = ...` if it changes)"
+                )
+                return true
+            case Tok.Assign if self.peek_at(1) == Tok.Gt and self.glued(0):
+                let s2 = Span(file=sp.file, lo=sp.lo, hi=self.toks[self.pos + 1].hi)
+                self.push_foreign(s2, "brine has no arrow functions", "`=>`", lambda_help)
+                return true
+            case Tok.Pipe if in_expr:
+                self.push_foreign(sp, "brine has no closures", "a closure's `|`", lambda_help)
+                return true
+            case Tok.Amp if in_expr:
+                var e = self.toks[self.pos + 1].lo
+                if self.peek_at(1) == Tok.Keyword(Kw.Mut):
+                    e = self.toks[self.pos + 2].lo
+                let d = diag.error(
+                    "E0115",
+                    "brine passes references with `ref`, not `&`"
+                ).label(sp, "`&`")
+                self.diags.push(
+                    d.with_help(
+                        "write `ref x`; the parameter is declared `ref name: type`"
+                    ).fix(Span(file=sp.file, lo=sp.lo, hi=e), "ref ", "replace with `ref`")
+                )
+                return true
+            case Tok.Keyword(Kw.Let) if in_expr:
+                # `if let Some(x) = opt:`
+                var i = self.pos + 1
+                var eq = -1
+                var colon = -1
+                while i < len(self.toks) and not is_layout(self.toks[i].tok):
+                    if self.toks[i].tok == Tok.Assign and eq < 0:
+                        eq = i
+                    if self.toks[i].tok == Tok.Colon:
+                        colon = i
+                    i += 1
+                var help = "use `match value:` with a `case Some(x):` line and a `case _:` line for the rest"
+                if eq > self.pos + 1 and colon > eq + 1:
+                    let pat = self.src(self.toks[self.pos + 1].lo, self.toks[eq - 1].hi)
+                    let val = self.src(self.toks[eq + 1].lo, self.toks[colon - 1].hi)
+                    if pat != "" and val != "":
+                        help = f"use `match {val}:` with a `case {pat}:` line and a `case _:` line for the rest"
+                self.push_foreign(sp, "brine has no `if let`", "`let` here", help)
+                return true
+            case Tok.DotDot if in_expr and self.peek_at(1) == Tok.Dot and self.glued(0):
+                let s2 = Span(file=sp.file, lo=sp.lo, hi=self.toks[self.pos + 1].hi)
+                let d = diag.error("E0115", "`...` isn't a statement in brine").label(s2, "`...`")
+                self.diags.push(
+                    d.with_help("an empty body is written `pass`").fix(s2, "pass", "write `pass`")
+                )
+                return true
+            case Tok.LBrace if is_ident(prev) and not in_expr:
+                return self.struct_literal()
+            case _:
+                pass
+        if prev == Tok.Ident("lambda"):
+            self.push_foreign(psp, "brine has no lambdas", "`lambda`", lambda_help)
+            return true
+        return false
+
+    # The statement so far is one word (`try`, `raise`, `retrun`, ...) and the
+    # current token can't follow it: a construct from another language, or a
+    # misspelled keyword. Only called at the end of a statement.
+    fn foreign_word(ref self) -> bool:
+        if not self.prev_starts_line():
+            return false
+        let prev = self.toks[self.pos - 1].tok
+        let psp = self.prev_span()
+        match prev:
+            case Tok.Ident(w):
+                match w:
+                    case "try" | "except" | "finally" | "catch":
+                        if w != "try" and self.after_try:
+                            return true
+                        self.after_try = true
+                        self.push_foreign(
+                            psp,
+                            "brine has no exceptions",
+                            f"`{w}`",
+                            "a function that can fail returns `Result[T, E]` (or `Option[T]`): handle it with `match` (`case Ok(v):` / `case Err(e):`), or pass it on with `?`; text to a number is `s.to_int()`, an `Option[int]`"
+                        )
+                        return true
+                    case "raise" | "throw":
+                        self.push_foreign(
+                            psp,
+                            "brine has no exceptions",
+                            f"`{w}`",
+                            "return `Err(\"...\")` from a function that returns `Result[T, str]`, or call `panic(\"...\")` to stop the program"
+                        )
+                        return true
+                    case "with":
+                        self.push_foreign(
+                            psp,
+                            "brine has no `with` blocks",
+                            "`with`",
+                            "files are read and written in one call, and nothing needs closing: `read_file(path)` gives a `Result[str, str]`, `write_file(path, text)` writes one"
+                        )
+                        return true
+                    case "switch":
+                        self.push_foreign(
+                            psp,
+                            "brine has no `switch`",
+                            "`switch`",
+                            "write `match x:` with a `case 1:` line for each value and `case _:` for the rest"
+                        )
+                        return true
+                    case "global" | "nonlocal":
+                        self.push_foreign(
+                            psp,
+                            "brine has no global variables",
+                            f"`{w}`",
+                            "pass the variable with `ref` (`fn bump(ref counter: int)`, called as `bump(ref counter)`), or return the new value"
+                        )
+                        return true
+                    case _:
+                        pass
+                if len(w) >= 3:
+                    let kws = [
+                        "return",
+                        "while",
+                        "for",
+                        "if",
+                        "elif",
+                        "else",
+                        "match",
+                        "let",
+                        "var",
+                        "break",
+                        "continue",
+                        "pass",
+                        "assert",
+                        "import",
+                        "struct",
+                        "enum",
+                        "const"
+                    ]
+                    match diag.best_match(w, kws):
+                        case Some(k):
+                            self.diags.push(
+                                diag.error("E0110", f"`{w}` isn't a keyword")
+                                .label(psp, "not a keyword")
+                                .with_help(f"did you mean `{k}`?")
+                                .fix(psp, k, f"replace with `{k}`")
+                            )
+                            return true
+                        case None:
+                            pass
+            case _:
+                pass
+        return false
+
+    # `Point { x: 1, y: 2 }` at the `{`: brine writes `Point(x=1, y=2)`
+    fn struct_literal(ref self) -> bool:
+        let head = self.toks[self.line_head()].tok
+        match head:
+            case Tok.Keyword(Kw.If) | Tok.Keyword(Kw.Elif) | Tok.Keyword(Kw.While) | Tok.Keyword(
+                Kw.For
+            ) | Tok.Keyword(Kw.Match) | Tok.Keyword(Kw.Fn) | Tok.Keyword(Kw.Struct) | Tok.Keyword(Kw.Enum):
+                return false
+            case _:
+                pass
+        let name = self.prev_span()
+        let lb = self.span()
+        var d = diag.error(
+            "E0115",
+            "brine builds a struct by calling its name"
+        ).label(lb, "a Rust/Go struct literal")
+        let n = self.src(name.lo, name.hi)
+        d = d.with_help(f"write `{n}(x=1, y=2)`: one keyword argument per field")
+        # the fix: `{` becomes `(`, each `field:` becomes `field=`, `}` becomes `)`
+        var i = self.pos + 1
+        var depth = 0
+        var edits: [(Span, str)] = [(Span(file=lb.file, lo=name.hi, hi=self.toks[i].lo), "(")]
+        var ok = false
+        while i < len(self.toks) and not is_layout(self.toks[i].tok):
+            let tk = self.toks[i]
+            match tk.tok:
+                case Tok.LParen | Tok.LBracket | Tok.LBrace:
+                    depth += 1
+                case Tok.RParen | Tok.RBracket:
+                    depth -= 1
+                case Tok.RBrace:
+                    if depth == 0:
+                        let last = self.toks[i - 1]
+                        edits.push((Span(file=lb.file, lo=last.hi, hi=tk.hi), ")"))
+                        ok = true
+                        break
+                    depth -= 1
+                case Tok.Colon if depth == 0 and is_ident(self.toks[i - 1].tok):
+                    let nx = self.toks[i + 1]
+                    edits.push((Span(file=lb.file, lo=tk.lo, hi=nx.lo), "="))
+                case _:
+                    pass
+            i += 1
+        if ok:
+            for s, r in edits:
+                d = d.fix(s, r, f"write `{n}(...)`")
+        self.diags.push(d)
+        return true
+
+    # `)`, `]` or `}` was expected at the current token, which is on a later line
+    # than the token before it: the bracket opened earlier is never closed. Point
+    # at it, and offer to close it where the line before ended.
+    fn unclosed(ref self, t: Tok) -> bool:
+        if not (t == Tok.RParen or t == Tok.RBracket or t == Tok.RBrace) or self.pos == 0:
+            return false
+        let prev = self.toks[self.pos - 1]
+        let cur = self.toks[self.pos]
+        if not self.at(Tok.Eof) and "\n" not in self.src(prev.hi, cur.lo):
+            return false
+        var depth = 0
+        var i = self.pos - 1
+        while i >= 0:
+            match self.toks[i].tok:
+                case Tok.RParen | Tok.RBracket | Tok.RBrace:
+                    depth += 1
+                case Tok.LParen | Tok.LBracket | Tok.LBrace:
+                    if depth == 0:
+                        break
+                    depth -= 1
+                case _:
+                    pass
+            i -= 1
+        if i < 0:
+            return false
+        let op = self.toks[i]
+        let open = punct_str(op.tok)
+        let close = punct_str(t)
+        let osp = Span(file=self.file, lo=op.lo, hi=op.hi)
+        let at = Span(file=self.file, lo=prev.hi, hi=prev.hi)
+        let d = diag.error("E0110", f"this `{open}` is never closed").label(osp, "opened here")
+        self.diags.push(
+            d.label(self.span(), f"expected `{close}` before this")
+            .with_help(f"add `{close}` where the expression ends")
+            .fix(at, close, f"add `{close}`")
+        )
+        return true
+
     fn expect(ref self, t: Tok, what: str) -> Result[Span, ()]:
         if self.at(t):
             return Ok(self.bump())
+        if self.unclosed(t) or self.foreign(false):
+            return Err(())
         let found = describe(self.peek())
         var d = self.error_here("E0110", f"expected {what}, found {found}", f"expected {what}")
         if t == Tok.Colon and self.at(Tok.Newline):
@@ -134,13 +476,19 @@ struct Parser:
             case Tok.Ident(s):
                 return Ok((s, self.bump()))
             case Tok.Keyword(k):
-                self.report(
+                let kw = kw_name(k)
+                let d = self.error_here(
                     "E0110",
-                    f"expected {what}, found keyword `{kw_name(k)}`",
+                    f"expected {what}, found keyword `{kw}`",
                     "keywords can't be used as names"
+                )
+                self.diags.push(
+                    d.with_help(f"`{kw}` is a keyword in brine; pick another name, such as `{kw}_`")
                 )
                 return Err(())
             case t:
+                if self.foreign(false):
+                    return Err(())
                 self.report("E0110", f"expected {what}, found {describe(t)}", f"expected {what}")
                 return Err(())
 
@@ -183,10 +531,17 @@ struct Parser:
             case Tok.Dedent | Tok.Eof:
                 return Ok(())
             case t:
-                self.report(
+                if self.foreign(false) or self.foreign_word():
+                    return Err(())
+                let d = self.error_here(
                     "E0110",
                     f"expected end of line, found {describe(t)}",
                     "unexpected here"
+                )
+                self.diags.push(
+                    d.with_help(
+                        "a statement ends at the end of its line; look for a missing operator, `,` or bracket before this"
+                    )
                 )
                 return Err(())
 
@@ -239,20 +594,74 @@ struct Parser:
                     "this line is indented but isn't inside a block"
                 )
                 return Err(())
-            case Tok.Ident(s) if s == "def":
+            # `def f(...)`, `function f(...)` and typos like `fucntion f(...)`: a
+            # function with another keyword; report it and read the function
+            case Tok.Ident(s) if is_ident(self.peek_at(1)) and (
+                self.peek_at(2) == Tok.LParen
+                or self.peek_at(2) == Tok.Lt
+                or self.peek_at(2) == Tok.LBracket
+            ):
                 let sp = self.span()
-                self.diags.push(
-                    diag.error("E0110", "brine uses `fn` to define functions")
-                    .label(sp, "use `fn` here")
-                    .fix(sp, "fn", "replace `def` with `fn`")
+                let other = s in ["def", "function", "func", "fun", "proc", "sub"]
+                let code = "E0115" if other else "E0110"
+                let msg = (
+                    "brine uses `fn` to define functions" if other else f"`{s}` isn't a keyword"
                 )
-                return Err(())
+                self.diags.push(
+                    diag.error(code, msg).label(sp, "use `fn` here").with_help(
+                        "a function is written `fn name(x: int) -> int:` with its body indented below"
+                    ).fix(sp, "fn", f"replace `{s}` with `fn`")
+                )
+                m.fns.push(self.fn_decl(None)?)
             case Tok.Ident(s) if s == "class":
                 let sp = self.span()
                 self.diags.push(
-                    diag.error("E0110", "brine uses `struct` to define types")
+                    diag.error("E0115", "brine uses `struct` to define types")
                     .label(sp, "use `struct` here")
                     .fix(sp, "struct", "replace `class` with `struct`")
+                    .with_help(
+                        "list the fields as `x: int` lines; a value is built with `Point(x=1, y=2)` (no `__init__`), and methods take `self` first"
+                    )
+                )
+                return Err(())
+            case Tok.Ident(s) if s in ["pub", "export", "public", "private", "static"]:
+                let sp = self.span()
+                let next = self.toks[self.pos + 1]
+                self.diags.push(
+                    diag.error("E0115", f"brine has no `{s}`")
+                    .label(sp, "not needed")
+                    .with_help(
+                        "every top-level item is visible to the modules that import this file"
+                    )
+                    .fix(Span(file=sp.file, lo=sp.lo, hi=next.lo), "", f"remove `{s}`")
+                )
+                self.bump()
+                return self.item(ref m)
+            case Tok.Ident(s) if s == "impl":
+                let sp = self.span()
+                self.push_foreign(
+                    sp,
+                    "brine has no `impl` blocks",
+                    "`impl`",
+                    "write the methods inside the `struct` (or `enum`) itself, indented under its fields, with `self` as the first parameter: `fn area(self) -> float:`"
+                )
+                return Err(())
+            case Tok.Ident(s) if s in ["trait", "interface", "protocol"]:
+                let sp = self.span()
+                self.push_foreign(
+                    sp,
+                    "brine has no traits or interfaces",
+                    f"`{s}`",
+                    "for a value that is one of several kinds, use an `enum` with a variant per kind and `match` on it; for code that works on many types, a generic function `fn f[T](x: T)`"
+                )
+                return Err(())
+            case Tok.Keyword(Kw.Var) | Tok.Keyword(Kw.Let):
+                let sp = self.span()
+                self.push_foreign(
+                    sp,
+                    "brine has no global variables",
+                    "outside any function",
+                    "use `const NAME = value` for a value that never changes; for one that does, create it in `main` and pass it with `ref` to the functions that change it"
                 )
                 return Err(())
             case Tok.Ident(s) if s == "from":
@@ -285,7 +694,16 @@ struct Parser:
 
     fn import_decl(ref self) -> Result[Import, ()]:
         let start = self.bump()
-        let path = self.module_path()?
+        var path = self.module_path()?
+        if self.at(Tok.Slash):
+            # `import util/strings`: a file path; brine writes `util.strings`
+            var d = diag.error("E0110", "module paths use `.`, not `/`").label(self.span(), "`/`")
+            while self.at(Tok.Slash) and is_ident(self.peek_at(1)):
+                d = d.fix(self.span(), ".", "replace `/` with `.`")
+                self.bump()
+                let (n, _) = self.expect_ident("module name")?
+                path.push(n)
+            self.diags.push(d.with_help("`import util.strings` loads util/strings.br"))
         var alias = path[len(path) - 1]
         if self.eat_kw(Kw.As):
             let (a, _) = self.expect_ident("alias")?
@@ -306,6 +724,15 @@ struct Parser:
             )
             self.diags.push(d.with_help("write `from module import name1, name2`"))
             return Err(())
+        if self.at(Tok.Star):
+            let mod = ".".join(path)
+            self.push_foreign(
+                self.span(),
+                "brine can't import every name at once",
+                "`*`",
+                f"name the ones you use: `from {mod} import area, Point`, or write `import {mod}` and use `{mod}.area`"
+            )
+            return Err(())
         var names = [self.expect_ident("a name to import")?]
         while self.eat(Tok.Comma):
             names.push(self.expect_ident("a name to import")?)
@@ -315,6 +742,13 @@ struct Parser:
 
     fn const_decl(ref self) -> Result[ConstDecl, ()]:
         let start = self.bump()
+        if self.at_kw(Kw.Fn):
+            self.diags.push(
+                diag.error("E0115", "brine has no `const fn`").label(start, "`const`").with_help(
+                    "write a plain `fn`; a `const` can only use literals, arithmetic and other constants"
+                ).fix(Span(file=start.file, lo=start.lo, hi=self.span().lo), "", "remove `const`")
+            )
+            return Err(())
         let (name, _) = self.expect_ident("constant name")?
         var ty: Option[TypeExpr] = None
         if self.eat(Tok.Colon):
@@ -458,6 +892,14 @@ struct Parser:
             let mut_span = self.span()
             let by_ref = self.eat_kw(Kw.Ref)
             let mutable = not by_ref and self.eat_kw(Kw.Mut)
+            if self.at(Tok.Star):
+                self.push_foreign(
+                    self.span(),
+                    "brine has no `*args`",
+                    "`*`",
+                    "take an array instead, `args: [int]`, and call with `log(\"msg\", [1, 2, 3])`"
+                )
+                return Err(())
             let (name, span) = self.expect_ident("parameter name")?
             if mutable and name == "self":
                 let d = diag.error(
@@ -476,7 +918,42 @@ struct Parser:
                     self.diags.push(d.with_help(f"write `{name}: int` (or another type)"))
                     return Err(())
                 self.bump()
+                var is_ref = by_ref
+                if self.at(Tok.Amp):
+                    # `xs: &mut [int]`: brine writes `ref xs: [int]`
+                    let amp = self.span()
+                    self.bump()
+                    self.eat_kw(Kw.Mut)
+                    let d = diag.error(
+                        "E0115",
+                        "brine passes references with `ref`, not `&`"
+                    ).label(amp, "`&`")
+                    var d2 = d.with_help(
+                        f"declare the parameter `ref {name}: ...`, and call with `ref`: `f(ref x)`"
+                    )
+                    if not by_ref:
+                        d2 = d2.fix(
+                            Span(file=span.file, lo=span.lo, hi=span.lo),
+                            "ref ",
+                            "add `ref`"
+                        )
+                    self.diags.push(
+                        d2.fix(Span(file=amp.file, lo=amp.lo, hi=self.span().lo), "", "remove `&`")
+                    )
+                    is_ref = true
                 ty = Some(self.type_expr()?)
+                if self.at(Tok.Assign):
+                    self.push_foreign(
+                        self.span(),
+                        "brine has no default parameter values",
+                        "a default value",
+                        "pass every argument at every call, or write a second function that calls this one with the default"
+                    )
+                    return Err(())
+                ps.push(Param(name=name, span=span, ty=ty, by_ref=is_ref, mutable=mutable))
+                if not self.eat(Tok.Comma):
+                    break
+                continue
             ps.push(Param(name=name, span=span, ty=ty, by_ref=by_ref, mutable=mutable))
             if not self.eat(Tok.Comma):
                 break
@@ -491,7 +968,11 @@ struct Parser:
     fn fn_decl(ref self, method_of: Option[str]) -> Result[FnDecl, ()]:
         let start = self.bump()
         let (name, name_span) = self.expect_ident("function name")?
-        let tparams = self.tparams()?
+        var tparams: [(str, Span)] = []
+        if self.at(Tok.Lt):
+            tparams = self.angle_brackets("type parameters", "fn first[T](xs: [T]) -> T")?
+        else:
+            tparams = self.tparams()?
         let params = self.params(method_of.is_some())?
         let ret = self.ret_type()?
         let sig_span = start.to(self.prev_span())
@@ -736,6 +1217,87 @@ struct Parser:
         self.expect(Tok.RBracket, "`]`")?
         return Ok(ps)
 
+    # `<T>` after a function name: report that brine writes `[T]`, and skip it
+    fn angle_brackets(ref self, what: str, example: str) -> Result[[(str, Span)], ()]:
+        let lt = self.span()
+        var i = self.pos + 1
+        var names: [(str, Span)] = []
+        while i < len(self.toks):
+            match self.toks[i].tok:
+                case Tok.Ident(n):
+                    names.push((n, Span(file=self.file, lo=self.toks[i].lo, hi=self.toks[i].hi)))
+                case Tok.Comma:
+                    pass
+                case _:
+                    break
+            i += 1
+        var d = diag.error("E0115", f"brine writes {what} in `[...]`, not `<...>`").label(lt, "`<`")
+        d = d.with_help(f"for example `{example}`")
+        if i < len(self.toks) and self.toks[i].tok == Tok.Gt:
+            let gt = self.toks[i]
+            d = d.fix(
+                lt,
+                "[",
+                "replace `<` with `[`"
+            ).fix(Span(file=lt.file, lo=gt.lo, hi=gt.hi), "]", "replace `>` with `]`")
+            self.diags.push(d)
+            self.pos = i + 1
+            return Ok(names)
+        self.diags.push(d)
+        return Err(())
+
+    # `Vec<int>`, `HashMap<str, int>`, `Option<T>` in a type: report what brine
+    # writes, then read the arguments so the rest of the line still parses
+    fn angle_type(ref self, path: [str], start: Span) -> Result[TypeExpr, ()]:
+        let name = path[len(path) - 1]
+        let lt = self.span()
+        self.bump()
+        var args: [TypeExpr] = []
+        var commas: [Span] = []
+        while true:
+            args.push(self.type_expr()?)
+            if not self.at(Tok.Comma):
+                break
+            commas.push(self.bump())
+        if not self.at(Tok.Gt):
+            self.report(
+                "E0115",
+                f"brine writes type arguments in `[...]`, not `<...>`",
+                "expected `>`"
+            )
+            return Err(())
+        let gt = self.bump()
+        let span = start.to(gt)
+        let head = Span(file=start.file, lo=start.lo, hi=lt.hi)
+        let is_array = name in ["Vec", "List", "Array", "ArrayList", "Slice", "list"]
+        let is_map = name in ["HashMap", "Map", "Dict", "BTreeMap", "dict", "Record"]
+        var d = diag.error(
+            "E0115",
+            f"brine writes type arguments in `[...]`, not `<...>`"
+        ).label(lt, "`<`")
+        if is_array and len(args) == 1:
+            d = (
+                d.with_help("an array of ints is `[int]`")
+                .fix(head, "[", "write `[...]`")
+                .fix(gt, "]", "write `[...]`")
+            )
+            self.diags.push(d)
+            return Ok(TypeExpr.Array(args[0], span))
+        if is_map and len(args) == 2:
+            d = d.with_help(
+                "a map from `str` to `int` is `{str: int}`"
+            ).fix(head, "{", "write `{K: V}`")
+            d = d.fix(commas[0], ":", "write `{K: V}`").fix(gt, "}", "write `{K: V}`")
+            self.diags.push(d)
+            return Ok(TypeExpr.Map(args[0], args[1], span))
+        d = (
+            d.with_help(f"write `{name}[...]`, like `Option[int]`")
+            .fix(lt, "[", "replace `<` with `[`")
+            .fix(gt, "]", "replace `>` with `]`")
+        )
+        self.diags.push(d)
+        return Ok(TypeExpr.Named(path, args, span))
+
     fn type_expr(ref self) -> Result[TypeExpr, ()]:
         let start = self.span()
         match self.peek():
@@ -768,6 +1330,8 @@ struct Parser:
                     let (n, _) = self.expect_ident("type name")?
                     path.push(n)
                 var args: [TypeExpr] = []
+                if self.at(Tok.Lt):
+                    return self.angle_type(path, start)
                 if self.eat(Tok.LBracket):
                     while true:
                         args.push(self.type_expr()?)
@@ -777,6 +1341,35 @@ struct Parser:
                             break
                     self.expect(Tok.RBracket, "`]`")?
                 return Ok(TypeExpr.Named(path, args, start.to(self.prev_span())))
+            case Tok.Keyword(Kw.Ref):
+                let returned = self.pos > 0 and self.toks[self.pos - 1].tok == Tok.Arrow
+                let msg = (
+                    "a function can't return a `ref`" if returned else "a `ref` can't be stored"
+                )
+                let d = self.error_here("E0110", msg, "`ref` here")
+                let help = (
+                    "return the value: copies are cheap (copy-on-write); to change the caller's variable, take it as a `ref` parameter instead"
+                    if returned
+                    else "references can't be kept in fields or arrays, so they never dangle: store the value itself (copies are cheap, copy-on-write), or pass the variable with `ref` to the functions that need it"
+                )
+                self.diags.push(
+                    d.with_help(help).fix(
+                        Span(file=start.file, lo=start.lo, hi=self.toks[self.pos + 1].lo),
+                        "",
+                        "remove `ref`"
+                    )
+                )
+                # read the type itself, so the rest of the function is checked too
+                self.bump()
+                return self.type_expr()
+            case Tok.Amp:
+                self.push_foreign(
+                    start,
+                    "brine passes references with `ref`, not `&`",
+                    "`&`",
+                    "a parameter that changes the caller's variable is declared `ref name: type`"
+                )
+                return Err(())
             case t:
                 self.report(
                     "E0110",
@@ -816,6 +1409,7 @@ struct Parser:
                     case Ok(s):
                         stmts.push(s)
                         self.take_pending(ref stmts)
+                        self.after_try = false
                     case Err(_):
                         self.pending = []
                         self.sync_line()
@@ -1160,6 +1754,9 @@ struct Parser:
                     self.diags.push(
                         diag.error("E0114", "use `elif` instead of `else if`")
                         .label(sp, "write `elif`")
+                        .with_help(
+                            "brine chains conditions with `elif cond:` lines between `if` and `else`"
+                        )
                         .fix(sp, "elif", "replace with `elif`")
                     )
                     self.bump()
@@ -1182,12 +1779,47 @@ struct Parser:
         if t == Tok.Keyword(Kw.Elif) or t == Tok.Keyword(Kw.Else):
             self.pos = i
 
+    # `let Some(x) = opt` (Rust): brine takes values apart with `match`
+    fn let_pattern(ref self, kw_span: Span) -> Result[StmtKind, ()]:
+        var i = self.pos
+        var eq = -1
+        while i < len(self.toks) and not is_layout(self.toks[i].tok):
+            if self.toks[i].tok == Tok.Assign and eq < 0:
+                eq = i
+            i += 1
+        var help = "use `match value:` with a `case Some(x):` line and a `case _:` line for the rest"
+        if eq > self.pos and eq + 1 < i:
+            let pat = self.src(self.toks[self.pos].lo, self.toks[eq - 1].hi)
+            let val = self.src(self.toks[eq + 1].lo, self.toks[i - 1].hi)
+            if pat != "" and val != "":
+                help = f"use `match {val}:` with a `case {pat}:` line and a `case _:` line for the rest (there, `{pat}` binds its names)"
+        let pend = self.toks[max(eq - 1, self.pos)]
+        let sp = Span(file=self.file, lo=self.toks[self.pos].lo, hi=pend.hi)
+        self.diags.push(
+            diag.error("E0115", "`let` can't take apart an enum value")
+            .label(sp, "a pattern")
+            .with_help(help)
+        )
+        return Err(())
+
     fn simple_kind(ref self) -> Result[StmtKind, ()]:
         match self.peek():
             case Tok.Keyword(Kw.Let) | Tok.Keyword(Kw.Var):
-                let mutable = self.at_kw(Kw.Var)
-                self.bump()
+                var mutable = self.at_kw(Kw.Var)
+                let kw_span = self.bump()
+                if not mutable and self.at_kw(Kw.Mut):
+                    # `let mut x = ...`: brine's word for that is `var`
+                    let ms = self.bump()
+                    self.diags.push(
+                        diag.error("E0115", "brine writes `var` for a variable that changes")
+                        .label(kw_span.to(ms), "`let mut`")
+                        .with_help("`let` names a value that never changes, `var` one that does")
+                        .fix(kw_span.to(ms), "var", "replace with `var`")
+                    )
+                    mutable = true
                 let lo = self.span()
+                if is_ident(self.peek()) and self.peek_at(1) == Tok.LParen:
+                    return self.let_pattern(kw_span)
                 let items = self.targets("variable name", false)?
                 var ty: Option[TypeExpr] = None
                 if self.eat(Tok.Colon):
@@ -1215,8 +1847,16 @@ struct Parser:
                         "variables must be initialized",
                         "expected `=` and a value"
                     )
+                    var vn = "x"
+                    match items[0]:
+                        case Target.Name(n, _, _):
+                            vn = n
+                        case _:
+                            pass
                     self.diags.push(
-                        d.with_help("write `var x = 0` — every variable starts with a value")
+                        d.with_help(
+                            f"every variable starts with a value: `var {vn} = 0`, or `var {vn}: [int] = []` for an empty array"
+                        )
                     )
                     return Err(())
                 self.bump()
@@ -1494,6 +2134,21 @@ struct Parser:
                     .fix(mut_span, "ref", "replace with `ref`")
                 )
                 by_ref = true
+            elif self.at(Tok.Amp):
+                # `f(&mut xs)`: brine writes `f(ref xs)`
+                let amp = self.bump()
+                self.eat_kw(Kw.Mut)
+                self.diags.push(
+                    diag.error("E0115", "brine passes references with `ref`, not `&`")
+                    .label(amp, "`&`")
+                    .with_help("write `f(ref x)`; the parameter is declared `ref name: type`")
+                    .fix(
+                        Span(file=amp.file, lo=amp.lo, hi=self.span().lo),
+                        "ref ",
+                        "replace with `ref`"
+                    )
+                )
+                by_ref = true
             else:
                 by_ref = self.eat_kw(Kw.Ref)
             var name: Option[(str, Span)] = None
@@ -1734,11 +2389,61 @@ struct Parser:
                 return Ok(mk(ExprKind.Unary(UnOp.Not, e), sp.to(e.span)))
             case _:
                 self.pos = before
+                if self.foreign(true):
+                    return Err(())
+                if tok == Tok.Indent:
+                    let d = self.error_here(
+                        "E0103",
+                        "unexpected indentation",
+                        "this line is indented more than the one above"
+                    )
+                    self.diags.push(
+                        d.with_help(
+                            "indent it like the line above; only a line that ends with `:` starts an indented block"
+                        )
+                    )
+                    return Err(())
+                if tok == Tok.Keyword(Kw.Else) or tok == Tok.Keyword(Kw.Elif):
+                    let kw = "else" if tok == Tok.Keyword(Kw.Else) else "elif"
+                    let d = self.error_here(
+                        "E0103",
+                        f"`{kw}` doesn't line up with an `if`",
+                        f"`{kw}` here"
+                    )
+                    self.diags.push(
+                        d.with_help(f"indent `{kw}` exactly like the `if` it belongs to")
+                    )
+                    return Err(())
+                if tok == Tok.Keyword(Kw.Ref) and self.pos + 1 < len(self.toks):
+                    # `return ref x`, `View(data=ref xs)`: the value itself is meant
+                    let rsp = self.span()
+                    let next = self.toks[self.pos + 1].lo
+                    self.diags.push(
+                        diag.error("E0110", "`ref` can't be used here")
+                        .label(rsp, "`ref` here")
+                        .with_help(
+                            "`ref` marks an argument for a `ref` parameter (`f(ref x)`) or names a variable (`let r = ref x`); a reference can't be returned or stored, so use the value itself (copies are cheap, copy-on-write)"
+                        )
+                        .fix(Span(file=self.file, lo=rsp.lo, hi=next), "", "remove `ref`")
+                    )
+                    self.bump()
+                    return self.unary()
                 var d = self.error_here(
                     "E0111",
                     f"expected an expression, found {describe(tok)}",
                     "expected an expression"
                 )
+                match tok:
+                    case Tok.Keyword(k) if k != Kw.Not:
+                        d = d.with_help(
+                            f"`{kw_name(k)}` is a keyword; it can't be used as a value or a name"
+                        )
+                    case Tok.Star:
+                        d = d.with_help(
+                            "brine has no `**` or `*args`: write `pow(x, y)` on floats, or `x * x`"
+                        )
+                    case _:
+                        pass
                 if tok == Tok.Newline:
                     d = d.with_help(
                         "the expression is incomplete; continue it on this line or wrap it in parentheses to span lines"
@@ -1827,8 +2532,30 @@ struct Parser:
                 case FPart.Expr(src, offset, spec):
                     let (toks, lex_diags) = lex(src, self.file, offset, false, false)
                     self.diags.extend(lex_diags)
-                    var sub = Parser(toks=toks, pos=0, file=self.file, diags=[], pending=[])
+                    var sub = Parser(
+                        toks=toks,
+                        pos=0,
+                        file=self.file,
+                        diags=[],
+                        pending=[],
+                        text=self.text,
+                        after_try=false
+                    )
                     let r = sub.expr()
+                    if r.is_ok() and sub.at(Tok.Assign) and sub.peek_at(1) == Tok.Eof:
+                        # `{x=}` (Python's debug form)
+                        let e = sub.prev_span()
+                        let field = Span(file=self.file, lo=offset - 1, hi=offset + len(src) + 1)
+                        let name = self.src(offset, e.hi)
+                        var d = diag.error(
+                            "E0115",
+                            "f-strings have no `{x=}` form"
+                        ).label(sub.span(), "`=`")
+                        d = d.with_help("write the name in the text: `x={x}`")
+                        if spec.is_none() and name != "":
+                            d = d.fix(field, name + "={" + name + "}", "write the name in the text")
+                        self.diags.push(d)
+                        return Err(())
                     if r.is_ok() and not sub.at(Tok.Eof):
                         sub.diags.push(
                             sub.error_here(
@@ -1855,33 +2582,75 @@ struct Parser:
 # Parse a whole file: the module and every error, the lexer's first.
 fn parse_module(text: str, file: int, name: str) -> (Module, [Diag]):
     let (toks, lex_diags) = lex(text, file, 0, false, true)
-    var p = Parser(toks=toks, pos=0, file=file, diags=[], pending=[])
+    var p = Parser(toks=toks, pos=0, file=file, diags=[], pending=[], text=text, after_try=false)
     let m = p.module(name)
-    # after a broken string, the rest of its line is no use to parse: drop
-    # the errors there, which only repeat the string's
+    # After a broken string the quotes pair up wrongly to the end of the file, so
+    # every later error is a guess: keep the ones before it (from the start of its
+    # token) and say how many were dropped. After a construct from another
+    # language (E0115, such as a C `for` line) or a character the lexer dropped
+    # (E0101), the parser's errors on that line are noise.
+    var cut = len(text) + 1
+    var cut_at = -1
     var quiet: [(int, int)] = []
-    for d in lex_diags:
-        if d.code != "E0102" or len(d.labels) == 0:
+    for i, d in enumerate(lex_diags):
+        if len(d.labels) == 0:
             continue
         let at = d.labels[0].span.lo
-        for t in toks:
-            if t.lo <= at and at < t.hi:
-                var e = t.hi
-                while e < len(text) and text[e] != "\n":
-                    e += 1
-                quiet.push((t.lo, e))
-                break
-    var diags = lex_diags
+        if d.code == "E0102" and cut_at < 0:
+            cut_at = i
+            cut = at
+            for t in toks:
+                if t.lo <= at and at < t.hi:
+                    cut = t.lo
+                    break
+        elif d.code == "E0115" or (d.code == "E0101" and d.msg.starts_with("unexpected character")):
+            var a = at
+            while a > 0 and text[a - 1] != "\n":
+                a -= 1
+            var b = at
+            while b < len(text) and text[b] != "\n":
+                b += 1
+            quiet.push((a, b))
+    var diags: [Diag] = []
+    var dropped = 0
+    for i, d in enumerate(lex_diags):
+        if cut_at >= 0 and i != cut_at and len(d.labels) > 0 and d.labels[0].span.lo >= cut:
+            dropped += 1
+        else:
+            diags.push(d)
     for d in p.diags:
         var keep = true
         if len(d.labels) > 0:
             let lo = d.labels[0].span.lo
+            if lo >= cut:
+                keep = false
+                dropped += 1
             for a, b in quiet:
                 if a <= lo and lo <= b:
                     keep = false
         if keep:
             diags.push(d)
-    return (m, diags)
+    if dropped > 0:
+        for k, d in enumerate(diags):
+            if d.code == "E0102":
+                let more = "1 later error is" if dropped == 1 else f"{dropped} later errors are"
+                diags[k] = d.note(
+                    f"{more} not shown: after a broken string the rest of the file can't be read reliably; fix this one and check again"
+                )
+                break
+    return (m, by_position(diags))
+
+# `ds` in source order (stable): the lexer's and the parser's errors interleaved
+fn by_position(ds: [Diag]) -> [Diag]:
+    var out: [Diag] = []
+    for d in ds:
+        out.push(d)
+        var j = len(out) - 1
+        while j > 0 and out[j - 1].span().lo > d.span().lo:
+            out[j] = out[j - 1]
+            j -= 1
+        out[j] = d
+    return out
 
 # The names `items` unpack `parent` into, nested tuples flattened: each gets a
 # hidden name (`tup'<offset>`) unpacked in turn. `ty` is the written type of
