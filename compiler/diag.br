@@ -426,17 +426,58 @@ fn render(d: Diag, sm: SourceMap, color: bool) -> str:
     return "".join(out)
 
 # A diagnostic as one line of JSON (the format of `--json`).
-fn to_json(d: Diag, sm: SourceMap) -> str:
-    var o = ["{"]
-    let sev = "error" if d.error else "warning"
-    o.push(
-        "\"severity\":\""
+# The one JSON shape of everything brine reports with `--json` (one object per
+# line), so a tool parses one thing (docs/DESIGN.md §4):
+#
+#   {"severity": "error" | "warning", "code": "E0308", "message": "...",
+#    "spans": [{"file": "src/a.br", "line": 3, "column": 5, "end_line": 3,
+#               "end_column": 9, "label": "...", "primary": true}, ...],
+#    "help": ["..."], "notes": ["..."], ...}
+#
+# `code` is null when there is none (a runtime panic). Lines and columns count
+# from 1; the primary span comes first; `file` is null
+# (and the line fields absent) when there is no file; `spans` may be empty.
+# Diagnostics add "fixes" (spans with a "replacement") and repeat the first
+# span at the top level ("file" ... "label") and the others in "related", as
+# before. `extra` is more fields, each starting with a comma.
+fn report_json(
+    error: bool,
+    code: str,
+    msg: str,
+    spans: [str],
+    help: [str],
+    notes: [str],
+    extra: str
+) -> str:
+    let sev = "error" if error else "warning"
+    return (
+        "{\"severity\":\""
         + sev
         + "\",\"code\":"
-        + ("null" if d.code == "" else json_str(d.code))
+        + ("null" if code == "" else json_str(code))
         + ",\"message\":"
-        + json_str(d.msg)
+        + json_str(msg)
+        + ",\"spans\":["
+        + ",".join(spans)
+        + "],\"help\":["
+        + ",".join([json_str(x) for x in help])
+        + "],\"notes\":["
+        + ",".join([json_str(x) for x in notes])
+        + "]"
+        + extra
+        + "}"
     )
+
+# One entry of report_json's spans.
+fn span_entry(sm: SourceMap, s: Span, label: str, primary: bool) -> str:
+    let p = "true" if primary else "false"
+    return "{" + span_json(sm, s) + ",\"label\":" + json_str(label) + ",\"primary\":" + p + "}"
+
+fn to_json(d: Diag, sm: SourceMap) -> str:
+    var spans: [str] = []
+    for i, l in enumerate(d.labels):
+        spans.push(span_entry(sm, l.span, l.msg, i == 0))
+    var o: [str] = []
     if len(d.labels) > 0:
         o.push("," + span_json(sm, d.labels[0].span) + ",\"label\":" + json_str(d.labels[0].msg))
     o.push(",\"related\":[")
@@ -446,10 +487,6 @@ fn to_json(d: Diag, sm: SourceMap) -> str:
         o.push(
             "{" + span_json(sm, d.labels[i].span) + ",\"label\":" + json_str(d.labels[i].msg) + "}"
         )
-    o.push("],\"notes\":[")
-    o.push(",".join([json_str(x) for x in d.notes]))
-    o.push("],\"help\":[")
-    o.push(",".join([json_str(x) for x in d.help]))
     o.push("],\"fixes\":[")
     for j, f in enumerate(d.fixes):
         if j > 0:
@@ -463,8 +500,8 @@ fn to_json(d: Diag, sm: SourceMap) -> str:
             + json_str(f.msg)
             + "}"
         )
-    o.push("]}")
-    return "".join(o)
+    o.push("]")
+    return report_json(d.error, d.code, d.msg, spans, d.help, d.notes, "".join(o))
 
 fn span_json(sm: SourceMap, s: Span) -> str:
     if not sm.has_file(s.file):

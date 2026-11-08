@@ -483,7 +483,28 @@ read is a warning (W0004), so a typo like `provn = true` doesn't go unnoticed.
 | `E0612` | code a rule covers has an effect the rule doesn't allow |
 | `E0613` | an approved rule or rules file changed since it was approved |
 | `E0614` | a runtime check fails every time it runs |
-| `E07xx` | driver: missing module, no C compiler, no `main`, C compile/link failures |
+| `E07xx` | driver: missing module, no C compiler, no `main`, compile/link failures, a bad command line (`E0708`), a program that couldn't be run (`E0709`) |
+
+### JSON errors
+
+With `--json`, every error and warning brine reports is one line in one shape,
+whatever the command (`report_json` in `compiler/diag.br` writes it; a runtime
+panic under `brine run --json` goes through it too):
+
+```json
+{"severity": "error", "code": "E0301", "message": "mismatched types",
+ "spans": [{"file": "src/a.br", "line": 2, "column": 18, "end_line": 2,
+            "end_column": 21, "label": "expected `int`, found `str`", "primary": true}],
+ "help": ["..."], "notes": ["..."]}
+```
+
+`code` is null only for a runtime panic, which has no code yet. Lines and columns count from 1 (columns in characters).
+The primary span comes first; `spans` is empty when nothing in a file is to
+blame (an unknown option), and a span's `file` is null, without the line fields,
+when it has no file. Compiler diagnostics add `fixes` (spans with a
+`replacement`), and for older tools repeat the first span at the top level
+(`file` … `label`) and the others in `related`. Other `--json` output (doctor's
+checks, fmt's files, rules) is one object per line too, with its own fields.
 
 Proof failures list the facts the prover knew at that point and the exact goal,
 so the fix (a stronger `requires`, an `invariant`, or an `assert`) is usually obvious.
