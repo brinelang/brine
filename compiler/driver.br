@@ -785,29 +785,28 @@ fn make_dirs(d: str) -> Result[(), Diag]:
         case Err(e):
             return Err(diag.error("E0704", f"cannot create `{d}`: {e}"))
 
-# Windows can't overwrite a running executable, but it can rename one, so
-# `brine build compiler/main.br -o brine` moves the running brine aside first.
-fn move_self_aside(out: str):
+# Windows can't overwrite a running executable, but it can rename one, so an
+# old build (a program still running, or brine rebuilding itself) is moved to
+# `<out>.old` first. True if it was moved.
+fn move_aside(out: str) -> bool:
     if os.name() != "windows" or not file_exists(out):
-        return
-    match os.abs_path(out):
-        case Ok(p):
-            if same_path(p, os.exe_path()):
-                let old = out + ".old"
-                # (a brine.exe.old that is still running stays; then so does this one)
-                match os.remove_file(old):
-                    case _:
-                        pass
-                match os.rename(out, old):
-                    case _:
-                        pass
-        case Err(_):
+        return false
+    let old = out + ".old"
+    # (an older one that is still running stays; then so does this one, and
+    # writing it fails as before)
+    match os.remove_file(old):
+        case _:
             pass
+    return os.rename(out, old).is_ok()
+
+# A link that failed puts the old build back.
+fn move_back(out: str, moved: bool):
+    if moved and not file_exists(out):
+        match os.rename(out + ".old", out):
+            case _:
+                pass
 
 # (abs_path's Windows paths start with `\\?\`)
-fn same_path(a: str, b: str) -> bool:
-    return plain_path(a) == plain_path(b)
-
 fn plain_path(p: str) -> str:
     let s = p.replace("/", "\\").lower()
     return s[4:] if s.starts_with("\\\\?\\") else s
@@ -1076,11 +1075,12 @@ fn compile_levels(
     link.extend(objs)
     link.extend([rt_obj, "-o", out_exe])
     link.extend(libs)
-    move_self_aside(out_exe)
+    let moved = move_aside(out_exe)
     match run_cc(link):
         case Ok(_):
             pass
         case Err(e):
+            move_back(out_exe, moved)
             return Err(cc_failed("linking the program failed", e, out_exe))
     phase_time(t, "link")
     if plat == Platform.Web:
@@ -1142,7 +1142,7 @@ fn link_native(o: ObjFile, out_exe: str) -> Result[bool, Diag]:
             return Err(io_diag(e))
     if os.name() != "windows" and not runs_ok(["chmod", "+x", tmp]):
         return Err(diag.error("E0704", f"cannot make `{display_path(out_exe)}` executable"))
-    move_self_aside(out_exe)
+    let moved = move_aside(out_exe)
     match os.rename(tmp, out_exe):
         case Ok(_):
             pass
@@ -1150,6 +1150,7 @@ fn link_native(o: ObjFile, out_exe: str) -> Result[bool, Diag]:
             match os.remove_file(tmp):
                 case _:
                     pass
+            move_back(out_exe, moved)
             return Err(
                 diag.error("E0704", f"cannot write `{display_path(out_exe)}`").note(e).with_help(
                     "is the program still running? Stop it and build again, or build somewhere else with `-o`"
