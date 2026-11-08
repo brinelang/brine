@@ -5,6 +5,102 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) 
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-08
+Fixes for what twelve real projects found in 0.9.0 (the 0.9.0 stress lab).
+
+### Changed
+- `--proven` code and code a rule covers must now be free of every runtime
+  check that can fail, including string slices, `int(s)` / `float(s)`,
+  `find` / `index` with a start, `min` / `max` of an empty array, `sum`,
+  `unwrap()`, `range` steps and `extern` strings. Code 0.9.0 wrongly called
+  proven can now fail with E0607; `brine explain E0607` says what to write
+  instead.
+- A runtime check that fails every time it runs (`xs[5]` on a 3-element array,
+  `10 / 0`) is an error, E0614, and the proofs after it still have to hold.
+  `assert false` written on purpose is still allowed.
+- An unapproved change to RULES.br (E0613) is a warning in dev builds, `check`
+  and `test`, and an error in `--release` builds, `brine rules` and CI (the
+  `CI` environment variable). `brine rules approve` no longer needs `brine.toml`.
+- A project's RULES.br applies to the main files in its source folder and the
+  modules they import, not to every file near it: scratch files, repros and
+  tools no longer fail E0610 / E0701. The build line names the RULES.br it used.
+- A struct invariant only stops writes to the fields it reads (E0406).
+- `brine new` no longer approves a starter rule, so a new project's first file
+  read works; its AGENTS.md says to run `rules approve` only when the owner
+  asked for the rule change. It doesn't run `git init` inside a repository.
+- f-string widths align strings left (as in Python and the guide) and count
+  characters, not bytes: `f"{s:6}"`.
+- `to_float()` and `float()` read decimal only, like `int()`:
+  `"0x10".to_float()` is `None`.
+- A constant whose value overflows its type, or a conversion in a constant that
+  would panic (`const A: u8 = 200 + 100`, `u8(300)`), is an error (E0317)
+  instead of a wrong value.
+- Every `--json` error, from any command, has one shape:
+  `{code, message, spans, help, notes}`; `brine run --json` prints a panic in
+  that shape too.
+- The build cache prunes itself, least recently used first, above
+  `BRINE_CACHE_SIZE` (default 2G). It can't see what older versions left in it:
+  delete the cache folder once to reclaim that space.
+- Rotates compile to one instruction (ChaCha20 1.75x faster), 128-bit products
+  use the multiply-high instruction (3.6x), proven narrowing conversions cost
+  nothing and unproven ones and shifts are inline, and copy-on-write checks
+  move out of loops (Dijkstra 1.15x).
+- `read_bytes` / `read_file` no longer hold two copies of the file; wasm
+  allocation no longer slows as the heap grows.
+
+### Fixed
+- `--release` builds no longer crash on a loop over a struct's array field
+  that range versioning copied (a pointer only the fast copy set).
+  `BRINE_VERIFY_IR=1` checks the compiler's IR, and the tests use it.
+- `brine check` no longer takes exponential time and memory on long functions
+  (54 GB, then a silent exit): proving is about linear in a function's length,
+  with a work budget and a memory ceiling per function that warn (W0005) and
+  keep the runtime checks. Release builds of large constant arrays are fast.
+- The prover knows more: `int(x)` of a float after a range check, lengths
+  after `+=` on arrays and from `starts_with`, `bytes()` and `chars()`,
+  bounds of `a if c else b`, the same value for the same bit operation or
+  pure call (a call in a `while` condition informs the body), array elements
+  a store at another index can't change, constants built from imported ones,
+  128-bit checks well inside the range, and products such as
+  `y*w + x < w*h`. Prover notes name values as the source does (no more `?`
+  or `for'305`) and are at most about 400 characters.
+- `--report` no longer says "0 remain" while checks still run, and marks
+  "always fails" apart from "might fail".
+- E0510 no longer fires when each arm of a `match` or `if` does the same
+  communication.
+- GPU `auto` no longer offloads loops whose copies cost more than the work
+  (`par` maps over arrays of arrays), and `BRINE_GPU_LOG=1` says why.
+- Panics show the values involved (an overflow's operands, a failed
+  conversion's input) and, on x86-64, the functions they came through; a stack
+  overflow names its function. `brine debug` stops at a panic.
+- Out of memory is a panic that says how much was asked for.
+- `brine check` checks what `brine run` checks (`main`'s signature, a missing
+  `main`) and every file of a project.
+- `brine run` passes a program's exit code through instead of calling codes
+  above 255 a crash.
+- A UTF-8 byte order mark at the start of a file is skipped, and `fmt` removes
+  it; E0101 names invisible and look-alike characters.
+- On Windows, a running program can be rebuilt, and paths over 260 characters
+  work in the runtime.
+- `.brine-hash` files are kept in the cache, not next to `-o` outputs.
+- `fmt` keeps aligned trailing comments and skips nested projects and
+  `node_modules`.
+- Constants accept conversions (`u8(3)`, `u64(0x…)`, `f32(1) / f32(255)`), an
+  untyped constant adapts to its context like its literal, a module's constant
+  can be a `case` pattern, and `Box[(int, int)]` is one type argument.
+- A loop that changes `self` only through its `ref self` methods keeps the
+  invariant.
+- Diagnostics: helps that work when followed (`let Some(x) = opt` suggests
+  `match`), constructs from other languages named (E0115), suggested fixes that
+  keep the code valid (`println!` became `printlnnot`), carets aligned after
+  tabs and wide characters, an unclosed bracket reported where it opens, fewer
+  cascades. 92% of the diagnostics corpus now has a help line (52% before).
+- `rules --explain`, `rules approve`, `spec-diff` and `fmt` papercuts; unknown
+  `brine.toml` keys warn (W0004).
+- The C runtime reads "nan" as the canonical quiet NaN, as native code does.
+- WebAssembly `list_dir` works under Node.js on Windows.
+- Stale texts that still mentioned a C compiler (`doctor`, `explain E0702`).
+
 ## [0.9.0] - 2026-11-06
 ### Added
 - `brine emit-ir` prints a program's intermediate representation, the code the
@@ -392,7 +488,8 @@ The first version.
 - The compiler is written in brine and builds itself; `bootstrap/brinec.c` builds it
   from scratch with only a C compiler.
 
-[Unreleased]: https://github.com/brinelang/brine/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/brinelang/brine/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/brinelang/brine/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/brinelang/brine/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/brinelang/brine/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/brinelang/brine/compare/v0.6.0...v0.7.0
