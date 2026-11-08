@@ -90,7 +90,8 @@ Two kinds of obligations:
   * `invariant` — loop invariant; proven on entry and preserved by every iteration.
     In a struct, a fact about `self` that every value of the type keeps: proven where
     a value is built and where a `ref self` method returns or uses `self` whole, and
-    assumed everywhere else. Only the struct's methods change its fields (E0406), and
+    assumed everywhere else. Only the struct's methods change the fields it reads
+    (E0406; other fields can't break it, so anyone may change those), and
     values can't alias, so nothing else can break it in between ("parse, don't
     validate": check input once when building the value, and the fact travels with it).
   * `prove e` — an inline claim.
