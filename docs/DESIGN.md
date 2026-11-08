@@ -96,12 +96,26 @@ Two kinds of obligations:
   * `prove e` — an inline claim.
 * **Implicit** obligations come from the language's own safety rules: array bounds,
   division by zero, integer overflow (also of `x += y`, `-x` and `abs`), shift amounts,
-  narrowing conversions, negative array lengths, `pop()` on empty arrays, missing map keys.
+  narrowing conversions, negative array lengths, `pop()` on empty arrays, missing map keys,
+  and every other operation that can stop the program: string slices (which must not
+  split a character), `int(s)`/`float(s)` on text, start offsets of `find`/`index`,
+  empty patterns, `min`/`max` of an empty sequence, `sum`/`product` overflow,
+  `unwrap()`, range steps and sizes. The list is one table (`compiler/checks.br`) that
+  the verifier applies to every call; a unit test checks it names every panic in the
+  runtime and in lowering, so a new builtin can't be forgotten.
   They are **proven when possible and otherwise checked at runtime** (and the check can
   never be disabled). `brine check --report` lists every remaining runtime check so they
-  can be eliminated by adding facts. A project can require that none remain:
-  `proven = true` under `[check]` in brine.toml (or `--proven`) makes each one, and
-  each `assert` the prover can't remove, an error (E0607), outside `test` blocks.
+  can be eliminated by adding facts, and the proven checks that still run (a few, such
+  as a slice's, are always made): "proven" never means "removed" when it isn't. A project
+  can require that none remain: `proven = true` under `[check]` in brine.toml (or
+  `--proven`) makes each one, and each `assert` the prover can't remove, an error
+  (E0607), outside `test` blocks.
+* A check the prover shows **fails every time it runs** (`xs[5]` on a 2-element array,
+  `10 / 0`) is an error (E0614), not a runtime check. Nothing is assumed from it, so the
+  proofs after it are still checked rather than vacuously true. Code the prover sees
+  can't run (after `panic(...)`, or in a branch whose condition is false) is never
+  reported, and an `assert` that always fails (`assert false`, on purpose) is allowed:
+  `--report` marks it "always fails" and treats the code after it as unreachable.
 
 When a claim isn't proven, the error shows the facts the prover knew, the goal, and,
 when the prover finds them, values it can't rule out (`len(xs) = 0`). They come from
@@ -440,6 +454,7 @@ Global flags: `--json` (machine-readable diagnostics, one JSON object per line),
 | `E0611` | code a rule covers can stop the program (`panic`, `exit`, `unwrap()`) |
 | `E0612` | code a rule covers has an effect the rule doesn't allow |
 | `E0613` | an approved rule or rules file changed since it was approved |
+| `E0614` | a runtime check fails every time it runs |
 | `E07xx` | driver: missing module, no C compiler, no `main`, C compile/link failures |
 
 Proof failures list the facts the prover knew at that point and the exact goal,

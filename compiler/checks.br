@@ -1,0 +1,336 @@
+# Every way a running program can stop on a failed check, in one place.
+#
+# The verifier asks this table about every operation it meets: what it
+# checks at runtime, and whether the prover can state that as a goal. An
+# operation the table says can fail is a runtime check (listed by `--report`,
+# an error under `--proven` and in code a rule covers) unless the verifier
+# proves its goal. The matches below have no catch-all, so a new builtin
+# doesn't compile until it is classified here, and `dev_checks.br` checks
+# that every panic in the runtime (and every one lowering emits) is named in
+# `rt_panics` / `lowered_panics`, so a new one can't be missed either.
+from types import Ty, IntTy, Builtin, StrM, NumM, Reducer, WorldOp, OsOp
+
+enum Check:
+    Index
+    Slice
+    # a `str` slice must not cut a UTF-8 character in two
+    CharBoundary
+    Overflow
+    Division
+    Remainder
+    Shift
+    Conversion
+    FloatToInt
+    ArrayLength
+    EmptyArray
+    InsertIndex
+    Character
+    RepeatCount
+    MapKey
+    # `s.find(t, start)`, `xs.index(x, start)`: 0 <= start <= len
+    Start
+    # `split`, `replace`, `count` with an empty pattern
+    EmptyPattern
+    # `int(s)`, `float(s)` on text that isn't a number
+    Number
+    # `min` / `max` of no elements
+    EmptySequence
+    # `range(a, b, 0)`
+    Step
+    # a range with more than 2^63 - 1 elements, where they're counted
+    RangeSize
+    # `unwrap()` on `None` / `Err`
+    Unwrap
+    # `world.broadcast(x, root)`: a rank that exists
+    Rank
+    # `world.exchange(xs)`: one element per rank
+    PerRank
+    # an array reduced across ranks has the same length on each
+    SameLength
+    # `os.wait(h)` and friends: a handle from `os.spawn`
+    ProcessHandle
+    # `os.output(h)` before `os.wait(h)`
+    ProcessDone
+    # a `str` passed to an `extern fn` can't contain a NUL byte
+    NulByte
+
+    # How `--report` and E0607 name it.
+    fn what(self) -> str:
+        match self:
+            case Check.Index:
+                return "index bounds check"
+            case Check.Slice:
+                return "slice bounds check"
+            case Check.CharBoundary:
+                return "character boundary check"
+            case Check.Overflow:
+                return "overflow check"
+            case Check.Division:
+                return "division check"
+            case Check.Remainder:
+                return "remainder check"
+            case Check.Shift:
+                return "shift check"
+            case Check.Conversion | Check.FloatToInt:
+                return "conversion check"
+            case Check.ArrayLength:
+                return "array length check"
+            case Check.EmptyArray:
+                return "empty array check"
+            case Check.InsertIndex:
+                return "insert index check"
+            case Check.Character:
+                return "character check"
+            case Check.RepeatCount:
+                return "repeat count check"
+            case Check.MapKey:
+                return "map key check"
+            case Check.Start:
+                return "start check"
+            case Check.EmptyPattern:
+                return "empty pattern check"
+            case Check.Number:
+                return "number check"
+            case Check.EmptySequence:
+                return "empty sequence check"
+            case Check.Step:
+                return "step check"
+            case Check.RangeSize:
+                return "range size check"
+            case Check.Unwrap:
+                return "unwrap check"
+            case Check.Rank:
+                return "rank check"
+            case Check.PerRank:
+                return "length check"
+            case Check.SameLength:
+                return "same length check"
+            case Check.ProcessHandle:
+                return "process handle check"
+            case Check.ProcessDone:
+                return "process finished check"
+            case Check.NulByte:
+                return "NUL byte check"
+
+    # The E0607 help for a check the prover can't remove ("" for the general one).
+    fn help(self) -> str:
+        match self:
+            case Check.MapKey:
+                return "use `m.get(k)`, which gives an `Option` to match on (the prover doesn't follow the keys of maps)"
+            case Check.FloatToInt:
+                return "converting a float to an int is always checked at runtime: compare it with the range you need first, or keep this code outside the proven part"
+            case Check.CharBoundary:
+                return "the prover doesn't follow which bytes start a character: slice `s.bytes()` instead, or keep this code outside the proven part"
+            case Check.Number:
+                return "use `s.to_int()` or `s.to_float()`, which give an `Option` to match on"
+            case Check.Unwrap:
+                return "`match` on the value and handle every case"
+            case Check.SameLength:
+                return "the prover doesn't follow other ranks' values: reduce single values, or keep this code outside the proven part"
+            case Check.ProcessHandle | Check.ProcessDone:
+                return "the prover doesn't follow processes: keep this code outside the proven part"
+            case Check.NulByte:
+                return "the prover doesn't follow a string's bytes: keep this call outside the proven part"
+            case Check.Overflow:
+                return "the prover doesn't follow the elements' values: add them in a loop with an `invariant` that bounds the total, or keep this code outside the proven part"
+            case _:
+                return ""
+
+# What an operation can fail on.
+enum Stop:
+    # the verifier states it as a goal: proven (and maybe removed), or a runtime check
+    Goal(c: Check)
+    # the prover can't follow what it depends on: always a runtime check
+    Always(c: Check)
+    # fails only when the world outside fails (another rank stops, a
+    # process is lost): no proof covers it, as with running out of memory
+    Outside(why: str)
+
+# A builtin function or method. `recv`: the receiver's type (or the first
+# argument's, for a function), `nargs`: how many arguments.
+fn builtin_stops(b: Builtin, recv: Ty, nargs: int) -> [Stop]:
+    match b:
+        case Builtin.Print | Builtin.Eprint | Builtin.Len | Builtin.Flush | Builtin.Clock:
+            return []
+        case Builtin.Abs:
+            match recv:
+                case Ty.Int(k):
+                    return [Stop.Goal(Check.Overflow)] if k.signed() else []
+                case _:
+                    return []
+        case Builtin.Min | Builtin.Max:
+            return []
+        case Builtin.Sqrt | Builtin.Sin | Builtin.Cos | Builtin.Tan | Builtin.Exp | Builtin.Log:
+            return []
+        case Builtin.Pow | Builtin.Floor | Builtin.Ceil | Builtin.Round:
+            return []
+        case Builtin.Math1(_) | Builtin.Math2(_):
+            return []
+        case Builtin.Args | Builtin.Enumerate | Builtin.Embed:
+            return []
+        # these stop on purpose: the verifier treats them as the end of the path
+        case Builtin.Exit | Builtin.Panic:
+            return []
+        case Builtin.Push | Builtin.Extend | Builtin.Sort | Builtin.Reverse | Builtin.Clear:
+            return []
+        case Builtin.Pop:
+            return [Stop.Goal(Check.EmptyArray)]
+        case Builtin.PopAt:
+            return [Stop.Goal(Check.Index)]
+        case Builtin.Insert:
+            return [Stop.Goal(Check.InsertIndex)]
+        case Builtin.Ord | Builtin.Chr:
+            return [Stop.Goal(Check.Character)]
+        # the file and process builtins report failure in their results
+        case Builtin.ReadFile | Builtin.WriteFile | Builtin.AppendFile | Builtin.FileExists:
+            return []
+        case Builtin.Getenv | Builtin.Run | Builtin.Input | Builtin.ReadStdin:
+            return []
+        case Builtin.Num(_) | Builtin.FromBits | Builtin.FromUtf8 | Builtin.ToInt | Builtin.ToFloat:
+            return []
+        case Builtin.IndexFrom:
+            return [Stop.Goal(Check.Start)]
+        case Builtin.IndexOf:
+            return []
+        case Builtin.Str(m):
+            return str_stops(m)
+        case Builtin.Get | Builtin.Remove | Builtin.Keys | Builtin.Values | Builtin.Items:
+            return []
+
+fn str_stops(m: StrM) -> [Stop]:
+    match m:
+        case StrM.Find | StrM.SplitWs | StrM.Join | StrM.StartsWith | StrM.EndsWith:
+            return []
+        case StrM.Strip | StrM.LStrip | StrM.RStrip | StrM.Upper | StrM.Lower | StrM.Lines:
+            return []
+        case StrM.IsDigit | StrM.IsAlpha | StrM.IsSpace | StrM.IsAlnum | StrM.Bytes | StrM.Chars:
+            return []
+        case StrM.Split | StrM.Replace | StrM.Count:
+            return [Stop.Goal(Check.EmptyPattern)]
+        case StrM.Repeat:
+            return [Stop.Goal(Check.RepeatCount)]
+        case StrM.FindFrom:
+            return [Stop.Goal(Check.Start)]
+
+# `sum(...)`, `min(...)`, ... over elements of type `elem`.
+fn reduce_stops(r: Reducer, elem: Ty) -> [Stop]:
+    match r:
+        case Reducer.Sum | Reducer.Product:
+            # floats don't overflow; integer elements the prover doesn't follow
+            return [Stop.Always(Check.Overflow)] if elem.is_int() else []
+        case Reducer.Min | Reducer.Max:
+            return [Stop.Goal(Check.EmptySequence)]
+        case Reducer.Any | Reducer.All | Reducer.First:
+            return []
+
+# `T(x)` from a value of type `src`.
+fn convert_stops(target: Ty, src: Ty) -> [Stop]:
+    match (target, src):
+        case (Ty.Int(_), Ty.Str) | (Ty.Float(_), Ty.Str):
+            return [Stop.Always(Check.Number)]
+        case (Ty.Int(_), Ty.Float(_)):
+            return [Stop.Always(Check.FloatToInt)]
+        case (Ty.Int(k), Ty.Int(s)):
+            let widens = k.signed() == s.signed() and k.bits() >= s.bits()
+            if widens or (k.signed() and not s.signed() and k.bits() > s.bits()):
+                return []
+            return [Stop.Goal(Check.Conversion)]
+        case _:
+            return []
+
+# `world.op(...)`. `arr`: the value is an array.
+fn world_stops(op: WorldOp, elem: Ty, arr: bool) -> [Stop]:
+    match op:
+        case WorldOp.Rank | WorldOp.Size | WorldOp.Barrier | WorldOp.Shift | WorldOp.GatherAll:
+            return [Stop.Outside("another rank stops or calls something else")]
+        case WorldOp.Any | WorldOp.All:
+            return [Stop.Outside("another rank stops or calls something else")]
+        case WorldOp.Broadcast:
+            return [Stop.Goal(Check.Rank)]
+        case WorldOp.Exchange:
+            return [Stop.Goal(Check.PerRank)]
+        case WorldOp.Sum | WorldOp.Min | WorldOp.Max:
+            var out: [Stop] = []
+            if arr:
+                out.push(Stop.Always(Check.SameLength))
+            if op == WorldOp.Sum and elem.is_int():
+                out.push(Stop.Always(Check.Overflow))
+            return out
+
+fn os_stops(op: OsOp) -> [Stop]:
+    match op:
+        case OsOp.Wait | OsOp.Poll | OsOp.Kill:
+            return [Stop.Always(Check.ProcessHandle)]
+        case OsOp.Output:
+            return [Stop.Always(Check.ProcessHandle), Stop.Always(Check.ProcessDone)]
+        case OsOp.ListDir | OsOp.IsDir | OsOp.IsFile | OsOp.MakeDir | OsOp.RemoveFile | OsOp.Rename:
+            return []
+        case OsOp.Cwd | OsOp.SetCwd | OsOp.ExePath | OsOp.WriteBytes | OsOp.TempDir | OsOp.AbsPath:
+            return []
+        case OsOp.Name | OsOp.Arch | OsOp.Pid | OsOp.CpuCount | OsOp.Sleep | OsOp.IsTerminal:
+            return []
+        case OsOp.EnableAnsi | OsOp.FreePorts | OsOp.Spawn | OsOp.ThreadCount | OsOp.ReadBytes:
+            return []
+        case OsOp.AppendBytes:
+            return []
+
+# Every function of runtime/rt.br that panics itself, and the checks of the
+# table above it carries out. An empty list is an exemption, and says why.
+# `dev_checks.br` fails when one is missing here or no longer panics.
+fn rt_panics() -> [(str, [Check], str)]:
+    return [
+        ("str_at", [Check.Index], ""),
+        ("slice_splits", [Check.CharBoundary], ""),
+        ("brine_str_slice", [Check.Slice, Check.CharBoundary], ""),
+        ("brine_ord", [Check.Character], ""),
+        ("brine_chr", [Check.Character], ""),
+        ("brine_s_find_from", [Check.Start], ""),
+        ("brine_start_chk", [Check.Start], ""),
+        ("brine_s_split", [Check.EmptyPattern], ""),
+        ("brine_s_replace", [Check.EmptyPattern], ""),
+        ("brine_s_count", [Check.EmptyPattern], ""),
+        ("brine_s_repeat", [Check.RepeatCount], ""),
+        ("bad_int_cold", [Check.Number], ""),
+        ("float_bad_cold", [Check.Number], ""),
+        # the integer helpers (`brine_x_add_i32`, conversions, `sum`, ...)
+        ("in_range", [Check.Overflow, Check.Conversion], ""),
+        ("shift_ok", [Check.Shift], ""),
+        ("nonzero", [Check.Division, Check.Remainder], ""),
+        ("mul_i64_ovf", [Check.Overflow], ""),
+        ("check", [Check.Overflow, Check.Division, Check.Conversion, Check.FloatToInt], ""),
+        ("comb_small", [Check.Overflow], ""),
+        ("neg_len_cold", [Check.ArrayLength], ""),
+        ("brine_arr_pop", [Check.EmptyArray], ""),
+        ("brine_arr_pop_at", [Check.Index], ""),
+        ("brine_arr_insert", [Check.InsertIndex], ""),
+        ("brine_arr_slice", [Check.Slice], ""),
+        ("map_missing_cold", [Check.MapKey], ""),
+        ("brine_cstr", [Check.NulByte], ""),
+        ("check_rank", [Check.Rank], ""),
+        ("brine_world_exchange", [Check.PerRank], ""),
+        ("red_take", [Check.SameLength], ""),
+        ("os_proc_get", [Check.ProcessHandle], ""),
+        ("brine_os_output", [Check.ProcessDone], ""),
+        ("peer_lost", [], "another rank stopped: it reports its own failure"),
+        ("mismatch", [], "ranks made different `world` calls, which the uniformity check rules out"),
+        ("world_recv", [], "ranks made different `world` calls, which the uniformity check rules out"),
+        ("brine_world_gather", [], "a malformed message from another rank: the transport failed"),
+        ("world_panic", [], "the panic primitive for `world` failures"),
+        ("panic_text_cold", [], "the panic primitive"),
+        ("panic_cold", [], "the panic primitive"),
+        ("brine_panic_at", [], "the panic primitive"),
+        ("brine_panic_idx", [], "the panic primitive"),
+        ("brine_panic_ovf", [], "the panic primitive"),
+        ("brine_panic_str", [], "`panic(...)` itself, which ends a path for the verifier"),
+        ("brine_assert_fail", [], "a failed `assert`, a runtime check the verifier lists itself")
+    ]
+
+# Every panic lowering emits itself (`self.panic_at(...)` in lower.br), by
+# its message.
+fn lowered_panics() -> [(str, [Check])]:
+    return [
+        ("range() step must not be zero", [Check.Step]),
+        ("range has too many elements", [Check.RangeSize]),
+        ("() of an empty sequence", [Check.EmptySequence]),
+        ("no such test", [])
+    ]

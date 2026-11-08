@@ -689,9 +689,17 @@ fn index_of(xs: [int], target: int) -> int:
 * The prover handles linear integer arithmetic (`+ - ` and multiplication or
   division by constants). It never accepts a false claim.
 * `brine check --report` lists the runtime checks that remain, `assert`s outside
-  `test` blocks included. With `proven = true` under `[check]` in brine.toml (or
-  `--proven`), each of them is an error (E0607): outside `test` blocks, the
-  program can't stop on a failed check.
+  `test` blocks included, then the proven checks that still run (marked "proven,
+  still runs"; a slice always checks its bounds). With `proven = true` under
+  `[check]` in brine.toml (or `--proven`), each remaining one is an error (E0607):
+  outside `test` blocks, the program can't stop on a failed check. That covers
+  every operation that can panic: also `int(s)`/`float(s)` (use `s.to_int()`),
+  a string slice that may split a character (slice `s.bytes()`), `unwrap()`,
+  `min`/`max` of an empty array, `sum` overflow and `find`/`index` start offsets.
+* A check that fails every time it runs (`xs[5]` on a 2-element array) is an
+  error (E0614), and the proofs after it still have to hold. Code that can't run
+  (after `panic(...)`, a false branch) isn't reported; an `assert false` is
+  allowed, and `--report` says it "always fails".
 * A proof means only what its spec says. `brine spec-diff` compares every
   `requires`, `ensures` and struct `invariant` with a git revision (`--base`,
   default `HEAD`) by asking the prover, so `0 <= i < n` and `i >= 0 and i < n`
