@@ -2575,6 +2575,211 @@ fn licm(ref sf: SF):
             pc.push(t)
             sf.bs[pre].code = pc
 
+# ================================================================ copy on write
+
+# `brine_arr_unique(p)` (before a write into the array *p) copies the array
+# when it is shared. After it the array has one reference, *p, until
+# something could share or replace it: a call (a retain, or a function that
+# has the reference too) or a store of a pointer. A check of the same p
+# before then finds it unique: it goes. A loop with neither checks a p it
+# doesn't change once, before it, when a check runs on every trip.
+fn uniques(ref sf: SF):
+    if not any(any(is_unique(x) for x in b.code) for b in sf.bs):
+        return
+    preheaders(ref sf)
+    let key = addr_keys(sf)
+    hoist_uniques(ref sf, key)
+    drop_uniques(ref sf, key)
+
+# The same number for addresses that are the same: a copy, or a constant
+# offset from the same address. (Constants aren't shared on x86-64, so two
+# `elem p + 8` are different vregs.)
+fn addr_keys(sf: SF) -> [int]:
+    let nv = len(sf.f.vk)
+    var key = [0] * nv
+    var konst = [false] * nv
+    var kval = [0] * nv
+    for v in 0..nv:
+        key[v] = v
+    for b in sf.bs:
+        for x in b.code:
+            if x.op == Op.Const and x.d >= 0 and not sf.f.vk[x.d].is_wide():
+                konst[x.d] = true
+                kval[x.d] = x.n
+    var seen: {str: int} = {}
+    let po = postorder(sf.bs)
+    var j = len(po) - 1
+    while j >= 0:
+        for x in sf.bs[po[j]].code:
+            if x.d < 0:
+                continue
+            if x.op == Op.Mov and sf.f.vk[x.d] == K.Ptr:
+                key[x.d] = key[x.a]
+            elif x.op == Op.Elem and konst[x.b]:
+                let k = f"{key[x.a]}+{kval[x.b] * x.n}"
+                match seen.get(k):
+                    case Some(v):
+                        key[x.d] = v
+                    case None:
+                        seen[k] = x.d
+        j -= 1
+    return key
+
+fn is_unique(x: Inst) -> bool:
+    return x.op == Op.Call and x.b == 0 and x.s == "brine_arr_unique" and len(x.args) == 1
+
+# Could x share or replace an array a check made unique?
+fn shares(x: Inst, vk: [K]) -> bool:
+    match x.op:
+        case Op.Call:
+            return not is_unique(x)
+        case Op.CallInd | Op.Copy | Op.Zero:
+            return true
+        case Op.Store:
+            return vk[x.b] == K.Ptr
+        case _:
+            return false
+
+fn hoist_uniques(ref sf: SF, key: [int]):
+    var loops = find_loops(sf)
+    if len(loops) == 0:
+        return
+    let n = len(sf.bs)
+    let nv = len(sf.f.vk)
+    var def_b = [-1] * nv
+    var def_i = [-1] * nv
+    for b in 0..n:
+        for i, x in enumerate(sf.bs[b].code):
+            if x.d >= 0:
+                def_b[x.d] = b
+                def_i[x.d] = i
+    # addresses that can be read anywhere in the function: a parameter (a
+    # `ref` one, as checks only take slot addresses) or a field of one. (Not
+    # a stack slot: lower.br does the local arrays, and a slot may not be
+    # set yet where a loop starts.)
+    var root = [false] * nv
+    for v in 0..sf.f.nparams:
+        root[v] = sf.f.vk[v] == K.Ptr
+    let po = postorder(sf.bs)
+    var j = len(po) - 1
+    while j >= 0:
+        for x in sf.bs[po[j]].code:
+            if x.d < 0 or x.op == Op.Phi:
+                continue
+            if x.op == Op.Mov and root[x.a]:
+                root[x.d] = true
+            if x.op == Op.Elem and root[x.a] and def_b[x.b] >= 0:
+                if sf.bs[def_b[x.b]].code[def_i[x.b]].op == Op.Const:
+                    root[x.d] = true
+        j -= 1
+    let idom = idoms(sf.bs, po)
+    let (tin, tout) = dom_numbers(dom_children(idom))
+    # innermost first: what moves out of one can move again with the outer
+    var order: [(int, int)] = []
+    for i, lp in enumerate(loops):
+        order.push((len(lp.body), i))
+    order.sort()
+    for (_, li) in order:
+        let lp = loops[li]
+        let h = lp.header
+        var inb = [false] * n
+        for b in lp.body:
+            inb[b] = true
+        var pre = -1
+        var latches: [int] = []
+        for p in sf.bs[h].pred:
+            if inb[p]:
+                latches.push(p)
+            else:
+                pre = p
+        if pre < 0:
+            continue
+        var ok = true
+        for b in lp.body:
+            for x in sf.bs[b].code:
+                if shares(x, sf.f.vk):
+                    ok = false
+        if not ok:
+            continue
+        var ps: [int] = []
+        var ks: [int] = []
+        for b in lp.body:
+            # (a block every trip runs)
+            if not all(tin[b] <= tin[l] and tin[l] < tout[b] for l in latches):
+                continue
+            for x in sf.bs[b].code:
+                if not is_unique(x):
+                    continue
+                let p = x.args[0]
+                if root[p] and not (def_b[p] >= 0 and inb[def_b[p]]) and key[p] not in ks:
+                    ps.push(p)
+                    ks.push(key[p])
+        if len(ps) == 0:
+            continue
+        var pc = sf.bs[pre].code
+        let t = pc.pop()
+        for p in ps:
+            var c = mk(Op.Call, -1, -1, 0, -1, 0)
+            c.s = "brine_arr_unique"
+            c.args = [p]
+            pc.push(c)
+        pc.push(t)
+        sf.bs[pre].code = pc
+
+# The checks one on every path here already did.
+fn drop_uniques(ref sf: SF, key: [int]):
+    let n = len(sf.bs)
+    let po = postorder(sf.bs)
+    # the addresses (keys) whose arrays are unique at the end of each block (none:
+    # not reached yet)
+    var out: [Option[[int]]] = [None] * n
+    var changed = true
+    while changed:
+        changed = false
+        var j = len(po) - 1
+        while j >= 0:
+            let b = po[j]
+            j -= 1
+            var s = unique_in(sf, out, b)
+            for x in sf.bs[b].code:
+                if is_unique(x):
+                    if key[x.args[0]] not in s:
+                        s.push(key[x.args[0]])
+                elif shares(x, sf.f.vk):
+                    s = []
+            if out[b] != Some(s):
+                out[b] = Some(s)
+                changed = true
+    for b in 0..n:
+        var s = unique_in(sf, out, b)
+        var code: [Inst] = []
+        for x in sf.bs[b].code:
+            if is_unique(x):
+                if key[x.args[0]] in s:
+                    continue
+                s.push(key[x.args[0]])
+            elif shares(x, sf.f.vk):
+                s = []
+            code.push(x)
+        sf.bs[b].code = code
+
+# The pointers unique on entry to block b: on every path that reaches it.
+fn unique_in(sf: SF, out: [Option[[int]]], b: int) -> [int]:
+    if b == 0:
+        return []
+    var s: Option[[int]] = None
+    for p in sf.bs[b].pred:
+        match out[p]:
+            case Some(o):
+                match s:
+                    case Some(t):
+                        s = Some([v for v in t if v in o])
+                    case None:
+                        s = Some(o)
+            case None:
+                pass
+    return s.unwrap_or([])
+
 # ================================================================ out of SSA
 
 fn split_edges(ref sf: SF):
@@ -4082,6 +4287,7 @@ fn optimize(f: Func, vw: int, a64: bool) -> (Func, [KFunc]):
     addressing(ref sf)
     gvn(ref sf, a64)
     copies(ref sf)
+    uniques(ref sf)
     licm(ref sf)
     gvn(ref sf, a64)
     copies(ref sf)

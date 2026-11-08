@@ -1085,11 +1085,12 @@ const INLINE_ROUNDS = 3
 const INLINE_SELF = 160
 
 # Calls that cost about as little as an instruction: reference count
-# increments (written inline by the backends) and the runtime's fast paths
-# in brine (`hot`, themselves inlined).
+# increments and the check before a write into an array (written inline by
+# the backends) and the runtime's fast paths in brine (`hot`, themselves
+# inlined).
 fn cheap_call(x: Inst, hot: {str: bool}) -> bool:
     if x.b == 0:
-        return x.s in hot
+        return x.s in hot or x.s == "brine_arr_unique"
     let n = x.s
     return (
         n == "brine_str_retain"
@@ -1103,22 +1104,44 @@ fn inlinable(f: Func, hot: {str: bool}) -> bool:
     # fast paths inlined at every call would make the program much bigger)
     if f.public or f.export or f.cold:
         return false
-    if len(f.code) > (INLINE_HOT if f.hot else INLINE_MAX):
+    if len(f.code) > INLINE_HOT:
         return false
     var calls = false
+    var writes = false
+    var loops = false
+    var seen = [false] * f.nlabels
     for x in f.code:
-        if x.op == Op.Switch:
-            return false
-        if x.op == Op.CallInd:
-            if not f.hot:
+        match x.op:
+            case Op.Switch:
                 return false
-            calls = true
-        if x.op == Op.Call:
-            if x.b == 0 and x.s == f.name:
-                return false
-            if not cheap_call(x, hot):
+            case Op.CallInd:
+                if not f.hot:
+                    return false
                 calls = true
-    return f.hot or not calls or len(f.code) <= INLINE_CALLS
+            case Op.Call:
+                if x.b == 0 and x.s == f.name:
+                    return false
+                if not cheap_call(x, hot):
+                    calls = true
+                if x.s == "brine_arr_unique":
+                    writes = true
+            case Op.Label:
+                seen[x.n] = true
+            case Op.Jmp | Op.Br | Op.BrNot:
+                if seen[x.n]:
+                    loops = true
+            case _:
+                pass
+    if f.hot:
+        return true
+    # a method that writes into arrays it is given (`ref self`), with no
+    # loop or call: in a caller's loop its copy-on-write checks can move
+    # out of the loop (ssa.uniques)
+    if writes and not calls and not loops:
+        return true
+    if len(f.code) > INLINE_MAX:
+        return false
+    return not calls or len(f.code) <= INLINE_CALLS
 
 # With `borrow` (optimized builds), the retains and releases a read-only
 # function needs for what it borrows are dropped first, so they don't count
