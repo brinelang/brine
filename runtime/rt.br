@@ -5068,7 +5068,7 @@ const ARR_SIZE = 56
 fn brine_x_calloc(n: int) -> ptr:
     let p = calloc(u64(max(n, 1)), u64(1))
     if addr(p) == 0:
-        oom_cold()
+        oom_cold(n)
     return p
 
 extern fn memchr(p: ptr, c: i32, n: u64) -> ptr
@@ -5137,7 +5137,7 @@ fn brine_arr_new(len: int, esz: int, rt: ptr, rl: ptr, loc: ptr) -> ptr:
         if in_heap(d):
             store_i64(a, ARR_CAP, class_size(size_class(bytes)) / esz)
         return a
-    store_ptr(a, ARR_DATA, brine_x_calloc(len * esz))
+    store_ptr(a, ARR_DATA, calloc_at(alloc_bytes(len, esz), loc))
     return a
 
 # An integer array kept as bytes (narrow.br), zeroed, with 16 more bytes
@@ -5147,7 +5147,7 @@ fn brine_bytes_new(len: int, loc: ptr) -> ptr:
     if len < 0:
         neg_len_cold(len, loc)
     let a = arr_header(len, len + 16, 1, null_ptr(), null_ptr())
-    store_ptr(a, ARR_DATA, brine_x_calloc(len + 16))
+    store_ptr(a, ARR_DATA, calloc_at(len + 16, loc))
     return a
 
 # A `[bool]` kept as bits (the compiler's pack.br): `len` elements in 64-bit
@@ -5157,7 +5157,7 @@ fn brine_bits_new(len: int, fill: int, loc: ptr) -> ptr:
         neg_len_cold(len, loc)
     let a = arr_header(len, len, 0, null_ptr(), null_ptr())
     let bytes = (len / 64 + 1) * 8
-    let d = brine_x_calloc(bytes)
+    let d = calloc_at(bytes, loc)
     if fill != 0:
         memset(d, 0xff, u64(bytes))
     store_ptr(a, ARR_DATA, d)
@@ -9014,13 +9014,82 @@ fn heap_batches() -> ptr:
 fn heap_mu() -> ptr:
     return global_mem("heap_mu", 64)
 
-fn oom_cold():
-    let m = ptr_of("out of memory\n") + STR_DATA
-    if os_is("windows"):
-        _write(i32(2), m, u32(14))
+fn oom_cold(n: int):
+    oom_at(n, null_ptr())
+
+# A failed allocation of n bytes is a panic, reported where the program
+# asked for the memory when `loc` says so. It allocates nothing itself: the
+# heap may be exhausted.
+fn oom_at(n: int, loc: ptr):
+    panic_claim()
+    lock(io_mu())
+    fflush(os_stdio(1))
+    if brine_world_size() > 1:
+        stderr_text("\npanic (rank ")
+        stderr_uint(brine_world_rank())
+        stderr_text("): ")
     else:
-        write(i32(2), m, u64(14))
-    abort()
+        stderr_text("\npanic: ")
+    stderr_text("out of memory: could not allocate ")
+    if n < 0:
+        # the size itself overflowed
+        stderr_text("more than 9223372036854775807 bytes")
+    else:
+        stderr_uint(n)
+        stderr_text(" bytes")
+        oom_units(n)
+    if addr(loc) != 0:
+        stderr_text("\n  --> ")
+        fwrite(loc, u64(1), strlen(loc), os_stdio(2))
+    stderr_text("\n")
+    fflush(os_stdio(2))
+    unlock(io_mu())
+    exit(i32(101))
+
+# ` (1.5 GiB)` for n bytes, when that says more than the number
+fn oom_units(n: int):
+    var unit = 1 << 40
+    var name = " TiB)"
+    if n < unit:
+        unit = 1 << 30
+        name = " GiB)"
+    if n < unit:
+        return
+    let tenths = n / (unit / 10)
+    stderr_text(" (")
+    stderr_uint(tenths / 10)
+    if tenths % 10 != 0:
+        stderr_text(".")
+        stderr_uint(tenths % 10)
+    stderr_text(name)
+
+# n >= 0 in decimal, without allocating
+fn stderr_uint(n: int):
+    let b = stack_mem(24)
+    var i = 24
+    var v = n
+    while true:
+        i -= 1
+        store_u8(b, i, u8(48 + v % 10))
+        v /= 10
+        if v == 0:
+            break
+    fwrite(b + i, u64(1), u64(24 - i), os_stdio(2))
+
+# n zero bytes for something the program asked for at `loc`
+fn calloc_at(n: int, loc: ptr) -> ptr:
+    if n < 0:
+        oom_at(n, loc)
+    let p = calloc(u64(max(n, 1)), u64(1))
+    if addr(p) == 0:
+        oom_at(n, loc)
+    return p
+
+# len * esz, or -1 when that overflows (no allocation can be that big)
+fn alloc_bytes(len: int, esz: int) -> int:
+    if esz > 0 and len > 9223372036854775807 / esz:
+        return -1
+    return len * esz
 
 # n zeroed bytes of fresh pages, or 0
 fn os_pages(n: int) -> ptr:
@@ -9066,7 +9135,7 @@ fn th_get() -> ptr:
 fn th_new_cold() -> ptr:
     let h = calloc(u64(1), u64(TH_SIZE))
     if addr(h) == 0:
-        oom_cold()
+        oom_cold(TH_SIZE)
     th_set(h)
     return h
 
@@ -9167,7 +9236,7 @@ fn chunk_new(c: int) -> ptr:
 fn big(n: int) -> ptr:
     let p = malloc(u64(n if n > 0 else 1))
     if addr(p) == 0:
-        oom_cold()
+        oom_cold(n)
     return p
 
 # hands a thread's free list for class c over as one batch
@@ -9247,14 +9316,14 @@ fn brine_free(p: ptr):
     if not push_free(p):
         free_miss_cold(p)
 
-# realloc for either heap's blocks; out of memory aborts
+# realloc for either heap's blocks; out of memory panics
 fn brine_x_realloc(p: ptr, n: int) -> ptr:
     if addr(p) == 0:
         return brine_alloc(n)
     if not in_heap(p):
         let q = realloc(p, u64(n if n > 0 else 1))
         if addr(q) == 0:
-            abort()
+            oom_cold(n)
         return q
     let hi = heap_info()
     let have = class_size(
@@ -9324,7 +9393,7 @@ fn drop_later_cold(h: ptr, p: ptr, f: ptr):
         let nc = cap * 2 if cap != 0 else 256
         let d = realloc(load_ptr(h, TH_DROPS), u64(nc * 8))
         if addr(d) == 0:
-            oom_cold()
+            oom_cold(nc * 8)
         store_ptr(h, TH_DROPS, d)
         store_i64(h, TH_CAPDROPS, nc)
     let d = load_ptr(h, TH_DROPS)
