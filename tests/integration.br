@@ -208,6 +208,7 @@ fn features() -> [str]:
         "tests/programs/ownership.br",
         "tests/programs/proofs.br",
         "tests/programs/proof_facts.br",
+        "tests/programs/proven_facts.br",
         "tests/programs/division.br",
         "tests/programs/references.br",
         "tests/programs/enums.br",
@@ -1224,9 +1225,9 @@ test "helps say what works for the mistake at hand":
             "self.area()"
         ),
         (
-            "fn main():\n    let x = 3.7\n    print(int(x))\n",
+            "fn f(x: float) -> int:\n    return int(x)\n\nfn main():\n    print(f(3.7))\n",
             "E0607",
-            "can't remove a float-to-int conversion check yet"
+            "compare the float with the range first"
         )
     ]
     let d = scratch("helps")
@@ -1580,6 +1581,62 @@ test "the notes of failed proofs":
     assert "`bi` is changed by a loop before this point" in e, e
     assert "where `p` is p + 1" in e, e
 
+test "the notes of failed proofs name values as the source does":
+    let f = "tests/programs/proof_note_names.br"
+    let e = brine(["check", f, "--proven"]).err
+    assert "to prove: f.fno >= -9223372036854775807" in e, e
+    assert "to prove: i >= 0 and len(fs) > i\n" in e, e
+    assert "to prove: l.starts[i] >= 0 and len(l.data) > l.starts[i]\n" in e, e
+    assert "to prove: d2 * d2 <= 9223372036854775807" in e, e
+    assert "?" not in e and "for'" not in e, e
+    # a note too long to read is cut short
+    let d = scratch("long_note")
+    var terms: [str] = []
+    for i in 0..60:
+        terms.push(f"p{i} * p{i + 1}")
+    let params = ", ".join([f"p{i}: int" for i in 0..61])
+    write(d + "/l.br", f"fn f({params}) -> int:\n    return " + " + ".join(terms) + "\n")
+    let l = brine(["check", d + "/l.br", "--proven"]).err
+    assert "to prove: p0 * p1 + p1 * p2" in l and "…" in l, l
+    assert all(len(x.chars()) < 440 for x in l.lines() if "= note:" in x), l
+
+test "the prover removes the checks it has the facts for":
+    let o = brine(["check", "tests/programs/proven_facts.br", "--proven"])
+    assert o.code == 0 and "0 remain" in o.all(), o.all()
+    # but not 128-bit operations that can overflow
+    let d = scratch("facts128")
+    write(
+        d + "/w.br",
+        "fn f(a: i128, b: i128, q: i128) -> i128:\n    return a + b + q / -1\n\nfn main():\n    print(f(1, 2, 3))\n"
+    )
+    let r = brine(["check", d + "/w.br", "--report"]).all()
+    assert "overflow check `a + b`" in r and "division check `q / -1`" in r, r
+    # past 2^126 the prover can't tell: a runtime check, not one that always fails
+    write(
+        d + "/big.br",
+        "fn main():\n    var y: i128 = 100000000000000000000000000000000000000\n    y += 2\n    print(y + 1)\n"
+    )
+    let b = brine(["check", d + "/big.br", "--report"])
+    assert b.code == 0 and "2 remain" in b.all(), b.all()
+
+test "float conversions are proven after a range check":
+    let d = scratch("float_int")
+    write(
+        d + "/f.br",
+        "fn pct(a: float, b: float) -> int:\n    let v = 100.0 * a / b\n    if v >= 0.0 and v <= 100.0:\n        return int(v)\n    return 0\n\n"
+        + "fn main():\n    print(pct(1.0, 3.0))\n"
+    )
+    let o = brine(["check", d + "/f.br", "--proven"])
+    assert o.code == 0, o.all()
+    # without one: a NaN or a value out of range is possible
+    write(
+        d + "/g.br",
+        "fn pct(a: float, b: float) -> int:\n    return int(100.0 * a / b)\n\nfn main():\n    print(pct(1.0, 3.0))\n"
+    )
+    let e = brine(["check", d + "/g.br", "--proven"]).err
+    assert "to prove: 100.0 * a / b is not NaN and int(100.0 * a / b) >= -9223372036854775808" in e, e
+    assert "100.0 * a / b is NaN = true" in e, e
+
 test "the prover says when it gave up":
     let f = "tests/programs/proof_gave_up.br"
     assert error_codes(f) == ["E0605@25", "E0605@30"]
@@ -1705,6 +1762,17 @@ test "failed proofs show values the prover can't rule out":
     # and in the JSON diagnostics
     let j = brine(["check", f, "--json"]).out
     assert "values the prover can't rule out: len(xs) = 0" in j, j
+    # a value from a call to a function without `ensures` is any value
+    let g = d + "/calls.br"
+    write(
+        g,
+        "fn discount(price: int, off: int) -> int:\n    return min(off, price)\n\n"
+        + "fn sell(price: int) -> int:\n    requires 0 <= price <= 1000\n    let d = discount(price, 3)\n    prove 0 <= d <= price\n    return price - d\n\n"
+        + "fn main():\n    print(sell(10))\n"
+    )
+    let c = brine(["check", g]).err
+    assert "`d` comes from `discount`, which has no `ensures`" in c, c
+    assert "help: add an `ensures` to `discount` that says what it returns" in c, c
 
 test "proven projects can't keep runtime checks":
     let d = scratch("proven")
@@ -2186,7 +2254,25 @@ test "proofs stay sound":
             "E0605@374",
             "E0605@381",
             "E0605@389",
-            "E0601@454"
+            "E0601@456",
+            "E0605@461",
+            "E0605@463",
+            "E0605@465",
+            "E0605@467",
+            "E0605@469",
+            "E0605@471",
+            "E0605@491",
+            "E0605@494",
+            "E0605@497",
+            "E0605@506",
+            "E0605@509",
+            "E0605@516",
+            "E0605@522",
+            "E0605@527",
+            "E0605@530",
+            "E0605@538",
+            "E0605@545",
+            "E0605@552"
         ]
     )
 

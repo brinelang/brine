@@ -4,7 +4,7 @@ from diag import Span, Diag, best_match
 import diag
 from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalKind, LocalInfo
 from types import int_ty, float_ty, builtins, world_ops, os_ops, NumM, num_methods
-from ast import TypeExpr, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Expr, ExprKind, mk
+from ast import TypeExpr, ConstDecl, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Expr, ExprKind, mk
 from ast import LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, stmt, pattern
 from ast import children, stmt_exprs, stmt_blocks, local_of, lvalue_root, parse_fmt_spec
 from ast import Param, FnDecl, FieldDecl, StructDecl, EnumDecl, Module, Program, Import, module_name
@@ -315,6 +315,10 @@ fn new_checker() -> Checker:
         or_names=None,
         or_seen=[],
         const_exprs={},
+        const_todo={},
+        const_at={},
+        const_busy={},
+        const_done={},
         ref_paths=[],
         failed_imports={},
         own_self=(-1, -1)
@@ -364,6 +368,12 @@ struct Checker:
     or_seen: [str]
     # array constants: the literal each use stands for, every element folded
     const_exprs: {int: Expr}
+    # constants not checked yet, where each is, the ones being checked, and
+    # the checked ones (see `need_const`)
+    const_todo: {int: (int, ConstDecl)}
+    const_at: {int: (int, int)}
+    const_busy: {int: bool}
+    const_done: {int: ConstDecl}
     # `let t = ref self.t`: the variable and the fields each alias stands for.
     # Its scope entry has id `-2 - k` for alias k.
     ref_paths: [(str, [str], Span)]
@@ -612,57 +622,27 @@ struct Checker:
                 self.info.fns[id].ret = ret
                 self.info.fns[id].has_self = has_self
 
-        # ---- constants
+        # ---- constants: each after the ones it uses (`const B = 64 + TAG`, with
+        # `TAG` imported or defined further down), see `need_const`
+        var decls: [(int, int, int)] = []
         for mi in 0..len(prog.modules):
-            self.cur_mod = mi
             for ci in 0..len(prog.modules[mi].consts):
                 match self.items[mi].get(prog.modules[mi].consts[ci].name):
                     case Some(Item.Const(id)):
-                        self.locals = []
-                        self.scopes = [[]]
-                        var c = prog.modules[mi].consts[ci]
-                        var ann: Option[Ty] = None
-                        match c.ty:
-                            case Some(te):
-                                ann = Some(self.resolve_type(te))
-                            case None:
-                                pass
-                        let nd = len(self.diags)
-                        let t = self.check_expr(ref c.value, ann)
-                        var ty = t
-                        match ann:
-                            case Some(a):
-                                self.expect_ty(a, c.value)
-                                ty = a
-                            case None:
-                                pass
-                        match self.eval_const(c.value):
-                            case Some(v):
-                                self.info.consts[id].value = v
-                                self.info.consts[id].ty = ty
-                                match v:
-                                    case ConstVal.Int(_):
-                                        self.info.consts[id].untyped = (
-                                            ann.is_none()
-                                            and ty == int_ty()
-                                            and not typed_int(c.value)
-                                        )
-                                    case _:
-                                        pass
-                            case None:
-                                match self.const_array(c.value):
-                                    case Some(lit):
-                                        self.const_exprs[id] = lit
-                                        self.info.consts[id].ty = ty
-                                    case None:
-                                        # (an error in the value was reported already)
-                                        if not t.is_error() and not any(
-                                            d.is_error() for d in self.diags[nd:]
-                                        ):
-                                            self.const_error(c.value)
-                        prog.modules[mi].consts[ci] = c
+                        if id not in self.const_todo:
+                            self.const_todo[id] = (mi, prog.modules[mi].consts[ci])
+                            self.const_at[id] = (mi, ci)
+                        decls.push((mi, ci, id))
                     case _:
                         pass
+        for mi, ci, id in decls:
+            if self.const_at[id] == (mi, ci):
+                self.need_const(id)
+                prog.modules[mi].consts[ci] = self.const_done[id]
+            else:
+                # a second constant of that name (reported): checked all the same
+                prog.modules[mi].consts[ci] = self.check_const(mi, prog.modules[mi].consts[ci], id)
+        self.const_todo = {}
 
         # ---- struct invariants, checked like contracts about `self`
         for mi in 0..len(prog.modules):
@@ -4541,9 +4521,76 @@ struct Checker:
                     )
                 return Some(x2)
 
+    # Check and fold the constant `id` now, unless it was. A constant used
+    # while it is being checked is defined in terms of itself.
+    fn need_const(ref self, id: int) -> bool:
+        if id in self.const_done or id not in self.const_todo:
+            return true
+        if id in self.const_busy:
+            return false
+        self.const_busy[id] = true
+        let (mi, c) = self.const_todo[id]
+        self.const_done[id] = self.check_const(mi, c, id)
+        return true
+
+    fn check_const(ref self, mi: int, c0: ConstDecl, id: int) -> ConstDecl:
+        let saved_mod = self.cur_mod
+        let saved_locals = self.locals
+        let saved_scopes = self.scopes
+        self.cur_mod = mi
+        self.locals = []
+        self.scopes = [[]]
+        var c = c0
+        var ann: Option[Ty] = None
+        match c.ty:
+            case Some(te):
+                ann = Some(self.resolve_type(te))
+            case None:
+                pass
+        let nd = len(self.diags)
+        let t = self.check_expr(ref c.value, ann)
+        var ty = t
+        match ann:
+            case Some(a):
+                self.expect_ty(a, c.value)
+                ty = a
+            case None:
+                pass
+        match self.eval_const(c.value):
+            case Some(v):
+                self.info.consts[id].value = v
+                self.info.consts[id].ty = ty
+                match v:
+                    case ConstVal.Int(_):
+                        self.info.consts[id].untyped = (
+                            ann.is_none() and ty == int_ty() and not typed_int(c.value)
+                        )
+                    case _:
+                        pass
+            case None:
+                match self.const_array(c.value):
+                    case Some(lit):
+                        self.const_exprs[id] = lit
+                        self.info.consts[id].ty = ty
+                    case None:
+                        # (an error in the value was reported already)
+                        if not t.is_error() and not any(d.is_error() for d in self.diags[nd:]):
+                            self.const_error(c.value)
+        self.cur_mod = saved_mod
+        self.locals = saved_locals
+        self.scopes = saved_scopes
+        return c
+
     # An array constant becomes its literal at each use; `res` still names the
     # constant, so changing it is reported as changing a constant.
     fn use_const(ref self, ref e: Expr, id: int):
+        if not self.need_const(id):
+            let name = self.info.consts[id].name
+            self.err(
+                diag.error("E0317", "constant value must be computable at compile time")
+                .label(e.span, f"`{name}` is defined in terms of itself")
+                .with_help("give one of these constants a value that doesn't use the others")
+            )
         match self.const_exprs.get(id):
             case Some(lit):
                 e.kind = lit.kind
