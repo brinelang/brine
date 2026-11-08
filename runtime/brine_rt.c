@@ -2657,7 +2657,9 @@ void brine_sb_group(brine_sb *sb, int64_t start) {
     }
 }
 void brine_sb_pad(brine_sb *sb, int64_t start, int64_t width, bool left, bool zero) {
-    int64_t n = sb->len - start;
+    /* the width counts characters, as in Python, not bytes */
+    int64_t n = 0;
+    for (int64_t i = start; i < sb->len; i++) n += ((unsigned char)sb->p[i] & 0xC0) != 0x80;
     if (n >= width) return;
     int64_t pad = width - n;
     br_sb_reserve(sb, pad);

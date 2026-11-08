@@ -450,8 +450,9 @@ decimal only: `"0x10".to_int()` and `"0x10".to_float()` are `None`. Floats also 
 Format specs in f-strings, as in Python: `{x:.2f}` (fixed), `{x:.3e}`
 (scientific), `{x:g}` / `{x:.10g}` (general: the shorter of the two, trailing
 zeros dropped), `{n:,}` / `{x:,.2f}` (thousands separators: `1,234,567.89`),
-`{n:x}` / `{n:b}` (hex, binary), a width `{n:8}` (`<8` to left-align, `08` to pad
-with zeros) and combinations like `{x:>12,.2f}`.
+`{n:x}` / `{n:b}` (hex, binary), a width `{n:8}` (in characters: strings align
+left and numbers right unless `<8` or `>8` says otherwise; `08` pads with zeros)
+and combinations like `{x:>12,.2f}`.
 
 ## Maps
 
