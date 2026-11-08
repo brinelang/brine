@@ -1,0 +1,197 @@
+# Unit tests for checks.br: every panic a program can reach is in its table.
+#
+#   brine test compiler/dev_checks.br        (from the repository root)
+#
+# The table is what the verifier asks about each operation, so a panic it
+# doesn't name would be one `--proven` and the rules can't see.
+from checks import Check, Stop, rt_panics, lowered_panics, builtin_stops, str_stops
+from types import Ty, Builtin, StrM
+
+# The calls that stop the program, in runtime/rt.br.
+fn primitives() -> [str]:
+    return [
+        "panic_text_cold",
+        "panic_cold",
+        "world_panic",
+        "brine_panic_idx",
+        "brine_panic_ovf",
+        "brine_panic_at",
+        "brine_panic_str"
+    ]
+
+fn text(path: str) -> str:
+    match read_file(path):
+        case Ok(t):
+            return t
+        case Err(e):
+            panic(f"run this from the repository root: {e}")
+
+fn ident_char(c: str) -> bool:
+    return c == "_" or c.is_alnum()
+
+# Does `line` call `name(` (not `xname(`)?
+fn calls(line: str, name: str) -> bool:
+    var at = 0
+    while true:
+        match line.find(name + "(", at):
+            case Some(i):
+                if i == 0 or not ident_char(line[i - 1]):
+                    return true
+                at = i + 1
+            case None:
+                return false
+    return false
+
+# The top-level functions of a brine file: (name, body lines).
+fn functions(src: str) -> [(str, [str])]:
+    var out: [(str, [str])] = []
+    var name = ""
+    var body: [str] = []
+    for l in src.lines():
+        if l.starts_with("fn ") and "(" in l:
+            if name != "":
+                out.push((name, body))
+            name = l[3:l.find("(").unwrap()]
+            body = []
+        elif name != "" and l != "" and not l.starts_with(" ") and not l.starts_with("#"):
+            out.push((name, body))
+            name = ""
+            body = []
+        elif name != "" and not l.strip().starts_with("#"):
+            body.push(l)
+    if name != "":
+        out.push((name, body))
+    return out
+
+# The functions of rt.br that stop the program themselves.
+fn panicking() -> [str]:
+    var out: [str] = []
+    for name, body in functions(text("runtime/rt.br")):
+        if any(any(calls(l, p) for p in primitives()) for l in body):
+            out.push(name)
+    return out
+
+test "every function of the runtime that panics is in the table":
+    let found = panicking()
+    assert len(found) > 30, f"found only {len(found)}: is runtime/rt.br there?"
+    var named: {str: bool} = {}
+    for name, cs, why in rt_panics():
+        named[name] = true
+        assert len(cs) > 0 or why != "", f"`{name}`: an exemption says why"
+        assert len(cs) == 0 or why == "", f"`{name}`: checks or an exemption, not both"
+    for f in found:
+        assert f in named, f"rt.br's `{f}` panics, but checks.br's rt_panics() doesn't say which check that is (or why it's exempt)"
+    # and none is stale
+    let prims = primitives()
+    for name, _, _ in rt_panics():
+        assert (
+            name in found or name in prims
+        ), f"rt_panics() names `{name}`, which no longer panics in rt.br"
+
+test "the verifier states every check the runtime makes":
+    # the verifier itself, and the tables of operations it applies to each call
+    let c0 = text("compiler/checks.br")
+    let v = text("compiler/verify.br") + c0[:c0.find("fn rt_panics(").unwrap()]
+    var cs: [Check] = []
+    for _, xs, _ in rt_panics():
+        cs.extend(xs)
+    for _, xs in lowered_panics():
+        cs.extend(xs)
+    for c in cs:
+        # by the table (`Check.X`) or by what it says (`"index bounds check"`)
+        let named = ("\"" + c.what() + "\"") in v or ("Check." + check_name(c)) in v
+        assert named, f"no obligation in verify.br or checks.br's tables for the {c.what()}"
+
+# (no catch-all: a new check needs a name here)
+fn check_name(c: Check) -> str:
+    match c:
+        case Check.Index:
+            return "Index"
+        case Check.Slice:
+            return "Slice"
+        case Check.CharBoundary:
+            return "CharBoundary"
+        case Check.Overflow:
+            return "Overflow"
+        case Check.Division:
+            return "Division"
+        case Check.Remainder:
+            return "Remainder"
+        case Check.Shift:
+            return "Shift"
+        case Check.Conversion:
+            return "Conversion"
+        case Check.FloatToInt:
+            return "FloatToInt"
+        case Check.ArrayLength:
+            return "ArrayLength"
+        case Check.EmptyArray:
+            return "EmptyArray"
+        case Check.InsertIndex:
+            return "InsertIndex"
+        case Check.Character:
+            return "Character"
+        case Check.RepeatCount:
+            return "RepeatCount"
+        case Check.MapKey:
+            return "MapKey"
+        case Check.Start:
+            return "Start"
+        case Check.EmptyPattern:
+            return "EmptyPattern"
+        case Check.Number:
+            return "Number"
+        case Check.EmptySequence:
+            return "EmptySequence"
+        case Check.Step:
+            return "Step"
+        case Check.RangeSize:
+            return "RangeSize"
+        case Check.Unwrap:
+            return "Unwrap"
+        case Check.Rank:
+            return "Rank"
+        case Check.PerRank:
+            return "PerRank"
+        case Check.SameLength:
+            return "SameLength"
+        case Check.ProcessHandle:
+            return "ProcessHandle"
+        case Check.ProcessDone:
+            return "ProcessDone"
+        case Check.NulByte:
+            return "NulByte"
+
+test "every panic lowering emits is in the table":
+    let ls = text("compiler/lower.br").lines()
+    let msgs = [m for m, _ in lowered_panics()]
+    var n = 0
+    for i, l in enumerate(ls):
+        if not (calls(l, "self.panic_at") or "\"brine_panic_" in l):
+            continue
+        n += 1
+        # the message is on the line, or set up just before it
+        var near = ""
+        for j in max(0, i - 4)..i + 1:
+            near += ls[j] + "\n"
+        let known = (
+            any(m in near for m in msgs)
+            or "fn panic_at(" in near
+            or ("\"brine_panic_str\"" in l and "Builtin.Panic" in near)
+        )
+        assert known, f"lower.br:{i + 1} panics, but checks.br's lowered_panics() doesn't name it:\n{l}"
+    assert n >= 5, f"found only {n} panics in lower.br"
+
+test "a start offset and an empty pattern are checks":
+    match builtin_stops(Builtin.IndexFrom, Ty.Unknown, 2)[0]:
+        case Stop.Goal(c):
+            assert c == Check.Start
+        case _:
+            assert false, "index(x, start) checks its start"
+    match str_stops(StrM.FindFrom)[0]:
+        case Stop.Goal(c):
+            assert c == Check.Start
+        case _:
+            assert false, "find(t, start) checks its start"
+    assert len(str_stops(StrM.Split)) == 1
+    assert len(str_stops(StrM.Find)) == 0

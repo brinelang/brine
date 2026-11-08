@@ -17,6 +17,7 @@ from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pat
 from ast import children, stmt_exprs, stmt_blocks, lvalue_root, local_of
 from info import ProgramInfo, ConstVal, PRELUDE, RT
 from solver import Lin, F, AtomSet, prove_, prove_full, counterexample, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
+from checks import Check, Stop, builtin_stops, reduce_stops, convert_stops, world_stops, os_stops
 
 struct Report:
     diags: [Diag]
@@ -24,6 +25,10 @@ struct Report:
     remaining: [(Span, str)]
     # implicit checks proven and removed
     proven: int
+    # checks proven, that still run (the runtime function checks anyway)
+    kept: [(Span, str)]
+    # `assert`s that fail whenever they're reached (a check that does is E0614)
+    always: [(Span, str)]
 
 enum V:
     Int(l: Lin)
@@ -154,7 +159,7 @@ fn verify_program(
     ]
     # let go of the bodies, so rewriting them below doesn't copy them
     fns = []
-    var report = Report(diags=[], remaining=[], proven=0)
+    var report = Report(diags=[], remaining=[], proven=0, kept=[], always=[])
     # `BRINE_TIMES=2`: the functions that take the prover long
     let slow_fns = getenv("BRINE_TIMES") == Some("2")
     var at = 0
@@ -170,6 +175,8 @@ fn verify_program(
                 eprint(f"  verify {r.name}: {r.time:.3f}s")
             report.diags.extend(r.diags)
             report.remaining.extend(r.remaining)
+            report.kept.extend(r.kept)
+            report.always.extend(r.always)
             report.proven += len(r.proven)
             if len(r.proven) == 0:
                 continue
@@ -191,6 +198,8 @@ fn verify_program(
                 continue
         out.push(r)
     report.remaining = out
+    report.kept = by_position(report.kept)
+    report.always = by_position(report.always)
     # generic code is verified once per instance; report each problem once
     var seen: {(str, str, int, int, int): bool} = {}
     var kept: [Diag] = []
@@ -205,10 +214,27 @@ fn verify_program(
     report.diags = kept
     return report
 
+# By position (stable), then without repeats.
+fn by_position(xs: [(Span, str)]) -> [(Span, str)]:
+    var keys: [(int, int, int)] = []
+    for i, r in enumerate(xs):
+        keys.push((r.0.file, r.0.lo, i))
+    var out: [(Span, str)] = []
+    for i in sort_keys(keys):
+        let r = xs[i]
+        if len(out) > 0:
+            let p = out[len(out) - 1].0
+            if p.file == r.0.file and p.lo == r.0.lo and p.hi == r.0.hi:
+                continue
+        out.push(r)
+    return out
+
 struct FnResult:
     name: str
     diags: [Diag]
     remaining: [(Span, str)]
+    kept: [(Span, str)]
+    always: [(Span, str)]
     # the checks proven everywhere they're reached
     proven: {(int, int, int, int): bool}
     time: float
@@ -226,7 +252,15 @@ fn verify_fn(
 ) -> FnResult:
     let t0 = clock()
     if f.is_extern:
-        return FnResult(name=f.name, diags=[], remaining=[], proven={}, time=0.0)
+        return FnResult(
+            name=f.name,
+            diags=[],
+            remaining=[],
+            kept=[],
+            always=[],
+            proven={},
+            time=0.0
+        )
     var v = new_vf(info, specs, fps, sm, f)
     v.test = test
     v.must_prove = must_prove
@@ -242,6 +276,8 @@ fn verify_fn(
         name=f.name,
         diags=v.diags,
         remaining=v.remaining,
+        kept=v.kept_proven,
+        always=v.always,
         proven=proven,
         time=clock() - t0
     )
@@ -919,6 +955,9 @@ fn new_vf(
         proven={},
         failed={},
         remaining=[],
+        kept_proven=[],
+        always=[],
+        nobl=0,
         test=false,
         must_prove=false,
         diags=[],
@@ -960,6 +999,12 @@ struct Vf:
     proven: {(int, int, int, int): bool}
     failed: {(int, int, int, int): bool}
     remaining: [(Span, str)]
+    # checks proven, that still run
+    kept_proven: [(Span, str)]
+    # `assert`s that always fail
+    always: [(Span, str)]
+    # obligations stated so far (to see that an operation's check was)
+    nobl: int
     # a `test` block: its `assert`s are its point, not checks to remove
     test: bool
     # every remaining runtime check is an error (E0607)
@@ -1258,16 +1303,54 @@ struct Vf:
     fn implicit(ref self, span: Span, tag: int, goal: F, what: str):
         if self.spec or not self.live:
             return
+        self.nobl += 1
         if self.holds(goal):
             self.proven[key(span, tag)] = true
         else:
             self.failed[key(span, tag)] = true
+            if self.refuted(span, what, goal):
+                return
             self.remain(span, what, Some(goal))
         self.assume(goal)
+
+    # A check whose goal is false in every state that reaches it stops the
+    # program whenever it runs: an error (E0614), not a runtime check. The
+    # goal must be exactly the condition the check tests, and the facts must
+    # not contradict each other (code the prover sees can't run is fine).
+    # Nothing is assumed after it, so what follows is still checked as if
+    # it passed, instead of being proven from a contradiction.
+    fn refuted(ref self, span: Span, what: str, goal: F) -> bool:
+        if self.spec or not self.live or not self.holds(goal.not_()) or self.holds(F.False):
+            return false
+        var d = diag.error(
+            "E0614",
+            f"this {what} always fails"
+        ).label(span, "this stops the program whenever it runs")
+        if goal == F.False:
+            d = d.note("with the values used here, it can never pass")
+        else:
+            for n in self.known_facts_note(goal):
+                d = d.note(n)
+            d = d.note("it passes only if " + self.show_f(goal) + ", which can't hold here")
+        self.diags.push(
+            d.with_help(
+                "fix the values it uses; if this line really can't run, make that visible to the prover (return before it, or a `requires` that rules the case out)"
+            )
+        )
+        return true
 
     # A check that stays at runtime: listed in `--report`, and an error where
     # everything must be proven. `goal`: what would remove it, if anything can.
     fn remain(ref self, span: Span, what: str, goal: Option[F]):
+        self.remain_h(span, what, goal, "")
+
+    # A check of the table in checks.br the prover can't state.
+    fn remain_c(ref self, span: Span, c: Check):
+        if not self.spec and self.live:
+            self.remain_h(span, c.what(), None, c.help())
+
+    # `help`: what removes it, when the general advice doesn't ("" for that).
+    fn remain_h(ref self, span: Span, what: str, goal: Option[F], help: str):
         self.remaining.push((span, what))
         if not self.must_prove:
             return
@@ -1281,14 +1364,8 @@ struct Vf:
             )
         )
         d = d.note(self.why_proven())
-        if what == "map key check":
-            d = d.with_help(
-                "use `m.get(k)`, which gives an `Option` to match on (the prover doesn't follow the keys of maps)"
-            )
-        elif what == "conversion check" and goal.is_none():
-            d = d.with_help(
-                "converting a float to an int is always checked at runtime: compare it with the range you need first, or keep this code outside the proven part"
-            )
+        if help != "":
+            d = d.with_help(help)
         elif is_assert:
             d = d.with_help(
                 "give the prover the facts that make it true (`requires`, `invariant`), turn it into a `prove`, or handle the failing case with an `if`"
@@ -1827,8 +1904,8 @@ struct Vf:
                 self.match_stmt(scrut, cases)
             case StmtKind.While(cond, invariants, body):
                 self.while_loop(cond, invariants, body)
-            case StmtKind.For(_, _, _, iter, invariants, body, _):
-                self.for_loop(iter, invariants, body, s.local)
+            case StmtKind.For(_, _, _, iter, invariants, body, is_par):
+                self.for_loop(iter, invariants, body, s.local, is_par)
             case StmtKind.Return(value):
                 var v: Option[V] = None
                 match value:
@@ -1863,6 +1940,12 @@ struct Vf:
                     self.failed[key(s.span, TAG_ASSERT)] = true
                     if not self.test and self.live:
                         self.remain(s.span, "assert", Some(c))
+                        # one that always fails is written on purpose (`assert false`)
+                        # or a bug: `--report` says which, and like `panic` it ends the path,
+                        # so nothing after it is proven from a contradiction
+                        if self.holds(c.not_()) and not self.holds(F.False):
+                            self.always.push((s.span, "assert"))
+                            self.live = false
                 self.assume(c)
             case StmtKind.Prove(e):
                 let f = self.spec_cond(e)
@@ -2412,7 +2495,56 @@ struct Vf:
             out = self.merge(out, Some(br), k)
         self.put(out)
 
-    fn for_loop(ref self, iter: Expr, invs: [Expr], body: Block, var_id: int):
+    # `range(a, b, s)`: `s != 0`; `counted`: its elements are counted in an
+    # int (a comprehension or a `par for`), so there can't be more than 2^63 - 1.
+    fn range_checks(ref self, span: Span, vals: [Lin], counted: bool):
+        if len(vals) == 3:
+            self.kept(span, F.eq(vals[2]).not_(), "step check")
+        if not counted:
+            return
+        if len(vals) == 1:
+            self.range_size(span, Lin.konst(0), vals[0], false)
+        elif len(vals) == 2:
+            self.range_size(span, vals[0], vals[1], false)
+        elif len(vals) == 3:
+            # either way the distance is enough (if not exact)
+            match (vals[1].sub(vals[0]), vals[0].sub(vals[1])):
+                case (Some(up), Some(down)):
+                    let m = Lin.konst(I64_BOUND)
+                    self.kept_x(
+                        span,
+                        F.and_(
+                            [
+                                F.or_([F.le(vals[1], vals[0]), F.le(up, m)]),
+                                F.or_([F.le(vals[0], vals[1]), F.le(down, m)])
+                            ]
+                        ),
+                        "range size check",
+                        false
+                    )
+                case _:
+                    pass
+
+    fn range_size(ref self, span: Span, a: Lin, b: Lin, inclusive: bool):
+        let ne = F.le(a, b) if inclusive else F.lt(a, b)
+        var d = b.sub(a)
+        if inclusive:
+            match d:
+                case Some(x):
+                    d = x.add_c(1)
+                case None:
+                    pass
+        match d:
+            case Some(sp):
+                self.kept(
+                    span,
+                    F.or_([ne.not_(), F.le(sp, Lin.konst(I64_BOUND))]),
+                    "range size check"
+                )
+            case None:
+                pass
+
+    fn for_loop(ref self, iter: Expr, invs: [Expr], body: Block, var_id: int, counted: bool):
         let vname = self.local_name(var_id)
         let vty = self.local_ty(var_id)
         var dom = D.Other
@@ -2423,6 +2555,8 @@ struct Vf:
                 let a = self.as_int(av, lo.ty)
                 let bv = self.eval(hi)
                 let b = self.as_int(bv, hi.ty)
+                if counted:
+                    self.range_size(iter.span, a, b, inclusive)
                 dom = D.Range(a, b, inclusive)
                 done = true
             case ExprKind.Call(_, args):
@@ -2431,6 +2565,7 @@ struct Vf:
                     for a in args:
                         let v = self.eval(a.expr)
                         vals.push(self.as_int(v, a.expr.ty))
+                    self.range_checks(iter.span, vals, counted)
                     if len(vals) == 1:
                         dom = D.Range(Lin.konst(0), vals[0], false)
                     elif len(vals) == 2:
@@ -3141,8 +3276,31 @@ struct Vf:
                     case CallRes.Builtin(b):
                         return self.builtin(b, Some(recv), args, e)
                     case CallRes.World(op):
+                        var vals: [V] = []
                         for a in args:
-                            self.eval(a.expr)
+                            vals.push(self.eval(a.expr))
+                        let n0 = self.nobl
+                        let size = Lin.atom(self.term(Term.Size, pos_range()))
+                        var arr = false
+                        var elem = Ty.Unknown
+                        if len(args) > 0:
+                            match args[0].expr.ty:
+                                case Ty.Array(t):
+                                    arr = true
+                                    elem = t
+                                case t:
+                                    elem = t
+                        # `world.broadcast(root, x)`
+                        if op == WorldOp.Broadcast and len(vals) > 1:
+                            let root = self.as_int(vals[0], args[0].expr.ty)
+                            self.kept(e.span, F.and_([F.ge(root), F.lt(root, size)]), "rank check")
+                        if op == WorldOp.Exchange and len(vals) > 0:
+                            match vals[0]:
+                                case V.Arr(_, l):
+                                    self.kept(e.span, F.equal(l, size), "length check")
+                                case _:
+                                    pass
+                        self.table_checks(e.span, world_stops(op, elem, arr), n0)
                         match op:
                             case WorldOp.Rank:
                                 return V.Int(Lin.atom(self.term(Term.Rank, nonneg_range())))
@@ -3157,9 +3315,11 @@ struct Vf:
                                 let nm = self.name_of(e)
                                 return self.fresh_val(e.ty, nm)
                     # opaque: `os` itself is the receiver, only the arguments are evaluated
-                    case CallRes.Os(_):
+                    case CallRes.Os(op):
+                        let n0 = self.nobl
                         for a in args:
                             self.eval(a.expr)
+                        self.table_checks(e.span, os_stops(op), n0)
                         let nm = self.name_of(e)
                         return self.fresh_val(e.ty, nm)
                     case _:
@@ -3349,8 +3509,18 @@ struct Vf:
                 return self.fresh_val(e.ty, "slice")
         let h = hi.unwrap_or(l)
         if not self.spec:
+            # the runtime function checks the bounds whether or not they're proven
             let g = F.and_([F.ge(lo), F.le(lo, h), F.le(h, l)])
-            self.implicit(e.span, TAG_INDEX, g, "slice bounds check")
+            self.kept(e.span, g, "slice bounds check")
+        # and that a string's ends are character boundaries, which the prover
+        # knows only of its first and last byte
+        if is_str and not self.spec and self.live:
+            self.nobl += 1
+            let edges = F.and_([F.or_([F.eq(lo), F.equal(lo, l)]), F.or_([F.eq(h), F.equal(h, l)])])
+            if self.holds(edges):
+                self.kept_proven.push((e.span, Check.CharBoundary.what()))
+            else:
+                self.remain_c(e.span, Check.CharBoundary)
         let n = self.lin(h.sub(lo), "len(slice)")
         if is_str:
             return V.Str(n)
@@ -3443,6 +3613,12 @@ struct Vf:
                         self.defs.push(
                             F.or_([F.and_([ne, F.equal(n, sp)]), F.and_([ne.not_(), F.eq(n)])])
                         )
+                        # its elements are counted, in an int
+                        self.kept(
+                            c.iter.span,
+                            F.or_([ne.not_(), F.le(sp, Lin.konst(I64_BOUND))]),
+                            "range size check"
+                        )
                     case None:
                         pass
                 v = V.Int(i)
@@ -3455,6 +3631,7 @@ struct Vf:
                         let x = self.eval(a.expr)
                         vals.push(self.as_int(x, a.expr.ty))
                     let i = self.fresh_int(vname, ik)
+                    self.range_checks(c.iter.span, vals, true)
                     if len(vals) <= 2:
                         var lo = Lin.konst(0)
                         var hi = vals[0]
@@ -3512,11 +3689,24 @@ struct Vf:
                 return self.fresh_nonneg("count")
 
     fn reduce(ref self, r: Reducer, arg: Expr, e: Expr) -> V:
+        let n0 = self.nobl
+        var count: Option[Lin] = None
         match arg.kind:
             case ExprKind.Comp(c):
-                self.comp(c, arg.local)
+                count = Some(self.comp(c, arg.local))
             case _:
-                self.eval(arg)
+                match self.eval(arg):
+                    case V.Arr(_, l):
+                        count = Some(l)
+                    case _:
+                        pass
+        if r == Reducer.Min or r == Reducer.Max:
+            match count:
+                case Some(n):
+                    self.kept(e.span, F.ge(n.add_c(-1).unwrap_or(n)), "empty sequence check")
+                case None:
+                    pass
+        self.table_checks(e.span, reduce_stops(r, e.ty), n0)
         let nm = self.name_of(e)
         match r:
             case Reducer.Any | Reducer.All:
@@ -3526,6 +3716,12 @@ struct Vf:
 
     fn convert(ref self, target: Ty, a: Expr, whole: Expr) -> V:
         let v = self.eval(a)
+        let n0 = self.nobl
+        let r = self.convert_val(target, a, whole, v)
+        self.table_checks(whole.span, convert_stops(target, a.ty), n0)
+        return r
+
+    fn convert_val(ref self, target: Ty, a: Expr, whole: Expr, v: V) -> V:
         match (target, a.ty, v):
             case (Ty.Int(k), Ty.Int(src), V.Int(l)):
                 # a narrowing conversion is checked
@@ -3534,10 +3730,8 @@ struct Vf:
                     return V.Int(l)
                 self.kept(whole.span, in_range(l, k), "conversion check")
                 return V.Int(l)
+            # in range and not NaN: always checked (the table says so)
             case (Ty.Int(_), Ty.Float(_), _):
-                # in range and not NaN: checked
-                if not self.spec and self.live:
-                    self.remain(whole.span, "conversion check", None)
                 return self.fresh_val(target, self.name_of(whole))
             case (Ty.Int(_), Ty.Bool, V.Bool(b)):
                 let r = self.fresh_int("int(bool)", IntTy.I64)
@@ -3552,6 +3746,19 @@ struct Vf:
                 return self.fresh_val(target, nm)
 
     fn builtin(ref self, b: Builtin, recv: Option[Expr], args: [Arg], e: Expr) -> V:
+        let n0 = self.nobl
+        let v = self.builtin_val(b, recv, args, e)
+        var rt = Ty.Unknown
+        match recv:
+            case Some(r):
+                rt = r.ty
+            case None:
+                if len(args) > 0:
+                    rt = args[0].expr.ty
+        self.table_checks(e.span, builtin_stops(b, rt, len(args)), n0)
+        return v
+
+    fn builtin_val(ref self, b: Builtin, recv: Option[Expr], args: [Arg], e: Expr) -> V:
         if b == Builtin.Push or b == Builtin.Pop:
             if recv.is_none():
                 return V.Opaque
@@ -3591,9 +3798,10 @@ struct Vf:
                             return self.fresh_val(e.ty, "?")
         if b.mutates_recv() and recv.is_some():
             return self.mutate(b, recv.unwrap(), args, e)
+        var rv = V.Opaque
         match recv:
             case Some(r):
-                self.eval(r)
+                rv = self.eval(r)
             case None:
                 pass
         var vals: [V] = []
@@ -3601,6 +3809,33 @@ struct Vf:
             vals.push(self.eval(a.expr))
         self.ref_args(args)
         match b:
+            # `xs.index(x, start)`, `s.find(t, start)`: 0 <= start <= len
+            case Builtin.IndexFrom | Builtin.Str(StrM.FindFrom):
+                var l: Option[Lin] = None
+                match rv:
+                    case V.Arr(_, x):
+                        l = Some(x)
+                    case V.Str(x):
+                        l = Some(x)
+                    case _:
+                        pass
+                if len(vals) > 1 and l.is_some():
+                    let k = self.as_int(vals[1], args[1].expr.ty)
+                    self.kept(e.span, F.and_([F.ge(k), F.le(k, l.unwrap())]), "start check")
+                return self.fresh_val(e.ty, self.name_of(e))
+            # an empty pattern is an error
+            case Builtin.Str(StrM.Split) | Builtin.Str(StrM.Replace) | Builtin.Str(StrM.Count):
+                if len(vals) > 0:
+                    match vals[0]:
+                        case V.Str(pl):
+                            self.kept(
+                                e.span,
+                                F.ge(pl.add_c(-1).unwrap_or(pl)),
+                                "empty pattern check"
+                            )
+                        case _:
+                            pass
+                return self.fresh_val(e.ty, self.name_of(e))
             case Builtin.Len:
                 if len(vals) > 0:
                     match vals[0]:
@@ -3689,8 +3924,13 @@ struct Vf:
                             # one byte surely is one character; passing only says
                             # it was one UTF-8 character of 1 to 4 bytes
                             let one = F.equal(l, Lin.konst(1))
-                            if not self.spec and self.live and not self.holds(one):
-                                self.remain(e.span, "character check", Some(one))
+                            # enough, not necessary ("é" passes): never refuted
+                            if not self.spec and self.live:
+                                self.nobl += 1
+                                if self.holds(one):
+                                    self.kept_proven.push((e.span, "character check"))
+                                else:
+                                    self.remain(e.span, "character check", Some(one))
                             self.assume(
                                 F.and_([F.ge(l.add_c(-1).unwrap_or(l)), F.le(l, Lin.konst(4))])
                             )
@@ -3798,19 +4038,45 @@ struct Vf:
     fn map_key_check(ref self, m: Expr, span: Span):
         match m.ty:
             case Ty.Map(_, _):
-                if not self.spec and self.live:
-                    self.remain(span, "map key check", None)
+                self.remain_c(span, Check.MapKey)
             case _:
                 pass
 
     # A runtime check that stays whether or not it's proven: listed in
     # `--report` unless proven; either way it holds afterwards.
     fn kept(ref self, span: Span, goal: F, what: str):
+        self.kept_x(span, goal, what, true)
+
+    # `exact`: the goal is just what the check tests (not merely enough for
+    # it), so failing it everywhere means the check always fails.
+    fn kept_x(ref self, span: Span, goal: F, what: str, exact: bool):
         if self.spec or not self.live:
             return
-        if not self.holds(goal):
+        self.nobl += 1
+        if self.holds(goal):
+            self.kept_proven.push((span, what))
+        else:
+            if exact and self.refuted(span, what, goal):
+                return
             self.remain(span, what, Some(goal))
         self.assume(goal)
+
+    # The checks the table in checks.br lists for an operation, after the
+    # verifier has stated the goals it can (`n0`: `nobl` before it did). A
+    # goal it didn't state stays as a runtime check, so an operation that
+    # can fail is never taken as one that can't.
+    fn table_checks(ref self, span: Span, stops: [Stop], n0: int):
+        if self.spec or not self.live:
+            return
+        for st in stops:
+            match st:
+                case Stop.Always(c):
+                    self.remain_c(span, c)
+                case Stop.Goal(c):
+                    if self.nobl == n0:
+                        self.remain_c(span, c)
+                case Stop.Outside(_):
+                    pass
 
     fn call_user(ref self, id: int, recv: Option[Expr], args: [Arg], e: Expr) -> V:
         let sig = self.info.fns[id]
@@ -3871,11 +4137,19 @@ struct Vf:
             case None:
                 pass
         if 0 <= id < len(self.stops) and self.stops[id]:
-            self.stop_call(
-                e.span,
-                f"`{sig.name}()`",
-                f"`{sig.name}()` stops the program when there's no value: `match` on it and handle every case"
-            )
+            if self.rule != "":
+                self.stop_call(
+                    e.span,
+                    f"`{sig.name}()`",
+                    f"`{sig.name}()` stops the program when there's no value: `match` on it and handle every case"
+                )
+            else:
+                # a check like any other (the prover doesn't follow which
+                # variant a value is)
+                self.remain_c(e.span, Check.Unwrap)
+        # a `str` for C is NUL-terminated: one with a NUL byte inside stops the program
+        if sig.is_extern and any(p.ty == Ty.Str for p in sig.params):
+            self.remain_c(e.span, Check.NulByte)
         # mutable arguments may change what the callee's footprint says,
         # arbitrarily (subject to its `ensures`)
         for i, p in enumerate(sig.params):
