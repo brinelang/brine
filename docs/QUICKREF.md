@@ -6,7 +6,7 @@ Blocks use `:` plus 4-space indentation. Comments start with `#`.
 ## Programs and commands
 
 ```
-brine new hello && cd hello    # create a project (brine.toml, src/main.br, AGENTS.md)
+brine new hello && cd hello    # create a project (brine.toml, src/main.br, RULES.br, AGENTS.md)
 brine run                      # build + run          brine run file.br -- args
 brine check                    # type-check + prove   brine check --report
 brine check --typed            # also require a written type on every variable
@@ -196,8 +196,10 @@ print(p, p.energy())                 # Particle(pos=0.2, vel=2.0) 2.0
 An `invariant` in a struct is a fact about `self` that every value of the type
 keeps. It is proven where a value is built and where a `ref self` method
 returns (or uses `self` whole); everywhere else it is a known fact. Only the
-struct's own methods change its fields, through `self` (E0406), so build values
-from untrusted input behind a check:
+struct's own methods change the fields its invariants read, through `self`
+(E0406); other fields anyone can change. Inside a method, a loop that changes
+`self` only through its `ref self` methods (or fields no invariant reads) keeps
+the invariant. Build values from untrusted input behind a check:
 
 ```python
 struct Ring:
@@ -716,8 +718,10 @@ fn index_of(xs: [int], target: int) -> int:
 
 ## Rules: RULES.br, what the program promises
 
-`RULES.br` (next to the main file, or at the project root) says what the program
-must do. People write it; agents write the code that keeps it. **Every build,
+`RULES.br` says what the program must do: a project's (next to `brine.toml`) is
+for the main files in `src/`, and otherwise one next to the main file is. A rule
+about modules a program doesn't import isn't checked for that program, and a file
+elsewhere (`repros/`, `tools/`) has no rules. People write it; agents write the code that keeps it. **Every build,
 run, test and check proves every rule, or nothing is built.**
 
 ```python
@@ -751,9 +755,12 @@ rule "a sensor glitch can never crash the controller":
   and `extern` (C code); `none` allows none of them.
 * `brine rules approve` records the owner's approval in RULES.lock: a hash of
   each rule, of RULES.br's own definitions and of each file in `rules/`. An
-  approved rule or file that changes or goes away stops the build (E0613) until
-  it's approved again; a new rule only warns (W0003). Put RULES.br, `rules/` and
-  RULES.lock under CODEOWNERS, so only the owner can approve.
+  approved rule or file that changes or goes away (E0613) stops `--release`
+  builds, `brine rules` and CI (the `CI` environment variable is set, as GitHub
+  Actions and GitLab do) until it's approved again; dev builds, `check` and
+  `test` only warn, so the owner can draft rules. A new rule only warns (W0003).
+  Put RULES.br, `rules/` and RULES.lock under CODEOWNERS, so only the owner can
+  approve.
 * Imports of `rules.x` load `rules/x.br` next to RULES.br, from every module, so
   the code can use the owner's types (`Settings`) too.
 * `brine rules` lists every rule as proven or not and approved or not (`--json`

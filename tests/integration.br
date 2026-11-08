@@ -1104,11 +1104,28 @@ test "struct invariants are kept by every value":
         error_codes("tests/programs/invariant_errors.br")
         == ["E0609@6", "E0609@13", "E0609@24", "E0609@27"]
     )
-    # only the struct's methods change its fields
+    # only the struct's methods change the fields its invariants read
     assert (
         error_codes("tests/programs/invariant_fields.br")
-        == ["E0406@17", "E0406@18", "E0406@19", "E0406@20"]
+        == ["E0406@17", "E0406@18", "E0406@19", "E0406@20", "E0406@45", "E0406@46"]
     )
+    let fe = brine(["check", "tests/programs/invariant_fields.br"]).err
+    assert "`hi` is in an `invariant` of `Tagged`" in fe, fe
+    # a copy of `self` is a value of its own: nothing proves its invariant
+    let cp = scratch("copy_self") + "/c.br"
+    write(
+        cp,
+        "struct Acc:\n    items: [int]\n    invariant len(self.items) < 100\n\n    fn plus(self, x: int) -> int:\n        var s = self\n        if len(s.items) < 99:\n            s.items.push(x)\n        return len(s.items)\n\nfn main():\n    print(Acc(items=[1]).plus(3))\n"
+    )
+    assert error_codes(cp) == ["E0406@8"]
+    # a loop that changes `self` only through calls that prove the invariant
+    # keeps it; one that writes a field the invariant reads doesn't
+    let lp = brine(["check", "tests/programs/invariant_loops.br"]).err
+    var at: [str] = []
+    for l in lp.lines():
+        if "--> tests/programs/invariant_loops.br:" in l:
+            at.push(l.split(":")[1])
+    assert at == ["23", "27", "31"], lp
     let e = brine(["check", "tests/programs/invariant_errors.br"]).err
     assert "values the prover can't rule out: self.lo = 0, self.hi = 0, by = -1" in e, e
     assert "`self` is used here, where it might break the invariant" in e, e
@@ -1289,9 +1306,19 @@ test "spec-diff finds specs that promise less":
     assert "\"checks_before\":1,\"checks_after\":2" in o.out, o.out
     let t = brine(["spec-diff", f])
     assert "main.br:6:4: weaker: `clamp` no longer promises `lo <= result <= hi`" in t.out, t.all()
+    # and what it promises now
+    assert "main.br:6:4: note: `clamp` now promises `lo <= result`" in t.out, t.all()
+    assert "note: `bump` now promises `n >= 0` and `n > 0 or n == 0`" in t.out, t.all()
     assert "runtime checks left: 1 → 2 (+1 index bounds check)" in t.out, t.all()
     let bad = brine(["spec-diff", f, "--base", "nope"])
     assert bad.code == 2 and "could not read" in bad.err, bad.all()
+    assert "there is no revision `nope` in this repository" in bad.err, bad.all()
+    # a repository without commits has nothing to compare with yet
+    let e = scratch("specdiff-empty")
+    write(e + "/main.br", main)
+    git(e, ["init", "-q"])
+    let none = brine(["spec-diff", e + "/main.br"])
+    assert none.code == 2 and "the repository has no commits yet" in none.err, none.all()
 
 # `code@file:line` for each error and warning in `--json` output.
 fn diag_codes(o: Out) -> [str]:
@@ -1350,9 +1377,12 @@ test "rules are proven on every build":
     write(pump, pump_src(true, ""))
     let ok = brine(["run", d])
     assert ok.code == 0 and ok.out == "3000\n", ok.all()
-    assert "Proven 4 rules from RULES.br; the 2 functions they cover can't stop the program" in ok.err, ok.err
+    assert "Proven 4 rules from " in ok.err, ok.err
+    assert "RULES.br; the 2 functions they cover can't stop the program" in ok.err, ok.err
     assert "4 rules not approved yet" in ok.err, ok.err
     # approval: then no warning, and every change to what was approved stops the build
+    let ci = {"CI": "true"}
+    let dev = {"CI": "false"}
     let a = brine(["rules", "approve", d])
     assert a.code == 0 and file_exists(d + "/RULES.lock"), a.all()
     let lock = text(d + "/RULES.lock")
@@ -1371,13 +1401,23 @@ test "rules are proven on every build":
         )
     )
     assert brine(["check", d]).code == 0
-    # weakening a rule, or the definitions it uses
+    # weakening a rule, or the definitions it uses: CI and release builds stop,
+    # dev builds warn, so the owner can draft
     write(d + "/RULES.br", PUMP_RULES.replace("0 <= d <= p.settings.max_bolus", "0 <= d"))
-    let weak = brine(["check", d, "--json"])
-    assert diag_codes(weak) == ["E0613@RULES.br:4"], weak.out
+    let weak = brine_env(["check", d, "--json"], ci)
+    assert weak.code == 1 and diag_codes(weak) == ["E0613@RULES.br:4"], weak.out
+    let draft = brine_env(["check", d, "--json"], dev)
+    assert draft.code == 0 and diag_codes(draft) == ["E0613@RULES.br:4"], draft.out
+    assert "\"severity\":\"warning\"" in draft.out, draft.out
+    let rel = brine_env(["build", "--release", d], dev)
+    assert rel.code == 1 and "error[E0613]" in rel.err, rel.all()
+    let dev_run = brine_env(["run", d], dev)
+    assert dev_run.code == 0 and "warning[E0613]" in dev_run.err, dev_run.all()
+    let rep = brine_env(["rules", d], dev)
+    assert rep.code == 1 and "release builds and CI fail" in rep.out, rep.all()
     write(d + "/RULES.br", PUMP_RULES)
     write(d + "/rules/dosing.br", PUMP_SETTINGS.replace("<= 25_000", "<= 250_000"))
-    let vocab = brine(["check", d, "--json"])
+    let vocab = brine_env(["check", d, "--json"], ci)
     assert diag_codes(vocab) == ["E0613@dosing.br:1"], vocab.out
     write(d + "/rules/dosing.br", PUMP_SETTINGS)
     # a removed rule; a new one only warns
@@ -1385,7 +1425,7 @@ test "rules are proven on every build":
         d + "/RULES.br",
         PUMP_RULES.replace("\nrule \"dosing has no effects\":\n    effects pump: none\n", "")
     )
-    let gone = brine(["check", d])
+    let gone = brine_env(["check", d], ci)
     assert (
         gone.code == 1 and "approved rule \"dosing has no effects\" is gone" in gone.err
     ), gone.all()
@@ -1393,7 +1433,7 @@ test "rules are proven on every build":
     match os.remove_file(d + "/RULES.br"):
         case _:
             pass
-    let none = brine(["check", d])
+    let none = brine_env(["check", d], ci)
     assert none.code == 1 and "E0613" in none.err and "approves 4 rules" in none.err, none.all()
     write(d + "/RULES.br", PUMP_RULES)
     write(d + "/src/RULES.br", "rule \"nothing\":\n    prove 1 == 1\n")
@@ -1446,6 +1486,115 @@ test "rules are proven on every build":
     ), js.all()
     # `brine test` doesn't run rules
     assert brine(["test", d]).code == 0
+
+test "rules next to a main file, outside a project":
+    let d = scratch("folder-rules")
+    write(
+        d + "/lib.br",
+        "fn twice(x: int) -> int:\n    if x > 1000 or x < -1000:\n        return 0\n    return 2 * x\n"
+    )
+    write(d + "/main.br", "import lib\n\nfn main():\n    print(lib.twice(2))\n")
+    write(d + "/RULES.br", "rule \"lib is pure\":\n    effects lib: none\n")
+    match os.set_cwd(d):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+    # `brine check main.br` applies them, so `brine rules approve` finds them too
+    assert "W0003" in brine(["check", "main.br"]).err
+    let a = brine(["rules", "approve"])
+    assert a.code == 0 and file_exists("RULES.lock"), a.all()
+    assert "W0003" not in brine(["check", "main.br"]).err
+    let r = brine(["rules"])
+    assert r.code == 0 and "done: yes" in r.out, r.all()
+
+test "rules are for the programs built from what they name":
+    let d = scratch("scoped-rules")
+    for sub in ["/src", "/repros", "/tools", "/tools/deep"]:
+        match os.make_dir(d + sub):
+            case _:
+                pass
+    write(d + "/brine.toml", "[package]\nname = \"scoped\"\n")
+    write(
+        d + "/src/lib.br",
+        "fn twice(x: int) -> int:\n    if x > 1000 or x < -1000:\n        return 0\n    return 2 * x\n"
+    )
+    write(d + "/src/main.br", "import lib\n\nfn main():\n    print(lib.twice(2))\n")
+    write(
+        d + "/RULES.br",
+        "rule \"main only prints\":\n    effects main: console\n\nrule \"lib is pure\":\n    effects lib: none\n"
+    )
+    # reads a file, which `main` may not: but these aren't the project's main file
+    let reads = "fn main():\n    print(file_exists(\"RULES.br\"))\n"
+    write(d + "/src/tool.br", reads)
+    write(d + "/repros/x.br", reads)
+    write(d + "/tools/deep/y.br", reads)
+    let main = brine(["build", d])
+    assert main.code == 0, main.all()
+    assert "Proven 2 rules from " in main.err, main.err
+    let tool = brine(["build", d + "/src/tool.br"])
+    assert tool.code == 0, tool.all()
+    assert (
+        "2 rules from " in tool.err
+        and "not checked: they are about modules this program doesn't use" in tool.err
+    ), tool.err
+    for f in ["/repros/x.br", "/tools/deep/y.br"]:
+        let o = brine(["build", d + f])
+        assert o.code == 0 and "RULES.br" not in o.err, o.all()
+    let report = brine(["rules", d + "/src/tool.br"])
+    assert (
+        "- not used" in report.out and "every rule this program uses is proven" in report.out
+    ), report.all()
+    # the project's main file is still held to them, also from inside src/
+    write(
+        d + "/src/main.br",
+        "import lib\n\nfn main():\n    print(file_exists(\"x\"), lib.twice(2))\n"
+    )
+    assert "E0612@" in " ".join(diag_codes(brine(["check", d, "--json"]))), "main isn't checked"
+    match os.set_cwd(d + "/src"):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+    let inside = brine(["check", "main.br"])
+    assert inside.code == 1 and "E0612" in inside.err, inside.all()
+    # a folder without a project: another main file next to RULES.br is its own program
+    let f = scratch("scoped-folder")
+    write(f + "/main.br", "fn main():\n    print(1)\n")
+    write(f + "/other.br", reads)
+    write(f + "/RULES.br", "rule \"main only prints\":\n    effects main: console\n")
+    assert brine(["build", f + "/main.br"]).code == 0
+    let other = brine(["build", f + "/other.br"])
+    assert other.code == 0 and "not checked" in other.err, other.all()
+
+test "rules read well to their owner":
+    let d = scratch("rules-words")
+    write(
+        d + "/main.br",
+        "fn half(x: u64) -> Option[u64]:\n    if x % 2 == 1:\n        return None\n    return Some(x / 2)\n\nfn main():\n    print(half(u64(4)).is_some())\n"
+    )
+    let header = "rule \"halves are never more than what they halve, for any of these three inputs\" for x: u64, y: f64, z: i32:"
+    write(
+        d + "/RULES.br",
+        "from main import half\n\n"
+        + header
+        + "\n    match half(x):\n        case Some(h):\n            prove h <= x\n        case None:\n            pass\n"
+    )
+    # `fmt` keeps a long header whole: it has no brackets of its own to break in
+    let f = brine(["fmt", d + "/RULES.br"])
+    assert f.code == 0 and header + "\n" in text(d + "/RULES.br"), f.all() + text(d + "/RULES.br")
+    let ex = brine(["rules", d + "/main.br", "--explain"])
+    assert "(a u64) and every y (an f64) and every z (an i32)" in ex.out, ex.all()
+    # an empty branch says so, and the closing sentence is about the whole rule
+    assert (
+        "     when half(x) is None:\n       nothing more is required.\n   Nothing this runs can stop the program." in ex.out
+    ), ex.out
+    # approving counts rules and vocabulary files apart
+    let a = brine(["rules", "approve", d])
+    assert "Approved 1 rule (1 new) and 1 vocabulary file (1 new)" in a.err, a.all()
+    write(d + "/RULES.br", "from main import half\n")
+    let b = brine(["rules", "approve", d])
+    assert "Approved 0 rules (1 removed) and 1 vocabulary file (unchanged)" in b.err, b.all()
 
 test "malformed rules":
     let d = scratch("bad-rules")
@@ -1899,7 +2048,8 @@ test "every error code is explained":
         "E0706",
         "E0707",
         "W0002",
-        "W0003"
+        "W0003",
+        "W0004"
     ]:
         let o = brine(["explain", code])
         assert o.code == 0, f"no explanation for {code}"
@@ -2124,9 +2274,27 @@ test "a new project works out of the box":
         case Err(e):
             panic(e)
     assert brine(["new", "app"]).code == 0
-    for f in ["brine.toml", "src/main.br", "RULES.br", "RULES.lock", "AGENTS.md", ".gitignore"]:
+    for f in ["brine.toml", "src/main.br", "RULES.br", "AGENTS.md", ".gitignore"]:
         assert file_exists("app/" + f), f"missing {f}"
-    match os.set_cwd("app"):
+    # nobody approved anything yet, and it's inside this repository's work tree
+    assert not file_exists("app/RULES.lock") and not file_exists("app/.git")
+    assert brine(["new", "../x"]).code != 0
+    # inside it, `brine init` takes the existing main.br and .gitignore as they are
+    match os.make_dir("own"):
+        case _:
+            pass
+    write("own/main.br", "fn main():\n    print(\"mine\")\n")
+    write("own/.gitignore", "notes.txt\n")
+    match os.set_cwd("own"):
+        case Ok(_):
+            pass
+        case Err(e1):
+            panic(e1)
+    assert brine(["init"]).code == 0
+    assert not file_exists("src/main.br") and "main = \"main.br\"" in text("brine.toml")
+    assert text(".gitignore") == "notes.txt\n/target\n", text(".gitignore")
+    assert brine(["run", "-q"]).out == "mine\n"
+    match os.set_cwd("../app"):
         case Ok(_):
             pass
         case Err(e2):
@@ -2136,10 +2304,43 @@ test "a new project works out of the box":
     assert brine(["test"]).code == 0
     assert brine(["check"]).code == 0
     assert brine(["fmt", "--check"]).code == 0
-    # its starter rule is proven and approved, with no warnings
+    # it starts with no rules, and no warnings
     let r = brine(["rules"])
-    assert r.code == 0 and "1 rule, 1 proven" in r.out and "done: yes" in r.out, r.all()
+    assert r.code == 0 and "0 rules" in r.out and "done: yes" in r.out, r.all()
     assert "warning" not in brine(["check"]).err
+    # so the first program that reads a file just works
+    write(
+        "src/main.br",
+        "fn main():\n    print(len(read_file(\"brine.toml\").unwrap_or(\"\")) > 0)\n"
+    )
+    let rd = brine(["run", "-q"])
+    assert rd.code == 0 and rd.out == "true\n", rd.all()
+    # a rule that forbids it says how to allow it, and AGENTS.md lets the owner's
+    # agent approve what the owner asked for
+    write("RULES.br", "rule \"the program only uses the console\":\n    effects main: console\n")
+    let fx = brine(["check"])
+    assert (
+        fx.code == 1
+        and "add `files` to this rule in RULES.br (`effects main: console, files`)" in fx.err
+    ), fx.all()
+    assert (
+        "never run" not in text("AGENTS.md")
+        and "only run `brine rules approve` when" in text("AGENTS.md")
+    )
+    # brine.toml keys brine doesn't read are typos, mostly
+    write(
+        "brine.toml",
+        "[package]\nname = \"app\"\n\n[check]\nprovn = true\n\n[chek]\ntyped = true\n"
+    )
+    let tw = brine(["check", "--json"])
+    assert (
+        "\"code\":\"W0004\"" in tw.out
+        and "did you mean `proven`?" in tw.out
+        and "did you mean `check`?" in tw.out
+    ), tw.out
+    write("brine.toml", "[package]\nname = '../evil'\n")
+    let bad = brine(["check"])
+    assert bad.code != 0 and "isn't a valid name" in bad.err, bad.all()
 
 # Each tests/syntax/NAME.br has NAME.lex and NAME.parse: the expected `brine lex`
 # and `brine parse` output (regenerate with `brine run tests/update_syntax.br`).

@@ -411,7 +411,9 @@ struct Checker:
                         c_name=f"{mm}__{s.name}",
                         origin=None,
                         invariants=[],
-                        inv_self=-1
+                        inv_self=-1,
+                        inv_fields=[],
+                        inv_all=false
                     )
                 )
                 self.info.struct_names.push(s.name)
@@ -1345,6 +1347,12 @@ struct Checker:
         self.in_spec = false
         self.info.structs[sid].invariants = s.invariants
         self.info.structs[sid].inv_self = id
+        var fields: [str] = []
+        var all = false
+        for e in s.invariants:
+            inv_reads(e, id, ref fields, ref all)
+        self.info.structs[sid].inv_fields = fields
+        self.info.structs[sid].inv_all = all
         self.locals = []
 
     fn check_fn(ref self, ref f: FnDecl, params: [ParamSig], ret: Ty):
@@ -3255,25 +3263,29 @@ struct Checker:
             for blk in stmt_blocks(s):
                 self.bad_uses_block(blk, w, lv, k, cs, ref bad)
 
-    # A struct with an `invariant` is changed only by its own methods, through
-    # `self`: the invariant is proven when they return, and holds everywhere else.
+    # The fields a struct's `invariant`s read are changed only by its own
+    # methods, through `self`: the invariants are proven when they return, and
+    # hold everywhere else. Other fields can't break them, so anyone may change
+    # those. (A copy of `self` is a value of its own, checked by nobody.)
     fn inv_fields_ok(ref self, e: Expr) -> bool:
         var cur = e
         while true:
             match cur.kind:
-                case ExprKind.Field(b, _, _):
+                case ExprKind.Field(b, name, _):
                     match b.ty:
                         case Ty.Struct(sid):
                             let own = (
                                 local_of(b) == Some(self.own_self.0) and self.own_self.1 == sid
                             )
-                            if len(self.info.structs[sid].invariants) > 0 and not own:
+                            let si = self.info.structs[sid]
+                            let kept = si.inv_all or name in si.inv_fields
+                            if len(si.invariants) > 0 and kept and not own:
                                 let n = self.info.struct_names[sid]
                                 self.err(
                                     diag.error("E0406", f"cannot change a field of `{n}` here")
-                                    .label(e.span, f"`{n}` has an `invariant`")
+                                    .label(e.span, f"`{name}` is in an `invariant` of `{n}`")
                                     .note(
-                                        f"only the methods of `{n}` change its fields, through `self`, so the invariant can be proven when they return"
+                                        f"only the methods of `{n}` change the fields its invariants read, through `self`, so the invariants can be proven when they return"
                                     )
                                     .with_help(
                                         f"call a `ref self` method of `{n}` that makes the change, or assign a whole new value: `x = {n}(...)`"
@@ -7335,7 +7347,9 @@ struct Checker:
                     c_name=c_name,
                     origin=origin,
                     invariants=[],
-                    inv_self=-1
+                    inv_self=-1,
+                    inv_fields=[],
+                    inv_all=false
                 )
             )
             self.info.struct_names.push(display)
@@ -8996,3 +9010,22 @@ fn compare_const(op: CmpOp, a: ConstVal, b: ConstVal) -> Option[bool]:
             return Some(c > 0)
         case CmpOp.Ge:
             return Some(c >= 0)
+
+# The fields of `self` (the local `me`) an invariant reads, into `fields`;
+# `all` when it uses `self` other than through a field (`self.ok()`, `f(self)`),
+# which can read any of them.
+fn inv_reads(e: Expr, me: int, ref fields: [str], ref all: bool):
+    match e.kind:
+        case ExprKind.Field(b, name, _):
+            if local_of(b) == Some(me):
+                if name not in fields:
+                    fields.push(name)
+                return
+        case ExprKind.Ident(_):
+            if local_of(e) == Some(me):
+                all = true
+            return
+        case _:
+            pass
+    for c in children(e):
+        inv_reads(c, me, ref fields, ref all)

@@ -86,7 +86,13 @@ fn read_at(path: str, rev: Option[str]) -> Result[str, str]:
                     let code = os.wait(p)
                     let (out, err) = os.output(p)
                     if code != 0:
-                        let why = err.strip().split("\n")[0].replace("fatal: ", "")
+                        var why = err.strip().split("\n")[0].replace("fatal: ", "")
+                        if why.starts_with("invalid object name"):
+                            why = (
+                                "the repository has no commits yet: commit once, or pass `--base <rev>`"
+                                if r == "HEAD"
+                                else f"there is no revision `{r}` in this repository"
+                            )
                         return Err(
                             f"could not read `{display_path(path)}` from git revision `{r}`: {why}"
                         )
@@ -169,18 +175,72 @@ fn parse_found(f: Found) -> (Module, [Diag]):
 fn load(entry: str, ref sm: SourceMap, ref diags: [Diag]) -> Option[Program]:
     return load_from(entry, on_disk(), ref sm, ref diags)
 
-# Where the rules are for a program whose main file is in `root`: the project
-# root above it (`src/main.br`) first, so a RULES.br next to the main file can't
-# stand in for the project's, else next to the main file. A RULES.lock counts,
-# so deleting RULES.br doesn't drop the approved rules. "" if nowhere.
-fn rules_dir(root0: str) -> str:
-    let root = root0 if root0 != "" else "."
-    let up = up_dir(root)
-    if file_exists(project.join(up, "brine.toml")) and has_rules(up):
-        return up
-    if has_rules(root):
-        return root
-    return ""
+# The rules that apply to a program.
+struct RulesAt:
+    # RULES.br's directory, "" if no rules apply
+    dir: str
+    # the program's main file is the one the rules call `main`
+    is_main: bool
+
+# Which rules apply to the program whose main file is `entry`. A project's
+# RULES.br (next to brine.toml) applies to the programs in its source folder,
+# the main file's (`src/`): their modules are the ones it names. Otherwise a
+# RULES.br next to the main file applies. A file elsewhere (`repros/`, `tools/`)
+# is a program of its own. A RULES.lock counts, so deleting RULES.br doesn't drop
+# the approved rules.
+fn rules_at(entry: str) -> RulesAt:
+    let d = dir_or_dot(dir_of(entry))
+    # (found from the absolute path, so that `..` works from inside `src/`)
+    match project.find(os.abs_path(d).unwrap_or(d)):
+        case Some(Ok(pr)):
+            let root = relative_to(d, dir_or_dot(pr.root))
+            # the main file from `root` too: a `\\?\` path can't mix separators
+            var main = pr.main
+            if main.starts_with(pr.root):
+                var i = len(pr.root)
+                while i < len(main) and (main[i] == "/" or main[i] == "\\"):
+                    i += 1
+                main = project.join(root, main[i:])
+            if has_rules(root):
+                if same_dir(d, dir_or_dot(dir_of(main))):
+                    return RulesAt(dir=root, is_main=is_rules_main(entry, main))
+                if same_dir(d, root):
+                    # a file at the root of a project whose code is elsewhere
+                    return RulesAt(dir="", is_main=false)
+        case _:
+            pass
+    if has_rules(d):
+        return RulesAt(dir=d, is_main=is_rules_main(entry, project.join(d, "main.br")))
+    return RulesAt(dir="", is_main=false)
+
+# `main` in RULES.br is `main_file`'s module; any main file is, when there's
+# no such file.
+fn is_rules_main(entry: str, main_file: str) -> bool:
+    return not os.is_file(main_file) or same_dir(entry, main_file)
+
+# `root`, a directory above `d`, written from `d` (`..`) when it can be.
+fn relative_to(d: str, root: str) -> str:
+    var x = d
+    for _ in 0..32:
+        if same_dir(x, root):
+            return x
+        x = up_dir(x)
+    return root
+
+fn dir_or_dot(d: str) -> str:
+    return d if d != "" else "."
+
+# The same file or directory, however it's written.
+fn same_dir(a: str, b: str) -> bool:
+    let x = os.abs_path(a).unwrap_or(a)
+    let y = os.abs_path(b).unwrap_or(b)
+    return trim_sep(plain_path(x)) == trim_sep(plain_path(y))
+
+fn trim_sep(p: str) -> str:
+    var n = len(p)
+    while n > 1 and (p[n - 1] == "\\" or p[n - 1] == "/"):
+        n -= 1
+    return p[:n]
 
 fn has_rules(d: str) -> bool:
     return file_exists(project.join(d, rules.FILE)) or file_exists(project.join(d, rules.LOCK))
@@ -190,7 +250,7 @@ fn load_from(entry: str, at: Source, ref sm: SourceMap, ref diags: [Diag]) -> Op
     if root == "":
         root = "."
     # RULES.br, and its vocabulary in rules/ (also when other modules import it)
-    let rdir = rules_dir(root)
+    let rdir = rules_at(entry).dir
     var text = ""
     match read_at(entry, at.rev):
         case Ok(t):
@@ -307,6 +367,23 @@ struct FrontOpts:
     typed: bool
     # every runtime check must be proven away (E0607)
     proven: bool
+    # rule changes nobody approved are errors (E0613), not warnings: release
+    # builds, CI and `brine rules`
+    strict_rules: bool
+
+# Running in CI: `CI` is set to anything but "", "0" or "false" (GitHub
+# Actions, GitLab, CircleCI, Travis and Buildkite all set `CI=true`).
+fn in_ci() -> bool:
+    match getenv("CI"):
+        case Some(v):
+            let x = v.strip().lower()
+            return x != "" and x != "0" and x != "false"
+        case None:
+            return false
+
+# Whether unapproved rule changes stop a build with this profile.
+fn strict_rules(release: bool) -> bool:
+    return release or in_ci()
 
 fn main_ok(info: ProgramInfo, id: int) -> bool:
     if id < 0 or id >= len(info.fns):
@@ -390,7 +467,17 @@ fn frontend_at(entry: str, opts: FrontOpts, at: Source) -> Frontend:
     var stops: [bool] = []
     if not has_errors(diags):
         let main_dir = dir_of(entry)
-        let r = rules.analyze(prog, info, sm, rules_dir(main_dir), main_dir, at.rev.is_none())
+        let ra = rules_at(entry)
+        let r = rules.analyze(
+            prog,
+            info,
+            sm,
+            ra.dir,
+            ra.is_main,
+            main_dir,
+            at.rev.is_none(),
+            opts.strict_rules
+        )
         covered = r.covered
         stops = r.stops
         rl = Some(r)

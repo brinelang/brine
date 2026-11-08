@@ -6,7 +6,8 @@
 #   must not be able to stop the program; `verify.br` proves that (E0607, E0611);
 # - `effects m: ...` lines, decided over the whole call graph (E0612);
 # - RULES.lock: a rule or vocabulary file that changed or went away since an
-#   owner approved it blocks the build until they approve again (E0613).
+#   owner approved it stops release builds and CI until they approve again,
+#   and warns in dev builds (E0613).
 from diag import Span, Diag, SourceMap, best_match, json_str
 import diag
 from types import CallRes, Builtin, OsOp
@@ -235,6 +236,10 @@ struct RuleSummary:
     # "approved", "new" or "changed"
     approval: str
     has_body: bool
+    # false when it is only about modules this program doesn't use (a second
+    # main file next to the project's): nothing of it is checked here but its
+    # approval
+    applies: bool
 
 struct Rules:
     # there is a RULES.br
@@ -339,16 +344,87 @@ fn unknown_target(prog: Program, path: [str], span: Span, what: str) -> Diag:
             )
     return d
 
+# The modules the main file imports, directly or not (not counting what only
+# RULES.br imports), and the owner's definitions, by module index.
+fn program_modules(prog: Program, rmi: int) -> [bool]:
+    var seen: [bool] = [false] * len(prog.modules)
+    if len(seen) == 0:
+        return seen
+    seen[0] = true
+    var todo = [0]
+    var i = 0
+    while i < len(todo):
+        let mi = todo[i]
+        i += 1
+        if mi >= len(prog.import_targets):
+            continue
+        for t in prog.import_targets[mi]:
+            if 0 <= t < len(seen) and not seen[t] and t != rmi:
+                seen[t] = true
+                todo.push(t)
+    # and the owner's own definitions
+    for mi, m in enumerate(prog.modules):
+        if mi == rmi or m.name.starts_with(VOCAB + "."):
+            seen[mi] = true
+    return seen
+
+# What a rule's `effects` or `proven` line names, in this program.
+struct Target:
+    # the functions, those of modules this program uses
+    ids: [int]
+    # names a module that exists but this program doesn't use: the line is
+    # about another program in the same folder
+    elsewhere: bool
+
+fn scoped(
+    prog: Program,
+    rmi: int,
+    path: [str],
+    used: [bool],
+    fn_mod: [int],
+    is_main: bool,
+    main_dir: str
+) -> Target:
+    let ids = resolve(prog, rmi, path)
+    var out: [int] = []
+    for id in ids:
+        let mi = fn_mod[id] if 0 <= id < len(fn_mod) else -1
+        # `main` is the rules' main file, which isn't this program's
+        if mi < 0 or (used[mi] and (mi != 0 or is_main)):
+            out.push(id)
+    if len(ids) > 0:
+        return Target(ids=out, elsewhere=len(out) == 0)
+    # not loaded: a module file of this folder that this program doesn't import?
+    if path[0] == "main":
+        return Target(ids=[], elsewhere=not is_main)
+    for k in 0..len(path):
+        let mod = path[:len(path) - k]
+        if len(mod) == 0:
+            break
+        if module_index(prog, ".".join(mod)) >= 0:
+            # the module is here and the function isn't: a typo
+            return Target(ids=[], elsewhere=false)
+        var p = main_dir if main_dir != "" else "."
+        for seg in mod:
+            p = project.join(p, seg)
+        if os.is_file(p + ".br"):
+            return Target(ids=[], elsewhere=true)
+    return Target(ids=[], elsewhere=false)
+
 # Everything a build needs to know about the rules. `dir`: where RULES.br is;
-# `main_dir`: the main file's; `lock`: compare with RULES.lock (not for a git
-# revision).
+# `is_main`: the program's main file is the one the rules call `main`;
+# `main_dir`: the main file's directory; `lock`: compare with RULES.lock (not
+# for a git revision); `strict`: changes nobody approved are errors, not
+# warnings.
 fn analyze(
     prog: Program,
     info: ProgramInfo,
     sm: SourceMap,
     dir: str,
+    is_main: bool,
     main_dir: str,
-    lock: bool
+    lock: bool,
+    strict: bool
 ) -> Rules:
     let n = len(info.fns)
     var out = none_rules(n)
@@ -372,7 +448,7 @@ fn analyze(
                     diag.error("E0610", "a `rule` outside RULES.br")
                     .label(t.span, "this rule is never proven")
                     .note(
-                        "rules live in RULES.br, next to the main file or at the project root, where their owner reviews them"
+                        "rules live in RULES.br, at the project root or next to the main file, where their owner reviews them"
                     )
                     .with_help("move it to RULES.br")
                 )
@@ -387,7 +463,7 @@ fn analyze(
                 )
     if rmi < 0:
         if dir != "" and lock:
-            lock_without_rules(ref out, dir)
+            lock_without_rules(ref out, dir, strict)
         return out
     let here = main_dir if main_dir != "" else "."
     if here != dir and file_exists(project.join(here, FILE)):
@@ -404,8 +480,18 @@ fn analyze(
     out.names = g.names
     let kinds = effect_kinds()
     var seen: {str: Span} = {}
-    # effect lines are checked once the effects of every function are known
-    var lines: [(int, int)] = []
+    # what each function belongs to, and which modules this program uses
+    var fn_mod: [int] = [-1] * n
+    for mi, m in enumerate(prog.modules):
+        for f in m.fns:
+            if 0 <= f.id < n:
+                fn_mod[f.id] = mi
+    # the rules' own program uses what RULES.br imports too; another main file
+    # only what it imports itself
+    let used = [true] * len(prog.modules) if is_main else program_modules(prog, rmi)
+    # effect lines are checked once the effects of every function are known:
+    # (rule, line, the functions it names)
+    var lines: [(int, int, [int])] = []
     for ti, t in enumerate(prog.modules[rmi].tests):
         match t.rule:
             case Some(r):
@@ -441,14 +527,20 @@ fn analyze(
                 var sc = Scan(calls=[], effects=[], stops=false)
                 scan_block(t.body, info, ref sc)
                 var roots = sc.calls
+                # lines about modules this program doesn't use
+                var away = 0
                 for path, span in r.proven:
-                    let ids = resolve(prog, rmi, path)
-                    if len(ids) == 0:
+                    let tg = scoped(prog, rmi, path, used, fn_mod, is_main, main_dir)
+                    if tg.elsewhere:
+                        away += 1
+                    elif len(tg.ids) == 0:
                         out.diags.push(unknown_target(prog, path, span, "proven"))
-                    roots.extend(ids)
+                    roots.extend(tg.ids)
                 for li, e in enumerate(r.effects):
-                    let ids = resolve(prog, rmi, e.module)
-                    if len(ids) == 0:
+                    let tg = scoped(prog, rmi, e.module, used, fn_mod, is_main, main_dir)
+                    if tg.elsewhere:
+                        away += 1
+                    elif len(tg.ids) == 0:
                         out.diags.push(unknown_target(prog, e.module, e.span, "effects"))
                     for a in e.allowed:
                         if a == "none":
@@ -474,7 +566,8 @@ fn analyze(
                                         "the effects are " + ", ".join(kinds) + ", or `none`"
                                     )
                             out.diags.push(d)
-                    lines.push((ti, li))
+                    if len(tg.ids) > 0:
+                        lines.push((ti, li, tg.ids))
                 let covers = reach(g, roots)
                 var externs: [str] = []
                 for id in covers:
@@ -491,7 +584,8 @@ fn analyze(
                         covers=covers,
                         externs=externs,
                         approval="new",
-                        has_body=not empty
+                        has_body=not empty,
+                        applies=not empty or away < len(r.proven) + len(r.effects)
                     )
                 )
             case None:
@@ -499,7 +593,7 @@ fn analyze(
     if len(lines) > 0:
         out.diags.extend(check_effects(prog, info, g, rmi, lines))
     if lock:
-        lock_check(ref out, prog, sm)
+        lock_check(ref out, prog, sm, strict)
     return out
 
 fn check_effects(
@@ -507,7 +601,7 @@ fn check_effects(
     info: ProgramInfo,
     g: Graph,
     rmi: int,
-    lines: [(int, int)]
+    lines: [(int, int, [int])]
 ) -> [Diag]:
     let n = len(g.calls)
     # the kinds of effect each function has, itself or through what it calls
@@ -527,11 +621,10 @@ fn check_effects(
                         eff[id].push(k)
                         changed = true
     var diags: [Diag] = []
-    for ti, li in lines:
+    for ti, li, ids in lines:
         let t = prog.modules[rmi].tests[ti]
         let r = t.rule.unwrap_or(empty_info())
         let e = r.effects[li]
-        let ids = resolve(prog, rmi, e.module)
         var reported: [str] = []
         for id in ids:
             if id < 0 or id >= n:
@@ -551,9 +644,18 @@ fn check_effects(
                     d = d.note(f"`{path[0]}` calls `{what}` through " + " -> ".join(path[1:]))
                 else:
                     d = d.note(f"`{at}` calls `{what}`")
-                d = d.with_help(
-                    f"move the call to `{what}` out of `{shown}` (pass its result in as a parameter), or ask the rule's owner to allow `{k}`"
-                )
+                if shown == "main" or at == "main.main":
+                    # nothing calls `main`, so nothing can pass the result in
+                    var more = e.allowed if e.allowed != ["none"] else []
+                    more.push(k)
+                    let line = ", ".join(more)
+                    d = d.with_help(
+                        f"`main` can't take this as a parameter: if the rule's owner agrees, add `{k}` to this rule in RULES.br (`effects {shown}: {line}`)"
+                    )
+                else:
+                    d = d.with_help(
+                        f"move the call to `{what}` out of `{shown}` (pass its result in as a parameter), or ask the rule's owner to allow `{k}`"
+                    )
                 # point at the call itself
                 for fid in 0..n:
                     if g.names[fid] == at and g.has_body[fid]:
@@ -689,9 +791,19 @@ fn find_entry(es: [Entry], kind: str, name: str) -> Option[Entry]:
             return Some(e)
     return None
 
+# E0613: an error in release builds, in CI and for `brine rules`; a warning in
+# dev builds, so the owner can draft rules without approving every step.
+fn unapproved(strict: bool, msg: str) -> Diag:
+    if strict:
+        return diag.error("E0613", msg)
+    return diag.warning(
+        "E0613",
+        msg
+    ).note("a warning in dev builds; `--release` builds, `brine rules` and CI (`CI` set) stop here")
+
 # Compare with RULES.lock: what's approved, new, changed and removed.
 # RULES.lock without RULES.br: every approved rule is gone.
-fn lock_without_rules(ref out: Rules, dir: str):
+fn lock_without_rules(ref out: Rules, dir: str, strict: bool):
     var approved: [Entry] = []
     match read_file(project.join(dir, LOCK)):
         case Ok(t):
@@ -706,7 +818,7 @@ fn lock_without_rules(ref out: Rules, dir: str):
     let n = len(out.removed)
     let what = "1 rule" if n == 1 else f"{n} rules"
     out.diags.push(
-        diag.error("E0613", f"RULES.br is gone, and RULES.lock approves {what} it had")
+        unapproved(strict, f"RULES.br is gone, and RULES.lock approves {what} it had")
         .note(
             f"{project.join(dir, LOCK)} records what an owner approved; without RULES.br none of it is proven"
         )
@@ -715,7 +827,7 @@ fn lock_without_rules(ref out: Rules, dir: str):
         )
     )
 
-fn lock_check(ref out: Rules, prog: Program, sm: SourceMap):
+fn lock_check(ref out: Rules, prog: Program, sm: SourceMap, strict: bool):
     let rmi = module_index(prog, MODULE)
     let src = sm.file(out.file).text
     let now = entries(src, prog.modules[rmi], out.dir)
@@ -740,7 +852,7 @@ fn lock_check(ref out: Rules, prog: Program, sm: SourceMap):
                 else:
                     out.rules[ri].approval = "changed"
                     out.diags.push(
-                        diag.error("E0613", f"rule \"{name}\" changed since it was approved")
+                        unapproved(strict, f"rule \"{name}\" changed since it was approved")
                         .label(out.rules[ri].head, "not the approved version")
                         .note(why)
                         .with_help(fix)
@@ -751,7 +863,7 @@ fn lock_check(ref out: Rules, prog: Program, sm: SourceMap):
         if a.kind == "rule" and find_entry(now, "rule", a.name).is_none():
             out.removed.push(a.name)
             out.diags.push(
-                diag.error("E0613", f"approved rule \"{a.name}\" is gone from RULES.br")
+                unapproved(strict, f"approved rule \"{a.name}\" is gone from RULES.br")
                 .label(top, "RULES.br")
                 .note(why)
                 .with_help(fix)
@@ -775,7 +887,7 @@ fn lock_check(ref out: Rules, prog: Program, sm: SourceMap):
                         else f"`{e.name}` changed"
                     )
                     out.diags.push(
-                        diag.error("E0613", f"{what} since the rules were approved")
+                        unapproved(strict, f"{what} since the rules were approved")
                         .label(at, "the rules' vocabulary")
                         .note(
                             "what rules say depends on these definitions, so they're locked with the rules"
@@ -789,7 +901,7 @@ fn lock_check(ref out: Rules, prog: Program, sm: SourceMap):
         if a.kind == "file" and find_entry(now, "file", a.name).is_none():
             out.vocab.push((a.name, "removed"))
             out.diags.push(
-                diag.error("E0613", f"`{a.name}` is gone since the rules were approved")
+                unapproved(strict, f"`{a.name}` is gone since the rules were approved")
                 .label(top, "RULES.br")
                 .note(why)
                 .with_help(fix)
@@ -1018,6 +1130,10 @@ struct English:
                 return self.text(e.span)
 
     fn block(ref self, depth: int, b: Block):
+        # `pass`: a branch that asks nothing (not a dangling `when`)
+        if all(is_pass(s) for s in b.stmts):
+            self.line(depth, "nothing more is required.")
+            return
         for s in b.stmts:
             self.stmt(depth, s)
 
@@ -1085,6 +1201,9 @@ fn is_pass(s: Stmt) -> bool:
             return false
 
 fn article(s: str) -> str:
+    # a type like `u64` is read letter by letter: "a u64", "an f64", "an i32"
+    if len(s) > 1 and "0123456789".contains(s[1]):
+        return ("an " if "aefhilmnorsx".contains(s[0].lower()) else "a ") + s
     if len(s) > 0 and "aeiouAEIOU".contains(s[0]):
         return "an " + s
     return "a " + s
@@ -1135,7 +1254,8 @@ fn explain(src: str, m: Module) -> [str]:
                 if has_body:
                     en.line(0, head if head != "" else "Always:")
                     en.block(1, t.body)
-                    en.line(1, "Nothing this runs can stop the program.")
+                    # about the whole rule, not its last branch
+                    en.line(0, "Nothing this runs can stop the program.")
                 for e in r.effects:
                     let shown = ".".join(e.module)
                     if e.allowed == ["none"]:

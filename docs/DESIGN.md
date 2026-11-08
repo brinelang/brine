@@ -90,7 +90,8 @@ Two kinds of obligations:
   * `invariant` — loop invariant; proven on entry and preserved by every iteration.
     In a struct, a fact about `self` that every value of the type keeps: proven where
     a value is built and where a `ref self` method returns or uses `self` whole, and
-    assumed everywhere else. Only the struct's methods change its fields (E0406), and
+    assumed everywhere else. Only the struct's methods change the fields it reads
+    (E0406; other fields can't break it, so anyone may change those), and
     values can't alias, so nothing else can break it in between ("parse, don't
     validate": check input once when building the value, and the fact travels with it).
   * `prove e` — an inline claim.
@@ -163,16 +164,33 @@ Right and wrong are what it says; the agent's job is code that keeps it.
 * **Approval.** `brine rules approve` writes RULES.lock: a hash (of the tokens, so
   comments and layout don't count) of each rule, of RULES.br's other definitions,
   and of each file in `rules/`, where definitions that decide what's right live.
-  An approved rule or file that changed stops the build (E0613); a new one warns
-  (W0003). The lock is what a CODEOWNERS entry protects; agents never run approve.
+  An approved rule or file that changed (E0613) stops release builds,
+  `brine rules` and CI (detected by the `CI` environment variable); dev builds,
+  `check` and `test` warn, so drafting a rule doesn't take an approval per
+  edit. A new rule warns (W0003). The lock is what a CODEOWNERS entry protects;
+  agents run approve only when the owner asked for the rule change.
   Any change counts, even one that makes a rule stronger: deciding that a change
   only strengthens a rule needs spec-diff over whole rule bodies (planned).
+* **Which programs a RULES.br is for.** A project's (next to `brine.toml`) is for
+  the main files in its source folder (`src/`); otherwise a RULES.br next to the
+  main file is. A file elsewhere in the project (`repros/`, `tools/`) is a program
+  of its own, with no rules. Within a program, a line about a module it doesn't
+  import (a second main file's `effects main: ...`, a library only another program
+  uses) isn't checked: rules are about the modules a program is built from, not
+  the folder it is in. The build line says which RULES.br it proved.
 * What it can't promise: termination (a rule holds whenever its code returns),
   memory and stack exhaustion, and `extern fn` C code, which is trusted.
 
 **[DECISION]** New rules only warn (W0003), even with no lock yet, so a project
 builds while its owner is still writing rules. Approval protects what was agreed,
 not what is being drafted.
+
+**[DECISION]** An approved rule that changed (E0613) is an error where it guards
+what ships: `--release` builds, `brine rules` (and `--receipt`) and CI, detected by
+the `CI` environment variable (anything but `""`, `0` or `false`). Dev builds,
+`check` and `test` warn, since there the owner is often the one editing the rules,
+and an approval per edit while drafting makes approving routine. CI is where
+CODEOWNERS and the lock meet, so a weakened rule still can't be merged.
 
 ### 2.3 Parallelism
 
@@ -420,7 +438,7 @@ from what brine knows that C doesn't (no aliasing, proven-away checks, race-free
 
 | Command | Purpose |
 |---|---|
-| `brine new <name>` / `brine init` | Create a project (`brine.toml`, `src/main.br`, `AGENTS.md`, `README.md`, `.gitignore`, a starter `RULES.br` and its `RULES.lock`). |
+| `brine new <name>` / `brine init` | Create a project (`brine.toml`, `src/main.br`, `AGENTS.md`, `README.md`, `.gitignore`, and a `RULES.br` with no rules yet, so nothing is approved), and a git repository unless it is inside one. `init` keeps an existing `main.br` as the main file and adds `/target` to an existing `.gitignore`. |
 | `brine run [file] [--ranks N] [--threads N] [-- args]` | Build and run. |
 | `brine build [--release\|--debug] [--emit-c]` | Build a native binary into `target/`. |
 | `brine check [--report] [--typed] [--proven]` | Type-check + verify, no codegen. Fastest feedback loop. `--typed` (or `typed = true` under `[check]` in brine.toml) requires a written type on every variable; `--proven` (or `proven = true`) requires every runtime check to be proven away. |
@@ -435,6 +453,11 @@ from what brine knows that C doesn't (no aliasing, proven-away checks, race-free
 
 Global flags: `--json` (machine-readable diagnostics, one JSON object per line),
 `--color auto|always|never`, `--quiet`.
+
+`brine.toml` has `[package]` (`name`, which names the executable, so it is
+letters, digits, `_` and `-`, and `version`), `[build]` (`main`, default
+`src/main.br`) and `[check]` (`typed`, `proven`). A key or section brine doesn't
+read is a warning (W0004), so a typo like `provn = true` doesn't go unnoticed.
 
 ### Diagnostic codes
 

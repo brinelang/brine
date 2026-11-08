@@ -964,6 +964,7 @@ fn new_vf(
         own_self=-1,
         own_sid=-1,
         own_ref=false,
+        own_kept=false,
         skip_inv=false,
         rule="",
         in_rule=false,
@@ -1016,6 +1017,8 @@ struct Vf:
     own_self: int
     own_sid: int
     own_ref: bool
+    # a loop keeps the invariant of `self` (see `own_inv_kept`)
+    own_kept: bool
     # `fresh_val` makes a value that may break its invariant (`self`, havocked)
     skip_inv: bool
     # the rule this code is, or that covers it ("" if none)
@@ -2319,9 +2322,52 @@ struct Vf:
     fn havoc(ref self, body: Block):
         var effs: [Eff] = []
         effs_block(body, self.info, ref effs)
-        self.havoc_mods(resolve_effs(effs, self.fps))
+        self.havoc_effs(effs)
 
-    # Forget what code that runs an unknown number of times may change.
+    # Forget what code that runs an unknown number of times may change: `effs`.
+    fn havoc_effs(ref self, effs: [Eff]):
+        self.own_kept = self.own_inv_kept(effs)
+        self.havoc_mods(resolve_effs(effs, self.fps))
+        self.own_kept = false
+
+    # Whether a loop that changes `self` (a method's, which may break its
+    # invariant in between) only through `effs` keeps the invariant: it holds
+    # before the loop, and each change keeps it. A call that takes `self`
+    # whole by `ref` proves it when it returns; a field no invariant reads
+    # can't break it.
+    fn own_inv_kept(ref self, effs: [Eff]) -> bool:
+        if self.own_self < 0 or not self.live:
+            return false
+        let si = self.info.structs[self.own_sid]
+        var any = false
+        for f in effs:
+            if f.root != self.own_self:
+                continue
+            any = true
+            if len(f.path) > 0:
+                let k = f.path[0]
+                if (
+                    0 <= k < len(si.fields)
+                    and not si.inv_all
+                    and si.fields[k].0 not in si.inv_fields
+                ):
+                    continue
+                return false
+            if not (0 <= f.callee < len(self.info.fns)):
+                return false
+            let ps = self.info.fns[f.callee].params
+            if not (0 <= f.param < len(ps)) or not ps[f.param].by_ref:
+                return false
+            if ps[f.param].ty != Ty.Struct(self.own_sid):
+                return false
+        if not any:
+            return false
+        let v = self.lookup(self.own_self, self.local_ty(self.own_self))
+        for g in self.inv_facts(self.own_sid, v):
+            if not self.holds(g):
+                return false
+        return true
+
     fn havoc_mods(ref self, mods: {int: [[int]]}):
         let na = len(self.atom_names)
         self.havoc_paths(mods)
@@ -2342,7 +2388,7 @@ struct Vf:
                         nv = self.havoc_at(nv, p, self.local_ty(id), self.local_name(id))
                     self.skip_inv = false
                     # only a method's `self` breaks its invariant in between
-                    if id != self.own_self:
+                    if id != self.own_self or self.own_kept:
                         match self.local_ty(id):
                             case Ty.Struct(sid):
                                 self.assume_inv(sid, nv)
@@ -2470,7 +2516,7 @@ struct Vf:
         effs_block(body, self.info, ref effs)
         effs_expr(cond, self.info, ref effs)
         let starts = self.mono_starts(body, Some(cond))
-        self.havoc_mods(resolve_effs(effs, self.fps))
+        self.havoc_effs(effs)
         self.mono_facts(starts)
         for inv in invs:
             let f = self.spec_cond(inv)
@@ -3663,7 +3709,7 @@ struct Vf:
                 effs_expr(fl, self.info, ref effs)
             case None:
                 pass
-        self.havoc_mods(resolve_effs(effs, self.fps))
+        self.havoc_effs(effs)
         let head = self.cur()
         let s = self.begin_assume(F.and_(extra))
         self.bind(local, v)

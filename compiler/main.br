@@ -83,11 +83,17 @@ fn usage(cmd: str) -> Option[str]:
             "Usage: brine new <name>",
             "",
             "Create a project in ./<name>: brine.toml, src/main.br, RULES.br (what the",
-            "program promises, proven on every build) and RULES.lock, AGENTS.md,",
-            "README.md and .gitignore."
+            "program promises, proven on every build; it starts with no rules),",
+            "AGENTS.md, README.md and .gitignore, and a git repository unless it is",
+            "inside one already."
         ]
     elif cmd == "init":
-        ls = ["Usage: brine init", "", "Create a project in the current directory, named after it."]
+        ls = [
+            "Usage: brine init",
+            "",
+            "Create a project in the current directory, named after it. A main.br",
+            "there stays the main file, and an existing .gitignore gets `/target`."
+        ]
     elif cmd == "run":
         ls = [
             "Usage: brine run [file | folder] [options] [-- program arguments]",
@@ -526,7 +532,23 @@ struct Target:
                     driver.out_name(p, plat)
                 )
 
-fn resolve(file: Option[str]) -> Result[Target, str]:
+# W0004: keys and sections in brine.toml that brine doesn't read (typos, mostly).
+fn toml_warnings(g: G, pr: project.Project):
+    if len(pr.unknown) == 0:
+        return
+    var sm = SourceMap.new()
+    let f = sm.add(display_path(project.join(pr.root, "brine.toml")), pr.toml)
+    var ds: [Diag] = []
+    for lo, hi, msg, help in pr.unknown:
+        ds.push(
+            diag.warning("W0004", msg)
+            .label(diag.Span(file=f, lo=lo, hi=hi), "not read")
+            .note("brine ignores it, so it changes nothing")
+            .with_help(help)
+        )
+    g.diag_list(ds, sm)
+
+fn resolve(g: G, file: Option[str]) -> Result[Target, str]:
     match file:
         case Some(f):
             if os.is_dir(f):
@@ -553,6 +575,7 @@ fn resolve(file: Option[str]) -> Result[Target, str]:
                     )
                 match project.find(f):
                     case Some(Ok(pr)):
+                        toml_warnings(g, pr)
                         return Ok(
                             Target(
                                 entry=pr.main,
@@ -583,6 +606,7 @@ fn resolve(file: Option[str]) -> Result[Target, str]:
     let cwd = os.cwd()
     match project.find(cwd):
         case Some(Ok(pr)):
+            toml_warnings(g, pr)
             if not file_exists(pr.main):
                 return Err("the project's main file `" + display_path(pr.main) + "` does not exist")
             var entry = pr.main
@@ -640,7 +664,13 @@ fn build(
     let t0 = clock()
     let fe = driver.frontend(
         t.entry,
-        FrontOpts(verify=true, need_main=not tests, typed=t.typed, proven=t.proven)
+        FrontOpts(
+            verify=true,
+            need_main=not tests,
+            typed=t.typed,
+            proven=t.proven,
+            strict_rules=driver.strict_rules(profile == Profile.Release)
+        )
     )
     g.diags(fe)
     if fe.has_errors():
@@ -696,12 +726,10 @@ fn cmd_new(g: G, a: Args) -> Result[int, str]:
         return Err("usage: brine new <name>")
     let name = a.pos[0]
     if not project.valid_name(name):
-        return Err(
-            f"`{name}` is not a valid project name (use letters, digits, `_` and `-`, starting with a letter)"
-        )
+        return Err(f"`{name}` {project.NAME_RULE}")
     if file_exists(name):
         return Err(f"`{name}` already exists")
-    approve_new(name, project.create(name, name)?)?
+    project.create(name, name)?
     if g.json:
         print("{\"created\":" + json_str(name) + "}")
     else:
@@ -709,15 +737,6 @@ fn cmd_new(g: G, a: Args) -> Result[int, str]:
         if not g.quiet:
             eprint(f"\n    cd {name}\n    brine run\n")
     return Ok(0)
-
-# A new project's starter rules are approved by whoever made the project.
-fn approve_new(dir: str, made: [str]) -> Result[bool, str]:
-    if rules.FILE not in made or file_exists(project.join(dir, rules.LOCK)):
-        return Ok(false)
-    let src = read_file(project.join(dir, rules.FILE))?
-    let (m, _) = parser.parse_module(src, 0, rules.MODULE)
-    write_file(project.join(dir, rules.LOCK), rules.lock_text(rules.entries(src, m, dir)))?
-    return Ok(true)
 
 fn cmd_init(g: G, a: Args) -> Result[int, str]:
     a.check_flags([])?
@@ -730,9 +749,7 @@ fn cmd_init(g: G, a: Args) -> Result[int, str]:
         else:
             mapped += "_"
     let name = mapped if project.valid_name(mapped) else "app_" + mapped
-    var made = project.create(cwd, name)?
-    if approve_new(cwd, made)?:
-        made.push(rules.LOCK)
+    let made = project.create(cwd, name)?
     let list = ", ".join(made)
     g.status("Created", f"project `{name}` ({list})")
     return Ok(0)
@@ -740,7 +757,7 @@ fn cmd_init(g: G, a: Args) -> Result[int, str]:
 fn cmd_build(g: G, a: Args) -> Result[int, str]:
     a.check_flags(["--release", "--debug", "-o", "--emit-c", "--typed", "--proven", "--target"])?
     let plat = platform_of(a)?
-    let t = resolve(first_pos(a))?.typed_if(a)
+    let t = resolve(g, first_pos(a))?.typed_if(a)
     var out: Option[str] = None
     match a.val("-o"):
         case Some(o):
@@ -883,7 +900,7 @@ fn cmd_run(g: G, a: Args) -> Result[int, str]:
         return Err(
             "a web build runs in a browser: build it with `brine build --target web` and open its index.html"
         )
-    let t = resolve(first_pos(a))?.typed_if(a)
+    let t = resolve(g, first_pos(a))?.typed_if(a)
     var ranks = 1
     match a.val("--ranks"):
         case Some(v):
@@ -954,7 +971,7 @@ fn find_debugger() -> Option[str]:
 
 fn cmd_debug(g: G, a: Args) -> Result[int, str]:
     a.check_flags([])?
-    let t = resolve(first_pos(a))?
+    let t = resolve(g, first_pos(a))?
     var exe = ""
     match build(g, t, Profile.Debug, false, None, false, Platform.Host)?:
         case Some(x):
@@ -997,7 +1014,7 @@ fn cmd_debug(g: G, a: Args) -> Result[int, str]:
 
 fn cmd_spec_diff(g: G, a: Args) -> Result[int, str]:
     a.check_flags(["--base"])?
-    let t = resolve(first_pos(a))?
+    let t = resolve(g, first_pos(a))?
     let base = a.val("--base").unwrap_or("HEAD")
     let t0 = clock()
     let o = specdiff.run(t.entry, base)?
@@ -1040,11 +1057,14 @@ fn cmd_spec_diff(g: G, a: Args) -> Result[int, str]:
                     + json_str(f.loc)
                     + ",\"message\":"
                     + json_str(f.message())
+                    + (",\"note\":" + json_str(f.note) if f.note != "" else "")
                     + "}"
                 )
             else:
                 let col = c.red() if f.bad else (c.green() if what == "stronger" else "")
                 print(f"{f.loc}: {c.bold()}{col}{what}{c.reset()}: {f.message()}")
+                if f.note != "":
+                    print(f"{f.loc}: {c.bold()}note{c.reset()}: {f.note}")
     var before = -1
     var after = -1
     var kinds = ""
@@ -1095,11 +1115,17 @@ fn cmd_spec_diff(g: G, a: Args) -> Result[int, str]:
 
 fn cmd_check(g: G, a: Args) -> Result[int, str]:
     a.check_flags(["--report", "--typed", "--proven"])?
-    let t = resolve(first_pos(a))?.typed_if(a)
+    let t = resolve(g, first_pos(a))?.typed_if(a)
     let t0 = clock()
     let fe = driver.frontend(
         t.entry,
-        FrontOpts(verify=true, need_main=false, typed=t.typed, proven=t.proven)
+        FrontOpts(
+            verify=true,
+            need_main=false,
+            typed=t.typed,
+            proven=t.proven,
+            strict_rules=driver.in_ci()
+        )
     )
     g.diags(fe)
     if fe.has_errors():
@@ -1186,8 +1212,12 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
 fn rules_line(g: G, fe: Frontend):
     match fe.rules:
         case Some(rl):
-            let n = len(rl.rules)
-            if rl.present and n > 0:
+            var n = 0
+            for r in rl.rules:
+                if r.applies:
+                    n += 1
+            let away = len(rl.rules) - n
+            if rl.present and len(rl.rules) > 0:
                 var fns = 0
                 for id in 0..len(rl.covered):
                     if rl.covered[id] != "":
@@ -1197,7 +1227,16 @@ fn rules_line(g: G, fe: Frontend):
                     more = "; the function they cover can't stop the program"
                 elif fns > 1:
                     more = f"; the {fns} functions they cover can't stop the program"
-                g.status("Proven", f"{n} rule{plural(n)} from {rules.FILE}{more}")
+                let them = "it is" if away == 1 else "they are"
+                let unused = f"not checked: {them} about modules this program doesn't use"
+                # which RULES.br: it can be the project's, above the main file
+                let from = display_path(project.join(rl.dir, rules.FILE))
+                if n == 0:
+                    g.status("Rules", f"{away} rule{plural(away)} from {from} {unused}")
+                    return
+                if away > 0:
+                    more += f" ({away} other{plural(away)} {unused})"
+                g.status("Proven", f"{n} rule{plural(n)} from {from}{more}")
         case None:
             pass
 
@@ -1207,11 +1246,18 @@ fn cmd_rules(g: G, a: Args) -> Result[int, str]:
     let approve = len(pos) > 0 and pos[0] == "approve"
     if approve:
         pos = pos[1:]
-    let t = resolve(Some(pos[0]) if len(pos) > 0 else None)?.typed_if(a)
-    let dir = driver.rules_dir(driver.dir_of(t.entry))
+    var file: Option[str] = Some(pos[0]) if len(pos) > 0 else None
+    if file.is_none() and project.find(os.cwd()).is_none():
+        # RULES.br next to a main file, outside a project, as `brine check main.br` finds it
+        if approve and driver.has_rules("."):
+            return rules_approve(g, ".", rules.FILE)
+        if os.is_file("main.br"):
+            file = Some(".")
+    let t = resolve(g, file)?.typed_if(a)
+    let dir = driver.rules_at(t.entry).dir
     if dir == "":
         return Err(
-            "no RULES.br next to the main file or at the project root: write one (see `brine guide`, \"Rules\")"
+            f"no RULES.br applies to `{display_path(t.entry)}`: a project's RULES.br is for the main files in its source folder (`src/`), and otherwise one next to the main file is (see `brine guide`, \"Rules\")"
         )
     let path = project.join(dir, rules.FILE)
     if approve:
@@ -1232,7 +1278,7 @@ fn cmd_rules(g: G, a: Args) -> Result[int, str]:
         return Ok(0)
     let fe = driver.frontend(
         t.entry,
-        FrontOpts(verify=true, need_main=false, typed=t.typed, proven=t.proven)
+        FrontOpts(verify=true, need_main=false, typed=t.typed, proven=t.proven, strict_rules=true)
     )
     if not g.json:
         g.diags(fe)
@@ -1268,7 +1314,9 @@ fn rules_base(dir: str, rev: Option[str]) -> Result[Option[(str, [rules.Entry])]
 fn rules_done(fe: Frontend) -> bool:
     return fe.report.is_some() and not fe.has_errors()
 
-fn rule_status(fe: Frontend, probs: [int]) -> str:
+fn rule_status(fe: Frontend, r: rules.RuleSummary, probs: [int]) -> str:
+    if not r.applies:
+        return "not used"
     if fe.report.is_none():
         return "unchecked"
     return "proven" if len(probs) == 0 else "not proven"
@@ -1307,7 +1355,7 @@ fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.E
     let probs = rules.problems(rl, fe.diags)
     var proven = 0
     for ri in 0..len(rl.rules):
-        if rule_status(fe, probs[ri]) == "proven":
+        if rule_status(fe, rl.rules[ri], probs[ri]) == "proven":
             proven += 1
     var attributed: {int: bool} = {}
     for ps in probs:
@@ -1327,7 +1375,7 @@ fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.E
                 "{\"name\":"
                 + json_str(r.name)
                 + ",\"status\":"
-                + json_str(rule_status(fe, probs[ri]))
+                + json_str(rule_status(fe, rl.rules[ri], probs[ri]))
                 + ",\"approval\":"
                 + json_str(r.approval)
                 + ",\"location\":"
@@ -1370,12 +1418,14 @@ fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.E
     let n = len(rl.rules)
     print(f"{rules.FILE}: {n} rule{plural(n)}, {proven} proven")
     for ri, r in enumerate(rl.rules):
-        let st = rule_status(fe, probs[ri])
+        let st = rule_status(fe, rl.rules[ri], probs[ri])
         var mark = f"{c.green()}✓ proven     {c.reset()}"
         if st == "not proven":
             mark = f"{c.red()}✗ not proven {c.reset()}"
         elif st == "unchecked":
             mark = f"{c.yellow()}? unchecked  {c.reset()}"
+        elif st == "not used":
+            mark = f"{c.yellow()}- not used   {c.reset()}"
         var tag = ""
         if r.approval == "new":
             tag = f"  {c.yellow()}(not approved yet){c.reset()}"
@@ -1392,6 +1442,8 @@ fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.E
     for p, s in rl.vocab:
         if s == "changed" or s == "removed":
             print(f"  {c.red()}! vocabulary {c.reset()} {p} {s} since approval")
+    if n == 0:
+        print("  no rules yet: write the first one in RULES.br (`brine guide`, \"Rules\")")
     if not rl.locked and n > 0:
         print(
             f"  no {rules.LOCK} yet: the rules' owner runs `brine rules approve` once they agree with them"
@@ -1405,12 +1457,16 @@ fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.E
     )
     if other > 0:
         print(f"{other} other error{plural(other)} (above), outside the rules")
-    if done:
+    if done and any(not r.applies for r in rl.rules):
+        print("done: yes, every rule this program uses is proven")
+    elif done:
         print("done: yes, every rule is proven")
     elif fe.report.is_none():
         print("done: no, the program has errors, so the rules weren't proven")
     elif any(d.code == "E0613" for d in fe.diags):
-        print("done: no, the rules changed since their owner approved them, so `brine build` fails")
+        print(
+            "done: no, the rules changed since their owner approved them, so release builds and CI fail"
+        )
     else:
         print("done: no, so `brine build` fails")
     return 0 if done else 1
@@ -1420,7 +1476,7 @@ fn receipt(fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.Entry])]) ->
     let probs = rules.problems(rl, fe.diags)
     var proven = 0
     for ri in 0..len(rl.rules):
-        if rule_status(fe, probs[ri]) == "proven":
+        if rule_status(fe, rl.rules[ri], probs[ri]) == "proven":
             proven += 1
     let n = len(rl.rules)
     var o: [str] = []
@@ -1430,7 +1486,7 @@ fn receipt(fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.Entry])]) ->
     o.push("|---|---|---|")
     for ri, r in enumerate(rl.rules):
         let name = r.name.replace("|", "\\|")
-        o.push(f"| {name} | {rule_status(fe, probs[ri])} | {r.approval} |")
+        o.push(f"| {name} | {rule_status(fe, rl.rules[ri], probs[ri])} | {r.approval} |")
     for x in rl.removed:
         o.push(f"| {x} | removed | was approved |")
     o.push("")
@@ -1483,6 +1539,38 @@ fn receipt(fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.Entry])]) ->
     o.push(f"**Sources:** {src_hash}")
     return "\n".join(o) + "\n"
 
+# For the rules (or the vocabulary files) in the lock: how many there are now,
+# and how many are new, changed, removed and unchanged.
+fn approve_counts(now: [rules.Entry], old: [rules.Entry], rule: bool) -> [int]:
+    var c = [0, 0, 0, 0, 0]
+    for e in now:
+        if (e.kind == "rule") != rule:
+            continue
+        c[0] += 1
+        match rules.find_entry(old, e.kind, e.name):
+            case Some(o):
+                if o.hash == e.hash:
+                    c[4] += 1
+                else:
+                    c[2] += 1
+            case None:
+                c[1] += 1
+    for o in old:
+        if (o.kind == "rule") == rule and rules.find_entry(now, o.kind, o.name).is_none():
+            c[3] += 1
+    return c
+
+# "2 rules (1 new, 1 unchanged)", "1 vocabulary file (unchanged)"
+fn approve_part(c: [int], what: str) -> str:
+    var parts: [str] = []
+    for i, w in [(1, "new"), (2, "changed"), (3, "removed")]:
+        if c[i] > 0:
+            parts.push(f"{c[i]} {w}")
+    if c[4] > 0:
+        parts.push("unchanged" if len(parts) == 0 else f"{c[4]} unchanged")
+    let s = f"{c[0]} {what}{plural(c[0])}"
+    return s + " (" + ", ".join(parts) + ")" if len(parts) > 0 else s
+
 fn rules_approve(g: G, dir: str, path: str) -> Result[int, str]:
     let src = read_file(path)?
     let (m, ds) = parser.parse_module(src, 0, rules.MODULE)
@@ -1500,25 +1588,13 @@ fn rules_approve(g: G, dir: str, path: str) -> Result[int, str]:
         case Err(_):
             pass
     write_file(lp, rules.lock_text(now))?
-    var fresh = 0
-    var changed = 0
-    var same = 0
-    var nrules = 0
-    for e in now:
-        if e.kind == "rule":
-            nrules += 1
-        match rules.find_entry(old, e.kind, e.name):
-            case Some(o):
-                if o.hash == e.hash:
-                    same += 1
-                else:
-                    changed += 1
-            case None:
-                fresh += 1
-    var removed = 0
-    for o in old:
-        if rules.find_entry(now, o.kind, o.name).is_none():
-            removed += 1
+    # counted apart: a removed rule isn't a removed file
+    let rc = approve_counts(now, old, true)
+    let fc = approve_counts(now, old, false)
+    let nrules = rc[0]
+    let fresh = rc[1] + fc[1]
+    let changed = rc[2] + fc[2]
+    let removed = rc[3] + fc[3]
     if g.json:
         print(
             "{\"approved\":"
@@ -1527,10 +1603,9 @@ fn rules_approve(g: G, dir: str, path: str) -> Result[int, str]:
             + "}"
         )
     else:
-        let files = len(now) - nrules
         g.status(
             "Approved",
-            f"{nrules} rule{plural(nrules)} and {files} vocabulary file{plural(files)} ({fresh} new, {changed} changed, {removed} removed, {same} unchanged)"
+            approve_part(rc, "rule") + " and " + approve_part(fc, "vocabulary file")
         )
         g.status(
             "Wrote",
@@ -1599,7 +1674,7 @@ fn cmd_test(g: G, a: Args) -> Result[int, str]:
                 filter = Some(a.pos[1])
         else:
             filter = Some(f)
-    let t = resolve(file)?.typed_if(a)
+    let t = resolve(g, file)?.typed_if(a)
     let profile = Profile.Release if a.has("--release") else Profile.Dev
     var exe = ""
     match build(g, t, profile, true, None, false, plat)?:
@@ -1950,7 +2025,13 @@ fn cmd_emit_c(g: G, a: Args) -> Result[int, str]:
     let tests = a.has("--tests")
     let fe = driver.frontend(
         a.pos[0],
-        FrontOpts(verify=true, need_main=not tests, typed=false, proven=false)
+        FrontOpts(
+            verify=true,
+            need_main=not tests,
+            typed=false,
+            proven=false,
+            strict_rules=driver.strict_rules(a.has("--release"))
+        )
     )
     g.diags(fe)
     if fe.has_errors():
@@ -1969,7 +2050,13 @@ fn cmd_emit_ir(g: G, a: Args) -> Result[int, str]:
     let tests = a.has("--tests")
     let fe = driver.frontend(
         a.pos[0],
-        FrontOpts(verify=true, need_main=not tests, typed=false, proven=false)
+        FrontOpts(
+            verify=true,
+            need_main=not tests,
+            typed=false,
+            proven=false,
+            strict_rules=driver.strict_rules(a.has("--release"))
+        )
     )
     g.diags(fe)
     if fe.has_errors():
