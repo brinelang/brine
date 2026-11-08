@@ -894,6 +894,16 @@ fn in_range(l: Lin, k: IntTy) -> F:
         return F.B(ATOM_UNKNOWN, true)
     return F.and_([F.le(Lin.konst(k.min()), l), F.le(l, Lin.konst(k.max()))])
 
+# A goal that implies `in_range` (the same one below 128 bits). The prover's
+# arithmetic can't state the limits of `i128` and `u128`, so it proves the
+# value is within 2^126 of zero; the fact afterwards is still `in_range`.
+fn fits_goal(l: Lin, k: IntTy) -> F:
+    if k.bits() == 128:
+        let m: i128 = 85070591730234615865843651857942052864
+        let lo = Lin.konst(-m) if k.signed() else Lin.konst(0)
+        return F.and_([F.le(lo, l), F.le(l, Lin.konst(m))])
+    return in_range(l, k)
+
 # The value range of `k` as known facts. The prover's arithmetic is 128-bit,
 # too small to reason near the limits of `i128` and `u128`: it only knows
 # that a `u128` isn't negative (the solver drops bounds at i128's edges),
@@ -1685,6 +1695,11 @@ struct Vf:
     # Implicit (safety) obligation: proven => the runtime check is removed.
     # Either way the fact holds afterwards (it was proven or checked).
     fn implicit(ref self, span: Span, tag: int, goal: F, what: str):
+        self.implicit_as(span, tag, goal, goal, what, true)
+
+    # The same, where what holds afterwards is `fact`, which `goal` implies
+    # (`fits_goal`); `exact` as for `kept_x`.
+    fn implicit_as(ref self, span: Span, tag: int, goal: F, fact: F, what: str, exact: bool):
         if self.spec or not self.live:
             return
         self.nobl += 1
@@ -1696,10 +1711,10 @@ struct Vf:
                 self.given_up += 1
             self.failed[key(span, tag)] = true
             # (not when it gave up: showing it always fails would be harder)
-            if not limited and self.refuted(span, what, goal):
+            if exact and not limited and self.refuted(span, what, goal):
                 return
             self.remain(span, what, Some(goal))
-        self.assume(goal)
+        self.assume(fact)
 
     # A check whose goal is false in every state that reaches it stops the
     # program whenever it runs: an error (E0614), not a runtime check. The
@@ -1797,7 +1812,14 @@ struct Vf:
         let fits = in_range(l, k)
         match op:
             case BinOp.Add | BinOp.Sub | BinOp.Mul:
-                self.implicit(span, TAG_COMPOUND, fits, "overflow check")
+                self.implicit_as(
+                    span,
+                    TAG_COMPOUND,
+                    fits_goal(l, k),
+                    fits,
+                    "overflow check",
+                    k.bits() < 128
+                )
             case BinOp.Div:
                 self.implicit(span, TAG_COMPOUND, div_goal(op, a, b, k), "division check")
             case BinOp.Mod:
@@ -3610,6 +3632,15 @@ struct Vf:
                         pass
                 let v = self.bit_term(" >> ", k, a, b)
                 let ab = self.bounds(a)
+                if not k.signed():
+                    match b.is_const():
+                        case Some(c):
+                            let w = i128(k.bits()) - c
+                            if c > 0 and 0 <= w <= 126:
+                                let one: i128 = 1
+                                self.assume(F.le(v, Lin.konst((one << w) - one)))
+                        case None:
+                            pass
                 if nonneg(ab):
                     self.assume(F.ge(v))
                     self.assume(F.le(v, a))
@@ -3790,7 +3821,7 @@ struct Vf:
                     case (UnOp.Neg, Ty.Int(k)):
                         let l = self.as_int(v, x.ty)
                         let n = self.lin(l.neg(), self.name_of(e))
-                        self.kept(e.span, in_range(n, k), "overflow check")
+                        self.kept_fit(e.span, n, k, "overflow check")
                         return V.Int(n)
                     case (UnOp.Neg, Ty.Float(_)):
                         # exact: `below` and `above` trade places
@@ -4097,7 +4128,14 @@ struct Vf:
                     case V.Int(res):
                         let f = in_range(res, k)
                         if (op == BinOp.Add or op == BinOp.Sub or op == BinOp.Mul) and e.checked:
-                            self.implicit(e.span, TAG_ARITH, f, "overflow check")
+                            self.implicit_as(
+                                e.span,
+                                TAG_ARITH,
+                                fits_goal(res, k),
+                                f,
+                                "overflow check",
+                                k.bits() < 128
+                            )
                         elif not self.spec:
                             self.assume(f)
                     case _:
@@ -4463,7 +4501,14 @@ struct Vf:
                 let widens = k.signed() == src.signed() and k.bits() >= src.bits()
                 if widens or (k.signed() and not src.signed() and k.bits() > src.bits()):
                     return V.Int(l)
-                self.implicit(whole.span, TAG_CONV, in_range(l, k), "conversion check")
+                self.implicit_as(
+                    whole.span,
+                    TAG_CONV,
+                    fits_goal(l, k),
+                    in_range(l, k),
+                    "conversion check",
+                    k.bits() < 128
+                )
                 return V.Int(l)
             case (Ty.Int(k), Ty.Float(_), V.Flt(t, nan, _, _)):
                 # in range and not NaN: checked (past 64 bits, always at
@@ -4651,7 +4696,7 @@ struct Vf:
                             case None:
                                 pass
                         if k.signed():
-                            self.kept(e.span, in_range(r, k), "overflow check")
+                            self.kept_fit(e.span, r, k, "overflow check")
                         elif not self.spec:
                             self.assume(in_range(r, k))
                         return V.Int(r)
@@ -4737,6 +4782,29 @@ struct Vf:
                 let top: i128 = 1114111
                 self.assume(F.le(r, Lin.konst(top)))
                 return V.Int(r)
+            # exact where the exact result fits
+            case Builtin.Num(
+                NumM.WrappingAdd
+            ) | Builtin.Num(NumM.WrappingSub) | Builtin.Num(NumM.WrappingMul):
+                var y = V.Opaque
+                if len(vals) == 1:
+                    y = vals[0]
+                match (e.ty, rv, y):
+                    case (Ty.Int(k), V.Int(x), V.Int(yl)):
+                        var op = BinOp.Add
+                        if b == Builtin.Num(NumM.WrappingSub):
+                            op = BinOp.Sub
+                        elif b == Builtin.Num(NumM.WrappingMul):
+                            op = BinOp.Mul
+                        match self.arith_val(op, x, yl, k):
+                            case V.Int(r):
+                                if self.holds(fits_goal(r, k)):
+                                    return V.Int(r)
+                            case _:
+                                pass
+                    case _:
+                        pass
+                return self.fresh_val(e.ty, self.name_of(e))
             # a count of bits: between 0 and the receiver's width
             case Builtin.Num(
                 NumM.CountOnes
@@ -4847,10 +4915,15 @@ struct Vf:
     # `exact`: the goal is just what the check tests (not merely enough for
     # it), so failing it everywhere means the check always fails.
     fn kept_x(ref self, span: Span, goal: F, what: str, exact: bool):
-        self.kept_h(span, goal, what, exact, "")
+        self.kept_as(span, goal, goal, what, exact, "")
 
     # `help`: as for `remain_h`.
     fn kept_h(ref self, span: Span, goal: F, what: str, exact: bool, help: str):
+        self.kept_as(span, goal, goal, what, exact, help)
+
+    # The same, where what holds afterwards is `fact`, which `goal` implies
+    # (`fits_goal`).
+    fn kept_as(ref self, span: Span, goal: F, fact: F, what: str, exact: bool, help: str):
         if self.spec or not self.live:
             return
         self.nobl += 1
@@ -4860,7 +4933,11 @@ struct Vf:
             if exact and self.refuted(span, what, goal):
                 return
             self.remain_h(span, what, Some(goal), help)
-        self.assume(goal)
+        self.assume(fact)
+
+    # `l` fits in `k`: checked, proven where it can be.
+    fn kept_fit(ref self, span: Span, l: Lin, k: IntTy, what: str):
+        self.kept_as(span, fits_goal(l, k), in_range(l, k), what, k.bits() < 128, "")
 
     # The checks the table in checks.br lists for an operation, after the
     # verifier has stated the goals it can (`n0`: `nobl` before it did). A
@@ -5141,7 +5218,13 @@ fn f_key(f: F) -> Option[str]:
 # `a / b` and `a % b` don't fail: no division by zero, nor `MIN / -1`.
 fn div_goal(op: BinOp, a: Lin, b: Lin, k: IntTy) -> F:
     var g = [F.ne(b)]
-    if op == BinOp.Div and k.signed():
+    var minus_one = true
+    match b.is_const():
+        case Some(c):
+            minus_one = c == -1
+        case None:
+            pass
+    if op == BinOp.Div and k.signed() and minus_one:
         let am = a.sub(Lin.konst(k.min()))
         let b1 = b.add_c(1)
         g.push(F.or_([F.ne(am.unwrap_or(a)), F.ne(b1.unwrap_or(b))]))
