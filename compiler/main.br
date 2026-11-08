@@ -127,7 +127,10 @@ fn usage(cmd: str) -> Option[str]:
         ls = [
             "Usage: brine check [file | folder] [options]",
             "",
-            "Type-check and verify without building (fastest).",
+            "Type-check and verify without building (fastest). In a project, every .br",
+            "file next to the main file and below is checked, imported or not, and the",
+            "main file needs a `main`, as for `brine run`. A lone file without `main` is",
+            "checked as a module.",
             "",
             "Options:",
             "  --report            list every runtime check the prover could not remove",
@@ -669,6 +672,7 @@ fn build(
         FrontOpts(
             verify=true,
             need_main=not tests,
+            check_main=not tests,
             typed=t.typed,
             proven=t.proven,
             strict_rules=driver.strict_rules(profile == Profile.Release)
@@ -1180,23 +1184,79 @@ fn cmd_spec_diff(g: G, a: Args) -> Result[int, str]:
         g.status("Compared", f"{t.name} with {base} in {clock() - t0:.2f}s — {ch}")
     return Ok(1 if weaker > 0 else 0)
 
+# The .br files under `dir` as import paths (`a/b.br`: ["a", "b"]), but
+# not those whose names can't be imported.
+fn module_paths(dir: str, prefix: [str], ref out: [[str]]):
+    var names: [str] = []
+    match os.list_dir(dir):
+        case Ok(ns):
+            names = ns
+        case Err(_):
+            return
+    for name in names:
+        let p = project.join(dir, name)
+        var seg = name
+        let file = not os.is_dir(p)
+        if file:
+            if not name.ends_with(".br"):
+                continue
+            seg = name[:len(name) - 3]
+        elif name == "target" or name.starts_with("."):
+            continue
+        if seg == "" or seg[0].is_digit() or not all(lexer.is_ident_char(c) for c in seg.chars()):
+            continue
+        var path = prefix
+        path.push(seg)
+        if file:
+            out.push(path)
+        else:
+            module_paths(p, path, ref out)
+
 fn cmd_check(g: G, a: Args) -> Result[int, str]:
     a.check_flags(["--report", "--typed", "--proven"])?
     let t = resolve(g, first_pos(a))?.typed_if(a)
     let t0 = clock()
-    let fe = driver.frontend(
+    # A project's main file starts a program, as for `brine run`, and every
+    # file next to it and below is checked, imported or not. A lone file may
+    # be a module, but a `main` it has must be able to start a program.
+    let whole = t.root.is_some()
+    var at = driver.on_disk()
+    if whole:
+        var paths: [[str]] = []
+        module_paths(driver.dir_of(t.entry), [], ref paths)
+        let main_name = driver.file_stem(t.entry)
+        for p in paths:
+            if p == [main_name] or p == [rules.MODULE] or p[0] == rules.VOCAB:
+                continue
+            at.also.push(p)
+    let fe = driver.frontend_at(
         t.entry,
         FrontOpts(
             verify=true,
-            need_main=false,
+            need_main=whole,
+            check_main=true,
             typed=t.typed,
             proven=t.proven,
             strict_rules=driver.in_ci()
-        )
+        ),
+        at
     )
     g.diags(fe)
     if fe.has_errors():
         return Ok(1)
+    var files = 0
+    for f in fe.sm.files:
+        if f.path.ends_with(".br"):
+            files += 1
+    var has_main = true
+    match fe.prog:
+        case Some(prog):
+            has_main = any(
+                f.name == "main" and f.method_of.is_none()
+                for f in prog.modules[prog.main_module].fns
+            )
+        case None:
+            pass
     rules_line(g, fe)
     var proven = 0
     var remaining: [(diag.Span, str)] = []
@@ -1249,6 +1309,7 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
             + f"{len(remaining)}"
             + ",\"checks_always_fail\":"
             + f"{len(always)}"
+            + f",\"files\":{files},\"has_main\":{has_main}"
             + "}"
         )
     else:
@@ -1267,10 +1328,16 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
                 if len(always) == 1
                 else f"{len(always)} of them always fail"
             )
+        let what = f"{t.name} ({files} files)" if files > 1 else t.name
         g.status(
             "Checked",
-            f"{t.name} in {clock() - t0:.2f}s — {proven} runtime check{plural(proven)} proven unnecessary{run}, {left}{see}"
+            f"{what} in {clock() - t0:.2f}s — {proven} runtime check{plural(proven)} proven unnecessary{run}, {left}{see}"
         )
+        if not has_main:
+            g.status(
+                "Note",
+                f"{display_path(t.entry)} has no `main`: checked as a module, which `brine run` can't start"
+            )
     return Ok(0)
 
 # ================================================================ rules
@@ -1345,7 +1412,14 @@ fn cmd_rules(g: G, a: Args) -> Result[int, str]:
         return Ok(0)
     let fe = driver.frontend(
         t.entry,
-        FrontOpts(verify=true, need_main=false, typed=t.typed, proven=t.proven, strict_rules=true)
+        FrontOpts(
+            verify=true,
+            need_main=false,
+            check_main=false,
+            typed=t.typed,
+            proven=t.proven,
+            strict_rules=true
+        )
     )
     if not g.json:
         g.diags(fe)
@@ -2097,6 +2171,7 @@ fn cmd_emit_c(g: G, a: Args) -> Result[int, str]:
         FrontOpts(
             verify=true,
             need_main=not tests,
+            check_main=not tests,
             typed=false,
             proven=false,
             strict_rules=driver.strict_rules(a.has("--release"))
@@ -2122,6 +2197,7 @@ fn cmd_emit_ir(g: G, a: Args) -> Result[int, str]:
         FrontOpts(
             verify=true,
             need_main=not tests,
+            check_main=not tests,
             typed=false,
             proven=false,
             strict_rules=driver.strict_rules(a.has("--release"))

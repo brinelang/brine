@@ -69,13 +69,16 @@ fn strip_bom(text: str) -> str:
 
 # Where `load` reads a program from: the files on disk, or (`rev`) the files
 # as they are in a git revision. `extra` is more source for a module, by module
-# name: `brine spec-diff` adds functions to a program this way.
+# name: `brine spec-diff` adds functions to a program this way. `also` are
+# more modules (import paths) to load as if the main file imported them:
+# `brine check` checks a project's every file this way.
 struct Source:
     rev: Option[str]
     extra: {str: str}
+    also: [[str]]
 
 fn on_disk() -> Source:
-    return Source(rev=None, extra={})
+    return Source(rev=None, extra={}, also=[])
 
 fn read_at(path: str, rev: Option[str]) -> Result[str, str]:
     match rev:
@@ -314,6 +317,21 @@ fn load_from(entry: str, at: Source, ref sm: SourceMap, ref diags: [Diag]) -> Op
                         found.push(Found(name=name, src=None, file=prog.modules[i].file))
             prog.import_targets.push(targets)
             i += 1
+            if i == 1:
+                # after the main file's own imports, so they keep their numbers
+                for path in at.also:
+                    let name = module_name(path)
+                    if name in by_name:
+                        continue
+                    let p = module_file(root, path)
+                    match read_at(p, at.rev):
+                        case Ok(src):
+                            by_name[name] = first_new + len(found)
+                            found.push(
+                                Found(name=name, src=Some(src), file=sm.add(display_path(p), src))
+                            )
+                        case Err(e):
+                            diags.push(diag.error("E0701", e))
         let parsed = par [parse_found(f) for f in found]
         for pm in parsed:
             diags.extend(pm.1)
@@ -366,7 +384,10 @@ fn not_found(name: str, path: [str], span: Span, root: str, p: str) -> Diag:
 
 struct FrontOpts:
     verify: bool
+    # E0703 without a `main`
     need_main: bool
+    # E0706 for a `main` that can't start a program
+    check_main: bool
     # require a written type on every variable
     typed: bool
     # every runtime check must be proven away (E0607)
@@ -433,20 +454,20 @@ fn frontend_at(entry: str, opts: FrontOpts, at: Source) -> Frontend:
     diags.extend(ck.diags)
     t = phase_time(t, "check")
     let info = ck.info
-    if opts.need_main and not has_errors(diags):
+    if (opts.need_main or opts.check_main) and not has_errors(diags):
         let m = prog.modules[prog.main_module]
         var found = -1
         for i, f in enumerate(m.fns):
             if f.name == "main" and f.method_of.is_none():
                 found = i
                 break
-        if found < 0:
+        if found < 0 and opts.need_main:
             diags.push(
                 diag.error("E0703", "this program has no `main` function")
                 .label(Span(file=m.file, lo=0, hi=0), "add `fn main():` here")
                 .with_help("every program starts at `fn main():` in its main file")
             )
-        else:
+        elif found >= 0:
             let f = m.fns[found]
             if len(f.tparams) > 0 or not main_ok(info, f.id):
                 diags.push(
