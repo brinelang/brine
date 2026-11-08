@@ -1009,14 +1009,11 @@ fn compile_levels(
         case Code.Native(_):
             panic("compile links native objects itself")
     let prog_hash = fnv(" ".join(hashes) + rt_obj)
-    # a web folder is what gets deployed: keep the stamp out of it
-    var stamp = with_extension(out_exe, "brine-hash")
-    if plat == Platform.Web:
-        stamp = project.join(dir, f"web-{hex16(fnv(out_exe))}.brine-hash")
+    let stamp = stamp_path(out_exe, dir)
     if file_exists(out_exe):
         match read_file(stamp):
             case Ok(st):
-                if st.strip() == hex16(prog_hash):
+                if st.strip() == f"{hex16(prog_hash)} {file_hash(out_exe)}":
                     if plat == Platform.Web:
                         web_files(dest)?
                     return Ok(false)
@@ -1088,10 +1085,25 @@ fn compile_levels(
     phase_time(t, "link")
     if plat == Platform.Web:
         web_files(dest)?
-    match write_file(stamp, hex16(prog_hash)):
+    match write_file(stamp, f"{hex16(prog_hash)} {file_hash(out_exe)}"):
         case _:
             pass
     return Ok(true)
+
+# Where the hash of what an executable was built from is kept, to skip an
+# unchanged link: in the cache directory, not next to the executable, which
+# `-o` can put anywhere (and a web folder is what gets deployed). It holds the
+# hash of the executable too, since another brine may have replaced it since.
+fn stamp_path(out_exe: str, dir: str) -> str:
+    let abs = os.abs_path(out_exe).unwrap_or(out_exe)
+    return project.join(dir, f"out-{hex16(fnv(abs))}.brine-hash")
+
+fn file_hash(p: str) -> str:
+    match os.read_bytes(p):
+        case Ok(b):
+            return hex16(fnv_bytes(b))
+        case Err(_):
+            return "none"
 
 # Links a native object into an executable with brine's own linker: no C
 # compiler involved. Ok(true) if the executable changed.
@@ -1110,15 +1122,10 @@ fn link_native(o: ObjFile, out_exe: str) -> Result[bool, Diag]:
             b = x
         case Err(e):
             return Err(cc_failed("linking the program failed", e, ""))
-    let h = hex16(fnv_bytes(b))
-    let stamp = with_extension(out_exe, "brine-hash")
-    if file_exists(out_exe):
-        match read_file(stamp):
-            case Ok(st):
-                if st.strip() == h:
-                    return Ok(false)
-            case Err(_):
-                pass
+    # an executable that already has these bytes is left alone (and keeps its
+    # time), whoever wrote it
+    if file_exists(out_exe) and file_hash(out_exe) == hex16(fnv_bytes(b)):
+        return Ok(false)
     match project.parent(out_exe):
         case Some(d):
             if d != "":
@@ -1149,9 +1156,6 @@ fn link_native(o: ObjFile, out_exe: str) -> Result[bool, Diag]:
                 )
             )
     phase_time(t, "link")
-    match write_file(stamp, h):
-        case _:
-            pass
     return Ok(true)
 
 # The loader is ours and always current; the page is a starting point that

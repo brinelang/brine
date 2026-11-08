@@ -368,7 +368,8 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
 * **Caching:** objects are named by a hash of what they're made from. C output is
   split into one translation unit per core (by a hash of each function's name, each
   unit declaring only what it uses), compiled in parallel; an edit recompiles only
-  the units it touches. An unchanged program skips the link (`.brine-hash` stamp).
+  the units it touches. An unchanged program skips the link (a `.brine-hash` stamp in the
+  cache, never next to the `-o` output).
 * **CPU levels:** native x86-64 `--release` code checks the CPU once and runs its
   vector loops as SSE2, AVX2 or AVX-512 code. Through C, an x86-64 `--release`
   build compiles the program three times, for plain x86-64, x86-64-v3 (AVX2)
