@@ -83,6 +83,7 @@ const XOR = 6
 const CMP = 7
 
 # shift opcode extensions
+const ROL = 0
 const SHL = 4
 const SHR = 5
 const SAR = 7
@@ -656,11 +657,15 @@ struct X:
         self.rm(0, 1, (op << 3) | 3, r, m, 0)
 
     fn alu_ri(ref self, op: int, r: int, v: int):
+        self.alu_riw(op, r, v, 1)
+
+    # (w 0: the 32-bit form, which zero-extends its result)
+    fn alu_riw(ref self, op: int, r: int, v: int, w: int):
         if fits8(v):
-            self.rr(0, 1, 131, op, r)
+            self.rr(0, w, 131, op, r)
             self.b(v)
         else:
-            self.rr(0, 1, 129, op, r)
+            self.rr(0, w, 129, op, r)
             self.b32(v)
 
     # mov [m], imm of `size` bytes (8: a sign-extended imm32)
@@ -732,6 +737,13 @@ struct X:
 
     fn shift_i(ref self, ext: int, r: int, n: int):
         self.rr(0, 1, 193, ext, r)
+        self.b(n)
+
+    fn shift_clw(ref self, ext: int, r: int, w: int):
+        self.rr(0, w, 211, ext, r)
+
+    fn shift_iw(ref self, ext: int, r: int, n: int, w: int):
+        self.rr(0, w, 193, ext, r)
         self.b(n)
 
     # movsd / movss xmm, [m]
@@ -994,20 +1006,24 @@ struct X:
 
     # op r, v (r is never rcx)
     fn alu_v(ref self, op: int, r: int, v: int):
+        self.alu_vw(op, r, v, 1)
+
+    # (w 0: the 32-bit form, which zero-extends its result)
+    fn alu_vw(ref self, op: int, r: int, v: int, w: int):
         if op == CMP and self.imm(v) and self.fval[v] == 0:
             # test r, r: the same flags
-            self.rr(0, 1, 133, r, r)
+            self.rr(0, w, 133, r, r)
         elif self.imm(v):
-            self.alu_ri(op, r, self.fval[v])
+            self.alu_riw(op, r, self.fval[v], w)
         elif self.fold[v] == F_NONE and self.reg[v] >= 0:
-            self.alu_rr(op, r, self.reg[v])
+            self.rr(0, w, (op << 3) | 1, self.reg[v], r)
         elif self.fold[v] == F_NONE and self.hit(v):
-            self.alu_rr(op, r, self.creg)
+            self.rr(0, w, (op << 3) | 1, self.creg, r)
         elif self.inmem(v):
-            self.alu_rm(op, r, self.vm(v))
+            self.rm(0, w, (op << 3) | 3, r, self.vm(v), 0)
         else:
             self.ld(RCX, v)
-            self.alu_rr(op, r, RCX)
+            self.rr(0, w, (op << 3) | 1, RCX, r)
 
     # The memory at pointer vreg p plus n; may load p into r.
     fn addr(ref self, p: int, n: int, r: int) -> Mem:
@@ -3092,7 +3108,7 @@ struct X:
                         self.fst(fl_of(k), x.d, self.freg[x.a])
                     else:
                         self.set_v(x.d, x.a)
-            case Op.Add | Op.Sub | Op.Mul | Op.Div | Op.Rem | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
+            case Op.Add | Op.Sub | Op.Mul | Op.Div | Op.Rem | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr | Op.Rotl:
                 let k = self.vk[x.d]
                 if k.is_wide():
                     self.wide_bin(x)
@@ -3102,6 +3118,16 @@ struct X:
                     self.int_bin(x)
             case Op.Neg | Op.Not:
                 self.unary(x)
+            case Op.MulHi:
+                # mul / imul b: rdx = the high half of rax * b
+                let ext = 5 if self.vk[x.d].is_signed() else 4
+                self.ld(RAX, x.a)
+                if self.inmem(x.b):
+                    self.rm(0, 1, 247, ext, self.vm(x.b), 0)
+                else:
+                    let s = self.use(RCX, x.b)
+                    self.rr(0, 1, 247, ext, s)
+                self.st(RDX, x.d)
             case Op.Eq | Op.Ne | Op.Lt | Op.Le | Op.Gt | Op.Ge:
                 return self.compare(i, x)
             case Op.Conv:
@@ -3268,6 +3294,8 @@ struct X:
 
     fn int_bin(ref self, x: Inst):
         let k = self.vk[x.d]
+        # u32 arithmetic in 32-bit instructions, which zero-extend: no norm
+        let w = 0 if k == K.U32 else 1
         match x.op:
             case Op.Add | Op.Sub | Op.And | Op.Or | Op.Xor:
                 # b just computed (in the cache register) goes first when the
@@ -3300,8 +3328,8 @@ struct X:
                     op = OR
                 elif x.op == Op.Xor:
                     op = XOR
-                self.alu_v(op, r, x.b)
-                if op == ADD or op == SUB:
+                self.alu_vw(op, r, x.b, w)
+                if (op == ADD or op == SUB) and w == 1:
                     self.norm(r, k)
                 if r != RAX:
                     return
@@ -3310,8 +3338,9 @@ struct X:
                 var r = self.dst(x.d)
                 if x.b == x.d:
                     r = RAX
-                self.mul_in(r, x.a, x.b)
-                self.norm(r, k)
+                self.mul_inw(r, x.a, x.b, w)
+                if w == 1:
+                    self.norm(r, k)
                 if r != RAX:
                     return
             case Op.Div | Op.Rem:
@@ -3339,6 +3368,8 @@ struct X:
                 var ext = SHL
                 if x.op == Op.Shr:
                     ext = SAR if k.is_signed() else SHR
+                elif x.op == Op.Rotl:
+                    ext = ROL
                 if self.fold[x.b] == F_CONST:
                     # (just the next shift's count: straight into rcx)
                     let n = self.cur + 1
@@ -3352,16 +3383,18 @@ struct X:
                     ):
                         r = RCX
                     self.ld(r, x.a)
-                    self.shift_i(ext, r, self.fval[x.b] & 63)
+                    self.shift_iw(ext, r, self.fval[x.b] & (31 if w == 0 else 63), w)
                     if r == RCX:
+                        if ext == SHL and w == 1:
+                            self.norm(RCX, k)
                         self.st(RCX, x.d)
                         return
                 else:
                     # the count first: b may live in d's register
                     self.ld(RCX, x.b)
                     self.ld(r, x.a)
-                    self.shift_cl(ext, r)
-                if ext == SHL:
+                    self.shift_clw(ext, r, w)
+                if ext == SHL and w == 1:
                     self.norm(r, k)
                 if r != RAX:
                     return
@@ -3373,20 +3406,24 @@ struct X:
 
     # r = a * b (low 64 bits; r isn't b's register)
     fn mul_in(ref self, r: int, a: int, b: int):
+        self.mul_inw(r, a, b, 1)
+
+    # (w 0: the low 32 bits, zero-extended)
+    fn mul_inw(ref self, r: int, a: int, b: int, w: int):
         if self.imm(b):
             if self.inmem(a):
-                self.rm(0, 1, 105, r, self.vm(a), 4)
+                self.rm(0, w, 105, r, self.vm(a), 4)
             else:
                 let s = self.use(r, a)
-                self.rr(0, 1, 105, r, s)
+                self.rr(0, w, 105, r, s)
             self.b32(self.fval[b])
             return
         self.ld(r, a)
         if self.inmem(b):
-            self.rm(0, 1, 4015, r, self.vm(b), 0)
+            self.rm(0, w, 4015, r, self.vm(b), 0)
         else:
             let s = self.use(RCX, b)
-            self.rr(0, 1, 4015, r, s)
+            self.rr(0, w, 4015, r, s)
 
     fn float_bin(ref self, x: Inst):
         let k = self.vk[x.d]

@@ -1151,6 +1151,76 @@ fn simplify(ref sf: SF):
         entry.extend(sf.bs[0].code)
         sf.bs[0].code = entry
 
+# `(u << s) | (u >> (w - s))`, the shifts `rotate_left` and `rotate_right`
+# lower to (or the same written out) is one rotate: `Rotl` (rol / ror).
+# Unsigned 32- and 64-bit kinds. With constant counts that add up to w, `^`
+# and `+` combine them the same way (no bits overlap); with a variable count
+# (rotate_left's `s = n & (w - 1)` and `(w - s) & (w - 1)`) only `|` does,
+# since s can be 0.
+fn rotates(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var is_c = [false] * nv
+    var cv = [0] * nv
+    var db = [-1] * nv
+    var di = [-1] * nv
+    for bi, b in enumerate(sf.bs):
+        for i, x in enumerate(b.code):
+            if x.d < 0:
+                continue
+            db[x.d] = bi
+            di[x.d] = i
+            if x.op == Op.Const and tracked(sf.f.vk[x.d]):
+                is_c[x.d] = true
+                cv[x.d] = x.n
+    for bi in 0..len(sf.bs):
+        for i in 0..len(sf.bs[bi].code):
+            let x = sf.bs[bi].code[i]
+            if x.op != Op.Or and x.op != Op.Xor and x.op != Op.Add:
+                continue
+            let k = sf.f.vk[x.d]
+            if k != K.U32 and k != K.U64:
+                continue
+            let w = k.size() * 8
+            for flip in [false, true]:
+                let p = x.b if flip else x.a
+                let q = x.a if flip else x.b
+                if db[p] < 0 or db[q] < 0:
+                    continue
+                let l = sf.bs[db[p]].code[di[p]]
+                let r = sf.bs[db[q]].code[di[q]]
+                if l.op != Op.Shl or r.op != Op.Shr or l.a != r.a or sf.f.vk[l.a] != k:
+                    continue
+                if sf.f.vk[p] != k or sf.f.vk[q] != k:
+                    continue
+                var ok = false
+                if is_c[l.b] and is_c[r.b]:
+                    ok = cv[l.b] > 0 and cv[l.b] < w and cv[l.b] + cv[r.b] == w
+                elif x.op == Op.Or:
+                    ok = (
+                        rot_pair(sf, db, di, is_c, cv, l.b, r.b, w)
+                        or rot_pair(sf, db, di, is_c, cv, r.b, l.b, w)
+                    )
+                if ok:
+                    sf.bs[bi].code[i] = mk(Op.Rotl, x.d, l.a, l.b, -1, 0)
+                    break
+
+# Is t `(w - s) & (w - 1)`?
+fn rot_pair(sf: SF, db: [int], di: [int], is_c: [bool], cv: [int], s: int, t: int, w: int) -> bool:
+    if db[t] < 0:
+        return false
+    let m = sf.bs[db[t]].code[di[t]]
+    if m.op != Op.And:
+        return false
+    var sub = -1
+    if is_c[m.b] and cv[m.b] == w - 1:
+        sub = m.a
+    elif is_c[m.a] and cv[m.a] == w - 1:
+        sub = m.b
+    if sub < 0 or db[sub] < 0:
+        return false
+    let y = sf.bs[db[sub]].code[di[sub]]
+    return y.op == Op.Sub and is_c[y.a] and cv[y.a] == w and y.b == s
+
 # Loads and stores through `p = elem q + c * n` with a constant c (field and
 # fixed-index addresses) use q and an offset instead, so the address needs no
 # register and alias analysis sees the base.
@@ -1463,6 +1533,80 @@ fn wide_halves(ref sf: SF):
                 code.push(y)
         sf.bs[b].code = code
 
+# A product of two 64-bit integers made 128-bit and only cut back to 64 bits
+# or less, as it is (the low half) or after a shift right by 64 (and maybe an
+# `& (2^64 - 1)`: the high half): a 64-bit multiplication, or a `MulHi`. Both
+# operands zero-extended (unsigned) or both sign-extended (signed).
+fn wide_muls(ref sf: SF):
+    let nv = len(sf.f.vk)
+    var db = [-1] * nv
+    var di = [-1] * nv
+    for bi, b in enumerate(sf.bs):
+        for i, x in enumerate(b.code):
+            if x.d >= 0:
+                db[x.d] = bi
+                di[x.d] = i
+    for bi in 0..len(sf.bs):
+        var code: [Inst] = []
+        var changed = false
+        for x in sf.bs[bi].code:
+            if x.op != Op.Conv or not narrow_int(sf.f.vk[x.d]) or not sf.f.vk[x.a].is_wide():
+                code.push(x)
+                continue
+            var s = x.a
+            var hi = false
+            let y = def_of(sf, db, di, s)
+            if y.op == Op.And and y.d >= 0:
+                if wide_k(sf, db, di, y.b, -1, -1):
+                    s = y.a
+                elif wide_k(sf, db, di, y.a, -1, -1):
+                    s = y.b
+            let z = def_of(sf, db, di, s)
+            if z.op == Op.Shr and z.d >= 0 and wide_k(sf, db, di, z.b, 64, 0):
+                s = z.a
+                hi = true
+            let m = def_of(sf, db, di, s)
+            if m.op != Op.Mul or m.d < 0 or not sf.f.vk[m.d].is_wide():
+                code.push(x)
+                continue
+            let ca = def_of(sf, db, di, m.a)
+            let cb = def_of(sf, db, di, m.b)
+            if ca.op != Op.Conv or cb.op != Op.Conv or ca.d < 0 or cb.d < 0:
+                code.push(x)
+                continue
+            let ka = sf.f.vk[ca.a]
+            let kb = sf.f.vk[cb.a]
+            let k64 = K.I64 if ka.is_signed() else K.U64
+            if (ka != K.U64 and ka != K.I64) or kb != ka:
+                code.push(x)
+                continue
+            let h = len(sf.f.vk)
+            sf.f.vk.push(k64)
+            code.push(mk(Op.MulHi if hi else Op.Mul, h, ca.a, cb.a, -1, 0))
+            if sf.f.vk[x.d] == k64:
+                code.push(mk(Op.Mov, x.d, h, -1, -1, 0))
+            else:
+                code.push(mk(Op.Conv, x.d, h, -1, -1, 0))
+            changed = true
+        if changed:
+            sf.bs[bi].code = code
+
+# The instruction setting v (a `Label` for none).
+fn def_of(sf: SF, db: [int], di: [int], v: int) -> Inst:
+    if v < 0 or v >= len(db) or db[v] < 0:
+        return mk(Op.Label, -1, -1, -1, -1, 0)
+    return sf.bs[db[v]].code[di[v]]
+
+# Is v a 128-bit constant with low word lo and high word hi (-1 and -1: one
+# whose low 64 bits are all ones)?
+fn wide_k(sf: SF, db: [int], di: [int], v: int, lo: int, hi: int) -> bool:
+    let c = def_of(sf, db, di, v)
+    if c.op != Op.Const or c.d < 0 or not sf.f.vk[c.d].is_wide():
+        return false
+    if lo == -1 and hi == -1:
+        return c.n == -1
+    return c.n == lo and c.c == hi
+
 # ================================================================ memory
 
 # The slots whose address only ever serves as the address of a load, a store,
@@ -1522,11 +1666,11 @@ fn gvn_key(x: Inst, vk: [K], consts: bool) -> str:
                 let hi = x.c if vk[x.d].is_wide() else 0
                 return f"{x.op.name()}|{vk[x.d].name()}|{hi}|{x.n}"
             return ""
-        case Op.Add | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Eq | Op.Ne:
+        case Op.Add | Op.Mul | Op.MulHi | Op.And | Op.Or | Op.Xor | Op.Eq | Op.Ne:
             let a = min(x.a, x.b)
             let b = max(x.a, x.b)
             return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{a}|{b}"
-        case Op.Sub | Op.Div | Op.Rem | Op.Shl | Op.Shr | Op.Lt | Op.Le | Op.Gt | Op.Ge:
+        case Op.Sub | Op.Div | Op.Rem | Op.Shl | Op.Shr | Op.Rotl | Op.Lt | Op.Le | Op.Gt | Op.Ge:
             return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{x.a}|{x.b}"
         case Op.Neg | Op.Not | Op.Conv | Op.Bits:
             return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{x.a}"
@@ -2280,9 +2424,9 @@ fn speculatable(x: Inst, sf: SF, def_b: [int], def_i: [int]) -> bool:
     match x.op:
         case Op.Const | Op.FConst | Op.Mov | Op.Global | Op.SlotAddr | Op.Elem:
             return true
-        case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr:
+        case Op.Add | Op.Sub | Op.Mul | Op.And | Op.Or | Op.Xor | Op.Shl | Op.Shr | Op.Rotl:
             return true
-        case Op.Neg | Op.Not | Op.Conv | Op.Bits:
+        case Op.MulHi | Op.Neg | Op.Not | Op.Conv | Op.Bits:
             return true
         # (not comparisons: a branch on one compares in place, and a hoisted
         # one is a byte kept in a register or spilled across the loop)
@@ -3918,6 +4062,8 @@ fn optimize(f: Func, vw: int, a64: bool) -> (Func, [KFunc]):
     copies(ref sf)
     sccp(ref sf)
     check_ranges(ref sf)
+    # (before simplify drops the `& 63` of 64-bit shift counts)
+    rotates(ref sf)
     simplify(ref sf)
     ffold(ref sf)
     rewrites(ref sf)
@@ -3931,6 +4077,7 @@ fn optimize(f: Func, vw: int, a64: bool) -> (Func, [KFunc]):
     copies(ref sf)
     bit_loads(ref sf)
     wide_halves(ref sf)
+    wide_muls(ref sf)
     # dead phis (of inlined calls' results) would hide loops' shapes
     dce(ref sf)
     # (a64.br: loop kernels of two lanes, which it makes NEON code)
