@@ -14,6 +14,7 @@ import verify
 import lower
 import ir
 import ir_c
+import irverify
 import x64
 import a64
 from obj import ObjFile
@@ -1155,6 +1156,7 @@ fn gen_code(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> Code
     let native = use_native(profile) and not plat.is_wasm()
     let l = lowered(fe, tests, profile, plat, native)
     t = phase_time(t, "lower")
+    verify_ir(l.m, native, profile == Profile.Release)
     if native:
         let win = os.name() == "windows"
         let arm = os.arch() == "aarch64"
@@ -1170,6 +1172,29 @@ fn gen_code(fe: Frontend, profile: Profile, tests: bool, plat: Platform) -> Code
     let (unit, data) = ir_c.emit_c_shared(l, 4096 if len(cpu_levels(profile, plat, 1)) > 0 else -1)
     phase_time(t, "emit C")
     return Code.C([unit], [data] if data != "" else [])
+
+# `BRINE_VERIFY_IR=1` (for the compiler's tests): check the IR the lowering
+# made and, for native release code, what the SSA optimizer makes of it
+# (irverify.br). (Without SSA, opt.promote can store a vreg not set yet back
+# to the slot it stands for, before a call fills that slot: harmless, but not
+# definitely assigned.)
+fn verify_ir(m: ir.Module, native: bool, release: bool):
+    match getenv("BRINE_VERIFY_IR"):
+        case Some(v):
+            if v == "" or v == "0":
+                return
+        case None:
+            return
+    var errs = irverify.verify(m)
+    var stage = "the lowering"
+    if len(errs) == 0 and native and release:
+        errs = irverify.verify(x64.optimized(m, release))
+        stage = "the optimizer"
+    if len(errs) == 0:
+        return
+    for e in errs:
+        eprint(f"  {e}")
+    panic(f"BRINE_VERIFY_IR: the IR from {stage} is wrong ({len(errs)} problems above)")
 
 # The program's IR as text (`brine emit-ir`); with `opt`, after the IR
 # optimizations the native backend runs.

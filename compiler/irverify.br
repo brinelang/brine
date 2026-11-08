@@ -1,0 +1,148 @@
+# A checker for the IR (ir.br), for tests of the compiler: `BRINE_VERIFY_IR=1`
+# runs it on every function the lowering makes and, in native release builds,
+# on what the SSA optimizer makes of it. It finds code generation bugs where they start, not
+# as a crash of the program much later:
+#
+# * every vreg and stack slot an instruction names exists, every label is
+#   placed once, and every jump goes to a placed label;
+# * every vreg is set on every path from the entry to each read of it (vregs
+#   are not SSA, so this is "definitely assigned" rather than "dominated by
+#   its one definition"). Code the entry doesn't reach is not checked.
+
+from ir import Op, Inst, Func, Module
+import ssa
+
+# What is wrong with module `m`, at most a few messages per function.
+fn verify(m: Module) -> [str]:
+    var out: [str] = []
+    for f in m.funcs:
+        out.extend(verify_func(f))
+    return out
+
+fn verify_func(f: Func) -> [str]:
+    let errs = structure(f)
+    if len(errs) > 0:
+        return errs
+    return assigned(f)
+
+fn vreg_ok(f: Func, v: int) -> bool:
+    return v >= 0 and v < len(f.vk)
+
+fn structure(f: Func) -> [str]:
+    var errs: [str] = []
+    var placed = [0] * max(f.nlabels, 0)
+    for i, x in enumerate(f.code):
+        if len(errs) >= 5:
+            break
+        if x.op == Op.Label:
+            if x.n < 0 or x.n >= f.nlabels:
+                errs.push(f"{f.name}: instruction {i} places label {x.n} of {f.nlabels}")
+            else:
+                placed[x.n] += 1
+            continue
+        if x.op == Op.Phi:
+            errs.push(f"{f.name}: instruction {i} is a phi in flat code")
+            continue
+        if x.d >= 0 and not vreg_ok(f, x.d):
+            errs.push(f"{f.name}: instruction {i} ({x.op.name()}) sets v{x.d} of {len(f.vk)}")
+        for v in ssa.uses(x):
+            if not vreg_ok(f, v):
+                errs.push(f"{f.name}: instruction {i} ({x.op.name()}) reads v{v} of {len(f.vk)}")
+        if x.op == Op.SlotAddr and (x.a < 0 or x.a >= len(f.slots)):
+            errs.push(
+                f"{f.name}: instruction {i} takes the address of slot {x.a} of {len(f.slots)}"
+            )
+    for i, x in enumerate(f.code):
+        # (in flat code a branch falls through when it doesn't jump)
+        let ls = [x.n] if x.op == Op.Br or x.op == Op.BrNot else ssa.targets(x)
+        for l in ls:
+            if len(errs) < 5 and (l < 0 or l >= f.nlabels or placed[l] == 0):
+                errs.push(
+                    f"{f.name}: instruction {i} ({x.op.name()}) jumps to label {l}, which is not placed"
+                )
+    for l in 0..len(placed):
+        if len(errs) < 5 and placed[l] > 1:
+            errs.push(f"{f.name}: label {l} is placed {placed[l]} times")
+    return errs
+
+# Definite assignment, as a forward data flow over the basic blocks: a vreg
+# is set at a block's start when it is set at the end of every predecessor.
+# Only the vregs some block reads before setting take part.
+fn assigned(f: Func) -> [str]:
+    let sf = ssa.build(f)
+    let bs = sf.bs
+    let nb = len(bs)
+    let nv = len(f.vk)
+    # the vregs each block reads before it sets them
+    var idx = [-1] * nv
+    var live: [int] = []
+    var exposed: [[int]] = []
+    var set = [false] * nv
+    for b in bs:
+        var ex: [int] = []
+        var mine: [int] = []
+        for x in b.code:
+            for v in ssa.uses(x):
+                if not set[v]:
+                    set[v] = true
+                    mine.push(v)
+                    if v >= f.nparams:
+                        ex.push(v)
+                        if idx[v] < 0:
+                            idx[v] = len(live)
+                            live.push(v)
+            if x.d >= 0 and not set[x.d]:
+                set[x.d] = true
+                mine.push(x.d)
+        for v in mine:
+            set[v] = false
+        exposed.push(ex)
+    if len(live) == 0:
+        return []
+    let w = (len(live) + 63) / 64
+    # the tracked vregs each block sets
+    var defs: [[int]] = []
+    for b in bs:
+        var d = [0] * w
+        for x in b.code:
+            if x.d >= 0 and idx[x.d] >= 0:
+                let k = idx[x.d]
+                d[k / 64] = d[k / 64] | (1 << (k % 64))
+        defs.push(d)
+    var ins: [[int]] = []
+    var outs: [[int]] = []
+    for i in 0..nb:
+        ins.push([0] * w)
+        outs.push([-1] * w)
+    # (block 0 is the entry: nothing is set before it, the parameters aren't tracked)
+    outs[0] = defs[0]
+    let po = ssa.postorder(bs)
+    var changed = true
+    while changed:
+        changed = false
+        var j = len(po) - 1
+        while j >= 0:
+            let b = po[j]
+            j -= 1
+            if b == 0:
+                continue
+            var cur = [-1] * w
+            for p in bs[b].pred:
+                for q in 0..w:
+                    cur[q] = cur[q] & outs[p][q]
+            var o = [0] * w
+            for q in 0..w:
+                o[q] = cur[q] | defs[b][q]
+            ins[b] = cur
+            if o != outs[b]:
+                outs[b] = o
+                changed = true
+    var errs: [str] = []
+    for i in 0..nb:
+        for v in exposed[i]:
+            let k = idx[v]
+            if (ins[i][k / 64] >> (k % 64)) & 1 == 0 and len(errs) < 5:
+                errs.push(
+                    f"{f.name}: v{v} is read in the block of label {bs[i].label} before every path there sets it"
+                )
+    return errs

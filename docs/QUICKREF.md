@@ -428,7 +428,9 @@ match line.to_int():                      # Option[int]; blanks around it are fi
 "2.5".to_float[f32]()                     # Some(2.5)
 str.from_utf8(bytes)                      # Result[str, str]: Err names the bad byte
 ```
-Both accept `_` between digits (`"1_000"`), as `int()` and `float()` do.
+Both accept `_` between digits (`"1_000"`), as `int()` and `float()` do, and read
+decimal only: `"0x10".to_int()` and `"0x10".to_float()` are `None`. Floats also read
+`inf` and `nan` (in any case, with a sign).
 
 Format specs in f-strings, as in Python: `{x:.2f}` (fixed), `{x:.3e}`
 (scientific), `{x:g}` / `{x:.10g}` (general: the shorter of the two, trailing
@@ -470,7 +472,9 @@ NaN) and order `-0.0` below `0.0`, the same on every target.
 
 The math functions give the same bits on every platform, natively and in
 WebAssembly: brine has its own math library (from musl) rather than the C
-library's, whose last bits differ between systems.
+library's, whose last bits differ between systems. Like musl's, its results
+are not always the nearest float (`atan2`, for example, is 1 ulp from glibc's in
+about one case in five), so compare with another library's with a tolerance.
 
 `print` output to a terminal or a pipe is written at the end of each line; to a
 file it is buffered (and written at exit, or when `eprint`, `run` or `flush()`
