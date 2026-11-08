@@ -1838,6 +1838,14 @@ static bool br_parse_float(brine_str *s, double *out) {
     double v = 0;
     bool ok = br_parse_f64_fast(p, p + n, &v);
     if (!ok) {
+        /* decimal only, like int(): strtod's hex floats ("0x1p4") don't read */
+        const char *q = p;
+        while (q < p + n && (*q == ' ' || (*q >= 9 && *q <= 13))) q++;
+        if (q < p + n && (*q == '-' || *q == '+')) q++;
+        if (q + 1 < p + n && q[0] == '0' && (q[1] | 32) == 'x') {
+            free(tmp);
+            return false;
+        }
         char *end;
         v = strtod(p, &end);
         while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
