@@ -101,6 +101,9 @@ struct FnSpec:
     requires: [Expr]
     ensures: [Expr]
     result: Option[int]
+    # a one-line getter's `return` expression (`getter_body`): a call to it
+    # is that, with the arguments
+    inline: Option[Expr]
 
 const TAG_ARITH = 0
 # Limits for one function, so a long one can't take minutes or all memory to
@@ -160,7 +163,8 @@ fn verify_program(
                         params=f.param_locals,
                         requires=f.requires,
                         ensures=f.ensures,
-                        result=f.result_local
+                        result=f.result_local,
+                        inline=getter_body(f, info)
                     )
                 )
     # functions are proven independently, so in parallel; the results are
@@ -6065,6 +6069,33 @@ struct Vf:
                 key = Some(k)
         var result = V.Opaque
         let na = len(self.atom_names)
+        var inline: Option[Expr] = None
+        match spec:
+            case Some(sp):
+                inline = sp.inline
+            case None:
+                pass
+        if inline.is_some():
+            key = None
+        match inline:
+            case Some(ie):
+                # a one-line getter: what its body says, with these arguments
+                var env: {int: V} = {}
+                match spec:
+                    case Some(sp):
+                        for i in 0..min(len(sp.params), len(vals)):
+                            env[sp.params[i]] = vals[i]
+                    case None:
+                        pass
+                let saved = self.alt_env
+                let was = self.spec
+                self.alt_env = Some(env)
+                self.spec = true
+                result = self.eval(ie)
+                self.spec = was
+                self.alt_env = saved
+            case None:
+                pass
         match key:
             case Some(k):
                 match self.memo.get(k):
@@ -6074,12 +6105,13 @@ struct Vf:
                         result = self.fresh_val(ret, nm)
                         self.memo[k] = result
             case None:
-                result = self.fresh_val(ret, nm)
+                if inline.is_none():
+                    result = self.fresh_val(ret, nm)
         # what a failed proof about the result should say (see `fail`)
-        var says = false
+        var says = inline.is_some()
         match spec:
             case Some(sp):
-                says = len(sp.ensures) > 0
+                says = says or len(sp.ensures) > 0
             case None:
                 pass
         if not says:
@@ -6109,6 +6141,57 @@ struct Vf:
             case None:
                 pass
         return result
+
+# `e` when `f` is a method without `ensures` whose body is just `return e`
+# for an `e` made of its parameters, fields, elements, constants,
+# arithmetic, comparisons and `len`, `abs`, `min`, `max`
+# (`fn size(self) -> int: return len(self.xs)`): no calls, so evaluating it
+# where it is called can't recurse, and nothing in it changes anything.
+# Functions, and methods with `ensures`, stay what their contract says.
+fn getter_body(f: FnDecl, info: ProgramInfo) -> Option[Expr]:
+    if f.is_extern or f.method_of.is_none() or len(f.ensures) > 0 or len(f.body.stmts) != 1:
+        return None
+    for p in f.params:
+        if p.by_ref:
+            return None
+    match f.body.stmts[0].kind:
+        case StmtKind.Return(Some(e)):
+            if simple_expr(e):
+                return Some(e)
+        case _:
+            pass
+    return None
+
+fn simple_expr(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Int(_) | ExprKind.Bool(_):
+            return true
+        case ExprKind.Ident(_):
+            match e.res:
+                case Res.Local(_) | Res.Const(_):
+                    return true
+                case _:
+                    return false
+        case ExprKind.Field(b, _, _):
+            return simple_expr(b)
+        case ExprKind.Index(b, i):
+            return simple_expr(b) and simple_expr(i)
+        case ExprKind.Unary(_, x):
+            return simple_expr(x)
+        case ExprKind.Binary(_, l, r):
+            return simple_expr(l) and simple_expr(r)
+        case ExprKind.Compare(first, rest):
+            return simple_expr(first) and all(simple_expr(x.1) for x in rest)
+        case ExprKind.Call(_, args):
+            match e.cres:
+                case CallRes.Builtin(Builtin.Len) | CallRes.Builtin(
+                    Builtin.Abs
+                ) | CallRes.Builtin(Builtin.Min) | CallRes.Builtin(Builtin.Max):
+                    return all(simple_expr(a.expr) and not a.by_ref for a in args)
+                case _:
+                    return false
+        case _:
+            return false
 
 # The functions whose result depends only on their arguments: nothing they
 # reach has effects (files, the console, the clock, `world`, extern code...),
