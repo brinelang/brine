@@ -454,7 +454,7 @@ static void br_panic_claim(void) {
 #define BR_OOM_HELP "check where the size comes from (often a wrong count or length), or work on the data in smaller parts"
 
 #ifndef BRINE_RT_BR
-static void br_hang_up(void);
+static void br_hang_up(double limit);
 static void br_world_failed(int64_t code);
 #endif
 
@@ -575,7 +575,7 @@ static BR_NORETURN void br_oom(int64_t n, const char *loc) {
         fclose(rf);
     }
 #ifndef BRINE_RT_BR
-    br_hang_up();
+    br_hang_up(2.0);
 #endif
     exit(101);
 }
@@ -5603,7 +5603,11 @@ static void br_world_finish(const char *how) {
     done = true;
     br_coll(BR_OP_FINISH, how);
     br_barrier("<end of the program>");
-    br_hang_up();
+    /* every peer is at its end too and hangs up right after its own part of
+       the barrier: wait for it however busy the machine is, or it may read
+       this rank's leaving as a failure (only a peer machine that went away
+       takes the whole minute) */
+    br_hang_up(60.0);
 }
 
 /* Leaving: a process that exits with its connections open resets them (on
@@ -5611,9 +5615,9 @@ static void br_world_finish(const char *how) {
  * not read yet, such as this rank's last message, which may say why it
  * failed. So say that nothing more comes (the other side reads everything
  * first) and wait until each peer has said the same, as it does when it
- * leaves; a peer that is busy elsewhere doesn't hold this rank for long.
- * It allocates nothing: it also runs when memory ran out. */
-static void br_hang_up(void) {
+ * leaves, for at most `limit` seconds. It allocates nothing: it also runs
+ * when memory ran out. */
+static void br_hang_up(double limit) {
 #ifndef BR_WASM
     if (!br_peers_up || __atomic_exchange_n(&br_hung, 1, __ATOMIC_ACQ_REL)) return;
     for (int64_t r = 0; r < br_size; r++)
@@ -5624,7 +5628,7 @@ static void br_hang_up(void) {
             shutdown(br_peers[r].sock, SHUT_WR);
 #endif
     double t0 = brine_clock();
-    while (brine_clock() - t0 < 2.0) {
+    while (brine_clock() - t0 < limit) {
         bool open = false;
         for (int64_t r = 0; r < br_size; r++)
             if (r != br_rank && !__atomic_load_n(&br_peers[r].closed, __ATOMIC_ACQUIRE)) open = true;
@@ -5639,7 +5643,8 @@ static void br_hang_up(void) {
 static void br_world_failed(int64_t code) {
     if (!br_peers_up || __atomic_load_n(&br_hung, __ATOMIC_ACQUIRE)) return;
     br_exit_record(code, true);
-    br_hang_up();
+    /* (a peer busy elsewhere doesn't hold a failing rank for long) */
+    br_hang_up(2.0);
 }
 
 /* Messages are encoded from a type description string, which the compiler
