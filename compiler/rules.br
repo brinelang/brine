@@ -1214,10 +1214,18 @@ fn is_pass(s: Stmt) -> bool:
             return false
 
 fn article(s: str) -> str:
-    # a type like `u64` is read letter by letter: "a u64", "an f64", "an i32"
-    if len(s) > 1 and "0123456789".contains(s[1]):
+    if len(s) == 0:
+        return s
+    # read letter by letter: a type like `u64` ("a u64", "an f64"), a one-letter
+    # name (`T`) and an acronym ("an RTree", "a URL", "an HTTPClient")
+    if len(s) == 1 or "0123456789".contains(s[1]) or (is_upper(s[0]) and is_upper(s[1])):
         return ("an " if "aefhilmnorsx".contains(s[0].lower()) else "a ") + s
-    if len(s) > 0 and "aeiouAEIOU".contains(s[0]):
+    let w = s.lower()
+    # a vowel that sounds like a consonant: "a unit", "a user", "a one-off"
+    for p in ["uni", "use", "usu", "uti", "ura", "eu", "one"]:
+        if w.starts_with(p):
+            return "a " + s
+    if "aeiou".contains(w[0]) or w.starts_with("hour") or w.starts_with("honest"):
         return "an " + s
     return "a " + s
 
@@ -1284,16 +1292,38 @@ fn explain(src: str, m: Module) -> [str]:
                             + ", ".join(ws)
                             + "."
                         )
+                var listed: [str] = []
                 for path, _ in r.proven:
                     let shown = ".".join(path)
+                    listed.push(shown)
                     en.line(
                         0,
-                        f"Nothing {shown} does, or anything it calls, can stop the program, for any input."
+                        f"Nothing {shown} does, or anything it calls, can stop the program, for any input its `requires` allow."
+                    )
+                if len(listed) > 0:
+                    # the scope is easy to misread: hostile input still crashes
+                    # code that isn't listed, before or after it gets there
+                    en.line(
+                        0,
+                        "Only "
+                        + " and ".join(listed)
+                        + " and what "
+                        + ("it calls is" if len(listed) == 1 else "they call are")
+                        + " covered: code outside can still stop the program, on the same input."
                     )
                 # what the rule judges with, and what it judges
                 var code: [str] = []
                 var sc_names: [str] = []
-                collect_calls(t.body, ref sc_names)
+                # a method's type, from the rule's inputs: `b.half()` is `Box.half`
+                var types: {str: str} = {}
+                for p in t.params:
+                    match p.ty:
+                        case Some(TypeExpr.Named(tp, _, _)):
+                            if len(tp) > 0:
+                                types[p.name] = tp[len(tp) - 1]
+                        case _:
+                            pass
+                collect_calls(t.body, types, ref sc_names)
                 for nm in sc_names:
                     let base = nm.split(".")[len(nm.split(".")) - 1]
                     if (
@@ -1309,14 +1339,14 @@ fn explain(src: str, m: Module) -> [str]:
                 pass
     return en.out
 
-fn collect_calls(b: Block, ref out: [str]):
+fn collect_calls(b: Block, types: {str: str}, ref out: [str]):
     for s in b.stmts:
         for e in stmt_exprs(s):
-            collect_expr(e, ref out)
+            collect_expr(e, types, ref out)
         for sb in stmt_blocks(s):
-            collect_calls(sb, ref out)
+            collect_calls(sb, types, ref out)
 
-fn collect_expr(e: Expr, ref out: [str]):
+fn collect_expr(e: Expr, types: {str: str}, ref out: [str]):
     match e.kind:
         case ExprKind.Call(callee, _):
             match callee.kind:
@@ -1333,7 +1363,86 @@ fn collect_expr(e: Expr, ref out: [str]):
                             pass
                 case _:
                     pass
+        case ExprKind.MethodCall(recv, name, _, _):
+            # the program's methods, by type when the rule's inputs say it; a
+            # built-in one (`xs.push`, `o.unwrap()`) isn't the agent's code
+            var q = ""
+            match recv.kind:
+                case ExprKind.Ident(r):
+                    match types.get(r):
+                        case Some(tn):
+                            if is_upper(tn[0]) and tn not in ["Option", "Result"]:
+                                q = tn + "." + name
+                        case None:
+                            pass
+                case _:
+                    pass
+            if q == "" and name not in builtin_methods():
+                q = name
+            if q != "" and q not in out:
+                out.push(q)
         case _:
             pass
     for c in children(e):
-        collect_expr(c, ref out)
+        collect_expr(c, types, ref out)
+
+fn is_upper(c: str) -> bool:
+    return len(c) == 1 and "ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(c)
+
+# Methods of the built-in types and of the prelude's `Option` and `Result`.
+fn builtin_methods() -> [str]:
+    return [
+        "all",
+        "any",
+        "bytes",
+        "chars",
+        "clear",
+        "contains",
+        "count",
+        "ends_with",
+        "extend",
+        "find",
+        "first",
+        "get",
+        "index",
+        "insert",
+        "is_alnum",
+        "is_alpha",
+        "is_digit",
+        "is_err",
+        "is_none",
+        "is_ok",
+        "is_some",
+        "is_space",
+        "items",
+        "join",
+        "keys",
+        "lines",
+        "lower",
+        "lstrip",
+        "max",
+        "min",
+        "ok",
+        "pop",
+        "pow",
+        "product",
+        "push",
+        "remove",
+        "repeat",
+        "replace",
+        "reverse",
+        "rstrip",
+        "sort",
+        "sorted",
+        "split",
+        "starts_with",
+        "strip",
+        "sum",
+        "to_bits",
+        "to_float",
+        "to_int",
+        "unwrap",
+        "unwrap_or",
+        "upper",
+        "values"
+    ]
