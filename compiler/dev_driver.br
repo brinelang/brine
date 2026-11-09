@@ -1,0 +1,103 @@
+# Unit tests for the C build's cache files in driver.br.
+#
+#   brine test compiler/dev_driver.br        (from the repository root)
+from driver import settle, unreadable_input, cache_file_diag, prune_cache, cache_start
+import project
+
+fn scratch(name: str) -> str:
+    let d = project.join(os.temp_dir(), f"brine-dev-driver-{os.pid()}-{name}")
+    match os.make_dir(d):
+        case _:
+            pass
+    return d
+
+fn put(path: str, text: str):
+    match write_file(path, text):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+
+fn text(path: str) -> str:
+    return read_file(path).unwrap_or("<missing>")
+
+# v091#3: on Windows a rename over an object another build is linking makes
+# that linker fail ("Permission denied"), so an object that is there stays
+test "a finished cache file is never replaced":
+    let d = scratch("settle")
+    let obj = project.join(d, "0123456789abcdef.o")
+    let tmp = project.join(d, "0123456789abcdef.77.o")
+    put(obj, "first")
+    put(tmp, "second")
+    settle(tmp, obj, false)
+    assert text(obj) == "first"
+    assert not file_exists(tmp)
+    # a missing one is moved in place
+    let other = project.join(d, "fedcba9876543210.o")
+    put(tmp, "third")
+    settle(tmp, other, false)
+    assert text(other) == "third"
+    assert not file_exists(tmp)
+    # and a broken one is replaced when asked
+    put(tmp, "fixed")
+    settle(tmp, obj, true)
+    assert text(obj) == "fixed"
+    assert not file_exists(tmp)
+
+test "a link that can't open a cached object is told apart":
+    let obj = "D:\\a\\brine\\target\\brine-cache\\obj-ece73d2dba382712\\479ce8fce8677378.o"
+    let rt = "D:/a/brine/target/brine-cache/rt-0011223344556677/brine_rt.o"
+    let ins = [obj, rt]
+    # GNU ld on Windows (as CI printed it), and when it reopens an input
+    let ld = "D:/msys64/ucrt64/bin/ld.exe: cannot find D:\\a\\brine\\target\\brine-cache\\obj-ece73d2dba382712\\479ce8fce8677378.o: Permission denied\ncollect2.exe: error: ld returned 1 exit status\n"
+    assert unreadable_input(ld, ins) == obj
+    let re = "ld.exe: reopening D:\\a\\brine\\target\\brine-cache\\obj-ece73d2dba382712\\479ce8fce8677378.o: Permission denied\nld.exe: final link failed: Permission denied\n"
+    assert unreadable_input(re, ins) == obj
+    # lld and Apple's ld, with forward slashes
+    assert (
+        unreadable_input(f"ld.lld: error: cannot open {rt}: No such file or directory", ins) == rt
+    )
+    assert unreadable_input(f"ld: file not found: {rt}", ins) == rt
+    # a missing symbol names the object too, but it's not the cache's fault
+    let undef = "D:\\a\\brine\\target\\brine-cache\\obj-ece73d2dba382712\\479ce8fce8677378.o:u.c:(.text+0x1f): undefined reference to `foo'\n"
+    assert unreadable_input(undef, ins) == ""
+    assert unreadable_input("ld: cannot find -lfoo: No such file or directory", ins) == ""
+    let dg = cache_file_diag(obj, ld, "D:\\a\\brine\\target\\brine-cache")
+    assert dg.code == "E0704"
+    assert "cache" in dg.msg, dg.msg
+
+# v091#3: a build pins its cache entries before it makes them; a prune by
+# another build (which rewrites the log) dropped the pins of entries not on
+# disk yet, so a later prune cleared the folder the build was writing
+test "a pin on an entry that isn't made yet survives a prune":
+    let d = scratch("pins")
+    let t = int(clock())
+    for e in ["b", "b/dev"]:
+        match os.make_dir(project.join(d, e)):
+            case _:
+                pass
+    put(project.join(d, "b/dev/x.exe"), "bbbb")
+    # build 7 pinned a/dev and still links it; build 8 finished b/dev
+    put(project.join(d, "uses.log"), f"# 0\na/dev - {t} 7\nb/dev 4 {t} 8\n")
+    prune_cache(d, ["b/dev"], 1)
+    assert f"a/dev - {t} 7" in text(project.join(d, "uses.log")), text(project.join(d, "uses.log"))
+    # build 7 made it; build 9 (of the same program) is done, then build 10
+    # of another program prunes: build 7 still pins it
+    for e in ["a", "a/dev"]:
+        match os.make_dir(project.join(d, e)):
+            case _:
+                pass
+    put(project.join(d, "a/dev/x.exe.7.tmp"), "aaaa")
+    match os.append_bytes(project.join(d, "uses.log"), f"a/dev 4 {t} 9\n".bytes()):
+        case _:
+            pass
+    prune_cache(d, ["c/dev"], 1)
+    assert file_exists(project.join(d, "a/dev/x.exe.7.tmp")), text(project.join(d, "uses.log"))
+    assert not file_exists(project.join(d, "b/dev/x.exe"))
+
+test "a C build pins its objects before it makes them":
+    let d = scratch("pin-obj")
+    let exe = project.join(d, "p.exe")
+    cache_start(d, exe)
+    let log = text(project.join(d, "uses.log"))
+    assert "obj-" in log and f" {os.pid()}" in log, log

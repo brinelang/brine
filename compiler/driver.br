@@ -876,29 +876,41 @@ fn place(tmp: str, out: str, before: Option[str]) -> Result[(), Diag]:
         match os.remove_file(out + ".old"):
             case _:
                 pass
-    if os.rename(tmp, out).is_ok():
-        return Ok(())
-    # (Windows can't replace a running program, but it can move it away)
-    let moved = move_aside(out)
-    match os.rename(tmp, out):
-        case Ok(_):
+    # (Windows: another brine building it at the same time may hold it a
+    # moment, reading it or moving its own copy in place, so try again)
+    var e = ""
+    for attempt in 0..5:
+        if attempt > 0:
+            os.sleep(0.05 * float(attempt))
+        if os.rename(tmp, out).is_ok():
             return Ok(())
-        case Err(e):
-            match os.remove_file(tmp):
-                case _:
-                    pass
-            move_back(out, moved)
-            match before:
-                case Some(h):
-                    if file_exists(out) and file_hash(out) != h:
-                        return Ok(())
-                case None:
-                    pass
-            return Err(
-                diag.error("E0704", f"cannot write `{display_path(out)}`").note(e).with_help(
-                    "is the program still running? Stop it and build again, or build somewhere else with `-o`"
-                )
-            )
+        # (Windows can't replace a running program, but it can move it away)
+        let moved = move_aside(out)
+        match os.rename(tmp, out):
+            case Ok(_):
+                return Ok(())
+            case Err(x):
+                e = x
+        move_back(out, moved)
+        match before:
+            case Some(h):
+                if file_exists(out) and file_hash(out) != h:
+                    match os.remove_file(tmp):
+                        case _:
+                            pass
+                    return Ok(())
+            case None:
+                pass
+        if os.name() != "windows":
+            break
+    match os.remove_file(tmp):
+        case _:
+            pass
+    return Err(
+        diag.error("E0704", f"cannot write `{display_path(out)}`").note(e).with_help(
+            "is the program still running? Stop it and build again, or build somewhere else with `-o`"
+        )
+    )
 
 # A link that failed puts the old build back.
 fn move_back(out: str, moved: bool):
@@ -911,6 +923,32 @@ fn move_back(out: str, moved: bool):
 fn plain_path(p: str) -> str:
     let s = p.replace("/", "\\").lower()
     return s[4:] if s.starts_with("\\\\?\\") else s
+
+# The input of a link that the linker says it couldn't open or find ("" if
+# none): `ld: cannot find <path>: Permission denied`, `cannot open <path>`.
+fn unreadable_input(e: str, inputs: [str]) -> str:
+    for l in e.lower().replace("\\", "/").lines():
+        if not any(
+            p in l for p in ["permission denied", "no such file", "not found", "cannot open"]
+        ):
+            continue
+        for p in inputs:
+            if p.lower().replace("\\", "/") in l:
+                return p
+    return ""
+
+# A link that failed on a file of the build cache: not a bug in brine's
+# generated code, so not E0705.
+fn cache_file_diag(bad: str, e: str, dir: str) -> Diag:
+    let ls = e.strip().lines()
+    return (
+        diag.error("E0704", f"cannot read the build cache file `{display_path(bad)}`")
+        .note(ls[0] if len(ls) > 0 else e)
+        .note("another brine building at the same time was most likely changing it")
+        .with_help(
+            f"build again; if it keeps happening, delete the cache folder `{display_path(dir)}` (brine fills it again)"
+        )
+    )
 
 fn cc_failed(what: str, e: str, out: str) -> Diag:
     let ls = e.strip().lines()
@@ -969,13 +1007,22 @@ fn runtime_object(cc: str, flags: [str], key: str, dir: str) -> Result[(str, str
     for name, text in [("brine_rt.h", RT_H), ("brine_rt.c", RT_C), ("brine_math.c", RT_M)]:
         let f = project.join(rt_dir, name)
         var same = false
+        var there = false
         match read_file(f):
             case Ok(t):
+                there = true
                 same = len(t) == len(text)
             case Err(_):
                 pass
         if not same:
-            write_or_diag(f, text)?
+            # written beside it and moved in: a build compiling with it
+            # never reads it half-written
+            let tmp = project.join(rt_dir, f"{name}.{os.pid()}.tmp")
+            write_or_diag(tmp, text)?
+            if there:
+                settle(tmp, f, true)
+            else:
+                settle_all(dir, [(tmp, f)])
     let tmp = project.join(rt_dir, f"brine_rt.{os.pid()}.o")
     var cmd = [cc]
     cmd.extend(flags)
@@ -987,10 +1034,40 @@ fn runtime_object(cc: str, flags: [str], key: str, dir: str) -> Result[(str, str
             return Err(
                 diag.error("E0705", "the C compiler failed on the brine runtime").note(e.strip())
             )
-    match os.rename(tmp, rt_obj):
-        case _:
-            pass
+    settle_all(dir, [(tmp, rt_obj)])
     return Ok((rt_dir, rt_obj))
+
+# Moves a finished cache file `tmp` (an object, a runtime source) to `path`,
+# unless `path` exists already: it is named by a hash of its contents, so it
+# has the same bytes. Not renamed over it, because on Windows that holds it
+# for deletion a moment, and a linker opening it then fails with "Permission
+# denied" (v091#3: concurrent builds of one program). `replace`: it exists
+# but is wrong (cut short), so it is replaced.
+fn settle(tmp: str, path: str, replace: bool):
+    if not replace and file_exists(path):
+        match os.remove_file(tmp):
+            case _:
+                pass
+        return
+    match os.rename(tmp, path):
+        case Ok(_):
+            pass
+        case Err(_):
+            match os.remove_file(tmp):
+                case _:
+                    pass
+
+# `settle` for several files of the cache `dir`. Two builds that both find
+# one missing would both move theirs in, the second over the first, so that
+# is done under the cache's lock (taken only when one is missing: on a
+# first build).
+fn settle_all(dir: str, moves: [(str, str)]):
+    var lock: Option[str] = None
+    if any(not file_exists(path) for _, path in moves):
+        lock = cache_lock(dir)
+    for tmp, path in moves:
+        settle(tmp, path, false)
+    cache_unlock(lock)
 
 # The x86-64 levels an optimized program is compiled for, as the extra C
 # compiler flags of each: plain x86-64, then x86-64-v3 (AVX2) and x86-64-v4
@@ -1146,6 +1223,7 @@ fn compile_levels(
                 return Err(diag.error("E0705", f"could not run the C compiler: {e}"))
     var t = clock()
     var failure = ""
+    var made: [(str, str)] = []
     for h, c_path, tmp, obj in jobs:
         let rc = os.wait(h)
         let (out, err) = os.output(h)
@@ -1153,12 +1231,11 @@ fn compile_levels(
             if failure == "":
                 failure = err + out
         else:
-            match os.rename(tmp, obj):
-                case _:
-                    pass
+            made.push((tmp, obj))
             match os.remove_file(c_path):
                 case _:
                     pass
+    settle_all(dir, made)
     prune(obj_dir, objs)
     if len(units) > 0:
         t = phase_time(t, f"cc ({len(jobs)}/{len(units)})")
@@ -1181,14 +1258,31 @@ fn compile_levels(
     link.extend(objs)
     link.extend([rt_obj, "-o", tmp])
     link.extend(libs)
-    match run_cc(link):
-        case Ok(_):
-            pass
-        case Err(e):
-            match os.remove_file(tmp):
-                case _:
-                    pass
-            return Err(cc_failed("linking the program failed", e, out_exe))
+    var inputs = objs
+    inputs.push(rt_obj)
+    var tries = 0
+    var failed = ""
+    while tries < 5:
+        tries += 1
+        match run_cc(link):
+            case Ok(_):
+                failed = ""
+            case Err(e):
+                failed = e
+        # the linker couldn't open one of the cached objects: another brine
+        # may be moving it in place or pruning it (Windows holds a file a
+        # moment for that), so try again shortly
+        if failed == "" or tries == 5 or unreadable_input(failed, inputs) == "":
+            break
+        os.sleep(0.05 * float(tries))
+    if failed != "":
+        match os.remove_file(tmp):
+            case _:
+                pass
+        let bad = unreadable_input(failed, inputs)
+        if bad != "":
+            return Err(cache_file_diag(bad, failed, dir))
+        return Err(cc_failed("linking the program failed", failed, out_exe))
     place(tmp, out_exe, Some(before))?
     phase_time(t, "link")
     if plat == Platform.Web:
@@ -1276,8 +1370,10 @@ fn reuse_object(dir: str, obj_dir: str, hash: str) -> bool:
         match os.read_bytes(src):
             case Ok(b):
                 let tmp = project.join(obj_dir, f"{hash}.{os.pid()}.o")
-                if os.write_bytes(tmp, b).is_ok() and os.rename(tmp, obj).is_ok():
-                    return true
+                if os.write_bytes(tmp, b).is_ok():
+                    settle_all(dir, [(tmp, obj)])
+                    if file_exists(obj):
+                        return true
             case Err(_):
                 pass
     return false
@@ -1459,13 +1555,14 @@ fn log_lines(dir: str, lines: [str]):
 fn now_mark() -> str:
     return f"{int(clock())}"
 
-# Before a build: pin its entries, so a prune doesn't take them.
-# (objects only once they exist: a native build has none)
+# Before a build: pin its entries, so a prune doesn't take them. All of
+# them, those it hasn't made yet too: a C build's objects, a first build's
+# folder (a prune by another build would clear them while this one writes
+# them).
 fn cache_start(dir: str, exe: str):
     var lines: [str] = []
     for e in cache_entries(dir, exe):
-        if not e.starts_with("obj-") or os.is_dir(project.join(dir, e)):
-            lines.push(f"{e} - {now_mark()} {os.pid()}")
+        lines.push(f"{e} - {now_mark()} {os.pid()}")
     log_lines(dir, lines)
 
 # Once a build is done with them (its program has started, or `build` wrote
@@ -1475,8 +1572,9 @@ fn cache_done(dir: str, exe: str):
     let mine = cache_entries(dir, exe)
     for e in mine:
         let p = project.join(dir, e)
-        if os.is_dir(p):
-            lines.push(f"{e} {tree_size(p)} {now_mark()} {os.pid()}")
+        # (one it never made is released too, with no bytes)
+        let n = tree_size(p) if os.is_dir(p) else 0
+        lines.push(f"{e} {n} {now_mark()} {os.pid()}")
     log_lines(dir, lines)
     prune_cache(dir, mine, cache_cap())
 
@@ -1597,7 +1695,8 @@ fn prune_locked(dir: str, log: str, mine: [str], cap: int):
     while k >= 0:
         let name = order[k]
         k -= 1
-        if name in gone or not os.is_dir(project.join(dir, name)):
+        # (an entry a build pins but hasn't made yet stays, with its pins)
+        if name in gone or (len(pins[name]) == 0 and not os.is_dir(project.join(dir, name))):
             continue
         let t = " " + since[name] if name in since else ""
         match size.get(name):
