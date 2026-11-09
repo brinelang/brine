@@ -697,9 +697,10 @@ test "GPU auto doesn't copy arrays of arrays that cost more than the work":
             let why = "copying its arrays of arrays to the GPU takes longer than running it on the CPU"
             assert why in lines[3], o.err
 
-# v091#15: the log names what keeps a loop off the GPU
-test "GPU auto says why a loop stays on the CPU":
+# v091#15: the log names what keeps a loop off the GPU, and auto re-measures
+test "GPU auto says why and keeps measuring the CPU":
     let f = "tests/programs/gpu_auto.br"
+    let at = "brine gpu: tests/programs/gpu_auto.br:"
     let r = brine_env(["run", f, "-q", "--release"], {"BRINE_GPU_LOG": "1"})
     assert r.code == 0 and r.out == "9207\n", r.all()
     for why in [
@@ -708,6 +709,25 @@ test "GPU auto says why a loop stays on the CPU":
     ]:
         assert f"(not GPU-eligible: {why}" in r.err, r.err
     assert "arrays of arrays" not in r.err, r.err
+    # cheap calls after an expensive one don't go to the GPU on its estimate
+    let s = brine_env(["run", f, "-q", "--release", "--", "sticky"], {"BRINE_GPU_LOG": "1"})
+    assert s.code == 0 and s.out == "48758\n", s.all()
+    let calls = [l for l in s.err.lines() if l.starts_with(at)]
+    assert len(calls) == 42, s.err
+    if gpu_ready(s.err):
+        for l in calls[22:]:
+            assert " -> gpu " not in l, s.err
+    # one big loop: once the GPU is ready, the CPU stops waiting for it
+    # (long enough on a GPU machine to take it well past the GPU's start)
+    let n = "3000000" if gpu_ready(r.err) else "100000"
+    let o = brine_env(["run", f, "-q", "--release", "--", "oneshot", n], {"BRINE_GPU_LOG": "1"})
+    assert o.code == 0 and o.out == "19390.741\n", o.all()
+    if gpu_ready(o.err):
+        let ready = o.err.split(" ready in ")[1].split(" ms")[0].to_float().unwrap_or(0.0)
+        for l in o.err.lines():
+            if l.starts_with(at) and " -> cpu " in l:
+                let cpu = l.split(" -> cpu ")[1].split(" ms")[0].to_float().unwrap_or(0.0)
+                assert not (cpu > ready + 50.0 and "starting the GPU" in l), o.err
 
 test "ranks take one GPU each":
     # with BRINE_GPU=auto, a second rank on a one-GPU machine stays on the CPU

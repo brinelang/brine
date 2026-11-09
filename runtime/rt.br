@@ -12573,6 +12573,8 @@ const CH_USE = 0
 const CH_CPU_S = 8
 const CH_GPU_S = 16
 const CH_WHY = 24
+# (the GPU is starting: run slices on the CPU until it is ready)
+const CH_SOON = 32
 
 fn gpu_dev_ns(k: ptr, st: ptr) -> float:
     let ns = load_f64(st, KS_GPU)
@@ -12583,6 +12585,7 @@ fn gpu_choose(k: ptr, st: ptr, rest: int, bytes: int, launches: int, c: ptr):
     let g = gpu()
     store_i64(c, CH_USE, 0)
     store_ptr(c, CH_WHY, null_ptr())
+    store_i64(c, CH_SOON, 0)
     let gpu_ns = gpu_dev_ns(k, st)
     let cpu_s = load_f64(st, KS_CPU) * 1.0e-9 * float(rest)
     # (planning the copies is paid again on every call)
@@ -12615,6 +12618,7 @@ fn gpu_choose(k: ptr, st: ptr, rest: int, bytes: int, launches: int, c: ptr):
     let soon = not ready and gpu_s < 0.75 * cpu_s
     if soon and cpu_s > 2.0e-3:
         gpu_start(code)
+        store_i64(c, CH_SOON, 1 if gpu_state() == GS_INIT else 0)
     # (not started for less than 2 ms of work: this one is faster as it is)
     let starting = soon and gpu_state() == GS_INIT
     store_ptr(c, CH_WHY, cz("starting the GPU") if starting else cz("faster on the CPU"))
@@ -12790,28 +12794,112 @@ fn gpu_note_probe(st: ptr, ns: float):
     store_f64(st, KS_CPU, ns / (float(brine_x_threads()) * CPU_EFF))
     unlock(g + G_MU)
 
-# The GPU part of a `par for`: returns how many leading elements are done
-# (all n when the device ran them, fewer when the CPU should run the rest).
-# Every element below the returned count has run exactly once.
-fn gpu_for(k: ptr, ctx: ptr, n: int, f: ptr, why: ptr) -> int:
+# One thread's time says little about the pool's when the body waits on
+# memory or its loops depend on the data (3x for b_geo's join, v091#15).
+# When the rest of [lo, n) would take a while on the CPU, two slices of
+# about 5 ms run on the pool, and the faster one's time is the estimate
+# (the first also wakes the threads and fills the caches). Returns where
+# the slices ended.
+fn cpu_sample(st: ptr, ctx: ptr, f: ptr, lo: int, n: int) -> int:
+    let ns = load_f64(st, KS_CPU)
+    if not (ns > 0.0) or ns * 1.0e-9 * float(n - lo) < 0.05:
+        return lo
+    var m = (n - lo) / 8
+    let q = 5.0e-3 / (ns * 1.0e-9)
+    if q < float(m):
+        m = int(q)
+    m = max(m, min(brine_x_threads(), (n - lo) / 2))
+    if m <= 0:
+        return lo
+    var best = 1.0e300
+    var at = lo
+    for _ in 0..2:
+        let t0 = brine_clock()
+        brine_par_run(at, at + m, par_plan(m), f, ctx)
+        best = min(best, brine_clock() - t0)
+        at += m
+    gpu_note_cpu(st, m, best)
+    return at
+
+# Before a call goes to the GPU on an estimate from earlier calls: a few of
+# its elements on this thread took `ns` each. Elements can cost far more
+# in one call than in the next (a loop over a tree node's rows), so when
+# that is more than 4x off, the estimate starts over from it. Without this
+# one expensive call kept every later one on the GPU (v091#15).
+fn gpu_recheck(st: ptr, ns: float) -> bool:
     let g = gpu()
+    lock(g + G_MU)
+    let seq = load_f64(st, KS_SEQ)
+    let off = ns > 4.0 * seq or 4.0 * ns < seq
+    if off:
+        store_f64(st, KS_SEQ, ns)
+        store_f64(st, KS_CPU, ns / (float(brine_x_threads()) * CPU_EFF))
+        store_i64(st, KS_SEEN, 0)
+    unlock(g + G_MU)
+    return off
+
+# About 10 ms of the CPU's work, out of `rest` elements (all when the
+# time per element isn't known)
+fn cpu_slice(k: ptr, rest: int) -> int:
+    let st = kstate(k)
+    let ns = load_f64(st, KS_CPU) if addr(st) != 0 else 0.0
+    if ns > 0.0:
+        let q = 0.01 / (ns * 1.0e-9)
+        if q < float(rest):
+            return max(int(q), 1)
+    return rest
+
+# The GPU part of a `par for` from element `lo` (those before it ran on
+# the CPU in this call, which measured them): returns how many leading
+# elements are done (all n when the device ran them, fewer when the CPU
+# should run the rest). Every element below the returned count has run
+# exactly once. why[0]: why not; why[8]: 1 when the GPU is starting.
+fn gpu_for(k: ptr, ctx: ptr, n: int, f: ptr, why: ptr, lo: int) -> int:
+    let g = gpu()
+    store_i64(why, 8, 0)
     let known = stack_mem(8)
     let st = gpu_begin(k, why, known)
     if addr(st) == 0:
-        return 0
-    var done = 0
-    if load_i64(known, 0) == 0 and gpu_mode() != GPU_ON:
+        return lo
+    var done = lo
+    let auto = gpu_mode() != GPU_ON
+    # (the estimate comes from this call)
+    var fresh = lo > 0
+    if load_i64(known, 0) == 0 and auto:
         let ns = stack_mem(8)
-        done = probe_for(f, ctx, 0, n, 1.0e-4, ns)
+        done = probe_for(f, ctx, done, n, 1.0e-4, ns)
         gpu_note_probe(st, load_f64(ns, 0))
+        if done < n:
+            done = cpu_sample(st, ctx, f, done, n)
         if done >= n:
             store_ptr(why, 0, cz("done while measuring"))
             return done
+        fresh = true
     let p = stack_mem(GP_SIZE)
     if not gpu_plan(p, k, st, ctx, n - done, why):
         gplan_free(p)
         return done
-    # arrays that go back whole need the elements the probe wrote on the
+    let c = stack_mem(40)
+    lock(g + G_MU)
+    gpu_choose(k, st, n - done, gplan_bytes(p), 1 + (n - done) / (1 << 22), c)
+    unlock(g + G_MU)
+    if load_i64(c, CH_USE) != 0 and auto and not fresh:
+        let ns = stack_mem(8)
+        done = probe_for(f, ctx, done, n, 2.0e-5, ns)
+        if done >= n:
+            gplan_free(p)
+            store_ptr(why, 0, cz("done while measuring"))
+            return done
+        if gpu_recheck(st, load_f64(ns, 0)):
+            lock(g + G_MU)
+            gpu_choose(k, st, n - done, gplan_bytes(p), 1 + (n - done) / (1 << 22), c)
+            unlock(g + G_MU)
+    if load_i64(c, CH_USE) == 0:
+        gplan_free(p)
+        store_ptr(why, 0, load_ptr(c, CH_WHY))
+        store_i64(why, 8, load_i64(c, CH_SOON))
+        return done
+    # arrays that go back whole need the elements the CPU wrote on the
     # device too
     store_i64(p, GP_LO, done)
     store_i64(p, GP_HI, n)
@@ -12820,14 +12908,6 @@ fn gpu_for(k: ptr, ctx: ptr, n: int, f: ptr, why: ptr) -> int:
             let ga = pl_arr(p, i)
             if load_i64(ga, GA_WRITTEN) != 0 and load_i64(ga, GA_DENSE) == 0:
                 store_i64(ga, GA_READ, 1)
-    let c = stack_mem(32)
-    lock(g + G_MU)
-    gpu_choose(k, st, n - done, gplan_bytes(p), 1 + (n - done) / (1 << 22), c)
-    unlock(g + G_MU)
-    if load_i64(c, CH_USE) == 0:
-        gplan_free(p)
-        store_ptr(why, 0, load_ptr(c, CH_WHY))
-        return done
     store_ptr(why, 0, cz("the GPU is busy"))
     if not try_lock(g + G_RUN):
         gplan_free(p)
@@ -12891,21 +12971,38 @@ fn brine_par_for(k: ptr, ctx: ptr, n: int, f: ptr):
     var why = gpu_skip(k, n)
     var done = 0
     var before = 0.0
+    var t0 = brine_clock()
     if addr(why) == 0:
-        let w = stack_mem(8)
-        let tb = brine_clock()
-        done = gpu_for(k, ctx, n, f, w)
+        let w = stack_mem(16)
+        done = gpu_for(k, ctx, n, f, w, 0)
         if done >= n:
             return
         why = load_ptr(w, 0)
-        before = brine_clock() - tb
-    let t0 = brine_clock()
+        before = brine_clock() - t0
+        t0 = brine_clock()
+        # while the GPU starts, slices run on the CPU; once it is ready it
+        # may take the rest, so a program with one big loop gets it too
+        # (v091#15)
+        var soon = load_i64(w, 8) != 0
+        while soon and done < n:
+            let m = cpu_slice(k, n - done)
+            let ts = brine_clock()
+            brine_par_run(done, done + m, par_plan(m), f, ctx)
+            gpu_note_cpu(kstate(k), m, brine_clock() - ts)
+            done += m
+            if done < n and gpu_state() != GS_INIT:
+                done = gpu_for(k, ctx, n, f, w, done)
+                if done >= n:
+                    return
+                why = load_ptr(w, 0)
+                soon = load_i64(w, 8) != 0
+    let t1 = brine_clock()
     brine_par_run(done, n, par_plan(n - done), f, ctx)
-    let dt = brine_clock() - t0
+    let t2 = brine_clock()
     if addr(load_ptr(k, K_PTX)) != 0 and n - done >= GPU_MIN_N and brine_x_in_par_get() == 0:
-        gpu_note_cpu(kstate(k), n - done, dt)
+        gpu_note_cpu(kstate(k), n - done, t2 - t1)
     if gpu_logging() and brine_x_in_par_get() == 0:
-        gpu_log_cpu(k, n, why, dt, before)
+        gpu_log_cpu(k, n, why, t2 - t0, before)
 
 # ---- reductions on the GPU
 
@@ -13010,7 +13107,7 @@ fn gpu_reduce(k: ptr, n: int, f: ptr, ctx: ptr, fo: ptr, loc: ptr, why: ptr, cpu
     if not gpu_plan(pl, k, st, ctx, rest, why):
         gplan_free(pl)
         return false
-    let c = stack_mem(32)
+    let c = stack_mem(40)
     lock(g + G_MU)
     gpu_choose(k, st, rest, gplan_bytes(pl), 2 + rest / (1 << 22), c)
     let gpu_ns = gpu_dev_ns(k, st)
