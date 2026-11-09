@@ -1297,12 +1297,13 @@ fn prune(obj_dir: str, keep: [str]):
 
 # A cache directory (brine-cache in the temp directory for files outside a
 # project, a project's target/cache) keeps what every build made, so it is
-# pruned (v09#25). Each build adds lines to its `uses.log`: `<entry> - <t>`
-# when it starts using an entry (a pin) and `<entry> <bytes> <t>` when it is
-# done with it, after the program it built has started (v091#3: a prune
-# between the build and the start deleted the program). `<t>` is `clock()`,
-# which counts from the machine's start in every process, so the pin of a
-# brine that died expires. When the entries listed add up to more than
+# pruned (v09#25). Each build adds lines to its `uses.log`: `<entry> - <t>
+# <pid>` when it starts using an entry (a pin) and `<entry> <bytes> <t> <pid>`
+# when it is done with it, after the program it built has started (v091#3: a
+# prune between the build and the start deleted the program). An entry stays
+# while any build's pin is unreleased: several can use one at once. `<t>` is
+# `clock()`, which counts from the machine's start in every process, so the
+# pin of a brine that died expires. When the entries listed add up to more than
 # BRINE_CACHE_SIZE, the least recently used that no one pins lose their files
 # (brine can't remove folders; empty ones cost nothing). What the log doesn't
 # list, such as what an older brine made, stays. The log is only read or
@@ -1462,7 +1463,7 @@ fn cache_start(dir: str, exe: str):
     var lines: [str] = []
     for e in cache_entries(dir, exe):
         if not e.starts_with("obj-") or os.is_dir(project.join(dir, e)):
-            lines.push(f"{e} - {now_mark()}")
+            lines.push(f"{e} - {now_mark()} {os.pid()}")
     log_lines(dir, lines)
 
 # Once a build is done with them (its program has started, or `build` wrote
@@ -1473,7 +1474,7 @@ fn cache_done(dir: str, exe: str):
     for e in mine:
         let p = project.join(dir, e)
         if os.is_dir(p):
-            lines.push(f"{e} {tree_size(p)} {now_mark()}")
+            lines.push(f"{e} {tree_size(p)} {now_mark()} {os.pid()}")
     log_lines(dir, lines)
     prune_cache(dir, mine, cache_cap())
 
@@ -1531,35 +1532,46 @@ fn prune_locked(dir: str, log: str, mine: [str], cap: int):
     if len(ls) > 0 and ls[0].starts_with("# "):
         base = ls[0][2:].to_int().unwrap_or(0)
     let now = clock()
-    # newest first: each entry's latest size, and whether a build still pins
-    # it (its latest line is `-`, and recent)
+    # newest first: each entry's latest size, and the pins on it that are
+    # still held: no later line of the same brine released them, and recent
     var order: [str] = []
     var size: {str: int} = {}
-    var busy: {str: bool} = {}
     var since: {str: str} = {}
+    var pins: {str: [str]} = {}
+    # (entry, owner) pairs that a later line released
+    var released: {str: bool} = {}
     var i = len(ls) - 1
     while i >= 0:
-        let parts = ls[i].split(" ")
+        let line = ls[i]
+        let parts = line.split(" ")
         i -= 1
-        if len(parts) < 2 or len(parts) > 3 or parts[0] == "#" or ".." in parts[0]:
+        if len(parts) < 2 or len(parts) > 4 or parts[0] == "#" or ".." in parts[0]:
             continue
         let name = parts[0]
-        if name not in busy:
+        let first = name not in pins
+        if first:
             order.push(name)
-            var pinned = parts[1] == "-"
-            if len(parts) == 3:
-                since[name] = parts[2]
-                let age = now - float(parts[2].to_int().unwrap_or(0))
-                pinned = pinned and -1.0 <= age <= PIN_MAX
-            else:
-                pinned = pinned and i >= len(ls) - 1 - 2 * CACHE_SLACK
-            busy[name] = pinned
-        if name not in size:
-            match parts[1].to_int():
-                case Some(n):
-                    size[name] = n
-                case None:
-                    pass
+            pins[name] = []
+        let owner = parts[3] if len(parts) == 4 else ""
+        if parts[1] != "-":
+            if name not in size:
+                match parts[1].to_int():
+                    case Some(n):
+                        size[name] = n
+                        if len(parts) >= 3:
+                            since[name] = parts[2]
+                    case None:
+                        pass
+            released[f"{name} {owner}"] = true
+        elif len(parts) == 2:
+            # an older brine's mark: it counts while it is the latest, and recent
+            if first and i >= len(ls) - 1 - 2 * CACHE_SLACK:
+                pins[name].push(line)
+        elif f"{name} {owner}" not in released:
+            let age = now - float(parts[2].to_int().unwrap_or(0))
+            if -1.0 <= age <= PIN_MAX:
+                pins[name].push(line)
+            released[f"{name} {owner}"] = true
     var total = 0
     for name in order:
         total += size.get(name).unwrap_or(0)
@@ -1572,7 +1584,7 @@ fn prune_locked(dir: str, log: str, mine: [str], cap: int):
     while over and j >= 0 and total > cap:
         let name = order[j]
         j -= 1
-        if busy[name] or name in mine:
+        if len(pins[name]) > 0 or name in mine:
             continue
         tree_clear(project.join(dir, name))
         total -= size.get(name).unwrap_or(0)
@@ -1591,8 +1603,12 @@ fn prune_locked(dir: str, log: str, mine: [str], cap: int):
                 out.push(f"{name} {n}{t}")
             case None:
                 pass
-        # (a build that still pins it keeps it)
-        if busy[name] or name not in size:
+        # (the builds that still pin it keep their pins, oldest first)
+        var q = len(pins[name]) - 1
+        while q >= 0:
+            out.push(pins[name][q])
+            q -= 1
+        if len(pins[name]) == 0 and name not in size:
             out.push(f"{name} -{t}")
     out[0] = f"# {len(out) - 1}"
     let tmp = f"{log}.{os.pid()}.tmp"
