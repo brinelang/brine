@@ -821,11 +821,13 @@ double brine_m_pow(double a, double b);
 double brine_m_atan2(double y, double x);
 double brine_m_hypot(double x, double y);
 static inline double brine_f_pow(double a, double b) { return brine_m_pow(a, b); }
-static inline double brine_f_atan2(double y, double x) { return brine_m_atan2(y, x); }
-static inline double brine_f_hypot(double x, double y) { return brine_m_hypot(x, y); }
+double br_atan2(double y, double x);
+double br_hypot(double x, double y);
+static inline double brine_f_atan2(double y, double x) { return br_atan2(y, x); }
+static inline double brine_f_hypot(double x, double y) { return br_hypot(x, y); }
 static inline float brine_f_powf(float a, float b) { return (float)brine_m_pow((double)a, (double)b); }
-static inline float brine_f_atan2f(float y, float x) { return (float)brine_m_atan2((double)y, (double)x); }
-static inline float brine_f_hypotf(float x, float y) { return (float)brine_m_hypot((double)x, (double)y); }
+static inline float brine_f_atan2f(float y, float x) { return (float)br_atan2((double)y, (double)x); }
+static inline float brine_f_hypotf(float x, float y) { return (float)br_hypot((double)x, (double)y); }
 /* float `%` also takes the sign of the divisor, like Python */
 static inline double brine_f_fmod(double a, double b) { double r = fmod(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
 static inline float brine_f_fmodf(float a, float b) { float r = fmodf(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
