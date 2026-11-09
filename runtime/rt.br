@@ -13493,10 +13493,11 @@ fn os_flen(f: ptr) -> int:
         return -2
     return int(n)
 
-# All of the file at `path`: its bytes (brine_alloc's), their count and the
-# size of the block in out[0], out[1] and out[2], or false with the message
-# in *err.
-fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
+# All of the file at `path`: the block its bytes are in (brine_alloc's),
+# their count and the room for them in out[0], out[1] and out[2], or false
+# with the message in *err. With `text` the bytes start at STR_DATA, in a
+# block a string of their length fits in, so read_file needn't copy them.
+fn os_slurp(path: ptr, out: ptr, err: ptr, text: bool) -> bool:
     let p = os_cstr(path)
     if addr(p) == 0:
         store_ptr(err, 0, os_msg("cannot read a path containing a NUL byte"))
@@ -13511,6 +13512,7 @@ fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
         store_ptr(err, 0, os_msg(f"cannot read {str_of(path)}: {str_of(e)}"))
         str_release(e)
         return false
+    let off = STR_DATA if text else 0
     var b = null_ptr()
     var n = 0
     var cap = 0
@@ -13520,13 +13522,16 @@ fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
     let flen = os_flen(f)
     var bad = flen == -2
     if flen > 0:
-        cap = flen + 1
-        b = brine_x_realloc(b, cap)
+        cap = str_block(flen) - off if text else flen + 1
+        b = brine_x_realloc(b, off + cap)
     while not bad:
         if n == cap:
             cap = cap * 2 if cap != 0 else 65536
-            b = brine_x_realloc(b, cap)
-        let got = int(fread(b + n, 1, u64(cap - n), f))
+            b = brine_x_realloc(b, off + cap)
+        # (up to the length first: a read into the whole block puts all
+        # of its pages in memory, and a string's block can be 25% more)
+        let want = flen + 1 - n if flen > 0 and flen >= n else cap - n
+        let got = int(fread(b + off + n, 1, u64(want), f))
         n += got
         if got == 0:
             break
@@ -13545,21 +13550,32 @@ fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
 
 fn brine_read_file(path: ptr, out: ptr) -> bool:
     let got = stack_mem(24)
-    if not os_slurp(path, got, out):
+    if not os_slurp(path, got, out, true):
         return false
-    let b = load_ptr(got, 0)
+    var b = load_ptr(got, 0)
     let n = load_i64(got, 8)
-    let ok = os_utf8_bad(b, n) < 0
-    if ok:
-        store_ptr(out, 0, brine_str_new(b, n))
-    else:
+    if os_utf8_bad(b + STR_DATA, n) >= 0:
         store_ptr(out, 0, os_msg(f"cannot read {str_of(path)}: the file is not valid UTF-8 text"))
-    brine_free(b)
-    return ok
+        brine_free(b)
+        return false
+    if n < 65536:
+        store_ptr(out, 0, brine_str_new(b + STR_DATA, n))
+        brine_free(b)
+        return true
+    # a big file becomes the string in the block it was read into: in
+    # memory once, not twice (the copy doubled the peak)
+    if STR_DATA + load_i64(got, 16) < str_block(n):
+        b = brine_x_realloc(b, str_block(n))
+    live(1)
+    store_i64(b, STR_RC, 1)
+    store_i64(b, STR_LEN, n)
+    store_u8(b, STR_DATA + n, 0)
+    store_ptr(out, 0, b)
+    return true
 
 fn brine_os_read_bytes(path: ptr, out: ptr, err: ptr) -> bool:
     let got = stack_mem(24)
-    if not os_slurp(path, got, err):
+    if not os_slurp(path, got, err, false):
         return false
     let b = load_ptr(got, 0)
     let n = load_i64(got, 8)
