@@ -19,7 +19,7 @@
 # keep values in registers across instructions, so whenever a debugger stops
 # at a line, variables are in memory where the debug info says.
 
-from ir import K, Op, Inst, Func, Module, KFunc, KOp
+from ir import K, Op, Inst, Func, Module, KFunc, KOp, site_text
 from ir import KO_MOV, KO_LD, KO_LDP, KO_LDH, KO_ST, KO_STH, KO_OP, KO_SQRT, KO_SHUF
 from ir import KO_CONST, KO_CONST2, KO_SPILL, KO_FILL, KO_ARG, KO_CHK, PFX_PD, PFX_SD
 from ir import KPath, KV_BCF, KV_BCI, KV_J, KV_JINC, KV_LD, KV_ST, KV_MOV, KV_FOP, KV_IOP, KV_SHI
@@ -32,6 +32,7 @@ import ssa
 import ra
 from dwarf import Dwarf, DFn, DRow, DLocal, new_dwarf, loc_breg, loc_deref, write_dwarf
 from obj import ObjFile, OSym, ORel, new_obj, write_coff, write_elf, put16, put32, put64, set32, uleb, sleb, log2
+from obj import fn_table
 from obj import SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, SEC_UNWIND, R_PC32, R_CALL, R_ABS64, R_GOT, R_RVA32
 
 const RAX = 0
@@ -148,6 +149,8 @@ struct Stub:
     # place (a is then worked out from it and b), else -1; unsigned operands
     r: int
     uns: bool
+    # the check's site (`Func.sites`)
+    site: str
 
 # What the unwind tables say about a function: where (offsets in .text) each
 # step of its prologue ends, and its epilogues.
@@ -306,6 +309,12 @@ struct X:
     ovf: [int]
     # where each function starts in .text and how a panic names it
     ftab: [(int, str)]
+    # where each call returns to in .text, and its site: the frames a panic's
+    # call chain names there (`Func.sites`, "" for none); the sites of the
+    # function being compiled, and of the instruction being compiled
+    calls: [(int, str)]
+    fsites: [str]
+    site: str
     # .rodata symbols of float constants, by their bits (and 1 << 64 for f32)
     fpool: {i128: int}
     # 16-byte constants (vector kernels), by "lo,hi"
@@ -902,7 +911,7 @@ struct X:
     fn jcc_ovf(ref self, cc: int, kind: int, a: int, b: int, c: int, r: int, uns: bool):
         self.b(15)
         self.b(128 + cc)
-        self.stubs.push(Stub(at=self.pos(), kind=kind, a=a, b=b, c=c, r=r, uns=uns))
+        self.stubs.push(Stub(at=self.pos(), kind=kind, a=a, b=b, c=c, r=r, uns=uns, site=self.site))
         self.b32(0)
 
     # ------------------------------------------------------------ vregs
@@ -1183,6 +1192,7 @@ struct X:
             self.b32(0)
         else:
             self.rr(0, 0, 255, 2, R11)
+        self.calls.push((self.pos(), self.site))
         for v in keep:
             if self.freg[v] >= 0:
                 self.fload(fl_of(self.vk[v]), self.freg[v], self.vm(v))
@@ -1791,6 +1801,8 @@ struct X:
     fn func(ref self, f: Func):
         let nv = len(f.vk)
         self.code = f.code
+        self.fsites = f.sites
+        self.site = ""
         self.vk = f.vk
         self.nparams = f.nparams
         self.has_ret = f.has_ret
@@ -2023,7 +2035,7 @@ struct X:
         self.rows = []
         if self.dbg and f.dline > 0 and not f.dfile.starts_with("<"):
             let fi = self.dw.file(f.dfile)
-            self.rows.push(DRow(pc=self.u.start, file=fi, line=f.dline))
+            self.rows.push(DRow(pc=self.u.start, file=fi, line=f.dline, stmt=true))
         self.thread_jumps(f.nlabels)
         var i = 0
         while i < ncode:
@@ -2032,6 +2044,7 @@ struct X:
             if self.dead[i]:
                 i += 1
             else:
+                self.site = site_text(self.code[i], self.fsites)
                 i = self.inst(i)
         self.ipos[ncode] = self.pos()
         if ncode == 0 or not (
@@ -2044,9 +2057,14 @@ struct X:
         # cold stubs (the operands go through scratch registers first, since
         # they may be in argument registers; nothing is kept around the calls)
         self.cur = -1
+        var cold: [(int, int, int)] = []
         for s in self.stubs:
             set32(ref self.o.text, s.at, self.pos() - (s.at + 4))
+            let start = self.pos()
+            if self.dbg:
+                self.stub_row(s.at)
             self.cpos = -1
+            self.site = s.site
             if s.kind == S_IDX:
                 self.ld(RAX, s.a)
                 self.stub_bc(s)
@@ -2077,6 +2095,14 @@ struct X:
                         CArg(how=A_REG, v=R11, fl=0)
                     ]
                 )
+            cold.push((s.at, start, self.pos()))
+        self.site = ""
+        # a call that never returns may end the function: its return address
+        # is then the next function's start, and a debugger's backtrace goes
+        # wrong from there (int3 keeps it inside)
+        let nc = len(self.calls)
+        if nc > 0 and self.calls[nc - 1].0 == self.pos():
+            self.b(0xCC)
         for j in 0..len(self.jat):
             set32(ref self.o.text, self.jat[j], self.lpos[self.jlab[j]] - (self.jat[j] + 4))
         for j in 0..len(self.tat):
@@ -2086,7 +2112,7 @@ struct X:
         else:
             self.unwind_elf()
         if self.dbg:
-            self.debug_func(f)
+            self.debug_func(f, cold)
 
     # A stub's b to r10 and c to r11 (b or c may be in r10 or r11 themselves)
     fn stub_bc(ref self, s: Stub):
@@ -2724,10 +2750,7 @@ struct X:
 
     # What a panic needs to print its call chain (runtime/rt.br, `call_chain`):
     # `brine_frame_ptr`, which returns its caller's rbp (it has no frame of its
-    # own, so needs no unwind entry), and `brine_fn_table`: the address of
-    # .text, the number of functions, the size of .text, then for each
-    # function its offset in .text and where its name starts in the NUL-ended
-    # names after the table ("" at 0 for the runtime and generated code).
+    # own, so needs no unwind entry), and `brine_fn_table` (see `fn_table`).
     fn frame_table(ref self):
         while len(self.o.text) % 16 != 0:
             self.o.text.push(204)
@@ -2735,31 +2758,9 @@ struct X:
         self.ftab.push((self.pos(), ""))
         # mov rax, rbp; ret
         self.o.text.extend([72, 137, 232, 195])
-        while len(self.o.data) % 8 != 0:
-            self.o.data.push(0)
-        self.o.data_align = max(self.o.data_align, 8)
-        let base = len(self.o.data)
+        let base = fn_table(ref self.o, self.ftab, self.calls)
         self.sym_def("brine_fn_table", SEC_DATA, base, true, false)
         self.o.drel.push(ORel(off=base, sym=self.text_sym, kind=R_ABS64, add=0))
-        put64(ref self.o.data, 0)
-        put64(ref self.o.data, len(self.ftab))
-        put64(ref self.o.data, len(self.o.text))
-        var names: [u8] = [0]
-        var at: {str: int} = {}
-        for (off, t) in self.ftab:
-            put32(ref self.o.data, off)
-            if t == "":
-                put32(ref self.o.data, 0)
-            else:
-                match at.get(t):
-                    case Some(n):
-                        put32(ref self.o.data, n)
-                    case None:
-                        at[t] = len(names)
-                        put32(ref self.o.data, len(names))
-                        names.extend(t.bytes())
-                        names.push(0)
-        self.o.data.extend(names)
 
     # an image-relative address in .pdata
     fn rva(ref self, sym: int, add: int):
@@ -2847,7 +2848,7 @@ struct X:
         if x.s.starts_with("<"):
             return
         let fi = self.dw.file(x.s)
-        let row = DRow(pc=self.pos(), file=fi, line=x.n)
+        let row = DRow(pc=self.pos(), file=fi, line=x.n, stmt=true)
         let n = len(self.rows)
         if n > 0:
             let last = self.rows[n - 1]
@@ -2862,6 +2863,24 @@ struct X:
     # A variable is visible from the line after its declaration (the
     # first line row after `pc`, at most `hi`): on the declaration's own line
     # it is not set yet.
+    # A stub's code is on the line it is jumped to from.
+    fn stub_row(ref self, at: int):
+        var line = -1
+        var fi = -1
+        for r in self.rows:
+            if r.pc > at:
+                break
+            line = r.line
+            fi = r.file
+        let n = len(self.rows)
+        if line < 0 or (self.rows[n - 1].line == line and self.rows[n - 1].file == fi):
+            return
+        let row = DRow(pc=self.pos(), file=fi, line=line, stmt=false)
+        if self.rows[n - 1].pc == row.pc:
+            self.rows[n - 1] = row
+        else:
+            self.rows.push(row)
+
     fn next_row(self, pc: int, hi: int) -> int:
         for r in self.rows:
             if r.pc > pc:
@@ -2872,7 +2891,8 @@ struct X:
         return loc_breg(dwarf_reg(self.slot_base[s]), self.slot_off[s])
 
     # The function's entry in the debug info: its range, lines and variables.
-    fn debug_func(ref self, f: Func):
+    # `cold`: each stub's jump to it, its start and its end
+    fn debug_func(ref self, f: Func, cold: [(int, int, int)]):
         let end = self.pos()
         for j in 1..len(self.ipos):
             if self.ipos[j] < 0:
@@ -2901,6 +2921,14 @@ struct X:
                     hi = self.ipos[v.hi]
                 lo = self.next_row(self.ipos[v.lo], hi)
             locals.push(DLocal(name=v.name, ty=v.ty, param=v.param, loc=loc, lo=lo, hi=hi))
+        # the stubs come after the body, outside every scope: each has the
+        # variables in scope where it is jumped to from (a panic stops there)
+        let nl = len(locals)
+        for at, lo, hi in cold:
+            for i in 0..nl:
+                let v = locals[i]
+                if v.lo >= 0 and v.lo <= at and at < v.hi and v.hi <= lo:
+                    locals.push(DLocal(name=v.name, ty=v.ty, param=false, loc=v.loc, lo=lo, hi=hi))
         if f.public and f.dname == "" and self.entry_main:
             # The C entry point that calls brine's `main` comes right before
             # it (see `emit_order`) and is described as a second range of it:
@@ -4694,6 +4722,9 @@ fn emit(
         xdata_sym=0,
         ovf=[-1, -1, -1],
         ftab=[],
+        calls=[],
+        fsites=[],
+        site="",
         fpool={},
         vpool={},
         cpu_sym=-1,

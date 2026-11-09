@@ -349,9 +349,15 @@ struct Func:
     dvars: [DVar]
     # the debug type of the result, when it is returned in a register (-1: none)
     dret: int
-    # how a panic's call chain names it: "name (file:line)" ("" for the runtime
-    # and generated code)
+    # how a panic's call chain names it: "name (file:line)" ("" for the runtime,
+    # the prelude and generated code)
     trace: str
+    # Where its calls and checks are in the source, for a panic's call chain:
+    # a call or check with n > 0 (`FB.site`) is at sites[n - 1], the frames
+    # it is in, innermost first, one per line: "name (file:line)". A function
+    # inlined into another adds its frame to its calls' sites (opt.br,
+    # `inline_call`), so the chain still names it.
+    sites: [str]
 
 # A pointer stored in data: the 8 bytes at `off` hold the address of `sym` + `add`.
 struct Reloc:
@@ -568,7 +574,8 @@ fn new_func(name: str, params: [K], has_ret: bool, ret: K) -> Func:
         dline=0,
         dvars=[],
         dret=-1,
-        trace=""
+        trace="",
+        sites=[]
     )
 
 # ================================================================ debug info
@@ -614,6 +621,16 @@ struct DVar:
     lo: int
     hi: int
 
+# The frames call or check x is in (see `Func.sites`), "" when it has none.
+fn site_text(x: Inst, sites: [str]) -> str:
+    if x.n <= 0 or x.n > len(sites):
+        return ""
+    match x.op:
+        case Op.Call | Op.CallInd | Op.AddO | Op.SubO | Op.MulO | Op.IdxChk:
+            return sites[x.n - 1]
+        case _:
+            return ""
+
 fn inst(op: Op, d: int, a: int, b: int, c: int, n: int, s: str, args: [int]) -> Inst:
     return Inst(op=op, d=d, a=a, b=b, c=c, n=n, s=s, args=args)
 
@@ -622,6 +639,8 @@ fn inst(op: Op, d: int, a: int, b: int, c: int, n: int, s: str, args: [int]) -> 
 # Appends to a function under construction.
 struct FB:
     f: Func
+    # the `n` of the calls and checks emitted now: their site (see `Func.sites`)
+    site: int
 
     fn vreg(ref self, k: K) -> int:
         self.f.vk.push(k)
@@ -690,7 +709,7 @@ struct FB:
 
     fn chk(ref self, op: Op, k: K, a: int, b: int, loc: int) -> int:
         let d = self.vreg(k)
-        self.f.code.push(inst(op, d, a, b, loc, 0, "", []))
+        self.f.code.push(inst(op, d, a, b, loc, self.site, "", []))
         return d
 
     fn un(ref self, op: Op, k: K, a: int) -> int:
@@ -761,26 +780,26 @@ struct FB:
     # a call with a result of kind k
     fn call(ref self, k: K, sym: str, args: [int]) -> int:
         let d = self.vreg(k)
-        self.f.code.push(inst(Op.Call, d, -1, 0, -1, 0, sym, args))
+        self.f.code.push(inst(Op.Call, d, -1, 0, -1, self.site, sym, args))
         return d
 
     fn call_void(ref self, sym: str, args: [int]):
-        self.f.code.push(inst(Op.Call, -1, -1, 0, -1, 0, sym, args))
+        self.f.code.push(inst(Op.Call, -1, -1, 0, -1, self.site, sym, args))
 
     # runtime helpers that are `static inline` in brine_rt.h (see `Op.Call`)
     fn rt(ref self, k: K, sym: str, args: [int]) -> int:
         let d = self.vreg(k)
-        self.f.code.push(inst(Op.Call, d, -1, 1, -1, 0, sym, args))
+        self.f.code.push(inst(Op.Call, d, -1, 1, -1, self.site, sym, args))
         return d
 
     fn rt_void(ref self, sym: str, args: [int]):
-        self.f.code.push(inst(Op.Call, -1, -1, 1, -1, 0, sym, args))
+        self.f.code.push(inst(Op.Call, -1, -1, 1, -1, self.site, sym, args))
 
     fn call_ind(ref self, has: bool, k: K, fp: int, args: [int]) -> int:
         var d = -1
         if has:
             d = self.vreg(k)
-        self.f.code.push(inst(Op.CallInd, d, fp, -1, -1, 0, "", args))
+        self.f.code.push(inst(Op.CallInd, d, fp, -1, -1, self.site, "", args))
         return d
 
     fn ret(ref self, v: int):

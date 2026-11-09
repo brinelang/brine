@@ -454,6 +454,45 @@ test "gdb stops at a panic":
     )
     assert "panic: index 2 is out of bounds" in o.all(), o.all()
     assert "Breakpoint 1, " in o.out and "panic_stop" in o.out, o.all()
+    # the backtrace goes on past the panicking function (whose last
+    # instruction is the call that panics) to `main`
+    assert "in fib (n=" in o.out and " in main () at " in o.out, o.all()
+    # with the pretty-printers, gdb selects the frame that panicked, where its
+    # variables are in scope
+    if gdb_ok(["-ex", "python import gdb"]):
+        let p = exec(
+            [
+                "gdb",
+                "-nx",
+                "-batch",
+                "-x",
+                "runtime/brine_gdb.py",
+                "-ex",
+                "break panic_stop",
+                "-ex",
+                "run",
+                "-ex",
+                "info locals",
+                "--args",
+                x,
+                "seq"
+            ],
+            {}
+        )
+        assert " in at (n=" in p.out and "xs = [1, 2]" in p.out, p.all()
+        # a breakpoint on the panicking line has one place, not the stub too
+        let q = exec(["gdb", "-nx", "-batch", "-ex", "break panic_chain.br:9", x], {})
+        assert "line 9." in q.out and "locations" not in q.out, q.all()
+
+# Without a terminal (an agent's shell, CI), `brine debug` runs the program
+# and shows where the panic came from instead of waiting for commands.
+test "brine debug without a terminal":
+    if not gdb_ok(["--version"]) and os.name() != "macos":
+        return
+    let o = brine(["debug", "tests/programs/panic_chain.br", "--", "seq"])
+    assert o.code == 0, o.all()
+    assert "panic: index 2 is out of bounds" in o.all(), o.all()
+    assert "panic_chain.br:9" in o.out and "panic_chain.br:16" in o.out, o.all()
 
 # The same under lldb on macOS, where the debug info stays in the
 # executable's __DWARF segment.
@@ -688,33 +727,154 @@ test "panics are clear":
     assert "--> tests/programs/panic_oom.br:4:14" in c.err, c.err
 
 test "a panic names the functions it came through":
-    # (x86-64 code only: AArch64 and the C backend print the location alone)
-    if os.arch() == "x86_64" and os.name() != "macos":
+    # (native code only: the C backend prints the location alone)
+    if os.arch() == "x86_64" or os.arch() == "aarch64":
         let f = "tests/programs/panic_chain.br"
+        # each frame at the line it was at
         let chain = (
             "  --> tests/programs/panic_chain.br:9:12\n"
-            + "  in at (tests/programs/panic_chain.br:7)\n"
-            + "  called from fib (tests/programs/panic_chain.br:2)\n"
-            + "  called from fib (tests/programs/panic_chain.br:2), 2 more times\n"
-            + "  called from main (tests/programs/panic_chain.br:11)\n"
+            + "  in at (tests/programs/panic_chain.br:9)\n"
+            + "  called from fib (tests/programs/panic_chain.br:4)\n"
+            + "  called from fib (tests/programs/panic_chain.br:5)\n"
+            + "  called from fib (tests/programs/panic_chain.br:5), 3 more times\n"
+            + "  called from main (tests/programs/panic_chain.br:16)\n"
         )
         # a `par` body ends the chain: the thread that ran it varies
         let in_par = (
-            "  in at (tests/programs/panic_chain.br:7)\n"
-            + "  called from a `par` body in main (tests/programs/panic_chain.br:11)\n"
+            "  in at (tests/programs/panic_chain.br:9)\n"
+            + "  called from a `par` body in main (tests/programs/panic_chain.br:13)\n"
         )
-        for mode in ["-q", "--release"]:
+        for mode in ["-q", "--release", "--debug"]:
             let o = brine(["run", f, mode, "-q", "--", "seq"])
-            assert o.code == 101 and o.err.ends_with(chain), f"{mode}: {o.all()}"
+            assert o.code == 101 and (chain + "  = help: ") in o.err, f"{mode}: {o.all()}"
             let p = brine(["run", f, mode, "-q", "--", "par"])
-            assert p.code == 101 and p.err.ends_with(in_par), f"{mode}: {p.all()}"
-        # a stack overflow names the function that overflowed
+            assert p.code == 101 and (in_par + "  = help: ") in p.err, f"{mode}: {p.all()}"
+        # functions the compiler inlined are there too, and the prelude's aren't
+        let g = "tests/programs/panic_inline.br"
+        let ends = [
+            (
+                "index",
+                "  in c (tests/programs/panic_inline.br:4)\n"
+                + "  called from b (tests/programs/panic_inline.br:7)\n"
+                + "  called from a (tests/programs/panic_inline.br:12)\n"
+                + "  called from main (tests/programs/panic_inline.br:30)\n"
+            ),
+            (
+                "overflow",
+                "  in grow (tests/programs/panic_inline.br:16)\n"
+                + "  called from main (tests/programs/panic_inline.br:32)\n"
+            ),
+            (
+                "unwrap",
+                "  --> tests/programs/panic_inline.br:19:12\n"
+                + "  in first (tests/programs/panic_inline.br:19)\n"
+                + "  called from main (tests/programs/panic_inline.br:34)\n"
+            ),
+            (
+                "method",
+                "  in Stack.top (tests/programs/panic_inline.br:25)\n"
+                + "  called from main (tests/programs/panic_inline.br:37)\n"
+            ),
+            (
+                "args",
+                "  in grow (tests/programs/panic_inline.br:16)\n"
+                + "  called from main (tests/programs/panic_inline.br:42)\n"
+            )
+        ]
+        for mode in ["-q", "--release"]:
+            for which, end in ends:
+                let o = brine(["run", g, mode, "-q", "--", which])
+                assert o.code == 101 and (end + "  = help: ") in o.err, f"{mode} {which}: {o.all()}"
+        # a stack overflow names the function that overflowed, and counts
+        # every frame
         let s = brine(["run", "tests/programs/panic_stack.br", "-q", "--", "100000000"])
-        let deep = "  in depth (tests/programs/panic_stack.br:3)\n  called from depth (tests/programs/panic_stack.br:3), "
+        let deep = (
+            "  in depth (tests/programs/panic_stack.br:3)\n"
+            + "  called from depth (tests/programs/panic_stack.br:6)\n"
+            + "  called from depth (tests/programs/panic_stack.br:6), "
+        )
         assert s.code == 101 and deep in s.err, s.all()
-        assert s.err.ends_with(
-            " more times\n  called from main (tests/programs/panic_stack.br:8)\n"
+        assert (
+            " more times\n  called from main (tests/programs/panic_stack.br:15)\n  = help: " in s.err
         ), s.all()
+
+test "a runtime panic says how to avoid it":
+    let f = "tests/programs/panic_help.br"
+    let index = "an index must be at least 0 and less than the length"
+    let empty = "check that it isn't empty first"
+    let cases = [
+        ("index 5", index),
+        ("slice 3", "a slice [lo:hi] needs 0 <= lo <= hi <= the length"),
+        ("char 1", "string positions count bytes"),
+        ("none 0", "match on the Option to handle None, or use `unwrap_or(default)`"),
+        ("err 1", "match on the Result to handle the error"),
+        ("div 0", "check that the divisor isn't 0 first"),
+        ("rem 0", "check that the divisor isn't 0 first"),
+        ("add 1", "use a wider type (such as `i128`), or `wrapping_add`"),
+        ("conv 300", "check that the value fits in the type before converting it"),
+        ("float 1", "check that the value is in the type's range, and isn't NaN"),
+        ("int 0", "`s.to_int()` gives None"),
+        ("parse 0", "`s.to_float()` gives None"),
+        ("key 0", "check with `k in m` first, or use `m.get(k)`"),
+        ("pop 1", empty),
+        ("max 0", empty)
+    ]
+    for backend in ["native", "c"]:
+        for which, help in cases:
+            var a = ["run", f, "-q", "--"]
+            a.extend(which.split(" "))
+            let o = brine_env(a, {"BRINE_BACKEND": backend})
+            assert o.code == 101 and f"\n  = help: {help}" in o.err, f"{backend} {which}: {o.all()}"
+        # the program's own `panic` has none, even with the same message
+        let u = brine_env(["run", f, "-q", "--", "user", "5"], {"BRINE_BACKEND": backend})
+        assert u.code == 101 and "index 5 is out of bounds" in u.err, u.all()
+        assert "help:" not in u.err, f"{backend}: {u.all()}"
+        let uw = brine_env(["run", f, "-q", "--", "own_unwrap", "0"], {"BRINE_BACKEND": backend})
+        assert uw.code == 101 and "unwrap() called on None" in uw.err, uw.all()
+        assert "help:" not in uw.err, f"{backend}: {uw.all()}"
+        # `--json` has it as the diagnostic's help
+        let j = brine_env(
+            ["run", "--json", f, "-q", "--", "index", "5"],
+            {"BRINE_BACKEND": backend}
+        )
+        assert f"\"help\":[\"{index}" in j.out, f"{backend}: {j.all()}"
+    let s = brine(["run", "tests/programs/panic_stack.br", "-q", "--", "100000000"])
+    assert "  = help: every thread has a 64 MB stack" in s.err, s.all()
+    let m = brine(["run", "tests/programs/panic_oom.br", "-q"])
+    assert "  = help: check where the size comes from" in m.err, m.all()
+
+test "a failed assert shows the values it compared":
+    let f = "tests/programs/assert_values.br"
+    let cases = [
+        ("int 3", "n * 2 == 10\n  left: 6\n  right: 10\n"),
+        ("u 4", "u64(n) < u64(3)\n  left: 4\n  right: 3\n  message: too big\n"),
+        ("f 2", "float(n) / 3.0 == 1.0\n  left: 0.6666666666666666\n  right: 1.0\n"),
+        ("f32 1", "f32(n) / f32(10) >= f32(1)\n  left: 0.1\n  right: 1.0\n"),
+        ("b 5", "(n > 3) == false\n  left: true\n  right: false\n"),
+        ("s 1", "f\"a{n}\" == \"a\"\n  left: \"a1\"\n  right: \"a\"\n"),
+        ("arr 5", "[n, 2] == [1, 2]\n  left: [5, 2]\n  right: [1, 2]\n"),
+        (
+            "p 7",
+            "P(x=n, y=1) == P(x=1, y=1)\n  left: P(x=7, y=1)\n  right: P(x=1, y=1)\n  message: n was 7\n"
+        ),
+        ("big 2", "i128(n) * i128(10) == i128(1)\n  left: 20\n  right: 1\n"),
+        ("opt 0", "\"ab\".find(\"b\") == Some(n)\n  left: Some(1)\n  right: Some(0)\n"),
+        # (not one comparison: the condition alone)
+        ("chain 5", "0 <= n < 3\n  -->"),
+        ("and 7", "n > 0 and n < 3\n  -->")
+    ]
+    for backend in ["native", "c"]:
+        for mode in ["-q", "--release"]:
+            for which, want in cases:
+                var a = ["run", f, mode, "-q", "--"]
+                a.extend(which.split(" "))
+                let o = brine_env(a, {"BRINE_BACKEND": backend})
+                assert (
+                    o.code == 101 and f"panic: assertion failed: {want}" in o.err
+                ), f"{backend} {mode} {which}: {o.all()}"
+    # `--json` has them as notes
+    let j = brine(["run", "--json", f, "-q", "--", "int", "3"])
+    assert "\"notes\":[\"left: 6\",\"right: 10\"" in j.out, j.all()
 
 test "brine run --json reports a panic like a build error":
     let f = "tests/programs/panic_chain.br"
@@ -728,8 +888,8 @@ test "brine run --json reports a panic like a build error":
         assert j.starts_with(
             "{\"severity\":\"error\",\"code\":null,\"message\":\"index 2 is out of bounds for an array of length 2\",\"spans\":[{\"file\":\"tests/programs/panic_chain.br\",\"line\":9,\"column\":12,"
         ), j
-        if backend == "native" and os.arch() == "x86_64" and os.name() != "macos":
-            assert "\"notes\":[\"in at (tests/programs/panic_chain.br:7)\"," in j, j
+        if backend == "native" and (os.arch() == "x86_64" or os.arch() == "aarch64"):
+            assert "\"notes\":[\"in at (tests/programs/panic_chain.br:9)\"," in j, j
         # the human-readable report is still on stderr
         assert "panic: index 2 is out of bounds" in o.err, o.all()
     # the same fields as a build error, in the same order

@@ -192,7 +192,10 @@ fn usage(cmd: str) -> Option[str]:
         ls = [
             "Usage: brine debug [file | folder] [-- program arguments]",
             "",
-            "Make a debug build and start it under gdb or lldb."
+            "Make a debug build and start it under gdb or lldb.",
+            "",
+            "Without a terminal, the debugger runs the commands piped in, or with none",
+            "runs the program and shows where a panic came from."
         ]
     elif cmd == "fmt":
         ls = [
@@ -1115,8 +1118,8 @@ fn panic_file(base: str, rank: int, ranks: int) -> str:
     return base if ranks <= 1 else f"{base}.{rank}"
 
 # The panic a program wrote (runtime/rt.br, `panic_record`: the location, a
-# NUL, the message, a NUL, then the call chain) as a diagnostic, its primary
-# span where it happened when that file can be read.
+# NUL, the message, a NUL, the call chain, a NUL, then the help) as a
+# diagnostic, its primary span where it happened when that file can be read.
 fn panic_diag(rec: str, rank: int) -> (Diag, SourceMap):
     let parts = rec.split("\0")
     let loc = parts[0] if len(parts) > 0 else ""
@@ -1144,6 +1147,8 @@ fn panic_diag(rec: str, rank: int) -> (Diag, SourceMap):
         for l in parts[2].lines():
             if l.strip() != "":
                 d = d.note(l.strip())
+    if len(parts) > 3 and parts[3] != "":
+        d = d.with_help(parts[3])
     return (d, sm)
 
 # A plain unsigned decimal number (no sign, no spaces).
@@ -1186,12 +1191,25 @@ fn cmd_debug(g: G, a: Args) -> Result[int, str]:
                     exe
                 )
             )
+    # Without a terminal the debugger reads its commands from stdin: piped
+    # ones run in batch mode, and none (an agent's shell, CI) runs the
+    # program and shows the frames of a panic. Otherwise gdb would wait
+    # forever on an empty stdin on Windows.
+    let dir = driver.dir_of(exe)
+    var script = ""
+    if not os.is_terminal(0):
+        var cmds = read_stdin().unwrap_or("")
+        if cmds.strip() == "":
+            cmds = "commands\n  bt\nend\nrun\n" if dbg == "gdb" else "run\nbt\n"
+        script = (dir if dir != "" else ".") + "/brine-debug." + dbg
+        write_file(script, cmds)?
     var cmd = [dbg]
     if dbg == "gdb":
         cmd.push("-q")
+        if script != "":
+            cmd.push("-batch")
         # the pretty-printers need a gdb with Python; without it brine
         # values print as their C layout
-        let dir = driver.dir_of(exe)
         let py = (dir if dir != "" else ".") + "/brine-gdb.py"
         let has_py = driver.runs_ok(["gdb", "-nx", "-batch", "-ex", "python import gdb"])
         if has_py and write_file(py, GDB_PY).is_ok():
@@ -1199,11 +1217,17 @@ fn cmd_debug(g: G, a: Args) -> Result[int, str]:
         else:
             cmd.extend(["-ex", "skip -gfi */brine_rt.c", "-ex", "skip -gfi */brine_rt.h"])
         # stop at a panic, once it is printed, with the frames that led to it
-        cmd.extend(["-ex", "break panic_stop", "--args", exe])
+        cmd.extend(["-ex", "break panic_stop"])
+        if script != "":
+            cmd.extend(["-x", script])
+        cmd.extend(["--args", exe])
     else:
         # don't step into the C runtime
         let avoid = "settings set target.process.thread.step-avoid-regexp ^(brine_|br_)"
-        cmd.extend(["-O", avoid, "-O", "breakpoint set -n panic_stop", "--", exe])
+        cmd.extend(["-O", avoid, "-O", "breakpoint set -n panic_stop"])
+        if script != "":
+            cmd.extend(["-b", "-s", script])
+        cmd.extend(["--", exe])
     cmd.extend(a.rest)
     let sp = os.spawn(cmd, {}, false, true)
     match sp:

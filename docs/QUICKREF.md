@@ -16,7 +16,9 @@ brine fmt                      # format               brine fmt --check
 brine spec-diff --base main    # which specs got weaker since a git revision
 brine run --ranks 4            # 4 cooperating processes (world module)
 brine debug file.br            # debug build in gdb/lldb: break file.br:12, step, print x
-                               # (it also stops at a panic, once it is printed)
+                               # (it also stops at a panic, once it is printed; gdb
+                               # selects the frame that panicked; with no terminal it runs the
+                               # commands piped in, or runs to the panic and prints `bt`)
 brine explain E0601            # explain any error code
 brine run --target wasm        # WebAssembly, run with Node.js (needs wasi-sdk, $WASI_SDK_PATH)
 brine build --target web -o d  # d/: index.html + brine.js + program.wasm, for a browser
@@ -60,9 +62,10 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
   unless the compiler proved they can't happen, in which case the check is removed.
   The message has the values involved (`integer overflow in addition:
   9223372036854775807 + 1`, `integer conversion out of range for u8: 300`) and
-  the source location. On x86-64, the functions the panic came through follow,
-  innermost first (`in at (app.br:7)`, `called from main (app.br:11)`); a
-  small function the compiler inlined is part of its caller there. A chain
+  the source location. In native code (x86-64 and AArch64; not the C
+  backend), the functions the panic came through follow, innermost first, each
+  at the line it was at (`in at (app.br:9)`, `called from main (app.br:14)`),
+  functions the compiler inlined included. A chain
   ends at a `par` body or task, since the thread that ran it varies.
   Only the first panic is reported, even when many `par` threads fail at once:
   that is the first one to fail in time, not necessarily the lowest index, so
@@ -728,7 +731,9 @@ fn index_of(xs: [int], target: int) -> int:
   `requires n < 0` is an error (E0608), since every claim in the body would be
   proven without meaning anything.
 * `assert e` checks at runtime (always, in every build) and is a known fact
-  afterwards. Use it to hand the prover a fact it can't derive itself.
+  afterwards. Use it to hand the prover a fact it can't derive itself. When
+  `assert a == b` (or another single comparison) fails, the panic shows both
+  values (`left: 6`, `right: 10`).
 * Specs may use arithmetic, comparisons, `and`/`or`/`not`, `len`, `abs`, `min`,
   `max`, fields, indexing, constants and `result`.
 * In `for i in a..b` loops, invariants may mention `i`: they must hold at the start

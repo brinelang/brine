@@ -17,7 +17,7 @@
 # Debug builds (`emit_obj` with `dbg`) keep every vreg in its home and get DWARF
 # line and variable info (dwarf.br), as in x64.br.
 
-from ir import K, Op, Inst, Func, Module, KFunc, KOp
+from ir import K, Op, Inst, Func, Module, KFunc, KOp, site_text
 from ir import KO_MOV, KO_LD, KO_LDP, KO_LDH, KO_ST, KO_STH, KO_OP, KO_SQRT, KO_SHUF
 from ir import KO_CONST, KO_CONST2, KO_SPILL, KO_FILL, KO_ARG, KPath
 from ir import KV_BCF, KV_LD, KV_ST, KV_MOV, KV_FOP, KV_RLD, KV_RST, KV_RED
@@ -27,6 +27,7 @@ from dwarf import Dwarf, DFn, DRow, DLocal, new_dwarf, loc_breg, loc_deref, writ
 from obj import ObjFile, OSym, ORel, new_obj, write_elf, put16, put32, set32, uleb, sleb, log2
 from obj import SEC_UNDEF, SEC_TEXT, SEC_DATA, SEC_RODATA, R_PC32, R_ABS64, ARCH_A64
 from obj import R_A64_CALL26, R_A64_PAGE, R_A64_LO12, R_A64_GOT_PAGE, R_A64_GOT_LO12, R_A64_LDR12
+from obj import fn_table
 import ra64
 from x64 import canon, fl_of, align_up, w128, wide_rt_helpers, emit_order, opt_func, div_magic
 from ra import int_div_rt
@@ -292,6 +293,8 @@ struct Stub:
     # S_RC: where its "done" exit goes, a position or (if >= 0) a label
     d: int
     e: int
+    # the check's site (`Func.sites`)
+    site: str
 
 # Where (offsets in .text) a function's prologue steps end, for .eh_frame.
 struct Unw:
@@ -329,6 +332,14 @@ struct A:
     wide_ret: {str: bool}
     wide_rt: {str: bool}
     text_sym: int
+    # for a panic's call chain (obj.br, `fn_table`): where each function
+    # starts in .text and how a panic names it; where each call returns to
+    # and its site (`Func.sites`, "" for none); the sites of the function
+    # being compiled, and of the instruction being compiled
+    ftab: [(int, str)]
+    calls: [(int, str)]
+    fsites: [str]
+    site: str
     ovf: [int]
     # the function being compiled
     code: [Inst]
@@ -769,7 +780,7 @@ struct A:
         self.st_end = -1
 
     fn bcc_stub(ref self, cc: int, kind: int, a: int, b: int, c: int):
-        self.stubs.push(Stub(at=self.pos(), kind=kind, a=a, b=b, c=c, d=-1, e=-1))
+        self.stubs.push(Stub(at=self.pos(), kind=kind, a=a, b=b, c=c, d=-1, e=-1, site=self.site))
         self.w(0x54000000 | cc)
 
     # ------------------------------------------------------------ vregs
@@ -1004,9 +1015,11 @@ struct A:
         elif sym >= 0:
             self.reloc(R_A64_CALL26, sym, 0)
             self.w(0x94000000)
+            self.calls.push((self.pos(), self.site))
         else:
             # blr (fp is in no argument register)
             self.w(0xD63F0000 | (self.use(T0, fp) << 5))
+            self.calls.push((self.pos(), self.site))
 
     fn call_rt(ref self, name: str, args: [CArg]):
         let s = self.sym_ref(name)
@@ -1097,7 +1110,7 @@ struct A:
                 self.here(skip, B14)
             let back = self.pos()
             self.stubs.push(
-                Stub(at=shared, kind=S_RC, a=flags | RC_RETAIN, b=b, c=back, d=back, e=-1)
+                Stub(at=shared, kind=S_RC, a=flags | RC_RETAIN, b=b, c=back, d=back, e=-1, site="")
             )
             return true
         var done: [int] = []
@@ -1161,7 +1174,7 @@ struct A:
                 self.here(at, done_kind(self.get32(at)))
             done_at = self.pos()
         self.stubs.push(
-            Stub(at=shared, kind=S_RC, a=flags, b=b, c=free_at, d=done_at, e=done_label)
+            Stub(at=shared, kind=S_RC, a=flags, b=b, c=free_at, d=done_at, e=done_label, site="")
         )
         return true
 
@@ -1759,6 +1772,9 @@ struct A:
             # nop
             self.w(0xD503201F)
         self.sym_def(f.name, SEC_TEXT, self.pos(), f.public or f.export, true)
+        self.ftab.push((self.pos(), f.trace))
+        self.fsites = f.sites
+        self.site = ""
         self.u = Unw(start=self.pos(), fp=0, pro_end=0, epis=[])
         # stp x29, x30, [sp, #-16]!; mov x29, sp
         self.w(0xA9BF7BFD)
@@ -1790,7 +1806,7 @@ struct A:
         self.rows = []
         if self.dbg and f.dline > 0 and not f.dfile.starts_with("<"):
             let fi = self.dw.file(f.dfile)
-            self.rows.push(DRow(pc=self.u.start, file=fi, line=f.dline))
+            self.rows.push(DRow(pc=self.u.start, file=fi, line=f.dline, stmt=true))
         self.dead = [false] * ncode
         if not self.dbg:
             self.thread_jumps(f.nlabels)
@@ -1801,6 +1817,7 @@ struct A:
                 continue
             self.cur = i
             self.ipos[i] = self.pos()
+            self.site = site_text(self.code[i], self.fsites)
             i = self.inst(i)
         self.ipos[ncode] = self.pos()
         if ncode == 0 or not (
@@ -1811,8 +1828,13 @@ struct A:
         ):
             self.epilogue()
         # cold stubs
+        var cold: [(int, int, int)] = []
         for s in self.stubs:
             self.here(s.at, B19)
+            let start = self.pos()
+            if self.dbg:
+                self.stub_row(s.at)
+            self.site = s.site
             if s.kind == S_RC:
                 self.rc_stub(s)
             elif s.kind == S_IDX:
@@ -1830,11 +1852,34 @@ struct A:
                     "brine_panic_ovf",
                     [CArg(how=A_SYM, v=msg, fl=0), CArg(how=A_VAL, v=s.c, fl=0)]
                 )
+            cold.push((s.at, start, self.pos()))
+        self.site = ""
+        # a call that never returns may end the function: its return address
+        # is then the next function's start, and a debugger's backtrace goes
+        # wrong from there (brk keeps it inside)
+        let nc = len(self.calls)
+        if nc > 0 and self.calls[nc - 1].0 == self.pos():
+            self.w(0xD4200000)
         for j in 0..len(self.jat):
             self.patch(self.jat[j], self.lpos[self.jlab[j]], self.jkind[j])
         self.unwind_elf()
         if self.dbg:
-            self.debug_func(f)
+            self.debug_func(f, cold)
+
+    # What a panic needs to print its call chain (runtime/rt.br, `call_chain`):
+    # `brine_frame_ptr`, which returns its caller's x29 (it has no frame of
+    # its own), and `brine_fn_table` (obj.br, `fn_table`).
+    fn frame_table(ref self):
+        while len(self.o.text) % 16 != 0:
+            self.w(0xD503201F)
+        self.sym_def("brine_frame_ptr", SEC_TEXT, self.pos(), true, true)
+        self.ftab.push((self.pos(), ""))
+        # mov x0, x29; ret
+        self.w(0xAA1D03E0)
+        self.w(0xD65F03C0)
+        let base = fn_table(ref self.o, self.ftab, self.calls)
+        self.sym_def("brine_fn_table", SEC_DATA, base, true, false)
+        self.o.drel.push(ORel(off=base, sym=self.text_sym, kind=R_ABS64, add=0))
 
     # ------------------------------------------------------------ kernels
     # A vector kernel (xkern.br) for SSE2's two-lane xmm registers, in NEON:
@@ -1852,6 +1897,7 @@ struct A:
         while len(self.o.text) % 16 != 0:
             self.w(0xD503201F)
         self.sym_def(k.name, SEC_TEXT, self.pos(), false, true)
+        self.ftab.push((self.pos(), ""))
         self.u = Unw(start=self.pos(), fp=0, pro_end=0, epis=[])
         # stp x29, x30, [sp, #-16]!; mov x29, sp
         self.w(0xA9BF7BFD)
@@ -2330,7 +2376,7 @@ struct A:
         if x.s.starts_with("<"):
             return
         let fi = self.dw.file(x.s)
-        let row = DRow(pc=self.pos(), file=fi, line=x.n)
+        let row = DRow(pc=self.pos(), file=fi, line=x.n, stmt=true)
         let n = len(self.rows)
         if n > 0:
             let last = self.rows[n - 1]
@@ -2341,13 +2387,32 @@ struct A:
                 return
         self.rows.push(row)
 
+    # A stub's code is on the line it is jumped to from.
+    fn stub_row(ref self, at: int):
+        var line = -1
+        var fi = -1
+        for r in self.rows:
+            if r.pc > at:
+                break
+            line = r.line
+            fi = r.file
+        let n = len(self.rows)
+        if line < 0 or (self.rows[n - 1].line == line and self.rows[n - 1].file == fi):
+            return
+        let row = DRow(pc=self.pos(), file=fi, line=line, stmt=false)
+        if self.rows[n - 1].pc == row.pc:
+            self.rows[n - 1] = row
+        else:
+            self.rows.push(row)
+
     fn next_row(self, pc: int, hi: int) -> int:
         for r in self.rows:
             if r.pc > pc:
                 return min(r.pc, hi)
         return hi
 
-    fn debug_func(ref self, f: Func):
+    # `cold`: each stub's jump to it, its start and its end
+    fn debug_func(ref self, f: Func, cold: [(int, int, int)]):
         let end = self.pos()
         for j in 1..len(self.ipos):
             if self.ipos[j] < 0:
@@ -2375,6 +2440,14 @@ struct A:
                     hi = self.ipos[v.hi]
                 lo = self.next_row(self.ipos[v.lo], hi)
             locals.push(DLocal(name=v.name, ty=v.ty, param=v.param, loc=loc, lo=lo, hi=hi))
+        # the stubs come after the body, outside every scope: each has the
+        # variables in scope where it is jumped to from (a panic stops there)
+        let nl = len(locals)
+        for at, lo, hi in cold:
+            for i in 0..nl:
+                let v = locals[i]
+                if v.lo >= 0 and v.lo <= at and at < v.hi and v.hi <= lo:
+                    locals.push(DLocal(name=v.name, ty=v.ty, param=false, loc=v.loc, lo=lo, hi=hi))
         if f.public and f.dname == "" and self.entry_main:
             self.entry = (self.u.start, end)
             return
@@ -3584,6 +3657,10 @@ fn emit(m0: Module, dbg: bool, on: bool, src: str, comp_dir: str, producer: str)
         wide_ret={},
         wide_rt=wide_rt_helpers(),
         text_sym=0,
+        ftab=[],
+        calls=[],
+        fsites=[],
+        site="",
         ovf=[-1, -1, -1],
         code=[],
         vk=[],
@@ -3682,6 +3759,7 @@ fn emit(m0: Module, dbg: bool, on: bool, src: str, comp_dir: str, producer: str)
             ks.extend(gk)
         for k in ks:
             x.kernel(k)
+    x.frame_table()
     # calls inside .text need no relocation
     var keep: [ORel] = []
     for r in x.o.trel:

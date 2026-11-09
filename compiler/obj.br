@@ -128,6 +128,105 @@ fn uleb(ref out: [u8], v: int):
         x = x >> 7
     out.push(u8(x))
 
+# ---------------------------------------------------------------- call chains
+# `brine_fn_table` in o's data: what a panic needs to name the functions it
+# came through and the lines of the calls (runtime/rt.br, `call_chain`).
+# `ftab` has where each function starts in .text and how a panic names it;
+# `calls` where each call returns to, in order, and its site: its frames,
+# innermost first, one "name (file:line)" per line (ir.br, `Func.sites`;
+# "" for none). The table, in 8-byte words then bytes:
+#   the address of .text (the caller relocates it), the number of functions,
+#   the size of .text, the number of calls, the number of names, the size
+#   of the sites;
+#   for each function: its offset in .text and its site (a u32 each);
+#   for each call where the site changes: where it returns to and its site
+#   (a call takes the site of the last entry at or before it);
+#   where each name ("name (file") starts in the names (a u32 each);
+#   the sites, each the number of frames then each frame's name and line
+#   (LEB128 numbers; 0 is no site: the runtime, the prelude, generated code);
+#   the names, NUL-ended.
+# Returns where it starts.
+fn fn_table(ref o: ObjFile, ftab: [(int, str)], calls: [(int, str)]) -> int:
+    var sites: [u8] = [0]
+    var names: [u8] = []
+    var name_at: [int] = []
+    var name_id: {str: int} = {}
+    var site_id: {str: int} = {}
+    var fs: [int] = []
+    for (_, t) in ftab:
+        fs.push(site_ref(t, ref sites, ref names, ref name_at, ref name_id, ref site_id))
+    var cs: [(int, int)] = []
+    var prev = ""
+    for (off, t) in calls:
+        if t != prev:
+            cs.push((off, site_ref(t, ref sites, ref names, ref name_at, ref name_id, ref site_id)))
+            prev = t
+    while len(o.data) % 8 != 0:
+        o.data.push(0)
+    o.data_align = max(o.data_align, 8)
+    let base = len(o.data)
+    put64(ref o.data, 0)
+    put64(ref o.data, len(ftab))
+    put64(ref o.data, len(o.text))
+    put64(ref o.data, len(cs))
+    put64(ref o.data, len(name_at))
+    put64(ref o.data, len(sites))
+    for i, (off, _) in enumerate(ftab):
+        put32(ref o.data, off)
+        put32(ref o.data, fs[i])
+    for (off, r) in cs:
+        put32(ref o.data, off)
+        put32(ref o.data, r)
+    for n in name_at:
+        put32(ref o.data, n)
+    o.data.extend(sites)
+    o.data.extend(names)
+    return base
+
+# Where site t is in `sites` (0 for ""), added there if it is new.
+fn site_ref(
+    t: str,
+    ref sites: [u8],
+    ref names: [u8],
+    ref name_at: [int],
+    ref name_id: {str: int},
+    ref site_id: {str: int}
+) -> int:
+    if t == "":
+        return 0
+    match site_id.get(t):
+        case Some(r):
+            return r
+        case None:
+            pass
+    var frames: [(int, int)] = []
+    for f in t.split("\n"):
+        # "name (file:line)": the line is after the last colon
+        let bs = f.bytes()
+        var c = len(bs) - 1
+        while c > 0 and bs[c] != 58:
+            c -= 1
+        let name = f[:c]
+        let line = f[c + 1:len(f) - 1].to_int().unwrap_or(0)
+        var id = 0
+        match name_id.get(name):
+            case Some(n):
+                id = n
+            case None:
+                id = len(name_at)
+                name_id[name] = id
+                name_at.push(len(names))
+                names.extend(name.bytes())
+                names.push(0)
+        frames.push((id, line))
+    let r = len(sites)
+    uleb(ref sites, len(frames))
+    for (id, line) in frames:
+        uleb(ref sites, id)
+        uleb(ref sites, line)
+    site_id[t] = r
+    return r
+
 fn sleb(ref out: [u8], v: int):
     var x = v
     while true:
