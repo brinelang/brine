@@ -8654,6 +8654,10 @@ extern fn GetCurrentProcessId() -> u32
 
 extern fn Sleep(ms: u32)
 
+extern fn CreateWaitableTimerExW(attr: ptr, name: ptr, flags: u32, access: u32) -> ptr
+
+extern fn SetWaitableTimer(t: ptr, due: ptr, period: i32, f: ptr, arg: ptr, resume: i32) -> i32
+
 extern fn clock_gettime(id: i32, ts: ptr) -> i32
 
 extern fn getpid() -> i32
@@ -8685,6 +8689,22 @@ fn brine_os_sleep(seconds: float):
     if not (seconds > 0.0):
         return
     if os_is("windows"):
+        # Sleep wakes on the next 15.6 ms tick: os.sleep(0.001) took 15.6 ms
+        # (v091#16). A high-resolution timer (Windows 10 1803 and later)
+        # wakes within about half a millisecond.
+        # (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+        let t = CreateWaitableTimerExW(null_ptr(), null_ptr(), u32(2), u32(2031619))
+        if addr(t) != 0:
+            # (in 100 ns units, negative for "from now")
+            let due = stack_mem(8)
+            let s = 9.0e11 if seconds > 9.0e11 else seconds
+            store_i64(due, 0, -max(int(s * 1.0e7), 1))
+            let ok = SetWaitableTimer(t, due, i32(0), null_ptr(), null_ptr(), i32(0)) != 0
+            if ok:
+                WaitForSingleObject(t, u32(4294967295))
+            CloseHandle(t)
+            if ok:
+                return
         var ms = ceil(seconds * 1000.0)
         while ms > 0.0:
             let part = 4000000000.0 if ms > 4000000000.0 else ms
@@ -9125,7 +9145,9 @@ const TH_DROP_DEPTH = 392
 const TH_DROPS = 400
 const TH_NDROPS = 408
 const TH_CAPDROPS = 416
-const TH_SIZE = 424
+# (Windows) the thread's own heap for blocks bigger than SMALL, see `xh_heap`
+const TH_XHEAP = 424
+const TH_SIZE = 432
 
 # past this many nested frees, brine_drop leaves objects for later
 const DROP_DEPTH = 200
@@ -9137,6 +9159,16 @@ extern fn TlsGetValue(i: u32) -> ptr
 extern fn TlsSetValue(i: u32, v: ptr) -> i32
 
 extern fn VirtualAlloc(p: ptr, n: u64, kind: u32, prot: u32) -> ptr
+
+extern fn HeapCreate(opts: u32, init: u64, most: u64) -> ptr
+
+extern fn GetProcessHeap() -> ptr
+
+extern fn HeapAlloc(h: ptr, flags: u32, n: u64) -> ptr
+
+extern fn HeapReAlloc(h: ptr, flags: u32, p: ptr, n: u64) -> ptr
+
+extern fn HeapFree(h: ptr, flags: u32, p: ptr) -> i32
 
 extern fn _write(fd: i32, p: ptr, n: u32) -> i32
 
@@ -9271,10 +9303,81 @@ fn stderr_uint(n: int):
 fn calloc_at(n: int, loc: ptr) -> ptr:
     if n < 0:
         oom_at(n, loc)
-    let p = calloc(u64(max(n, 1)), u64(1))
+    var p = null_ptr()
+    if os_is("windows"):
+        p = xh_alloc(n, true)
+    else:
+        p = calloc(u64(max(n, 1)), u64(1))
     if addr(p) == 0:
         oom_at(n, loc)
     return p
+
+# Windows: blocks bigger than SMALL come from a heap of the thread's own,
+# not the process heap the C library shares. Past the process heap's
+# low-fragmentation sizes (16 KiB) every thread takes one lock and walks
+# one free list, which a big heap built by many threads at once makes
+# long: `par` jobs ran 6-20x slower while such data was alive (v091#12).
+# Each block starts with 16 bytes naming its heap, so any thread frees it.
+fn xh_heap() -> ptr:
+    if load_u64(heap_info(), HI_BASE) == 0:
+        return GetProcessHeap()
+    let h = th_get()
+    let x = load_ptr(h, TH_XHEAP)
+    if addr(x) != 0:
+        return x
+    return xh_new_cold(h)
+
+# A heap from HeapCreate gives freed pages back to the system past 64 KiB
+# free, so a block grown again and again (`+=` on a long string) faults its
+# pages back in each time: 10x slower. RtlCreateHeap (what HeapCreate
+# calls) takes the thresholds: keep free blocks under 1 MiB, and up to
+# 4 MiB free in all.
+fn xh_new_cold(h: ptr) -> ptr:
+    var x = null_ptr()
+    # (ntdll is always loaded: this only finds it)
+    let f = GetProcAddress(LoadLibraryA(lit("ntdll.dll")), lit("RtlCreateHeap"))
+    if addr(f) != 0:
+        # RTL_HEAP_PARAMETERS: its size, then the thresholds at 24 and 32
+        let prm = stack_mem(96)
+        for i in 0..12:
+            store_i64(prm, i * 8, 0)
+        store_u32(prm, 0, u32(96))
+        store_i64(prm, 24, 1048576)
+        store_i64(prm, 32, 4194304)
+        # (HEAP_GROWABLE)
+        x = call_ptr(f, u32(2), null_ptr(), u64(0), u64(0), null_ptr(), prm)
+    if addr(x) == 0:
+        x = HeapCreate(u32(0), u64(0), u64(0))
+    if addr(x) == 0:
+        x = GetProcessHeap()
+    store_ptr(h, TH_XHEAP, x)
+    return x
+
+# n bytes (zeroed when `zero`), or 0
+fn xh_alloc(n: int, zero: bool) -> ptr:
+    if n > 4611686018427387904:
+        return null_ptr()
+    let x = xh_heap()
+    # (HEAP_ZERO_MEMORY)
+    let p = HeapAlloc(x, u32(8) if zero else u32(0), u64(max(n, 1) + 16))
+    if addr(p) == 0:
+        return p
+    store_ptr(p, 0, x)
+    return p + 16
+
+# (like free, it takes null)
+fn xh_free(p: ptr):
+    if addr(p) == 0:
+        return
+    let b = p - 16
+    HeapFree(load_ptr(b, 0), u32(0), b)
+
+fn xh_realloc(p: ptr, n: int) -> ptr:
+    if n > 4611686018427387904:
+        return null_ptr()
+    let b = p - 16
+    let q = HeapReAlloc(load_ptr(b, 0), u32(0), b, u64(max(n, 1) + 16))
+    return q if addr(q) == 0 else q + 16
 
 # len * esz, or -1 when that overflows (no allocation can be that big)
 fn alloc_bytes(len: int, esz: int) -> int:
@@ -9425,6 +9528,11 @@ fn chunk_new(c: int) -> ptr:
     return p
 
 fn big(n: int) -> ptr:
+    if os_is("windows"):
+        let x = xh_alloc(n, false)
+        if addr(x) == 0:
+            oom_cold(n)
+        return x
     let p = malloc(u64(n if n > 0 else 1))
     if addr(p) == 0:
         oom_cold(n)
@@ -9491,7 +9599,10 @@ fn brine_alloc(n: int) -> ptr:
 
 fn free_miss_cold(p: ptr):
     if not in_heap(p):
-        free(p)
+        if os_is("windows"):
+            xh_free(p)
+        else:
+            free(p)
         return
     let hi = heap_info()
     let c = int(load_u8(load_ptr(hi, HI_CLASSES), (addr(p) - load_u64(hi, HI_BASE)) >> 16))
@@ -9512,7 +9623,11 @@ fn brine_x_realloc(p: ptr, n: int) -> ptr:
     if addr(p) == 0:
         return brine_alloc(n)
     if not in_heap(p):
-        let q = realloc(p, u64(n if n > 0 else 1))
+        var q = null_ptr()
+        if os_is("windows"):
+            q = xh_realloc(p, n)
+        else:
+            q = realloc(p, u64(n if n > 0 else 1))
         if addr(q) == 0:
             oom_cold(n)
         return q
@@ -12241,6 +12356,17 @@ fn gplan_make(p: ptr, k: ptr, ctx: ptr, deadline: float) -> bool:
             store_i64(g, GA_DOFF, load_i64(g, GA_DOFF) + at)
     return load_i64(p, GP_OK) != 0
 
+# whether a construct's context has arrays of arrays (see gplan_make)
+fn gplan_nested(k: ptr) -> bool:
+    let ptrs = load_ptr(k, K_PTRS)
+    let nf = load_i64(ptrs, 0)
+    let nodes = ptrs + (1 + 3 * nf) * 8
+    for f in 0..nf:
+        let node = load_i64(ptrs, (1 + 3 * f) * 8 + 16)
+        if load_i64(nodes + node * 8, 8) != 0:
+            return true
+    return false
+
 # Plans the copies for the `rest` elements still to do (p: GP_SIZE bytes);
 # false, with the reason in `why`, when that fails. Walking arrays of
 # arrays visits every inner array, which can cost more than running the
@@ -12253,7 +12379,11 @@ fn gpu_plan(p: ptr, k: ptr, st: ptr, ctx: ptr, rest: int, why: ptr) -> bool:
     let cpu_ns = load_f64(st, KS_CPU)
     let plan_ns = load_f64(st, KS_PLAN)
     unlock(g + G_MU)
-    let slow = cz("copying its arrays of arrays to the GPU takes longer than running it on the CPU")
+    let slow = cz(
+        "copying its arrays of arrays to the GPU takes longer than running it on the CPU"
+        if gplan_nested(k)
+        else "preparing its copies to the GPU takes longer than running it on the CPU"
+    )
     if auto and plan_ns > 0.0 and plan_ns >= 0.75 * cpu_ns:
         memset(p, 0, u64(GP_SIZE))
         store_ptr(why, 0, slow)
@@ -12463,6 +12593,8 @@ const CH_USE = 0
 const CH_CPU_S = 8
 const CH_GPU_S = 16
 const CH_WHY = 24
+# (the GPU is starting: run slices on the CPU until it is ready)
+const CH_SOON = 32
 
 fn gpu_dev_ns(k: ptr, st: ptr) -> float:
     let ns = load_f64(st, KS_GPU)
@@ -12473,6 +12605,7 @@ fn gpu_choose(k: ptr, st: ptr, rest: int, bytes: int, launches: int, c: ptr):
     let g = gpu()
     store_i64(c, CH_USE, 0)
     store_ptr(c, CH_WHY, null_ptr())
+    store_i64(c, CH_SOON, 0)
     let gpu_ns = gpu_dev_ns(k, st)
     let cpu_s = load_f64(st, KS_CPU) * 1.0e-9 * float(rest)
     # (planning the copies is paid again on every call)
@@ -12505,7 +12638,10 @@ fn gpu_choose(k: ptr, st: ptr, rest: int, bytes: int, launches: int, c: ptr):
     let soon = not ready and gpu_s < 0.75 * cpu_s
     if soon and cpu_s > 2.0e-3:
         gpu_start(code)
-    store_ptr(c, CH_WHY, cz("starting the GPU") if soon else cz("faster on the CPU"))
+        store_i64(c, CH_SOON, 1 if gpu_state() == GS_INIT else 0)
+    # (not started for less than 2 ms of work: this one is faster as it is)
+    let starting = soon and gpu_state() == GS_INIT
+    store_ptr(c, CH_WHY, cz("starting the GPU") if starting else cz("faster on the CPU"))
 
 # Runs elements [lo, n) of a `par for` sequentially on this thread until
 # about `secs` have passed; returns where it stopped (the time per element
@@ -12678,28 +12814,112 @@ fn gpu_note_probe(st: ptr, ns: float):
     store_f64(st, KS_CPU, ns / (float(brine_x_threads()) * CPU_EFF))
     unlock(g + G_MU)
 
-# The GPU part of a `par for`: returns how many leading elements are done
-# (all n when the device ran them, fewer when the CPU should run the rest).
-# Every element below the returned count has run exactly once.
-fn gpu_for(k: ptr, ctx: ptr, n: int, f: ptr, why: ptr) -> int:
+# One thread's time says little about the pool's when the body waits on
+# memory or its loops depend on the data (3x for b_geo's join, v091#15).
+# When the rest of [lo, n) would take a while on the CPU, two slices of
+# about 5 ms run on the pool, and the faster one's time is the estimate
+# (the first also wakes the threads and fills the caches). Returns where
+# the slices ended.
+fn cpu_sample(st: ptr, ctx: ptr, f: ptr, lo: int, n: int) -> int:
+    let ns = load_f64(st, KS_CPU)
+    if not (ns > 0.0) or ns * 1.0e-9 * float(n - lo) < 0.05:
+        return lo
+    var m = (n - lo) / 8
+    let q = 5.0e-3 / (ns * 1.0e-9)
+    if q < float(m):
+        m = int(q)
+    m = max(m, min(brine_x_threads(), (n - lo) / 2))
+    if m <= 0:
+        return lo
+    var best = 1.0e300
+    var at = lo
+    for _ in 0..2:
+        let t0 = brine_clock()
+        brine_par_run(at, at + m, par_plan(m), f, ctx)
+        best = min(best, brine_clock() - t0)
+        at += m
+    gpu_note_cpu(st, m, best)
+    return at
+
+# Before a call goes to the GPU on an estimate from earlier calls: a few of
+# its elements on this thread took `ns` each. Elements can cost far more
+# in one call than in the next (a loop over a tree node's rows), so when
+# that is more than 4x off, the estimate starts over from it. Without this
+# one expensive call kept every later one on the GPU (v091#15).
+fn gpu_recheck(st: ptr, ns: float) -> bool:
     let g = gpu()
+    lock(g + G_MU)
+    let seq = load_f64(st, KS_SEQ)
+    let off = ns > 4.0 * seq or 4.0 * ns < seq
+    if off:
+        store_f64(st, KS_SEQ, ns)
+        store_f64(st, KS_CPU, ns / (float(brine_x_threads()) * CPU_EFF))
+        store_i64(st, KS_SEEN, 0)
+    unlock(g + G_MU)
+    return off
+
+# About 10 ms of the CPU's work, out of `rest` elements (all when the
+# time per element isn't known)
+fn cpu_slice(k: ptr, rest: int) -> int:
+    let st = kstate(k)
+    let ns = load_f64(st, KS_CPU) if addr(st) != 0 else 0.0
+    if ns > 0.0:
+        let q = 0.01 / (ns * 1.0e-9)
+        if q < float(rest):
+            return max(int(q), 1)
+    return rest
+
+# The GPU part of a `par for` from element `lo` (those before it ran on
+# the CPU in this call, which measured them): returns how many leading
+# elements are done (all n when the device ran them, fewer when the CPU
+# should run the rest). Every element below the returned count has run
+# exactly once. why[0]: why not; why[8]: 1 when the GPU is starting.
+fn gpu_for(k: ptr, ctx: ptr, n: int, f: ptr, why: ptr, lo: int) -> int:
+    let g = gpu()
+    store_i64(why, 8, 0)
     let known = stack_mem(8)
     let st = gpu_begin(k, why, known)
     if addr(st) == 0:
-        return 0
-    var done = 0
-    if load_i64(known, 0) == 0 and gpu_mode() != GPU_ON:
+        return lo
+    var done = lo
+    let auto = gpu_mode() != GPU_ON
+    # (the estimate comes from this call)
+    var fresh = lo > 0
+    if load_i64(known, 0) == 0 and auto:
         let ns = stack_mem(8)
-        done = probe_for(f, ctx, 0, n, 1.0e-4, ns)
+        done = probe_for(f, ctx, done, n, 1.0e-4, ns)
         gpu_note_probe(st, load_f64(ns, 0))
+        if done < n:
+            done = cpu_sample(st, ctx, f, done, n)
         if done >= n:
             store_ptr(why, 0, cz("done while measuring"))
             return done
+        fresh = true
     let p = stack_mem(GP_SIZE)
     if not gpu_plan(p, k, st, ctx, n - done, why):
         gplan_free(p)
         return done
-    # arrays that go back whole need the elements the probe wrote on the
+    let c = stack_mem(40)
+    lock(g + G_MU)
+    gpu_choose(k, st, n - done, gplan_bytes(p), 1 + (n - done) / (1 << 22), c)
+    unlock(g + G_MU)
+    if load_i64(c, CH_USE) != 0 and auto and not fresh:
+        let ns = stack_mem(8)
+        done = probe_for(f, ctx, done, n, 2.0e-5, ns)
+        if done >= n:
+            gplan_free(p)
+            store_ptr(why, 0, cz("done while measuring"))
+            return done
+        if gpu_recheck(st, load_f64(ns, 0)):
+            lock(g + G_MU)
+            gpu_choose(k, st, n - done, gplan_bytes(p), 1 + (n - done) / (1 << 22), c)
+            unlock(g + G_MU)
+    if load_i64(c, CH_USE) == 0:
+        gplan_free(p)
+        store_ptr(why, 0, load_ptr(c, CH_WHY))
+        store_i64(why, 8, load_i64(c, CH_SOON))
+        return done
+    # arrays that go back whole need the elements the CPU wrote on the
     # device too
     store_i64(p, GP_LO, done)
     store_i64(p, GP_HI, n)
@@ -12708,14 +12928,6 @@ fn gpu_for(k: ptr, ctx: ptr, n: int, f: ptr, why: ptr) -> int:
             let ga = pl_arr(p, i)
             if load_i64(ga, GA_WRITTEN) != 0 and load_i64(ga, GA_DENSE) == 0:
                 store_i64(ga, GA_READ, 1)
-    let c = stack_mem(32)
-    lock(g + G_MU)
-    gpu_choose(k, st, n - done, gplan_bytes(p), 1 + (n - done) / (1 << 22), c)
-    unlock(g + G_MU)
-    if load_i64(c, CH_USE) == 0:
-        gplan_free(p)
-        store_ptr(why, 0, load_ptr(c, CH_WHY))
-        return done
     store_ptr(why, 0, cz("the GPU is busy"))
     if not try_lock(g + G_RUN):
         gplan_free(p)
@@ -12779,21 +12991,38 @@ fn brine_par_for(k: ptr, ctx: ptr, n: int, f: ptr):
     var why = gpu_skip(k, n)
     var done = 0
     var before = 0.0
+    var t0 = brine_clock()
     if addr(why) == 0:
-        let w = stack_mem(8)
-        let tb = brine_clock()
-        done = gpu_for(k, ctx, n, f, w)
+        let w = stack_mem(16)
+        done = gpu_for(k, ctx, n, f, w, 0)
         if done >= n:
             return
         why = load_ptr(w, 0)
-        before = brine_clock() - tb
-    let t0 = brine_clock()
+        before = brine_clock() - t0
+        t0 = brine_clock()
+        # while the GPU starts, slices run on the CPU; once it is ready it
+        # may take the rest, so a program with one big loop gets it too
+        # (v091#15)
+        var soon = load_i64(w, 8) != 0
+        while soon and done < n:
+            let m = cpu_slice(k, n - done)
+            let ts = brine_clock()
+            brine_par_run(done, done + m, par_plan(m), f, ctx)
+            gpu_note_cpu(kstate(k), m, brine_clock() - ts)
+            done += m
+            if done < n and gpu_state() != GS_INIT:
+                done = gpu_for(k, ctx, n, f, w, done)
+                if done >= n:
+                    return
+                why = load_ptr(w, 0)
+                soon = load_i64(w, 8) != 0
+    let t1 = brine_clock()
     brine_par_run(done, n, par_plan(n - done), f, ctx)
-    let dt = brine_clock() - t0
+    let t2 = brine_clock()
     if addr(load_ptr(k, K_PTX)) != 0 and n - done >= GPU_MIN_N and brine_x_in_par_get() == 0:
-        gpu_note_cpu(kstate(k), n - done, dt)
+        gpu_note_cpu(kstate(k), n - done, t2 - t1)
     if gpu_logging() and brine_x_in_par_get() == 0:
-        gpu_log_cpu(k, n, why, dt, before)
+        gpu_log_cpu(k, n, why, t2 - t0, before)
 
 # ---- reductions on the GPU
 
@@ -12898,7 +13127,7 @@ fn gpu_reduce(k: ptr, n: int, f: ptr, ctx: ptr, fo: ptr, loc: ptr, why: ptr, cpu
     if not gpu_plan(pl, k, st, ctx, rest, why):
         gplan_free(pl)
         return false
-    let c = stack_mem(32)
+    let c = stack_mem(40)
     lock(g + G_MU)
     gpu_choose(k, st, rest, gplan_bytes(pl), 2 + rest / (1 << 22), c)
     let gpu_ns = gpu_dev_ns(k, st)
@@ -13284,10 +13513,11 @@ fn os_flen(f: ptr) -> int:
         return -2
     return int(n)
 
-# All of the file at `path`: its bytes (brine_alloc's), their count and the
-# size of the block in out[0], out[1] and out[2], or false with the message
-# in *err.
-fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
+# All of the file at `path`: the block its bytes are in (brine_alloc's),
+# their count and the room for them in out[0], out[1] and out[2], or false
+# with the message in *err. With `text` the bytes start at STR_DATA, in a
+# block a string of their length fits in, so read_file needn't copy them.
+fn os_slurp(path: ptr, out: ptr, err: ptr, text: bool) -> bool:
     let p = os_cstr(path)
     if addr(p) == 0:
         store_ptr(err, 0, os_msg("cannot read a path containing a NUL byte"))
@@ -13302,6 +13532,7 @@ fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
         store_ptr(err, 0, os_msg(f"cannot read {str_of(path)}: {str_of(e)}"))
         str_release(e)
         return false
+    let off = STR_DATA if text else 0
     var b = null_ptr()
     var n = 0
     var cap = 0
@@ -13311,13 +13542,16 @@ fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
     let flen = os_flen(f)
     var bad = flen == -2
     if flen > 0:
-        cap = flen + 1
-        b = brine_x_realloc(b, cap)
+        cap = str_block(flen) - off if text else flen + 1
+        b = brine_x_realloc(b, off + cap)
     while not bad:
         if n == cap:
             cap = cap * 2 if cap != 0 else 65536
-            b = brine_x_realloc(b, cap)
-        let got = int(fread(b + n, 1, u64(cap - n), f))
+            b = brine_x_realloc(b, off + cap)
+        # (up to the length first: a read into the whole block puts all
+        # of its pages in memory, and a string's block can be 25% more)
+        let want = flen + 1 - n if flen > 0 and flen >= n else cap - n
+        let got = int(fread(b + off + n, 1, u64(want), f))
         n += got
         if got == 0:
             break
@@ -13336,21 +13570,32 @@ fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
 
 fn brine_read_file(path: ptr, out: ptr) -> bool:
     let got = stack_mem(24)
-    if not os_slurp(path, got, out):
+    if not os_slurp(path, got, out, true):
         return false
-    let b = load_ptr(got, 0)
+    var b = load_ptr(got, 0)
     let n = load_i64(got, 8)
-    let ok = os_utf8_bad(b, n) < 0
-    if ok:
-        store_ptr(out, 0, brine_str_new(b, n))
-    else:
+    if os_utf8_bad(b + STR_DATA, n) >= 0:
         store_ptr(out, 0, os_msg(f"cannot read {str_of(path)}: the file is not valid UTF-8 text"))
-    brine_free(b)
-    return ok
+        brine_free(b)
+        return false
+    if n < 65536:
+        store_ptr(out, 0, brine_str_new(b + STR_DATA, n))
+        brine_free(b)
+        return true
+    # a big file becomes the string in the block it was read into: in
+    # memory once, not twice (the copy doubled the peak)
+    if STR_DATA + load_i64(got, 16) < str_block(n):
+        b = brine_x_realloc(b, str_block(n))
+    live(1)
+    store_i64(b, STR_RC, 1)
+    store_i64(b, STR_LEN, n)
+    store_u8(b, STR_DATA + n, 0)
+    store_ptr(out, 0, b)
+    return true
 
 fn brine_os_read_bytes(path: ptr, out: ptr, err: ptr) -> bool:
     let got = stack_mem(24)
-    if not os_slurp(path, got, err):
+    if not os_slurp(path, got, err, false):
         return false
     let b = load_ptr(got, 0)
     let n = load_i64(got, 8)

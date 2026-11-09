@@ -1,0 +1,119 @@
+# GPU auto mode (v091#15): what BRINE_GPU_LOG says, and what it chooses.
+#   reasons: why loops can't run on a GPU, named as the source has them
+#   sticky:  cheap calls after an expensive one stay on the CPU
+#   oneshot: a program with one big loop still gets the GPU once it is ready
+
+# 2 KB: over the 1 KB of arrays kept in the stack frame
+fn big_stack(x: int) -> int:
+    var st = [0] * 256
+    st[x % 256] = x
+    return st[x % 256] + 1
+
+fn bump(ref e: [int], i: int):
+    if 0 <= i and i < len(e):
+        e[i] += 1
+
+# passed by `ref`: on the heap
+fn by_ref(x: int) -> int:
+    var e = [0] * 16
+    bump(ref e, x % 16)
+    return e[x % 16]
+
+# a flat array, and no arrays of arrays
+fn quantize(v: [float], s: float) -> [int]:
+    let n = len(v)
+    var q = [0] * n
+    par for r in 0..n:
+        q[r] = int(floor(v[r] * s + 0.5))
+    return q
+
+fn reasons() -> int:
+    let n = 100000
+    var a = [0] * n
+    par for i in 0..n:
+        a[i] = big_stack(i)
+    var b = [0] * n
+    par for i in 0..n:
+        b[i] = by_ref(i)
+    var v = [0.0] * 20000
+    for i in 0..20000:
+        v[i] = float(i % 97) * 0.01
+    var t = a[5] + b[5]
+    for k in 0..200:
+        t += quantize(v, 1024.0)[k % 10]
+    return t
+
+# each element scans m rows: the cost per element changes with m
+fn cells(bins: [int], g: [int], m: int) -> [int]:
+    let nc = 7168
+    var out = [0] * nc
+    let k = min(m, min(len(bins), len(g)))
+    par for j in 0..nc:
+        var s = 0
+        let b = j % 256
+        for r in 0..k:
+            if bins[r] == b:
+                s += g[r]
+        out[j] = s
+    return out
+
+fn sticky() -> int:
+    let n = 1000000
+    var bins = [0] * n
+    var g = [0] * n
+    for r in 0..n:
+        bins[r] = (r * 7919) % 256
+        g[r] = r % 13
+    var t = 0
+    for _ in 0..2:
+        t += cells(bins, g, n)[3]
+        for i in 0..20:
+            t += cells(bins, g, 2000)[i]
+    return t
+
+# One DFT bin per element, computed again more times the later it is: the
+# first elements, which the estimate starts from, are the cheapest (about
+# 0.4 s for 2M on 32 threads). Bins repeat every 2048 elements, so the
+# result is the same for any n >= 2048.
+fn oneshot(n: int) -> float:
+    var x = [0.0] * 512
+    var cw = [0.0] * 2048
+    var sw = [0.0] * 2048
+    for i in 0..512:
+        x[i] = float(i % 17) * 0.1 - 0.8
+    for i in 0..2048:
+        cw[i] = cos(float(i) * 0.0015339807878856412)
+        sw[i] = sin(float(i) * 0.0015339807878856412)
+    var out = [0.0] * n
+    par for k in 0..n:
+        let a = cw[k % 2048]
+        let b = sw[k % 2048]
+        var p = 0.0
+        for _ in 0..1 + k / (n / 12 + 1):
+            var re = 0.0
+            var im = 0.0
+            var c = 1.0
+            var s = 0.0
+            for t in 0..512:
+                re += x[t] * c
+                im -= x[t] * s
+                let c2 = c * a - s * b
+                s = s * a + c * b
+                c = c2
+            p = re * re + im * im
+        out[k] = p
+    var m = 0.0
+    for v in out:
+        m = max(m, v)
+    return m
+
+fn main():
+    let a = args()
+    let what = a[0] if len(a) > 0 else "reasons"
+    if what == "sticky":
+        print(sticky())
+    elif what == "oneshot":
+        let n = (a[1].to_int().unwrap_or(2000000)) if len(a) > 1 else 2000000
+        print(f"{oneshot(n):.3f}")
+    else:
+        print(reasons())

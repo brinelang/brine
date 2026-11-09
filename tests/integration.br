@@ -326,6 +326,7 @@ fn features() -> [str]:
         "tests/programs/take_put.br",
         "tests/programs/own_update.br",
         "tests/programs/borrow_let.br",
+        "tests/programs/borrow_views.br",
         "tests/programs/stdlib.br",
         "tests/programs/par_small.br",
         "tests/programs/first.br",
@@ -695,6 +696,38 @@ test "GPU auto doesn't copy arrays of arrays that cost more than the work":
         if gpu_ready(o.err):
             let why = "copying its arrays of arrays to the GPU takes longer than running it on the CPU"
             assert why in lines[3], o.err
+
+# v091#15: the log names what keeps a loop off the GPU, and auto re-measures
+test "GPU auto says why and keeps measuring the CPU":
+    let f = "tests/programs/gpu_auto.br"
+    let at = "brine gpu: tests/programs/gpu_auto.br:"
+    let r = brine_env(["run", f, "-q", "--release"], {"BRINE_GPU_LOG": "1"})
+    assert r.code == 0 and r.out == "9207\n", r.all()
+    for why in [
+        "makes a 2048-byte array in `big_stack`: arrays over 1 KB are made on the heap",
+        "makes an array on the heap in `by_ref`: only one of at most 1 KB"
+    ]:
+        assert f"(not GPU-eligible: {why}" in r.err, r.err
+    assert "arrays of arrays" not in r.err, r.err
+    # cheap calls after an expensive one don't go to the GPU on its estimate
+    let s = brine_env(["run", f, "-q", "--release", "--", "sticky"], {"BRINE_GPU_LOG": "1"})
+    assert s.code == 0 and s.out == "48758\n", s.all()
+    let calls = [l for l in s.err.lines() if l.starts_with(at)]
+    assert len(calls) == 42, s.err
+    if gpu_ready(s.err):
+        for l in calls[22:]:
+            assert " -> gpu " not in l, s.err
+    # one big loop: once the GPU is ready, the CPU stops waiting for it
+    # (long enough on a GPU machine to take it well past the GPU's start)
+    let n = "3000000" if gpu_ready(r.err) else "100000"
+    let o = brine_env(["run", f, "-q", "--release", "--", "oneshot", n], {"BRINE_GPU_LOG": "1"})
+    assert o.code == 0 and o.out == "19390.741\n", o.all()
+    if gpu_ready(o.err):
+        let ready = o.err.split(" ready in ")[1].split(" ms")[0].to_float().unwrap_or(0.0)
+        for l in o.err.lines():
+            if l.starts_with(at) and " -> cpu " in l:
+                let cpu = l.split(" -> cpu ")[1].split(" ms")[0].to_float().unwrap_or(0.0)
+                assert not (cpu > ready + 50.0 and "starting the GPU" in l), o.err
 
 test "ranks take one GPU each":
     # with BRINE_GPU=auto, a second rank on a one-GPU machine stays on the CPU
@@ -2989,6 +3022,43 @@ test "native release builds scan for a byte 16 bytes at a time":
     let sc = brine_env(["emit-ir", "--release", "--opt", "tests/programs/byte_scans.br"], native)
     assert sc.code == 0, sc.all()
     assert "call rt brine_find_u8(" in sc.out and "call rt brine_skip_u8(" in sc.out, sc.out
+
+# Views of shared arrays borrow them: no count every `par` thread hits (v091#11).
+test "views and field loops borrow shared arrays":
+    let ir = brine(["emit-ir", "--release", "--opt", "tests/programs/borrow_views.br"])
+    assert ir.code == 0, ir.all()
+    var f = ""
+    for l in ir.out.lines():
+        if l.starts_with("fn "):
+            f = l.split("(")[0]
+        elif f == "fn main__total" or f == "fn main__count":
+            assert "_retain(" not in l and "_release(" not in l, f"{f}: {l}"
+
+# A big heap made by `par` must not slow later `par` jobs down (v091#12).
+# Without the leak check, which serializes allocation and hides it.
+test "par jobs stay fast while a big par-made heap is alive":
+    let f = "tests/programs/par_live_heap.br"
+    let o = brine_env(["run", f, "-q", "--release"], {"BRINE_THREADS": "16"})
+    assert o.code == 0 and o.out == expected(f), o.all()
+
+# read_file read a file and copied it into the string: twice its size at
+# the peak. Only Linux tells a program its peak (the output says so).
+test "read_file holds a big file in memory once":
+    let f = "tests/programs/read_file_peak.br"
+    let o = brine(["run", f, "-q", "--release"])
+    let want = "96 MB\nin memory once\n" if os.name() == "linux" else "96 MB\n"
+    assert o.code == 0 and o.out == want, o.all()
+
+# Windows slept to the next 15.6 ms tick (v091#16). A run can miss on a
+# busy machine, so three are tried.
+test "os.sleep sleeps about as long as asked":
+    let f = "tests/programs/sleep_fine.br"
+    var o = brine(["run", f, "-q"])
+    for _ in 0..2:
+        if o.code == 0 and o.out == expected(f):
+            break
+        o = brine(["run", f, "-q"])
+    assert o.code == 0 and o.out == expected(f), o.all()
 
 # How many times the bytes of `s` appear in a file.
 fn count_in(path: str, s: str) -> int:
