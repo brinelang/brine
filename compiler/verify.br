@@ -30,6 +30,8 @@ struct Report:
     kept: [(Span, str)]
     # `assert`s that fail whenever they're reached (a check that does is E0614)
     always: [(Span, str)]
+    # remaining checks the prover gave up on at a limit of their function (W0005)
+    gave_up: [(Span, str)]
 
 enum V:
     Int(l: Lin)
@@ -146,6 +148,9 @@ const PROBE_MAX = 20000
 # Largest disjunction (in formula nodes) a merge of two branches keeps. Past
 # that the solver spends its time re-reading it; dropping it only loses facts.
 const MERGE_MAX = 256
+# How many of the checks it gave up on W0005 names, and how many errors that
+# say the prover gave up a function shows
+const GAVE_UP_SHOWN = 3
 const TAG_INDEX = 1
 const TAG_ASSERT = 2
 # the overflow check of a compound assignment (`x += 1`), keyed by the statement
@@ -225,7 +230,7 @@ fn verify_program(
     ]
     # let go of the bodies, so rewriting them below doesn't copy them
     fns = []
-    var report = Report(diags=[], remaining=[], proven=0, kept=[], always=[])
+    var report = Report(diags=[], remaining=[], proven=0, kept=[], always=[], gave_up=[])
     # `BRINE_TIMES=2`: the functions that take the prover long
     let slow_fns = getenv("BRINE_TIMES") == Some("2")
     var at = 0
@@ -245,6 +250,7 @@ fn verify_program(
             report.remaining.extend(r.remaining)
             report.kept.extend(r.kept)
             report.always.extend(r.always)
+            report.gave_up.extend(r.gave_up)
             report.proven += len(r.proven)
             if len(r.proven) == 0:
                 continue
@@ -268,6 +274,7 @@ fn verify_program(
     report.remaining = out
     report.kept = by_position(report.kept)
     report.always = by_position(report.always)
+    report.gave_up = by_position(report.gave_up)
     # generic code is verified once per instance; report each problem once
     var seen: {(str, str, int, int, int): bool} = {}
     var kept: [Diag] = []
@@ -303,6 +310,7 @@ struct FnResult:
     remaining: [(Span, str)]
     kept: [(Span, str)]
     always: [(Span, str)]
+    gave_up: [(Span, str)]
     # the checks proven everywhere they're reached
     proven: {(int, int, int, int): bool}
     time: float
@@ -331,6 +339,7 @@ fn verify_fn(
             remaining=[],
             kept=[],
             always=[],
+            gave_up=[],
             proven={},
             time=0.0,
             work=0,
@@ -345,25 +354,9 @@ fn verify_fn(
     v.stops = stops
     v.pure = pure
     v.run(f)
+    v.fold_limited()
     if v.given_up > 0:
-        let n = v.given_up
-        let s = "" if n == 1 else "s"
-        let it = "the check it gave up on" if n == 1 else "the checks it gave up on"
-        let verb = "s" if n == 1 else ""
-        var why = "it does a limited amount of work per function, and ran out"
-        if v.too_big:
-            why = "what it knows about the function's values grew past its memory limit"
-        v.diags.push(
-            diag.warning(
-                "W0005",
-                f"gave up proving {n} runtime check{s} in `{f.name}`: the function is too long or complex for the prover"
-            )
-            .label(f.name_span, "in this function")
-            .note(f"{why}; {it} stay{verb} at run time (`--report` lists the checks that remain)")
-            .with_help(
-                f"split `{f.name}` into smaller functions: each is proven on its own, so they don't share the limit"
-            )
-        )
+        v.diags.push(v.w0005(f.name_span))
     var proven: {(int, int, int, int): bool} = {}
     for p in v.proven.keys():
         if p not in v.failed:
@@ -374,6 +367,7 @@ fn verify_fn(
         remaining=v.remaining,
         kept=v.kept_proven,
         always=v.always,
+        gave_up=v.gave_up_at,
         proven=proven,
         time=clock() - t0,
         work=v.work,
@@ -1215,6 +1209,9 @@ fn new_vf(
         too_big=false,
         given_up=0,
         extra=0,
+        gave_up_at=[],
+        claims_given_up=0,
+        limited_diags=[],
         mods=[],
         hidden={},
         aliases={},
@@ -1360,6 +1357,12 @@ struct Vf:
     too_big: bool
     given_up: int
     extra: int
+    # the runtime checks given up on: (span, what); how many claims (a call's
+    # `requires`, `invariant`, `ensures`, `prove`) it gave up on; and which
+    # errors in `diags` say it gave up (all but the first few are left out)
+    gave_up_at: [(Span, str)]
+    claims_given_up: int
+    limited_diags: [int]
     # the values `a % c` for a constant `c` (see `const_mod`), with their `a`
     mods: [(int, Lin)]
     # a hidden loop variable (`for k, v in ...` loops over `for'12`): the name
@@ -2071,6 +2074,69 @@ struct Vf:
             self.st.facts = self.st.facts[:n]
         return r
 
+    # W0005: the runtime checks given up on, the first few by name.
+    fn w0005(self, at: Span) -> Diag:
+        let n = self.given_up
+        let s = "" if n == 1 else "s"
+        var why = "it does a limited amount of work per function, and ran out"
+        if self.too_big:
+            why = "what it knows about the function's values grew past its memory limit"
+        var d = (
+            diag.warning(
+                "W0005",
+                f"gave up proving {n} runtime check{s} in `{self.fn_name}`: the function is too long or complex for the prover"
+            ).label(at, "in this function")
+        )
+        for i in 0..min(len(self.gave_up_at), GAVE_UP_SHOWN):
+            let (sp, what) = self.gave_up_at[i]
+            d = d.label(sp, f"gave up on this {what}")
+        let it = "the check it gave up on" if n == 1 else "the checks it gave up on"
+        if self.must_prove:
+            let are = "is an error" if n == 1 else "are errors"
+            d = d.note(f"{why}; here everything must be proven, so {it} {are}")
+        else:
+            let verb = "s" if n == 1 else ""
+            let them = "it" if n == 1 else "them"
+            d = d.note(
+                f"{why}; {it} stay{verb} at run time (`check --report` marks {them} \"prover gave up\")"
+            )
+        if self.claims_given_up > 0:
+            let c = self.claims_given_up
+            let cs = "" if c == 1 else "s"
+            d = d.note(
+                f"it also gave up on {c} claim{cs} (a call's `requires`, an `invariant`, an `ensures`, a `prove`): those are errors"
+            )
+        return d.with_help(
+            f"split `{self.fn_name}` into smaller functions: each is proven on its own, so they don't share the limit"
+        )
+
+    # Of the errors that say the prover gave up, keep the first few: past its
+    # limits a long function can have hundreds, all alike.
+    fn fold_limited(ref self):
+        let ls = self.limited_diags
+        if len(ls) <= GAVE_UP_SHOWN:
+            return
+        let last = ls[GAVE_UP_SHOWN - 1]
+        var drop: {int: bool} = {}
+        for i in ls[GAVE_UP_SHOWN:]:
+            drop[i] = true
+        let m = len(ls) - GAVE_UP_SHOWN
+        let ms = "" if m == 1 else "s"
+        var out: [Diag] = []
+        for i, d in enumerate(self.diags):
+            if i in drop:
+                continue
+            if i == last:
+                out.push(
+                    d.note(
+                        f"the prover gave up on {m} more claim{ms} or check{ms} in `{self.fn_name}`: errors too, not shown one by one"
+                    )
+                )
+            else:
+                out.push(d)
+        self.diags = out
+        self.limited_diags = ls[:GAVE_UP_SHOWN]
+
     # Implicit (safety) obligation: proven => the runtime check is removed.
     # Either way the fact holds afterwards (it was proven or checked).
     fn implicit(ref self, span: Span, tag: int, goal: F, what: str):
@@ -2089,6 +2155,7 @@ struct Vf:
             let limited = self.limited
             if limited:
                 self.given_up += 1
+                self.gave_up_at.push((span, what))
             self.failed[key(span, tag)] = true
             # (not when it gave up: showing it always fails would be harder)
             if exact and not limited and self.refuted(span, what, goal, shown):
@@ -2589,10 +2656,13 @@ struct Vf:
                 d = d.note(cap_note("to prove: " + self.show_f(goal)))
             if limited:
                 d = d.note(
-                    f"the prover gave up: `{self.fn_name}` is too long or complex for it (it does a limited amount of work per function), so this may well be true"
+                    f"the prover gave up: `{self.fn_name}` is too long or complex for it (it does a limited amount of work per function), so it can't tell whether this holds"
                 )
+                # (an `assert` is an error too where everything must be proven)
                 d.help = [
-                    f"split `{self.fn_name}` into smaller functions (each is proven on its own), or check this with `assert` instead"
+                    f"split `{self.fn_name}` into smaller functions: each is proven on its own"
+                    if self.must_prove
+                    else f"split `{self.fn_name}` into smaller functions (each is proven on its own), or check this with `assert` instead"
                 ]
             elif self.live:
                 var all = self.st.facts
@@ -2627,9 +2697,15 @@ struct Vf:
                     )
                     # the usual advice (add facts) would only add cases
                     d.help = [
-                        "check it with `assert` (at runtime) instead, or move the branches before this point into a function whose `ensures` states just what is needed here"
+                        "move the branches before this point into a function whose `ensures` states just what is needed here"
+                        if self.must_prove
+                        else "check it with `assert` (at runtime) instead, or move the branches before this point into a function whose `ensures` states just what is needed here"
                     ]
             d = self.from_call_notes(d, open)
+            if limited:
+                self.limited_diags.push(len(self.diags))
+                if d.code != "E0607":
+                    self.claims_given_up += 1
         # false whenever this point is reached: more facts can't help, the
         # code or the claim is wrong
         var never = goal == F.False
@@ -3070,11 +3146,15 @@ struct Vf:
                 let c = self.as_bool(v)
                 # removing the assert removes the checks in its condition too:
                 # only when none of them stays
-                if pure_expr(cond) and len(self.remaining) == r0 and self.holds(c):
+                let tried = pure_expr(cond) and len(self.remaining) == r0
+                if tried and self.holds(c):
                     self.proven[key(s.span, TAG_ASSERT)] = true
                 else:
                     self.failed[key(s.span, TAG_ASSERT)] = true
                     if not self.test and self.live:
+                        if tried and self.limited:
+                            self.given_up += 1
+                            self.gave_up_at.push((s.span, "assert"))
                         self.remain(s.span, "assert", Some(c))
                         # one that always fails is written on purpose (`assert false`)
                         # or a bug: `--report` says which, and like `panic` it ends the path,
@@ -4060,7 +4140,7 @@ struct Vf:
                     case None:
                         pass
         let mono = self.mono_starts(body, None)
-        let na = len(self.atom_names)
+        let na_loop = len(self.atom_names)
         let kh = len(self.st.facts) if self.live else 0
         self.havoc(body)
         self.mono_facts(mono)
@@ -4158,7 +4238,7 @@ struct Vf:
         for inv in invs:
             let f = self.spec_cond(inv)
             self.assume(f)
-        self.narrow_looped(na, kh)
+        self.narrow_looped(na_loop, kh)
         var is_range = false
         match dom:
             case D.Range(_, _, _):
