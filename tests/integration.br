@@ -1981,6 +1981,89 @@ test "the prover says when it dropped what many branches knew":
     assert "the prover gave up on what the branches before this point say about `i`" in o.err, o.all()
     assert "nothing is known" not in o.err, o.all()
 
+test "a loop invariant still holds after branches too big to merge":
+    # 0.9.1 forgot `invariant i >= 0` after a long `elif` chain and failed
+    # with the impossible value i = -1 (v091 lab, R1)
+    let o = brine(["check", "tests/programs/proof_loop_merge.br"])
+    assert o.code == 0, o.all()
+
+test "past the prover's limits, what plainly holds is still proven":
+    # 0.9.1 gave up on everything past a limit, even `to prove: true`, and
+    # correct programs failed (v091#4)
+    let d = scratch("past_limits")
+    # past the work limit: the invariant follows from the facts about `i`
+    var s = "fn f(b: [u8]) -> int:\n    var i = 0\n    var acc = 0\n    while i < len(b):\n"
+    s += "        invariant 0 <= i <= len(b)\n"
+    for k in 0..700:
+        s += f"        if b[i] == {k % 256}:\n            acc += 1\n"
+    s += "        i += 1\n    return acc\n\nfn main():\n    print(f([u8(1), u8(2)]))\n"
+    write(d + "/loop.br", s)
+    let o = brine(["check", d + "/loop.br"])
+    assert o.code == 0 and "W0005" in o.err, o.all()
+    # past the size limit: `h`'s `requires` follows from the ranges alone
+    var c = "fn h(x: int) -> int:\n    requires 0 <= x < 1000000\n    ensures 0 <= result < 1000\n"
+    c += "    return x % 1000\n\nfn main():\n    var s = 0\n"
+    for k in 0..1600:
+        c += f"    s += h({k})\n"
+    write(d + "/calls.br", c + "    print(s)\n")
+    let o2 = brine(["check", d + "/calls.br"])
+    assert o2.code == 0, o2.all()
+
+# The work `BRINE_TIMES=2` reports for function `f` (-1 if none).
+fn verify_work(err: str, f: str) -> int:
+    for l in err.lines():
+        let t = l.strip()
+        if t.starts_with(f"verify {f}: ") and "(work " in t:
+            let w = t[t.find("(work ").unwrap() + 6:]
+            return w[:w.find(",").unwrap_or(len(w))].to_int().unwrap_or(-1)
+    return -1
+
+test "one proof can't overrun the prover's work limit":
+    # the limit was tested only between proofs, and one proof here did 4.5
+    # times the limit's work (v091 lab, b_regress: 270M against 60M)
+    let d = scratch("work_limit")
+    var s = "fn main():\n    let a = args()\n    var acc = len(a)\n    let v = len(a) * 7\n"
+    for i in 0..100:
+        s += f"    if acc > {i}:\n        acc += v\n    else:\n        acc -= 1\n"
+    write(d + "/w.br", s + "    print(acc)\n")
+    let o = brine_env(["check", d + "/w.br"], {"BRINE_TIMES": "2"})
+    assert o.code == 0 and "W0005" in o.err, o.all()
+    let w = verify_work(o.err, "main")
+    # (WORK_MAX is 60M; past it only small proofs run)
+    assert 0 < w < 64000000, o.all()
+
+test "W0005 names the checks it gave up on, and they don't flood --proven":
+    # it gave only a count, `--report` didn't mark them, and under `--proven`
+    # each was an error that said to use `assert` (itself an error there):
+    # 806 errors for one function (v091 lab, b_regress 5, b_agentdx 10)
+    let d = scratch("gave_up")
+    var s = "fn main():\n    let a = args()\n    var acc = len(a)\n    let v = len(a) * 7\n"
+    for i in 0..100:
+        s += f"    if acc > {i}:\n        acc += v\n    else:\n        acc -= 1\n"
+    write(d + "/g.br", s + "    print(acc)\n")
+    let o = brine(["check", d + "/g.br", "--report"])
+    assert o.code == 0 and "gave up on this overflow check" in o.err, o.all()
+    assert "(prover gave up)" in o.out, o.all()
+    let p = brine(["check", d + "/g.br", "--proven"])
+    assert p.code != 0, p.all()
+    assert "more claims or checks in `main`: errors too, not shown one by one" in p.err, p.all()
+    # (the first three given up on, then a count)
+    assert "assert" not in p.err and p.err.count("is too long or complex for it") == 3, p.all()
+
+test "checks the prover can't remove cost it one proof each":
+    # each also paid for a proof that it always fails (E0614) and one from
+    # the facts about its values, which were all the facts: 0.9.1 checked
+    # this 1.3x slower than 0.9.0 (v091 lab, R5: 54M work, now 42M)
+    let d = scratch("unprovable")
+    var s = "fn h(x: int) -> int:\n    return x\n\nfn main():\n    var s = 0\n"
+    for i in 0..100:
+        s += f"    s += h({i})\n"
+    write(d + "/u.br", s + "    print(s)\n")
+    let o = brine_env(["check", d + "/u.br"], {"BRINE_TIMES": "2"})
+    assert o.code == 0 and "99 remain" in o.all(), o.all()
+    let w = verify_work(o.err, "main")
+    assert 0 < w < 46000000, o.all()
+
 # A `main` of `n` repeated lines of one shape.
 fn long_main(shape: str, n: int) -> str:
     var s = "fn h(x: int) -> int:\n    return x\n\nfn main():\n    let k = len(args())\n    var acc = 0\n"
@@ -2034,6 +2117,41 @@ test "the prover's time grows far less than cubically with a function's length":
         # 4x the lines: 4x to 16x the time for most shapes ("mixed" is about
         # n^1.7); n^3 would be 64x, and the old blowups were worse
         assert t[1] < 32.0 * t[0] + 0.5, f"{shape}: {t[0]:.3f}s for 200 lines, {t[1]:.3f}s for 800"
+
+test "the prover's time grows about linearly with a function's length":
+    # Each branch copied every fact known before it, so these grew as n^2:
+    # 44x to 68x the time for 8x the lines, and an `elif` chain of 6400 arms
+    # took 3.6 GB (v091 lab, section 4)
+    let d = scratch("linear")
+    for shape in ["ifs", "elifs", "lets", "mixed"]:
+        var t: [float] = []
+        for n in [1000, 8000]:
+            var s = "fn main():\n    var acc = len(args())\n"
+            if shape == "elifs":
+                s += "    var r = 0\n    if acc == 0:\n        r = 1\n"
+            for i in 0..n:
+                if shape == "ifs" or (shape == "mixed" and i % 3 == 0):
+                    s += f"    if acc > {i}:\n        acc -= 1\n"
+                elif shape == "elifs":
+                    s += f"    elif acc == {i + 1}:\n        r = {i}\n"
+                elif shape == "lets":
+                    s += f"    let v{i} = acc * 3 + {i}\n    acc = (acc + v{i}) % 1000003\n"
+                elif i % 3 == 1:
+                    s += f"    let v{i} = acc + {i}\n"
+                else:
+                    s += f"    acc = (acc + v{i - 1}) % 1000003\n"
+            if shape == "elifs":
+                s += "    prove r >= 0\n"
+            let f = d + f"/{shape}_{n}.br"
+            write(f, s + "    print(acc)\n")
+            let o = brine_env(["check", f], {"BRINE_TIMES": "1"})
+            assert o.code == 0 and "W0005" not in o.err, o.all()
+            t.push(verify_secs(o.err))
+        assert t[0] >= 0.0 and t[1] >= 0.0, f"no verify time for {shape}"
+        # n^2 would be 64x; now it's 5x to 14x
+        assert (
+            t[1] < 24.0 * t[0] + 0.3
+        ), f"{shape}: {t[0]:.3f}s for 1000 lines, {t[1]:.3f}s for 8000"
 
 test "a release build's time grows about linearly with a constant array's length":
     # The code filling the array stored to a new place for each string, and

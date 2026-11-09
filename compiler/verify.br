@@ -17,7 +17,7 @@ from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pat
 from ast import children, left_chain, left_spine, stmt_exprs, stmt_blocks, lvalue_root, local_of
 from info import ProgramInfo, ConstVal, PRELUDE, RT
 from rules import builtin_effect, os_effect
-from solver import Lin, F, AtomSet, prove_work, near_facts, local_facts, counterexample, PROVED, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
+from solver import Lin, F, AtomSet, prove_work, prove_capped, local_facts, atoms_of, counterexample, PROVED, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
 from checks import Check, Stop, builtin_stops, reduce_stops, convert_stops, world_stops, os_stops
 
 struct Report:
@@ -30,6 +30,8 @@ struct Report:
     kept: [(Span, str)]
     # `assert`s that fail whenever they're reached (a check that does is E0614)
     always: [(Span, str)]
+    # remaining checks the prover gave up on at a limit of their function (W0005)
+    gave_up: [(Span, str)]
 
 enum V:
     Int(l: Lin)
@@ -137,9 +139,18 @@ const LOCAL_MAX = 64
 # Past WORK_MAX, these proofs may still do this much work in all: they are
 # small, and often enough.
 const EXTRA_MAX = 2000000
+# Past WORK_MAX, the proof from the facts about the goal's own values
+# (`by_own`) gives up after this much work: it runs for every check, so the
+# time past the limit grows with their number, not their product.
+const PAST_MAX = 20000
+# The work of the proof that a check always fails (E0614)
+const PROBE_MAX = 20000
 # Largest disjunction (in formula nodes) a merge of two branches keeps. Past
 # that the solver spends its time re-reading it; dropping it only loses facts.
 const MERGE_MAX = 256
+# How many of the checks it gave up on W0005 names, and how many errors that
+# say the prover gave up a function shows
+const GAVE_UP_SHOWN = 3
 const TAG_INDEX = 1
 const TAG_ASSERT = 2
 # the overflow check of a compound assignment (`x += 1`), keyed by the statement
@@ -219,7 +230,7 @@ fn verify_program(
     ]
     # let go of the bodies, so rewriting them below doesn't copy them
     fns = []
-    var report = Report(diags=[], remaining=[], proven=0, kept=[], always=[])
+    var report = Report(diags=[], remaining=[], proven=0, kept=[], always=[], gave_up=[])
     # `BRINE_TIMES=2`: the functions that take the prover long
     let slow_fns = getenv("BRINE_TIMES") == Some("2")
     var at = 0
@@ -239,6 +250,7 @@ fn verify_program(
             report.remaining.extend(r.remaining)
             report.kept.extend(r.kept)
             report.always.extend(r.always)
+            report.gave_up.extend(r.gave_up)
             report.proven += len(r.proven)
             if len(r.proven) == 0:
                 continue
@@ -262,6 +274,7 @@ fn verify_program(
     report.remaining = out
     report.kept = by_position(report.kept)
     report.always = by_position(report.always)
+    report.gave_up = by_position(report.gave_up)
     # generic code is verified once per instance; report each problem once
     var seen: {(str, str, int, int, int): bool} = {}
     var kept: [Diag] = []
@@ -297,6 +310,7 @@ struct FnResult:
     remaining: [(Span, str)]
     kept: [(Span, str)]
     always: [(Span, str)]
+    gave_up: [(Span, str)]
     # the checks proven everywhere they're reached
     proven: {(int, int, int, int): bool}
     time: float
@@ -325,6 +339,7 @@ fn verify_fn(
             remaining=[],
             kept=[],
             always=[],
+            gave_up=[],
             proven={},
             time=0.0,
             work=0,
@@ -339,25 +354,9 @@ fn verify_fn(
     v.stops = stops
     v.pure = pure
     v.run(f)
+    v.fold_limited()
     if v.given_up > 0:
-        let n = v.given_up
-        let s = "" if n == 1 else "s"
-        let it = "the check it gave up on" if n == 1 else "the checks it gave up on"
-        let verb = "s" if n == 1 else ""
-        var why = "it does a limited amount of work per function, and ran out"
-        if v.too_big:
-            why = "what it knows about the function's values grew past its memory limit"
-        v.diags.push(
-            diag.warning(
-                "W0005",
-                f"gave up proving {n} runtime check{s} in `{f.name}`: the function is too long or complex for the prover"
-            )
-            .label(f.name_span, "in this function")
-            .note(f"{why}; {it} stay{verb} at run time (`--report` lists the checks that remain)")
-            .with_help(
-                f"split `{f.name}` into smaller functions: each is proven on its own, so they don't share the limit"
-            )
-        )
+        v.diags.push(v.w0005(f.name_span))
     var proven: {(int, int, int, int): bool} = {}
     for p in v.proven.keys():
         if p not in v.failed:
@@ -368,6 +367,7 @@ fn verify_fn(
         remaining=v.remaining,
         kept=v.kept_proven,
         always=v.always,
+        gave_up=v.gave_up_at,
         proven=proven,
         time=clock() - t0,
         work=v.work,
@@ -1209,6 +1209,9 @@ fn new_vf(
         too_big=false,
         given_up=0,
         extra=0,
+        gave_up_at=[],
+        claims_given_up=0,
+        limited_diags=[],
         mods=[],
         hidden={},
         aliases={},
@@ -1228,8 +1231,59 @@ fn new_vf(
         from_call={},
         from_spec={},
         flt_cmps={},
-        ins={}
+        ins={},
+        fix=new_ix(),
+        ix_ok=0,
+        dix=new_ix()
     )
+
+# The facts that mention each atom, by their positions in a list of facts,
+# so finding the facts about a goal's values doesn't read all of them.
+struct FactIx:
+    at: [[int]]
+    unknown: [int]
+    # the atoms of each fact indexed, by position
+    of: [[int]]
+
+    fn add(ref self, f: F):
+        let p = len(self.of)
+        let s = atoms_of(f)
+        for a in s.xs:
+            if a == ATOM_UNKNOWN:
+                self.unknown.push(p)
+            else:
+                while len(self.at) <= a:
+                    self.at.push([])
+                self.at[a].push(p)
+        self.of.push(s.xs)
+
+    fn drop_last(ref self):
+        let xs = self.of.pop()
+        for a in xs:
+            if a == ATOM_UNKNOWN:
+                self.unknown.pop()
+            else:
+                self.at[a].pop()
+
+    # The positions of the facts that mention an atom of `s`, in order.
+    fn find(self, s: AtomSet) -> [int]:
+        var ps: [int] = []
+        for a in s.xs:
+            if a == ATOM_UNKNOWN:
+                ps.extend(self.unknown)
+            elif a < len(self.at):
+                ps.extend(self.at[a])
+        if len(s.xs) > 1:
+            ps.sort()
+            var out: [int] = []
+            for p in ps:
+                if len(out) == 0 or out[len(out) - 1] != p:
+                    out.push(p)
+            return out
+        return ps
+
+fn new_ix() -> FactIx:
+    return FactIx(at=[], unknown=[], of=[])
 
 struct Vf:
     info: ProgramInfo
@@ -1303,6 +1357,12 @@ struct Vf:
     too_big: bool
     given_up: int
     extra: int
+    # the runtime checks given up on: (span, what); how many claims (a call's
+    # `requires`, `invariant`, `ensures`, `prove`) it gave up on; and which
+    # errors in `diags` say it gave up (all but the first few are left out)
+    gave_up_at: [(Span, str)]
+    claims_given_up: int
+    limited_diags: [int]
     # the values `a % c` for a constant `c` (see `const_mod`), with their `a`
     mods: [(int, Lin)]
     # a hidden loop variable (`for k, v in ...` loops over `for'12`): the name
@@ -1339,6 +1399,12 @@ struct Vf:
     muls: [(Lin, Lin, Lin)]
     mul_keys: [(str, str, str)]
     mul_seen: {str: bool}
+    # `near`'s index of `st.facts` (its first `ix_ok` facts are the ones
+    # indexed: whatever changes an earlier one says so with `touch`) and of
+    # `defs` (which only grow)
+    fix: FactIx
+    ix_ok: int
+    dix: FactIx
     # atoms made for the result of a call to a function without `ensures`,
     # and the function
     from_call: {int: int}
@@ -1359,12 +1425,45 @@ struct Vf:
         return Some(self.st)
 
     fn put(ref self, s: Option[St]):
+        self.put_at(s, 0)
+
+    # `put`, where the first `k` facts of `s` are the current state's.
+    fn put_at(ref self, s: Option[St], k: int):
         match s:
             case Some(x):
+                self.touch(k)
                 self.st = x
                 self.live = true
             case None:
                 self.live = false
+
+    # Facts of the state from position `n` on may change (see `fix`).
+    fn touch(ref self, n: int):
+        if n < self.ix_ok:
+            self.ix_ok = n
+
+    fn sync_ix(ref self):
+        let n = len(self.st.facts)
+        let m = min(self.ix_ok, n)
+        while len(self.fix.of) > m:
+            self.fix.drop_last()
+        for i in m..n:
+            self.fix.add(self.st.facts[i])
+        self.ix_ok = n
+        while len(self.dix.of) < len(self.defs):
+            self.dix.add(self.defs[len(self.dix.of)])
+
+    # The facts (of the state, then `defs`) that mention a value of `goal`:
+    # `near_facts` of them all, without reading them all.
+    fn near(ref self, goal: F) -> [F]:
+        self.sync_ix()
+        let ga = atoms_of(goal)
+        var out: [F] = []
+        for p in self.fix.find(ga):
+            out.push(self.st.facts[p])
+        for p in self.dix.find(ga):
+            out.push(self.defs[p])
+        return out
 
     fn cur(self) -> Option[St]:
         return Some(self.st) if self.live else None
@@ -1812,50 +1911,103 @@ struct Vf:
         self.limited = false
         if not self.live:
             return PROVED
+        # the ranges of its values are often enough (and the solver can lose
+        # its way in bounds near the limits of 64-bit types); they cost nothing,
+        # so past the limits too
+        if self.by_ranges(goal):
+            return PROVED
         if self.weight > WEIGHT_MAX or len(self.atom_names) > ATOMS_MAX:
             self.too_big = true
         if self.too_big:
+            # what the facts about its values alone imply, as past WORK_MAX:
+            # a goal that a fact the error would list implies is no error
+            if self.by_own(self.near(goal), goal):
+                return PROVED
             self.limited = true
             return GAVE_UP
-        var all = self.st.facts
-        all.extend(self.defs)
         let over = self.work > WORK_MAX
-        # the ranges of its values are often enough (and the solver can lose
-        # its way in bounds near the limits of 64-bit types)
-        if self.by_ranges(goal):
-            return PROVED
-        if len(all) > NEAR_MIN:
-            let near = near_facts(all, goal)
+        let nall = len(self.st.facts) + len(self.defs)
+        if nall > NEAR_MIN or over:
+            let near = self.near(goal)
+            if over and self.by_own(near, goal):
+                return PROVED
             var nw = 0
             for f in near:
                 nw += weight(f)
-            # (not when it's most of what is known: that would be the same work twice)
-            if nw <= NEAR_MAX or (not over and 2 * len(near) <= len(all)):
-                if prove_work(near, goal, self.ranges, ref self.work) == PROVED:
+            # (not when it's most of what is known: that would be the same work twice;
+            # past the limit, only up to a small extra amount of work)
+            # (and not when it's all that is known: the proof from all of it follows)
+            let room = self.extra < EXTRA_MAX if over else len(near) < nall
+            if (nw <= NEAR_MAX and room) or (not over and 2 * len(near) <= nall):
+                if self.prove_in(near, goal, max(EXTRA_MAX - self.extra, 1)) == PROVED:
                     return PROVED
             # then what is linked to them, except through values most facts mention
             # (past the limit, only up to a small extra amount of work)
             if not over or self.extra < EXTRA_MAX:
+                var all = self.st.facts
+                all.extend(self.defs)
                 let w0 = self.work
                 var r = GAVE_UP
                 match local_facts(all, goal, HUB_MAX, LOCAL_MAX, ref self.work):
                     case Some(loc):
+                        if over:
+                            self.extra += self.work - w0
                         if len(near) < len(loc) < len(all):
-                            r = prove_work(loc, goal, self.ranges, ref self.work)
+                            r = self.prove_in(loc, goal, max(EXTRA_MAX - self.extra, 1))
                     case None:
-                        pass
-                if over:
-                    self.extra += self.work - w0
+                        if over:
+                            self.extra += self.work - w0
                 if r == PROVED:
                     return PROVED
-        if over:
+        if self.work > WORK_MAX:
             self.limited = true
             return GAVE_UP
-        return prove_work(all, goal, self.ranges, ref self.work)
+        var all = self.st.facts
+        all.extend(self.defs)
+        let r = self.prove_in(all, goal, 0)
+        # (it stopped at the limit)
+        self.limited = r == GAVE_UP and self.work > WORK_MAX
+        return r
+
+    # `prove_work` that stops at the function's limit, so one proof can't
+    # overrun it many times over: before WORK_MAX, at WORK_MAX; past it,
+    # after `past` more work, counted in `extra`.
+    fn prove_in(ref self, fs: [F], goal: F, past: int) -> int:
+        let w0 = self.work
+        if w0 <= WORK_MAX:
+            return prove_capped(fs, goal, self.ranges, ref self.work, WORK_MAX + 1 - w0)
+        let r = prove_capped(fs, goal, self.ranges, ref self.work, past)
+        self.extra += self.work - w0
+        return r
+
+    # `goal` follows from the facts about its values alone (each conjunct of
+    # them that mentions no other value): the facts an error lists. A small
+    # proof, tried past the limits, so a goal they imply never fails there.
+    fn by_own(ref self, near: [F], goal: F) -> bool:
+        let ga = atoms_of(goal)
+        if ga.is_empty() or ga.contains(ATOM_UNKNOWN):
+            return false
+        var own: [F] = []
+        var w = 0
+        for f in near:
+            var parts: [F] = []
+            conjuncts(f, ref parts)
+            for x in parts:
+                if within(x, ga):
+                    own.push(x)
+                    w += weight(x)
+        if len(own) == 0 or w > NEAR_MAX:
+            return false
+        var work = 0
+        let r = prove_capped(own, goal, self.ranges, ref work, PAST_MAX)
+        self.extra += work
+        return r == PROVED
 
     # `goal` follows from the ranges of its values or the facts about them
-    # (all facts, in a short function): for what is seldom true, like a check
-    # that always fails, whose proof would cost a long function the most.
+    # (all facts, in a short function), in a small proof: for what is seldom
+    # true, like a check that always fails, tried on every check that isn't
+    # proven. Its proofs are short; the others would cost a long function
+    # the most, so not from more than NEAR_MAX of facts.
     fn holds_near(ref self, goal: F) -> bool:
         if not self.live:
             return true
@@ -1863,11 +2015,21 @@ struct Vf:
             return false
         if self.by_ranges(goal):
             return true
-        var all = self.st.facts
-        all.extend(self.defs)
-        if len(all) > NEAR_MIN:
-            all = near_facts(all, goal)
-        return prove_work(all, goal, self.ranges, ref self.work) == PROVED
+        var fs = self.st.facts
+        if len(self.st.facts) + len(self.defs) > NEAR_MIN:
+            fs = self.near(goal)
+            var w = 0
+            for f in fs:
+                w += weight(f)
+            if w > NEAR_MAX:
+                return false
+        else:
+            fs.extend(self.defs)
+        let w0 = self.work
+        let r = prove_capped(fs, goal, self.ranges, ref self.work, PROBE_MAX)
+        if w0 > WORK_MAX:
+            self.extra += self.work - w0
+        return r == PROVED
 
     # `f` follows from the ranges of its values alone (interval arithmetic).
     fn by_ranges(self, f: F) -> bool:
@@ -1908,8 +2070,72 @@ struct Vf:
         self.assume(extra)
         let r = self.holds(goal)
         if self.live:
+            self.touch(n)
             self.st.facts = self.st.facts[:n]
         return r
+
+    # W0005: the runtime checks given up on, the first few by name.
+    fn w0005(self, at: Span) -> Diag:
+        let n = self.given_up
+        let s = "" if n == 1 else "s"
+        var why = "it does a limited amount of work per function, and ran out"
+        if self.too_big:
+            why = "what it knows about the function's values grew past its memory limit"
+        var d = (
+            diag.warning(
+                "W0005",
+                f"gave up proving {n} runtime check{s} in `{self.fn_name}`: the function is too long or complex for the prover"
+            ).label(at, "in this function")
+        )
+        for i in 0..min(len(self.gave_up_at), GAVE_UP_SHOWN):
+            let (sp, what) = self.gave_up_at[i]
+            d = d.label(sp, f"gave up on this {what}")
+        let it = "the check it gave up on" if n == 1 else "the checks it gave up on"
+        if self.must_prove:
+            let are = "is an error" if n == 1 else "are errors"
+            d = d.note(f"{why}; here everything must be proven, so {it} {are}")
+        else:
+            let verb = "s" if n == 1 else ""
+            let them = "it" if n == 1 else "them"
+            d = d.note(
+                f"{why}; {it} stay{verb} at run time (`check --report` marks {them} \"prover gave up\")"
+            )
+        if self.claims_given_up > 0:
+            let c = self.claims_given_up
+            let cs = "" if c == 1 else "s"
+            d = d.note(
+                f"it also gave up on {c} claim{cs} (a call's `requires`, an `invariant`, an `ensures`, a `prove`): those are errors"
+            )
+        return d.with_help(
+            f"split `{self.fn_name}` into smaller functions: each is proven on its own, so they don't share the limit"
+        )
+
+    # Of the errors that say the prover gave up, keep the first few: past its
+    # limits a long function can have hundreds, all alike.
+    fn fold_limited(ref self):
+        let ls = self.limited_diags
+        if len(ls) <= GAVE_UP_SHOWN:
+            return
+        let last = ls[GAVE_UP_SHOWN - 1]
+        var drop: {int: bool} = {}
+        for i in ls[GAVE_UP_SHOWN:]:
+            drop[i] = true
+        let m = len(ls) - GAVE_UP_SHOWN
+        let ms = "" if m == 1 else "s"
+        var out: [Diag] = []
+        for i, d in enumerate(self.diags):
+            if i in drop:
+                continue
+            if i == last:
+                out.push(
+                    d.note(
+                        f"the prover gave up on {m} more claim{ms} or check{ms} in `{self.fn_name}`: errors too, not shown one by one"
+                    )
+                )
+            else:
+                out.push(d)
+        self.diags = out
+        self.limited_diags = ls[:GAVE_UP_SHOWN]
 
     # Implicit (safety) obligation: proven => the runtime check is removed.
     # Either way the fact holds afterwards (it was proven or checked).
@@ -1929,6 +2155,7 @@ struct Vf:
             let limited = self.limited
             if limited:
                 self.given_up += 1
+                self.gave_up_at.push((span, what))
             self.failed[key(span, tag)] = true
             # (not when it gave up: showing it always fails would be harder)
             if exact and not limited and self.refuted(span, what, goal, shown):
@@ -2145,9 +2372,10 @@ struct Vf:
 
     fn end_assume(ref self, saved: (Option[St], int)):
         if self.live:
+            self.touch(saved.1)
             self.st.facts = self.st.facts[:saved.1]
         else:
-            self.put(saved.0)
+            self.put_at(saved.0, saved.1)
 
     # ------------------------------------------------------------ display
     fn atom_name(self, a: int) -> str:
@@ -2428,16 +2656,20 @@ struct Vf:
                 d = d.note(cap_note("to prove: " + self.show_f(goal)))
             if limited:
                 d = d.note(
-                    f"the prover gave up: `{self.fn_name}` is too long or complex for it (it does a limited amount of work per function), so this may well be true"
+                    f"the prover gave up: `{self.fn_name}` is too long or complex for it (it does a limited amount of work per function), so it can't tell whether this holds"
                 )
+                # (an `assert` is an error too where everything must be proven)
                 d.help = [
-                    f"split `{self.fn_name}` into smaller functions (each is proven on its own), or check this with `assert` instead"
+                    f"split `{self.fn_name}` into smaller functions: each is proven on its own"
+                    if self.must_prove
+                    else f"split `{self.fn_name}` into smaller functions (each is proven on its own), or check this with `assert` instead"
                 ]
             elif self.live:
                 var all = self.st.facts
                 all.extend(self.defs)
                 var w = 0
-                let gave_up = prove_work(all, goal, self.ranges, ref w) == GAVE_UP
+                let room = max(WORK_MAX - self.work, PAST_MAX)
+                let gave_up = prove_capped(all, goal, self.ranges, ref w, room) == GAVE_UP
                 if not gave_up:
                     match self.values_note(all, open):
                         case Some(n):
@@ -2465,9 +2697,15 @@ struct Vf:
                     )
                     # the usual advice (add facts) would only add cases
                     d.help = [
-                        "check it with `assert` (at runtime) instead, or move the branches before this point into a function whose `ensures` states just what is needed here"
+                        "move the branches before this point into a function whose `ensures` states just what is needed here"
+                        if self.must_prove
+                        else "check it with `assert` (at runtime) instead, or move the branches before this point into a function whose `ensures` states just what is needed here"
                     ]
             d = self.from_call_notes(d, open)
+            if limited:
+                self.limited_diags.push(len(self.diags))
+                if d.code != "E0607":
+                    self.claims_given_up += 1
         # false whenever this point is reached: more facts can't help, the
         # code or the claim is wrong
         var never = goal == F.False
@@ -2873,7 +3111,7 @@ struct Vf:
                     case _:
                         pass
             case StmtKind.If(branches, els):
-                self.if_chain(branches, els)
+                self.if_chain(branches, 0, els)
             case StmtKind.Match(scrut, cases):
                 self.match_stmt(scrut, cases)
             case StmtKind.While(cond, invariants, body):
@@ -2908,11 +3146,15 @@ struct Vf:
                 let c = self.as_bool(v)
                 # removing the assert removes the checks in its condition too:
                 # only when none of them stays
-                if pure_expr(cond) and len(self.remaining) == r0 and self.holds(c):
+                let tried = pure_expr(cond) and len(self.remaining) == r0
+                if tried and self.holds(c):
                     self.proven[key(s.span, TAG_ASSERT)] = true
                 else:
                     self.failed[key(s.span, TAG_ASSERT)] = true
                     if not self.test and self.live:
+                        if tried and self.limited:
+                            self.given_up += 1
+                            self.gave_up_at.push((s.span, "assert"))
                         self.remain(s.span, "assert", Some(c))
                         # one that always fails is written on purpose (`assert false`)
                         # or a bug: `--report` says which, and like `panic` it ends the path,
@@ -2948,14 +3190,29 @@ struct Vf:
             return a0
         let a = a0.unwrap()
         let b = b0.unwrap()
-        let n0 = len(self.atom_names)
-        let (env, ea, eb, hull) = self.merge_env(a.env, b.env)
         let k = min(k0, min(len(a.facts), len(b.facts)))
+        let (env, add) = self.meet_paths(a.env, a.facts[k:], b.env, b.facts[k:])
         var facts = a.facts[:k]
-        var fa = a.facts[k:]
+        facts.extend(add)
+        return Some(St(env=env, facts=facts))
+
+    # Two paths that share the facts before some point meet: from their
+    # environments and the facts each learned since, the environment there
+    # and the facts to add to the shared ones.
+    fn meet_paths(
+        ref self,
+        ea_env: {int: V},
+        fa0: [F],
+        eb_env: {int: V},
+        fb0: [F]
+    ) -> ({int: V}, [F]):
+        let n0 = len(self.atom_names)
+        let (env, ea, eb, hull) = self.merge_env(ea_env, eb_env)
+        var fa = fa0
         fa.extend(ea)
-        var fb = b.facts[k:]
+        var fb = fb0
         fb.extend(eb)
+        var facts: [F] = []
         let both = F.or_([F.and_(fa), F.and_(fb)])
         if both.size() <= MERGE_MAX:
             facts.push(both)
@@ -2966,7 +3223,47 @@ struct Vf:
                     facts.push(f)
             self.drop_from(n0)
         facts.extend(hull)
-        return Some(St(env=env, facts=facts))
+        return (env, facts)
+
+    # Branches run in place, on the facts they share. `cut` takes the current
+    # path off (None where it can't run) as its environment and the facts it
+    # learned since there were `k`; the state keeps the facts before `k` for
+    # the next branch (`resume`) and where they meet (`meet`). Copying all the
+    # facts for every branch made a long function quadratic.
+    fn cut(ref self, k: int) -> Option[St]:
+        let live = self.live
+        self.live = false
+        let env = self.st.env
+        var tail: [F] = []
+        if len(self.st.facts) > k:
+            self.touch(k)
+            tail = self.st.facts[k:]
+            while len(self.st.facts) > k:
+                self.st.facts.pop()
+        if not live:
+            return None
+        return Some(St(env=env, facts=tail))
+
+    # Continue on path `p` (from `cut` or `meet`), after the facts kept.
+    fn resume(ref self, p: Option[St]):
+        match p:
+            case Some(x):
+                self.st.env = x.env
+                self.st.facts.extend(x.facts)
+                self.live = true
+            case None:
+                self.live = false
+
+    # Where paths `a0` and `b0` (from `cut`) meet.
+    fn meet(ref self, a0: Option[St], b0: Option[St]) -> Option[St]:
+        if a0.is_none():
+            return b0
+        if b0.is_none():
+            return a0
+        let a = a0.unwrap()
+        let b = b0.unwrap()
+        let (env, add) = self.meet_paths(a.env, a.facts, b.env, b.facts)
+        return Some(St(env=env, facts=add))
 
     fn has_dropped(self, v: V) -> bool:
         if len(self.dropped) == 0:
@@ -3125,6 +3422,40 @@ struct Vf:
             case _:
                 pass
 
+    # The values a loop made at its head (atoms from `na` on) keep the facts
+    # assumed there (from `k` on: invariants, monotone steps) wherever they
+    # are used, so those facts can narrow their ranges. A range survives a
+    # merge in the body that drops what the branches knew (MERGE_MAX), so
+    # `invariant i >= 0` still proves `i >= 0` after a long `elif` chain.
+    # Only facts about one new value and older ones: a `for` loop's variable
+    # is new too, and stands for another value after the loop.
+    fn narrow_looped(ref self, na: int, k: int):
+        if not self.live:
+            return
+        var by: {int: [F]} = {}
+        for i in k..len(self.st.facts):
+            var parts: [F] = []
+            conjuncts(self.st.facts[i], ref parts)
+            for f in parts:
+                var s = AtomSet.new()
+                f.atoms(ref s)
+                var only = -1
+                for a in s.xs:
+                    if a >= na:
+                        only = a if only == -1 or only == a else -2
+                if only >= 0:
+                    match by.get(only):
+                        case Some(fs):
+                            var fs2 = fs
+                            fs2.push(f)
+                            by[only] = fs2
+                        case None:
+                            by[only] = [f]
+        var ks = by.keys()
+        ks.sort()
+        for a in ks:
+            self.narrow(a, by[a])
+
     # The name and type of field `k` of a struct or tuple type.
     fn field_of(self, ty: Ty, k: int) -> Option[(str, Ty)]:
         match ty:
@@ -3189,7 +3520,7 @@ struct Vf:
                 if ng != F.True:
                     other.facts.push(ng)
                 let joined = self.join(fk, s1, guard, Some(other), ng)
-                self.put(joined)
+                self.put_at(joined, fk.k)
                 return v
             case None:
                 let s = self.begin_assume(guard)
@@ -3197,73 +3528,70 @@ struct Vf:
                 self.end_assume(s)
                 return v
 
-    fn if_chain(ref self, branches: [(Expr, Block)], els: Option[Block]):
-        let c = self.cond(branches[0].0)
-        let base0 = self.take()
-        if base0.is_none():
+    # Branch `i` on (an index, not a slice: the rest of a long `elif` chain
+    # copied at every level took memory quadratic in its length).
+    fn if_chain(ref self, branches: [(Expr, Block)], i: int, els: Option[Block]):
+        let c = self.cond(branches[i].0)
+        if not self.live:
             return
-        let base = base0.unwrap()
-        let k = len(base.facts)
-        var t = base
+        let k = len(self.st.facts)
+        let env0 = self.st.env
         if c != F.True:
-            t.facts.push(c)
-        self.put(Some(t))
-        self.block(branches[0].1)
-        let s1 = self.take()
-        var e = base
+            self.st.facts.push(c)
+        self.block(branches[i].1)
+        let s1 = self.cut(k)
+        self.resume(Some(St(env=env0, facts=[])))
         let nc = c.not_()
         if nc != F.True:
-            e.facts.push(nc)
-        self.put(Some(e))
-        if len(branches) > 1:
-            self.if_chain(branches[1:], els)
+            self.st.facts.push(nc)
+        if i + 1 < len(branches):
+            self.if_chain(branches, i + 1, els)
         else:
             match els:
                 case Some(b):
                     self.block(b)
                 case None:
                     pass
-        let s2 = self.take()
-        let m = self.merge(s1, s2, k)
-        self.put(m)
+        let s2 = self.cut(k)
+        self.resume(self.meet(s1, s2))
 
     # Cases are tried in order: each case sees the facts of its own pattern and
     # (when expressible) that the earlier patterns didn't match.
     fn match_stmt(ref self, scrut: Expr, cases: [Case]):
         let sv = self.eval(scrut)
-        let base0 = self.take()
-        if base0.is_none():
+        if not self.live:
             return
-        var cur = base0.unwrap()
-        let k = len(cur.facts)
+        let k = len(self.st.facts)
+        # the path where no case so far matched, and the paths after the
+        # cases (both as `cut` makes them)
+        var cur = self.cut(k).unwrap()
         var out: Option[St] = None
         for c in cases:
             let hit = self.pat_cond(c.pat, sv)
-            var t = cur
+            self.resume(Some(cur))
             match hit:
                 case Some(h):
                     if h != F.True:
-                        t.facts.push(h)
+                        self.st.facts.push(h)
                 case None:
                     pass
-            self.put(Some(t))
             self.bind_pattern(c.pat, sv, scrut.ty)
             var gcond = F.True
-            # the state after a guard that changes something
+            # the path after a guard that changes something
             var after_guard: Option[St] = None
             match c.guard:
                 case Some(g):
                     var gm: {int: int} = {}
                     mods_expr(g, self.info, ref gm)
                     gcond = self.cond(g)
-                    if len(gm) > 0:
-                        after_guard = self.cur()
+                    if len(gm) > 0 and self.live:
+                        after_guard = Some(St(env=self.st.env, facts=self.st.facts[k:]))
                     self.assume(gcond)
                 case None:
                     pass
             self.block(c.body)
-            let s = self.take()
-            out = self.merge(out, s, k)
+            let s = self.cut(k)
+            out = self.meet(out, s)
             # later cases run only if this one didn't match
             match after_guard:
                 case Some(ag0):
@@ -3281,7 +3609,7 @@ struct Vf:
                     let ng = gcond.not_()
                     if ng != F.True:
                         ag.facts.push(ng)
-                    match self.merge(Some(miss), Some(ag), len(cur.facts)):
+                    match self.meet_at(miss, ag, len(cur.facts)):
                         case Some(m):
                             cur = m
                         case None:
@@ -3294,7 +3622,15 @@ struct Vf:
                                 cur.facts.push(n)
                         case None:
                             pass
-        self.put(out)
+        self.resume(out)
+
+    # `meet` of two paths that also share their first `k` facts.
+    fn meet_at(ref self, a: St, b: St, k0: int) -> Option[St]:
+        let k = min(k0, min(len(a.facts), len(b.facts)))
+        let (env, add) = self.meet_paths(a.env, a.facts[k:], b.env, b.facts[k:])
+        var facts = a.facts[:k]
+        facts.extend(add)
+        return Some(St(env=env, facts=facts))
 
     # Exact condition for `p` matching `v`, when it can be expressed.
     fn pat_cond(ref self, p: Pattern, v: V) -> Option[F]:
@@ -3619,11 +3955,13 @@ struct Vf:
         effs_block(body, self.info, ref effs)
         effs_expr(cond, self.info, ref effs)
         let starts = self.mono_starts(body, Some(cond))
+        let na = len(self.atom_names)
         self.havoc_effs(effs)
         self.mono_facts(starts)
         for inv in invs:
             let f = self.spec_cond(inv)
             self.assume(f)
+        self.narrow_looped(na, k)
         let c = self.cond(cond)
         let head0 = self.take()
         if head0.is_none():
@@ -3633,7 +3971,7 @@ struct Vf:
         exit.facts.push(c.not_())
         var b = head
         b.facts.push(c)
-        self.put(Some(b))
+        self.put_at(Some(b), len(head.facts))
         self.loops.push(LoopCx(invs=invs, next=None, breaks=[], asc=None, asc_ok=false))
         self.block(body)
         let end = body.stmts[len(body.stmts) - 1].span if len(body.stmts) > 0 else body.span
@@ -3642,7 +3980,7 @@ struct Vf:
         var out: Option[St] = Some(exit)
         for br in cx.breaks:
             out = self.merge(out, Some(br), k)
-        self.put(out)
+        self.put_at(out, k)
 
     # `range(a, b, s)`: `s != 0`; `counted`: its elements are counted in an
     # int (a comprehension or a `par for`), so there can't be more than 2^63 - 1.
@@ -3802,6 +4140,8 @@ struct Vf:
                     case None:
                         pass
         let mono = self.mono_starts(body, None)
+        let na_loop = len(self.atom_names)
+        let kh = len(self.st.facts) if self.live else 0
         self.havoc(body)
         self.mono_facts(mono)
         let head = self.cur()
@@ -3898,6 +4238,7 @@ struct Vf:
         for inv in invs:
             let f = self.spec_cond(inv)
             self.assume(f)
+        self.narrow_looped(na_loop, kh)
         var is_range = false
         match dom:
             case D.Range(_, _, _):
@@ -3926,7 +4267,7 @@ struct Vf:
         self.check_preserved(end)
         let cx = self.loops.pop()
         # after the loop
-        self.put(head)
+        self.put_at(head, k)
         var out: Option[St] = None
         if len(invs) == 0:
             out = self.take()
@@ -3977,7 +4318,7 @@ struct Vf:
                 pass
         for br in cx.breaks:
             out = self.merge(out, Some(br), k)
-        self.put(out)
+        self.put_at(out, k)
 
     # ------------------------------------------------------------ lvalues
     # `insert`: `e` is assigned with `=`, so if it's `m[k]` the key needn't exist.
@@ -4870,7 +5211,7 @@ struct Vf:
                     let saved = self.cur()
                     self.check_own_inv(e.span)
                     self.check_ensures(None, e.span)
-                    self.put(saved)
+                    self.put_at(saved, len(saved.unwrap().facts))
                 # an `Option` the prover models (`found`): it was `Some`
                 match (x.ty, xv):
                     case (Ty.Enum(eid), V.Agg(parts)):
@@ -4991,7 +5332,7 @@ struct Vf:
                     if ng != F.True:
                         other.facts.push(ng)
                     let joined = self.join(fk, s1, g, Some(other), ng)
-                    self.put(joined)
+                    self.put_at(joined, fk.k)
                 return V.Bool(F.and_(fs))
             case ExprKind.IfElse(cond, then, els):
                 let c = self.cond(cond)
@@ -5004,11 +5345,11 @@ struct Vf:
                         var other = fk.base
                         if nc != F.True:
                             other.facts.push(nc)
-                        self.put(Some(other))
+                        self.put_at(Some(other), fk.k)
                         let b = self.eval(els)
                         let s2 = self.take()
                         let joined = self.join(fk, s1, c, s2, nc)
-                        self.put(joined)
+                        self.put_at(joined, fk.k)
                         return self.ite(c, a, b, e.ty, self.name_of(e))
                     case None:
                         let s1 = self.begin_assume(c)
@@ -5749,7 +6090,7 @@ struct Vf:
                 self.eval(c.body)
         self.end_assume(s)
         if len(effs) > 0 and head.is_some():
-            self.put(head)
+            self.put_at(head, len(head.unwrap().facts))
         match count:
             case Some(n):
                 if c.filter.is_none():
@@ -7587,6 +7928,11 @@ fn hull_lin(n: Lin, x: Lin, y: Lin, ref out: [F]):
                     pass
         case None:
             pass
+
+# Every value `f` mentions is in `s`.
+fn within(f: F, s: AtomSet) -> bool:
+    let fa = atoms_of(f)
+    return all(s.contains(a) for a in fa.xs)
 
 # `f` split at its top-level `and`s.
 fn conjuncts(f: F, ref out: [F]):
