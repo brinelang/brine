@@ -246,6 +246,7 @@ fn features() -> [str]:
         "tests/programs/proofs.br",
         "tests/programs/proof_facts.br",
         "tests/programs/proven_facts.br",
+        "tests/programs/proven_gaps.br",
         "tests/programs/division.br",
         "tests/programs/references.br",
         "tests/programs/enums.br",
@@ -1839,8 +1840,9 @@ test "the notes of failed proofs name values as the source does":
     assert all(len(x.chars()) < 440 for x in l.lines() if "= note:" in x), l
 
 test "the prover removes the checks it has the facts for":
-    let o = brine(["check", "tests/programs/proven_facts.br", "--proven"])
-    assert o.code == 0 and "0 remain" in o.all(), o.all()
+    for f in ["tests/programs/proven_facts.br", "tests/programs/proven_gaps.br"]:
+        let o = brine(["check", f, "--proven"])
+        assert o.code == 0 and "0 remain" in o.all(), o.all()
     # but not 128-bit operations that can overflow
     let d = scratch("facts128")
     write(
@@ -2011,6 +2013,40 @@ test "failed proofs show values the prover can't rule out":
     let c = brine(["check", g]).err
     assert "`d` comes from `discount`, which has no `ensures`" in c, c
     assert "help: add an `ensures` to `discount` that says what it returns" in c, c
+
+test "failed proofs point at what to fix":
+    let d = scratch("pointers")
+    let f = d + "/p.br"
+    write(
+        f,
+        "struct Span:\n    buf: [u8]\n    end: int\n    invariant 0 <= self.end <= len(self.buf)\n\n"
+        + "    fn size(self) -> int:\n        ensures result >= 0\n        return self.end\n\n"
+        + "fn byte8(sp: Span, off: int) -> int:\n    requires off >= 0\n    if off + 8 < sp.size():\n        return int(sp.buf[off + 8])\n    return 0\n\n"
+        + "fn same(x: int) -> int:\n    requires 0 <= x <= 10\n    ensures result > x\n    return x\n\n"
+        + "fn small(x: int) -> int:\n    requires 0 <= x <= 10\n    ensures result > 5\n    if x > 3:\n        return 9\n    return x\n\n"
+        + "fn get(m: {str: int}, k: str) -> int:\n    requires k in m\n    return m[k]\n\n"
+        + "fn mask(xs: [int], x: int) -> int:\n    requires len(xs) == 100\n    return xs[x & 127]\n\n"
+        + "fn clampf(x: float, c: float) -> float:\n    requires c > 0.0\n    ensures -c <= result <= c\n    if x > c:\n        return c\n    return x\n\n"
+        + "fn zero() -> float:\n    ensures 0.0 <= result\n    return 0.0\n\n"
+        + "fn rows(ws: [[int]]) -> int:\n    var s = 0\n    for w in ws:\n        s = w[1]\n    return s\n\n"
+        + "fn main():\n    print(byte8(Span(buf=[u8(1)] * 20, end=20), 3), same(1), small(2), get({\"a\": 1}, \"a\"))\n"
+        + "    print(mask([0] * 100, 5), clampf(1.0, 2.0), zero(), rows([[1, 2]]))\n"
+    )
+    let e = brine(["check", "--proven", f]).err
+    # a weak `ensures` of a call the proof leans on
+    assert "all the prover knows about what `size` returns" in e, e
+    assert "`sp.size()` comes from `size`: the prover knows only what its `ensures` says" in e, e
+    # a claim that can't hold isn't a missing fact
+    assert "fix the value it returns, or the `ensures`" in e, e
+    assert "whenever this point is reached, this is false" in e, e
+    # `in`, a mask and floats, as written and without made-up values
+    assert "the prover doesn't follow `in` yet: to it, `k in m` is" in e, e
+    assert "in = " not in e, e
+    assert "to prove: len(xs) > x & 127" in e, e
+    assert "to prove: len(w) >= 2" in e, e
+    assert "the prover knows floats only roughly" in e, e
+    assert "-c <= result <= c = " not in e and "-c <= result <= c and -c <= result <= c" not in e, e
+    assert "`zero`" not in e, e
 
 test "proven projects can't keep runtime checks":
     let d = scratch("proven")
@@ -2599,7 +2635,8 @@ test "proofs stay sound":
             "E0605@530",
             "E0605@538",
             "E0605@545",
-            "E0605@552"
+            "E0605@552",
+            "E0605@560"
         ]
     )
 
