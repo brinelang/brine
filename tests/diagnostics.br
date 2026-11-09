@@ -1,0 +1,326 @@
+# The errors brine reports for programs with a common mistake in them, mostly
+# from other languages (tests/diagnostics/NAME.br, from the 0.9.1 lab's
+# corpus; `# mistake:` says what the program gets wrong). NAME.diag is what
+# `brine check` says, in short: one line per diagnostic (its code, where, and
+# whether it has a help line and a fix), then what checking the program with
+# every fix applied gives.
+#
+#   brine test tests/diagnostics.br                 from the repository root
+#   brine run tests/diagnostics.br [-- path/to/brine]   to regenerate NAME.diag
+#
+# Review the diff after regenerating: a lost help line or a fix that stopped
+# compiling is a regression.
+
+const DIR = "tests/diagnostics"
+# programs checked at once
+const BATCH = 16
+
+fn brine_exe() -> str:
+    match getenv("BRINE"):
+        case Some(b):
+            return b
+        case None:
+            return "brine"
+
+fn text(path: str) -> str:
+    match read_file(path):
+        case Ok(t):
+            return t.replace("\r\n", "\n")
+        case Err(e):
+            panic(e)
+
+fn write(path: str, t: str):
+    match write_file(path, t):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+
+fn cases() -> [str]:
+    var out: [str] = []
+    match os.list_dir(DIR):
+        case Ok(ns):
+            for n in ns:
+                if n.ends_with(".br"):
+                    out.push(n[:len(n) - 3])
+        case Err(e):
+            panic(e)
+    out.sort()
+    return out
+
+# The flags in a `# flags:` line of the program.
+fn flags(src: str) -> [str]:
+    for l in src.lines():
+        if l.starts_with("# flags:"):
+            return [f for f in l[8:].split(" ") if f != ""]
+    return []
+
+# `brine check --json` of each file, `BATCH` at a time.
+fn check_all(exe: str, files: [str], fl: [[str]]) -> [str]:
+    var outs: [str] = []
+    var i = 0
+    while i < len(files):
+        var hs: [int] = []
+        for j in i..min(i + BATCH, len(files)):
+            var cmd = [exe, "check", files[j], "--json"]
+            cmd.extend(fl[j])
+            match os.spawn(cmd, {"NO_COLOR": "1"}, true, false):
+                case Ok(h):
+                    hs.push(h)
+                case Err(e):
+                    panic(f"cannot run {exe}: {e}")
+        for h in hs:
+            os.wait(h)
+            let (o, _) = os.output(h)
+            outs.push(o.replace("\r\n", "\n"))
+        i += BATCH
+    return outs
+
+fn json_int(s: str, key: str) -> int:
+    let i = s.find(key).unwrap()
+    var n = 0
+    for c in s[i + len(key):].chars():
+        if not c.is_digit():
+            break
+        n = n * 10 + c.to_int().unwrap()
+    return n
+
+# The string after `key` in a line of JSON, unescaped.
+fn json_string(s: str, key: str) -> str:
+    let cs = s[s.find(key).unwrap() + len(key) + 1:].chars()
+    var out = ""
+    var i = 0
+    while cs[i] != "\"":
+        if cs[i] == "\\":
+            i += 1
+            match cs[i]:
+                case "n":
+                    out += "\n"
+                case "t":
+                    out += "\t"
+                case "r":
+                    out += "\r"
+                case "u":
+                    var code = 0
+                    for h in cs[i + 1:i + 5]:
+                        code = code * 16 + "0123456789abcdef".find(h.lower()).unwrap()
+                    out += chr(code)
+                    i += 4
+                case _:
+                    out += cs[i]
+        else:
+            out += cs[i]
+        i += 1
+    return out
+
+# The diagnostics of `brine check --json` output (not the summary line).
+fn diags(json: str) -> [str]:
+    return [l for l in json.lines() if l.starts_with("{\"severity\":")]
+
+# `src` with every fix in `json` applied, last first; a fix that overlaps one
+# already applied is skipped. (fixed source, fixes applied)
+fn apply_fixes(src: str, json: str) -> (str, int):
+    let cs = src.chars()
+    var starts = [0]
+    for i, c in enumerate(cs):
+        if c == "\n":
+            starts.push(i + 1)
+    var edits: [(int, int, str)] = []
+    for l in diags(json):
+        match l.find("\"fixes\":["):
+            case Some(k):
+                for part in l[k:].split("{\"file\":")[1:]:
+                    let lo = (
+                        starts[json_int(part, "\"line\":") - 1] + json_int(part, "\"column\":") - 1
+                    )
+                    let hi = (
+                        starts[json_int(part, "\"end_line\":") - 1]
+                        + json_int(part, "\"end_column\":")
+                        - 1
+                    )
+                    edits.push((lo, hi, json_string(part, "\"replacement\":")))
+            case None:
+                pass
+    edits.sort()
+    var out = cs
+    var limit = len(cs) + 1
+    var n = 0
+    var k = len(edits) - 1
+    while k >= 0:
+        let (lo, hi, r) = edits[k]
+        if hi <= limit:
+            out = out[:lo] + r.chars() + out[hi:]
+            limit = lo
+            n += 1
+        k -= 1
+    return ("".join(out), n)
+
+# One line per diagnostic: `E0115 4:9 help fix`.
+fn summary(json: str) -> str:
+    var out = ""
+    for l in diags(json):
+        let code = json_string(l, "\"code\":") if "\"code\":\"" in l else "-"
+        var s = code
+        if "\"line\":" in l:
+            s += " " + str(json_int(l, "\"line\":")) + ":" + str(json_int(l, "\"column\":"))
+        if "\"help\":[]" not in l:
+            s += " help"
+        if "\"fixes\":[{" in l:
+            s += " fix"
+        out += s + "\n"
+    return out if out != "" else "no errors\n"
+
+# The NAME.diag of every case, worked out with `exe`.
+fn digests(exe: str) -> [(str, str)]:
+    let names = cases()
+    var files: [str] = []
+    var fl: [[str]] = []
+    for n in names:
+        files.push(f"{DIR}/{n}.br")
+        fl.push(flags(text(f"{DIR}/{n}.br")))
+    let outs = check_all(exe, files, fl)
+    # check each program again with its fixes applied
+    let tmp = f"target/it/diagnostics-{os.pid()}"
+    for d in ["target", "target/it"]:
+        # (they may be there already)
+        let _ = os.make_dir(d)
+    match os.make_dir(tmp):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+    var fixed: [str] = []
+    var ffl: [[str]] = []
+    var which: [int] = []
+    for i, n in enumerate(names):
+        let (src, k) = apply_fixes(text(files[i]), outs[i])
+        if k > 0:
+            let f = f"{tmp}/{n}.br"
+            write(f, src)
+            fixed.push(f)
+            ffl.push(fl[i])
+            which.push(i)
+    let fouts = check_all(exe, fixed, ffl)
+    var res: [(str, str)] = []
+    for i, n in enumerate(names):
+        var d = summary(outs[i])
+        for j, w in enumerate(which):
+            if w == i:
+                let codes = [
+                    json_string(l, "\"code\":")
+                    for l in diags(fouts[j])
+                    if "\"severity\":\"error\"" in l
+                ]
+                d += (
+                    "with the fixes: "
+                    + ("no errors" if len(codes) == 0 else " ".join(codes))
+                    + "\n"
+                )
+        res.push((n, d))
+    return res
+
+test "the diagnostics of common mistakes":
+    var changed: [str] = []
+    var n = 0
+    for name, d in digests(brine_exe()):
+        let want = text(f"{DIR}/{name}.diag")
+        if d != want:
+            changed.push(f"{name}:\n--- expected\n{want}--- got\n{d}")
+        # a fix must at least give code that parses (E01xx: the lexer and parser)
+        for l in d.lines():
+            if l.starts_with("with the fixes:"):
+                assert " E01" not in l and ": E01" not in l, f"the fixes of {name} don't parse: {l}"
+        n += 1
+    assert n > 80, f"found only {n} programs in {DIR}"
+    assert (
+        len(changed) == 0
+    ), f"{len(changed)} changed (regenerate with `brine run tests/diagnostics.br`):\n" + "\n".join(changed)
+
+# What `brine <args>` prints (both streams, without color).
+fn brine_says(args: [str]) -> str:
+    var cmd = [brine_exe()]
+    cmd.extend(args)
+    match os.spawn(cmd, {"NO_COLOR": "1"}, true, false):
+        case Ok(h):
+            os.wait(h)
+            let (o, e) = os.output(h)
+            return (o + e).replace("\r\n", "\n")
+        case Err(e):
+            panic(e)
+
+test "helps that lead somewhere":
+    # (program, what `check` must say, what it must not say)
+    let cases = [
+        (
+            # 0.9.1 asked to add an `ensures` to the prelude's `unwrap_or`
+            "fn half(x: int) -> int:\n    requires x >= 0\n    return x / 2\n\nfn main():\n    let d = \"5\".to_int().unwrap_or(0)\n    print(half(d))\n",
+            ["E0601", "`d` comes from the built-in `unwrap_or`"],
+            ["<prelude>", "add an `ensures` to `unwrap_or`"]
+        ),
+        (
+            "fn f(x: int) -> int:\n    requires sum([x, 1]) > 0\n    return x\n\nfn main():\n    print(f(1))\n",
+            ["E0606", "help: "],
+            []
+        ),
+        (
+            # `float(x)` would give another mismatch
+            "fn f(a: u64, i: int) -> bool:\n    return a < i\n\nfn main():\n    print(f(u64(1), 2))\n",
+            ["E0305", "`u64(...)`", "`int(...)`"],
+            ["float(x)"]
+        ),
+        (
+            "struct P:\n    x: int\n\nfn main():\n    var p: P\n    p = P(x=1)\n    print(p)\n",
+            ["E0110", "`var p: P = P(...)`"],
+            ["`var p = 0`"]
+        ),
+    ]
+    let d = f"target/it/helps-{os.pid()}"
+    for x in ["target", "target/it", d]:
+        let _ = os.make_dir(x)
+    for i, (src, want, not_want) in enumerate(cases):
+        let f = f"{d}/case{i}.br"
+        write(f, src)
+        let o = brine_says(["check", f])
+        for w in want:
+            assert w in o, f"`brine check` of\n{src}\nshould say {w}:\n{o}"
+        for w in not_want:
+            assert w not in o, f"`brine check` of\n{src}\nshouldn't say {w}:\n{o}"
+
+test "a long line is shown around the error":
+    # 0.9.1 printed the whole line and a caret line as long as the span
+    let long = " + ".join([f"a * {k}" for k in 0..40])
+    let src = (
+        "struct R:\n    lo: int\n    hi: int\n    invariant self.lo <= self.hi\n\n"
+        + f"fn make(a: int) -> R:\n    return R(lo={long} + 1, hi={long})\n\n"
+        + "fn main():\n    print(make(1).lo)\n"
+    )
+    let d = f"target/it/long-{os.pid()}"
+    for x in ["target", "target/it", d]:
+        let _ = os.make_dir(x)
+    write(d + "/long.br", src)
+    let o = brine_says(["check", d + "/long.br"])
+    assert "E0609" in o and "..." in o, o
+    for l in o.lines():
+        # the line is cut to 120 characters, and the label follows the carets
+        assert len(l) < 200, f"a line of {len(l)} characters:\n{o}"
+
+test "explain E0607 names every check":
+    let o = brine_says(["explain", "E0607"]).replace("\n", " ")
+    # the checks 0.9.1 added and didn't list
+    for c in [
+        "start check",
+        "empty sequence check",
+        "overflow check",
+        "step check",
+        "NUL byte check"
+    ]:
+        assert c in o, f"`brine explain E0607` doesn't name the {c}"
+
+fn main():
+    let a = args()
+    let exe = a[0] if len(a) > 0 else "brine"
+    var n = 0
+    for name, d in digests(exe):
+        write(f"{DIR}/{name}.diag", d)
+        n += 1
+    print(f"updated {n} files")

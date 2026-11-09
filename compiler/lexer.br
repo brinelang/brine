@@ -287,6 +287,8 @@ struct Lexer:
     at_line_start: bool
     keywords: {str: Kw}
     singles: {str: Tok}
+    # the `;` of a `vec![x; n]` already reported, read as `,`
+    quiet_semi: int
 
     # the one-character string at `i`, or "" past the end
     fn at(self, i: int) -> str:
@@ -1110,41 +1112,71 @@ struct Lexer:
                 to = "print"
             case "eprintln" | "eprint":
                 to = "eprint"
-            case "panic":
+            case "panic" | "todo" | "unimplemented" | "unreachable":
                 to = "panic"
-            case "assert":
+            case "assert" | "debug_assert" | "assert_eq" | "assert_ne" | "debug_assert_eq" | "debug_assert_ne":
                 to = "assert"
+            case "dbg":
+                to = "print"
             case "vec":
                 to = ""
             case _:
                 pass
-        # a Rust format string (`"{}"`) means something else to `print`
-        var j = lo + 2
-        while j < len(self.bytes) and self.bytes[j] == 32:
-            j += 1
-        var fmt_braces = false
-        if j < len(self.bytes) and self.bytes[j] == 34:
-            j += 1
-            while j < len(self.bytes) and self.bytes[j] != 34 and self.bytes[j] != 10:
-                if self.bytes[j] == 123:
-                    fmt_braces = true
-                j += 1
+        let (margs, close, semi) = self.macro_args(lo + 1)
+        let whole = self.span(s, close + 1)
         var d = diag.error(
             "E0115",
             "brine has no macros"
         ).label(self.span(s, lo + 1), "`!` makes this a Rust macro call")
+        let fmt = rust_format(margs)
         if name == "vec":
+            if semi >= 0 and len(margs) == 2 and close > 0:
+                # `vec![x; n]`; the `;` is read as a `,` so this is the only error
+                let rep = f"[{margs[0]}] * {margs[1]}"
+                d = d.with_help(f"write `{rep}`").fix(whole, rep, f"write `{rep}`")
+                self.quiet_semi = semi
+            else:
+                d = d.with_help(
+                    "an array is written `[1, 2, 3]`"
+                ).fix(self.span(s, lo + 1), "", "remove `vec!`")
+        elif name.starts_with("assert_") or name.starts_with("debug_assert_"):
+            let op = "==" if name.ends_with("_eq") else "!="
+            if (len(margs) == 2 or len(margs) == 3) and close > 0:
+                var rep = f"assert {margs[0]} {op} {margs[1]}"
+                if len(margs) == 3:
+                    rep += f", {margs[2]}"
+                d = d.with_help(f"write `{rep}`").fix(whole, rep, f"write `{rep}`")
+            else:
+                d = d.with_help(f"write `assert a {op} b`")
+        elif to == "-" and name == "format":
+            match fmt:
+                case Some(f):
+                    d = d.with_help(f"use an f-string: `{f}`").fix(whole, f, "write an f-string")
+                case None:
+                    d = d.with_help("use an f-string: `f\"total: {n}\"`")
+        elif to == "-" and name == "matches":
             d = d.with_help(
-                "an array is written `[1, 2, 3]`"
-            ).fix(self.span(s, lo + 1), "", "remove `vec!`")
+                "use `match x:` with a `case pattern:` line, or compare with `==` (enum values compare too)"
+            )
         elif to == "-":
             d = d.with_help(
-                f"call a function instead: `{name}(...)`"
-            ).fix(self.span(lo, lo + 1), "", "remove `!`")
-        elif fmt_braces:
-            d = d.with_help(
-                f"call `{to}(...)`; it takes the values themselves (`{to}(a, b)`), or use an f-string: `{to}(f\"total: {{n}}\")`"
+                f"brine has no macros to define either: write a function `fn {name}(...)` and call it"
             )
+        elif to == "panic" and name != "panic" and len(margs) == 0 and close > 0:
+            let rep = f"panic(\"{name}\")"
+            d = d.with_help(f"call `{rep}`").fix(whole, rep, f"write `{rep}`")
+        elif to != "assert" and len(margs) > 0 and margs[0].starts_with("\"") and "{" in margs[0]:
+            # a Rust format string (`"{}"`) means something else to `print`
+            match fmt:
+                case Some(f):
+                    let rep = f"{to}({f})"
+                    d = d.with_help(
+                        f"use an f-string: `{rep}`"
+                    ).fix(whole, rep, "write an f-string")
+                case None:
+                    d = d.with_help(
+                        f"call `{to}(...)`; it takes the values themselves (`{to}(a, b)`), or use an f-string: `{to}(f\"total: {{n}}\")`"
+                    )
         else:
             d = d.with_help(
                 f"call `{to}(...)`"
@@ -1158,11 +1190,49 @@ struct Lexer:
             self.toks[n - 1].tok = Tok.Keyword(Kw.Assert) if to == "assert" else Tok.Ident(to)
         self.pos += 1
 
+    # The arguments of a macro call whose bracket opens at `open`, as source
+    # text: (the arguments, the closing bracket or -1, a `;` between them or -1).
+    fn macro_args(self, open: int) -> ([str], int, int):
+        var args: [str] = []
+        var depth = 0
+        var start = open + 1
+        var semi = -1
+        var i = open + 1
+        while i < len(self.bytes):
+            let b = self.bytes[i]
+            if b == 34:
+                # a string: skip to its closing quote
+                i += 1
+                while i < len(self.bytes) and self.bytes[i] != 34 and self.bytes[i] != 10:
+                    if self.bytes[i] == 92:
+                        i += 1
+                    i += 1
+            elif b == 40 or b == 91 or b == 123:
+                depth += 1
+            elif b == 41 or b == 93 or b == 125:
+                if depth == 0:
+                    let last = self.text[start:i].strip()
+                    if last != "":
+                        args.push(last)
+                    return (args, i, semi)
+                depth -= 1
+            elif (b == 44 or b == 59) and depth == 0:
+                args.push(self.text[start:i].strip())
+                start = i + 1
+                if b == 59:
+                    semi = i
+            i += 1
+        return (args, -1, -1)
+
     # `;` at `lo`
     fn semicolon(ref self, lo: int):
         self.pos += 1
-        if self.layout and self.depth == 0 and self.line_opens_with(Kw.For):
-            # `for i := 0; i < n; i++:`; the rest of the line would only add errors
+        if lo == self.quiet_semi:
+            self.push(Tok.Comma, lo, lo + 1)
+            return
+        if self.layout and self.line_opens_with(Kw.For):
+            # `for i := 0; i < n; i++:` or `for (i = 0; ...)`; the rest of the
+            # line would only add errors
             let d = diag.error(
                 "E0115",
                 "brine has no C-style `for` loop"
@@ -1174,6 +1244,7 @@ struct Lexer:
             )
             while not self.done() and self.peek() != "\n":
                 self.pos += 1
+            self.depth = 0
             return
         var e = self.pos
         while (
@@ -1220,6 +1291,50 @@ struct Lexer:
         let lo = self.pos
         self.pos += n
         self.push(t, lo, self.pos)
+
+# Rust's `"x = {}", x` as the f-string `f"x = {x}"`, when every `{}` has its
+# argument and the format has no other specs.
+fn rust_format(args: [str]) -> Option[str]:
+    if len(args) == 0 or len(args[0]) < 2:
+        return None
+    if not args[0].starts_with("\"") or not args[0].ends_with("\""):
+        return None
+    let f = args[0][1:len(args[0]) - 1]
+    var out = ""
+    var k = 1
+    var i = 0
+    var run = 0
+    while i < len(f):
+        if f[i] == "{" and i + 1 < len(f) and f[i + 1] == "{":
+            i += 2
+            continue
+        if f[i] == "}" and i + 1 < len(f) and f[i + 1] == "}":
+            i += 2
+            continue
+        if f[i] == "{":
+            var j = i + 1
+            while j < len(f) and f[j] != "}":
+                j += 1
+            if j >= len(f):
+                return None
+            let inner = f[i + 1:j]
+            out += f[run:i]
+            if inner == "" or inner == ":?":
+                if k >= len(args):
+                    return None
+                out += "{" + args[k] + "}"
+                k += 1
+            elif inner.is_alnum() or "_" in inner:
+                out += "{" + inner + "}"
+            else:
+                return None
+            i = j + 1
+            run = i
+            continue
+        i += 1
+    if k != len(args):
+        return None
+    return Some("f\"" + out + f[run:] + "\"")
 
 # Characters that can't be seen, or look like an ASCII one, and are pasted in
 # from editors and web pages: (character, name, the ASCII to write, or "" for
@@ -1297,7 +1412,8 @@ fn lex(text: str, file: int, base: int, keep_comments: bool, layout: bool) -> ([
         layout=layout,
         at_line_start=true,
         keywords=keywords,
-        singles=singles
+        singles=singles,
+        quiet_semi=-1
     )
     # a byte order mark that starts a file isn't part of the program
     if base == 0 and text.starts_with("\u{FEFF}"):
