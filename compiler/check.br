@@ -1098,6 +1098,13 @@ struct Checker:
             case ExprKind.Array(xs):
                 for x in xs:
                     out.push(self.const_elem(x)?)
+            # `("letter", "L")`, in an array of pairs
+            case ExprKind.Tuple(xs):
+                for x in xs:
+                    out.push(self.const_elem(x)?)
+                var r = e
+                r.kind = ExprKind.Tuple(out)
+                return Some(r)
             case ExprKind.Repeat(x, n):
                 let v = self.const_elem(x)?
                 match self.eval_const(n)?:
@@ -1131,7 +1138,7 @@ struct Checker:
     # would panic: `u8(300)`, `LIMIT * 1000` in an `i32`.
     fn const_panic(self, e: Expr) -> Option[(Span, str)]:
         match e.kind:
-            case ExprKind.Array(xs):
+            case ExprKind.Array(xs) | ExprKind.Tuple(xs):
                 for x in xs:
                     match self.const_panic(x):
                         case Some(w):
@@ -1388,6 +1395,12 @@ struct Checker:
             return Some(Err((rspan, f"a shift by {y} is out of range for a {bits}-bit integer")))
         if op == BinOp.Shr:
             return Some(Ok(ConstVal.Int(x >> y)))
+        if bits == 128:
+            # `i128(1) << 127`: the bits past 128 drop here too
+            let w = x << y
+            if w < 0 and e.ty == Ty.Int(IntTy.U128):
+                return Some(Ok(ConstVal.UInt(u128(w & IntTy.I128.max()) | (u128(1) << 127))))
+            return Some(Ok(ConstVal.Int(w)))
         let v = num.checked_shl(x, y)?
         match e.ty:
             case Ty.Int(k):
@@ -4649,7 +4662,10 @@ struct Checker:
             case None:
                 pass
         let nd = len(self.diags)
-        let t = self.check_expr(ref c.value, ann)
+        # `const SIGN = 0x8000000000000000`: an untyped literal past `int`
+        # adapts to where it's used, as the literal itself would
+        let big = big_lit(c.value) if ann.is_none() else None
+        let t = self.check_expr(ref c.value, ann if big.is_none() else big)
         var ty = t
         match ann:
             case Some(a):
@@ -4663,9 +4679,11 @@ struct Checker:
                 self.info.consts[id].ty = ty
                 match v:
                     case ConstVal.Int(_):
-                        self.info.consts[id].untyped = (
+                        self.info.consts[id].untyped = big.is_some() or (
                             ann.is_none() and ty == int_ty() and not typed_int(c.value)
                         )
+                    case ConstVal.UInt(_):
+                        self.info.consts[id].untyped = big.is_some()
                     case _:
                         pass
             case None:
@@ -4717,9 +4735,55 @@ struct Checker:
                             return Ty.Float(f)
                         case _:
                             pass
+                    if v > IntTy.I64.max() or v < IntTy.I64.min():
+                        let need = "u64" if v > 0 and v <= IntTy.U64.max() else "i128"
+                        return self.big_const(e, c.name, f"{v}", need, exp)
+                case ConstVal.UInt(v):
+                    e.kind = ExprKind.UInt(v)
+                    if exp == Some(Ty.Int(IntTy.U128)):
+                        return Ty.Int(IntTy.U128)
+                    return self.big_const(e, c.name, f"{v}", "u128", exp)
                 case _:
                     pass
         return c.ty
+
+    # `SIGN` or `k.SIGN`: a name that isn't a local, maybe a constant.
+    fn global_name(self, e: Expr) -> bool:
+        match e.kind:
+            case ExprKind.Ident(name):
+                return self.lookup_local(name).is_none()
+            case ExprKind.Field(b, _, _):
+                match b.kind:
+                    case ExprKind.Ident(m):
+                        if self.lookup_local(m).is_none():
+                            match self.item(m):
+                                case Some(Item.Module(_)):
+                                    return true
+                                case _:
+                                    pass
+                    case _:
+                        pass
+            case _:
+                pass
+        return false
+
+    # An untyped constant too large for `int`, used where no larger integer
+    # type is expected: what the literal there would be.
+    fn big_const(ref self, e: Expr, name: str, v: str, need: str, exp: Option[Ty]) -> Ty:
+        var what = "`int`"
+        match exp:
+            case Some(t):
+                what = self.tn(t)
+            case None:
+                pass
+        self.err(
+            diag.error("E0315", f"constant `{name}` is too large for {what}")
+            .label(e.span, f"`{name}` is {v}")
+            .with_help(
+                f"use it where a `{need}` is expected, or give the constant a type: `const {name}: {need} = ...`"
+            )
+        )
+        return Ty.Error
 
     fn check_ident(ref self, ref e: Expr, name: str, exp: Option[Ty]) -> Ty:
         let span = e.span
@@ -5443,14 +5507,11 @@ struct Checker:
                     self.err(d)
                     self.check_all(ref args)
                     return target
-                # `u64(0xcbf29ce484222325)`: an integer literal takes the type it's converted to
+                # `u64(0xcbf29ce484222325)`: an integer literal takes the type it's
+                # converted to, and so does an untyped constant, `i128(SIGN)`
                 var aexp: Option[Ty] = None
-                if target.is_int() and args[0].expr.is_literal():
-                    match args[0].expr.kind:
-                        case ExprKind.Int(_) | ExprKind.UInt(_):
-                            aexp = Some(target)
-                        case _:
-                            pass
+                if target.is_int() and (int_lit(args[0].expr) or self.global_name(args[0].expr)):
+                    aexp = Some(target)
                 let at = self.check_expr(ref args[0].expr, aexp)
                 if at.is_error():
                     return target
@@ -9649,6 +9710,42 @@ fn expr_to_type(e: Expr) -> Option[TypeExpr]:
 # An integer constant's value names its type: a conversion (`int(x)`) or a
 # constant declared with one (`const T: int = 5`). The uses of untyped constants
 # were already replaced by their literals.
+# `5` or `-5`: takes the type it is converted to, `i128(-5)`
+fn int_lit(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Int(_) | ExprKind.UInt(_):
+            return true
+        case ExprKind.Unary(op, x):
+            match x.kind:
+                case ExprKind.Int(_):
+                    return op == UnOp.Neg
+                case _:
+                    return false
+        case _:
+            return false
+
+# The type that holds an integer literal too large for `int`, if it is one.
+fn big_lit(e: Expr) -> Option[Ty]:
+    var v = i128(0)
+    match e.kind:
+        case ExprKind.Int(n):
+            v = n
+        case ExprKind.UInt(_):
+            return Some(Ty.Int(IntTy.U128))
+        case ExprKind.Unary(op, x):
+            match x.kind:
+                case ExprKind.Int(n):
+                    if op != UnOp.Neg:
+                        return None
+                    v = -n
+                case _:
+                    return None
+        case _:
+            return None
+    if v >= IntTy.I64.min() and v <= IntTy.I64.max():
+        return None
+    return Some(Ty.Int(IntTy.I128))
+
 fn typed_int(e: Expr) -> bool:
     match e.kind:
         case ExprKind.Ident(_) | ExprKind.Field(_, _, _):
