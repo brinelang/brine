@@ -803,7 +803,9 @@ rule "a sensor glitch can never crash the controller":
   proven away (E0607), and it can't reach `panic`, `exit` or `unwrap()` (E0611).
 * `effects m: ...` is decided over everything `m` calls (E0612). The effects
   are `files`, `console`, `processes`, `clock`, `environment`, `network`, `world`
-  and `extern` (C code); `none` allows none of them.
+  and `extern` (C code); `none` allows none of them. `environment` is
+  `args()`, `getenv`, `os.pid()` and the CPU counts; `os.name()` and `os.arch()`
+  are constants of the build, not effects.
 * `brine rules approve` records the owner's approval in RULES.lock: a hash of
   each rule, of RULES.br's own definitions and of each file in `rules/`. An
   approved rule or file that changes or goes away (E0613) stops `--release`
