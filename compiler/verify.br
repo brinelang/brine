@@ -35,7 +35,9 @@ enum V:
     Int(l: Lin)
     Bool(f: F)
     Arr(c: int, len: Lin)
-    Str(len: Lin)
+    # a string: its length, and a content id that stands for its bytes
+    # (`Term.Bnd`, `Term.Ascii` say where its characters start)
+    Str(len: Lin, id: int)
     Agg(vs: [V])
     # a float: whether it's NaN, and what `int` of it would be (rounded toward
     # zero), between -FLOAT_BIG and FLOAT_BIG (an infinity is one of those).
@@ -56,6 +58,10 @@ enum Term:
     Bit(op: str, ty: str, a: Lin, b: Lin)
     Rank
     Size
+    # a character starts at byte `i` of string `s` (or `i` is its end)
+    Bnd(s: int, i: Lin)
+    # every byte of string `s` is ASCII (below 128)
+    Ascii(s: int)
 
 struct St:
     env: {int: V}
@@ -66,6 +72,10 @@ struct LoopCx:
     # for range loops: (loop var, value it has in the next iteration)
     next: Option[(int, V)]
     breaks: [St]
+    # a loop over the bytes of a string (its id) and the byte: whether each
+    # iteration that goes on saw that the byte is below 128 (see `for_loop`)
+    asc: Option[(int, Lin)]
+    asc_ok: bool
 
 # The state before code that runs on some paths only: its facts (`k` of
 # them) and the number of atoms then (`na`; later ones are new).
@@ -985,6 +995,10 @@ fn term_key(t: Term) -> str:
             return "rank"
         case Term.Size:
             return "size"
+        case Term.Bnd(c, i):
+            return f"C{c}|" + lin_key(i)
+        case Term.Ascii(c):
+            return f"A{c}"
 
 # The size of a fact: its nodes and the terms of its linear forms.
 fn weight(f: F) -> int:
@@ -1156,6 +1170,8 @@ fn new_vf(
         hidden={},
         aliases={},
         chars={},
+        bnds={},
+        bytes_of={},
         one_char={},
         pure=[],
         memo={},
@@ -1244,6 +1260,10 @@ struct Vf:
     # the contents of `s.chars()`, and the lengths (by `lin_key`) of their
     # elements: each is one character, whatever its length in bytes
     chars: {int: bool}
+    # per string: positions where a character starts (see `bnd_f`), and the
+    # string whose bytes a content is (`s.bytes()`)
+    bnds: {int: [(Lin, int)]}
+    bytes_of: {int: int}
     one_char: {str: bool}
     # functions whose result depends on their arguments alone (`pure_fns`),
     # and the results of the calls to them so far, by callee and arguments:
@@ -1438,6 +1458,15 @@ struct Vf:
                 name = "world.rank()"
             case Term.Size:
                 name = "world.size()"
+            case Term.Bnd(c, i):
+                name = (
+                    "a character starts at byte "
+                    + self.show_lin(i)
+                    + " of "
+                    + self.content_names[c]
+                )
+            case Term.Ascii(c):
+                name = self.content_names[c] + " is ASCII"
         let a = self.new_atom(name, range)
         self.terms[tk] = a
         match t:
@@ -1481,7 +1510,8 @@ struct Vf:
                 let c = self.fresh_content(name)
                 return V.Arr(c, self.fresh_len("len(" + name + ")"))
             case Ty.Str:
-                return V.Str(self.fresh_len("len(" + name + ")"))
+                let sl = self.fresh_len("len(" + name + ")")
+                return V.Str(sl, self.fresh_content(name))
             case Ty.Tuple(ts):
                 var vs: [V] = []
                 for i, t in enumerate(ts):
@@ -1550,7 +1580,10 @@ struct Vf:
                 )
             )
             self.one_char[lin_key(l)] = true
-            return V.Str(l)
+            return V.Str(
+                l,
+                self.fresh_content(self.content_names[c] + "[" + self.show_lin(i) + "]")
+            )
         match ety:
             case Ty.Int(_) | Ty.Bool:
                 let p = self.unstored(c, i)
@@ -2412,11 +2445,8 @@ struct Vf:
                                         let a = self.as_int(cur, target.ty)
                                         let b = self.as_int(rhs, value.ty)
                                         new = self.compound(s.span, o, a, b, k)
-                                    case (Ty.Str, V.Str(a), V.Str(b)):
-                                        let nm = "len(" + self.name_of(target) + ")"
-                                        let n = self.lin(a.add(b), nm)
-                                        self.cap_len(n)
-                                        new = V.Str(n)
+                                    case (Ty.Str, V.Str(_, _), V.Str(_, _)):
+                                        new = self.concat(cur, rhs, self.name_of(target))
                                     case (Ty.Array(_), V.Arr(c, a), V.Arr(_, b)):
                                         # `xs += ys` is `xs = xs + ys`
                                         let nm = "len(" + self.name_of(target) + ")"
@@ -2910,8 +2940,29 @@ struct Vf:
                         return Some(F.and_(fs))
                     case _:
                         return None
+            case PatKind.Variant(_, _):
+                let (is_some, f, x) = self.option_parts(p, v)?
+                if not is_some:
+                    return Some(f.not_())
+                if len(p.fields) == 1:
+                    return Some(F.and_([f, self.pat_cond(p.fields[0], x)?]))
+                return Some(f)
             case _:
                 return None
+
+    # A value made for a pattern (`found`) is named as the pattern names it.
+    fn name_part(ref self, p: Pattern, v: V):
+        match (p.kind, v):
+            case (PatKind.Bind(_), V.Int(l)):
+                if len(l.t) == 1 and l.c == 0 and l.t[0].1 == 1:
+                    let a = l.t[0].0
+                    if (
+                        0 <= a < len(self.atom_names)
+                        and self.atom_names[a].starts_with("the index ")
+                    ):
+                        self.atom_names[a] = self.local_name(p.local)
+            case _:
+                pass
 
     fn bind_pattern(ref self, p: Pattern, v: V, ty: Ty):
         match p.kind:
@@ -2942,8 +2993,25 @@ struct Vf:
                 match p.vres:
                     case Some((eid, vi)):
                         let fts = self.info.enums[eid].variants[vi].fields
+                        match self.option_parts(p, v):
+                            case Some((true, _, x)):
+                                if len(p.fields) == 1 and len(fts) == 1:
+                                    self.name_part(p.fields[0], x)
+                                    self.bind_pattern(p.fields[0], x, fts[0].1)
+                                    return
+                            case _:
+                                pass
                         for i in 0..min(len(p.fields), len(fts)):
-                            let x = self.fresh_val(fts[i].1, fts[i].0)
+                            # named as the pattern names it
+                            var nm = split_ws(self.snippet(p.fields[i].span))
+                            match p.fields[i].kind:
+                                case PatKind.Bind(_):
+                                    nm = self.local_name(p.fields[i].local)
+                                case PatKind.Wild:
+                                    nm = fts[i].0
+                                case _:
+                                    pass
+                            let x = self.fresh_val(fts[i].1, nm)
                             self.bind_pattern(p.fields[i], x, fts[i].1)
                     case None:
                         pass
@@ -3078,6 +3146,13 @@ struct Vf:
     fn check_preserved(ref self, at: Span):
         if not self.live or len(self.loops) == 0:
             return
+        let top = len(self.loops) - 1
+        match self.loops[top].asc:
+            case Some((_, el)):
+                if self.loops[top].asc_ok and not self.holds(F.lt(el, Lin.konst(128))):
+                    self.loops[top].asc_ok = false
+            case None:
+                pass
         let cx = self.loops[len(self.loops) - 1]
         let invs = cx.invs
         let next = cx.next
@@ -3162,7 +3237,7 @@ struct Vf:
         var b = head
         b.facts.push(c)
         self.put(Some(b))
-        self.loops.push(LoopCx(invs=invs, next=None, breaks=[]))
+        self.loops.push(LoopCx(invs=invs, next=None, breaks=[], asc=None, asc_ok=false))
         self.block(body)
         let end = body.stmts[len(body.stmts) - 1].span if len(body.stmts) > 0 else body.span
         self.check_preserved(end)
@@ -3401,7 +3476,17 @@ struct Vf:
         elif len(invs) > 0:
             # the invariant must hold for whatever the next element is
             nx = Some((var_id, self.fresh_val(vty, vname)))
-        self.loops.push(LoopCx(invs=invs, next=nx, breaks=[]))
+        var asc: Option[(int, Lin)] = None
+        match (dom, v):
+            case (D.Arr(c, _, _), V.Int(el)):
+                match self.bytes_of.get(c):
+                    case Some(sid):
+                        asc = Some((sid, el))
+                    case None:
+                        pass
+            case _:
+                pass
+        self.loops.push(LoopCx(invs=invs, next=nx, breaks=[], asc=asc, asc_ok=asc.is_some()))
         self.block(body)
         let end = body.stmts[len(body.stmts) - 1].span if len(body.stmts) > 0 else body.span
         self.check_preserved(end)
@@ -3433,6 +3518,17 @@ struct Vf:
                 let f = self.spec_cond(inv)
                 self.assume(f)
             out = self.take()
+        # every iteration went on only past a byte below 128, and none
+        # stopped the loop: the string is ASCII
+        match cx.asc:
+            case Some((sid, _)):
+                if cx.asc_ok and len(cx.breaks) == 0 and out.is_some():
+                    self.put(out)
+                    let af = self.ascii_f(sid)
+                    self.assume(af)
+                    out = self.take()
+            case None:
+                pass
         for br in cx.breaks:
             out = self.merge(out, Some(br), k)
         self.put(out)
@@ -4038,7 +4134,7 @@ struct Vf:
             case ExprKind.Bool(b):
                 return V.Bool(F.from_bool(b))
             case ExprKind.Str(s):
-                return V.Str(Lin.konst(i128(len(s))))
+                return self.str_lit(s)
             case ExprKind.FStr(segs):
                 for s in segs:
                     match s:
@@ -4046,7 +4142,8 @@ struct Vf:
                             self.eval(x)
                         case _:
                             pass
-                return V.Str(self.fresh_len("len(f-string)"))
+                let fl = self.fresh_len("len(f-string)")
+                return V.Str(fl, self.fresh_content("f-string"))
             case ExprKind.Ident(_):
                 match e.res:
                     case Res.Local(id):
@@ -4066,13 +4163,25 @@ struct Vf:
                     case _:
                         return V.Opaque
             case ExprKind.Try(x):
-                self.eval(x)
+                let xv = self.eval(x)
                 # the path where `x` is `None`/`Err` returns here
                 if self.live:
                     let saved = self.cur()
                     self.check_own_inv(e.span)
                     self.check_ensures(None, e.span)
                     self.put(saved)
+                # an `Option` the prover models (`found`): it was `Some`
+                match (x.ty, xv):
+                    case (Ty.Enum(eid), V.Agg(parts)):
+                        if self.info.enums[eid].name.starts_with("Option") and len(parts) == 2:
+                            match parts[0]:
+                                case V.Bool(f):
+                                    self.assume(f)
+                                    return parts[1]
+                                case _:
+                                    pass
+                    case _:
+                        pass
                 return self.fresh_val(e.ty, self.name_of(e))
             case ExprKind.Unary(op, x):
                 let v = self.eval(x)
@@ -4312,19 +4421,21 @@ struct Vf:
                             let g = F.and_([F.ge(i), F.lt(i, l)])
                             self.implicit(e.span, TAG_INDEX, g, "index bounds check")
                         return self.sel(c, i, e.ty)
-                    case V.Str(l):
+                    case V.Str(l, sid):
                         if not self.spec:
                             let g = F.and_([F.ge(i), F.lt(i, l)])
                             self.implicit(e.span, TAG_INDEX, g, "index bounds check")
                         # the character at i, which the runtime checks starts
-                        # there; the prover knows that only of the first byte
+                        # there (see `edge` for where the prover knows one does)
                         if not self.spec and self.live:
                             self.nobl += 1
-                            if self.holds(F.eq(i)):
+                            if self.holds(self.edge(sid, l, i)):
                                 self.kept_proven.push((e.span, Check.CharBoundary.what()))
                             else:
                                 self.remain_c(e.span, Check.CharBoundary)
-                        return V.Str(self.char_len(i, l))
+                        let r = self.fresh_content(self.name_of(e))
+                        self.ascii_from(sid, r)
+                        return V.Str(self.char_len(i, l), r)
                     case _:
                         self.map_key_check(b, e.span)
                         return self.fresh_val(e.ty, self.name_of(e))
@@ -4410,16 +4521,18 @@ struct Vf:
                 return v
             case Ty.Str:
                 match (av, bv):
-                    case (V.Str(x), V.Str(y)):
-                        let n = self.lin(x.add(y), "len(" + self.name_of(e) + ")")
-                        self.cap_len(n)
-                        return V.Str(n)
+                    case (V.Str(_, _), V.Str(_, _)):
+                        return self.concat(av, bv, self.name_of(e))
                     # `s * n`: the length is a product
-                    case (V.Str(x), V.Int(c)):
+                    case (V.Str(x, xs), V.Int(c)):
                         self.kept(e.span, F.ge(c), "repeat count check")
-                        return V.Str(self.repeat_len(x, c, self.name_of(e)))
+                        let nm = self.name_of(e)
+                        let rs = self.fresh_content(nm)
+                        self.ascii_from(xs, rs)
+                        let rl = self.repeat_len(x, c, nm)
+                        return V.Str(rl, rs)
                     case _:
-                        return V.Str(self.fresh_len("len(" + self.name_of(e) + ")"))
+                        return self.fresh_val(e.ty, self.name_of(e))
             # `xs + ys`: new contents, the two lengths added
             case Ty.Array(_):
                 match (av, bv):
@@ -4468,12 +4581,14 @@ struct Vf:
                 pass
         var l = Lin.konst(0)
         var is_str = false
+        var sid = -1
         match bv:
             case V.Arr(_, x):
                 l = x
-            case V.Str(x):
+            case V.Str(x, id):
                 l = x
                 is_str = true
+                sid = id
             case _:
                 return self.fresh_val(e.ty, "slice")
         let h = hi.unwrap_or(l)
@@ -4481,19 +4596,122 @@ struct Vf:
             # the runtime function checks the bounds whether or not they're proven
             let g = F.and_([F.ge(lo), F.le(lo, h), F.le(h, l)])
             self.kept(e.span, g, "slice bounds check")
-        # and that a string's ends are character boundaries, which the prover
-        # knows only of its first and last byte
+        # and that a string's ends are character boundaries (see `edge`)
         if is_str and not self.spec and self.live:
             self.nobl += 1
-            let edges = F.and_([F.or_([F.eq(lo), F.equal(lo, l)]), F.or_([F.eq(h), F.equal(h, l)])])
+            let e1 = self.edge(sid, l, lo)
+            let edges = F.and_([e1, self.edge(sid, l, h)])
             if self.holds(edges):
                 self.kept_proven.push((e.span, Check.CharBoundary.what()))
             else:
                 self.remain_c(e.span, Check.CharBoundary)
         let n = self.lin(h.sub(lo), "len(slice)")
         if is_str:
-            return V.Str(n)
+            # a slice of an ASCII string is ASCII
+            let r = self.fresh_content(self.name_of(e))
+            self.ascii_from(sid, r)
+            return V.Str(n, r)
         return V.Arr(self.fresh_content("slice"), n)
+
+    # ------------------------------------------------------------ strings
+    # Where the characters of string `s` (of length `l`) start: at its ends,
+    # anywhere in an ASCII string, and where `starts_with`, `ends_with`,
+    # `find` or a concatenation showed one (`Term.Bnd`, by position).
+    fn edge(ref self, s: int, l: Lin, x: Lin) -> F:
+        var alts = [F.eq(x), F.equal(x, l), self.ascii_f(s)]
+        alts.push(F.B(self.term(Term.Bnd(s, x), None), true))
+        for p, a in self.bnds.get(s).unwrap_or([]):
+            if lin_key(p) != lin_key(x):
+                alts.push(F.and_([F.equal(x, p), F.B(a, true)]))
+        return F.or_(alts)
+
+    fn ascii_f(ref self, s: int) -> F:
+        return F.B(self.term(Term.Ascii(s), None), true)
+
+    # `r` is ASCII when `s` is.
+    fn ascii_from(ref self, s: int, r: int):
+        let a = self.ascii_f(s)
+        let b = self.ascii_f(r)
+        self.defs.push(F.or_([a.not_(), b]))
+
+    # A character starts at byte `x` of `s`.
+    fn bnd_f(ref self, s: int, x: Lin) -> F:
+        let fresh = term_key(Term.Bnd(s, x)) not in self.terms
+        let a = self.term(Term.Bnd(s, x), None)
+        if fresh:
+            var ps = self.bnds.get(s).unwrap_or([])
+            # (a few are enough: the newest)
+            if len(ps) < 8:
+                ps.push((x, a))
+                self.bnds[s] = ps
+        return F.B(a, true)
+
+    # `s.find(t)` (from byte `start`): modelled as (found, i), the parts of
+    # `Some(i)` (see `option_parts`): `start <= i`, `i + len(t) <= len(s)`,
+    # and characters start at `i` and at `i + len(t)`.
+    fn found(ref self, sv: V, tv: V, start: Lin, e: Expr) -> V:
+        match (sv, tv):
+            case (V.Str(l, sid), V.Str(tl, _)):
+                let nm = self.name_of(e)
+                let some = self.fresh_bool(nm + " is Some")
+                let i = Lin.atom(self.new_atom("the index " + nm + " gives", nonneg_range()))
+                match i.add(tl):
+                    case Some(j):
+                        let bi = self.bnd_f(sid, i)
+                        let bj = self.bnd_f(sid, j)
+                        self.defs.push(
+                            F.or_([some.not_(), F.and_([F.le(start, i), F.le(j, l), bi, bj])])
+                        )
+                    case None:
+                        pass
+                return V.Agg([V.Bool(some), V.Int(i)])
+            case _:
+                return self.fresh_val(e.ty, self.name_of(e))
+
+    # For a pattern `Some(x)` or `None` of an `Option` the prover models as
+    # (found, x) (`found`): whether it matches `Some`, and the value inside.
+    fn option_parts(self, p: Pattern, v: V) -> Option[(bool, F, V)]:
+        let (eid, vi) = p.vres?
+        let en = self.info.enums[eid]
+        if not en.bare or not en.name.starts_with("Option") or len(en.variants) != 2:
+            return None
+        match v:
+            case V.Agg(vs):
+                if len(vs) == 2:
+                    match vs[0]:
+                        case V.Bool(f):
+                            return Some((en.variants[vi].name == "Some", f, vs[1]))
+                        case _:
+                            pass
+            case _:
+                pass
+        return None
+
+    # A string literal: ASCII if its bytes are.
+    fn str_lit(ref self, s: str) -> V:
+        let plain = len(s) <= 16 and all(32 <= b < 127 and b != 34 and b != 92 for b in s.bytes())
+        let id = self.fresh_content("\"" + s + "\"" if plain else "a string literal")
+        if all(b < 128 for b in s.bytes()):
+            self.defs.push(self.ascii_f(id))
+        return V.Str(Lin.konst(i128(len(s))), id)
+
+    # `a + b` for strings: a character starts where `b` does, and two ASCII
+    # strings make one.
+    fn concat(ref self, a: V, b: V, name: str) -> V:
+        match (a, b):
+            case (V.Str(x, xs), V.Str(y, ys)):
+                let n = self.lin(x.add(y), "len(" + name + ")")
+                self.cap_len(n)
+                let r = self.fresh_content(name)
+                let at = self.bnd_f(r, x)
+                self.defs.push(at)
+                let ax = self.ascii_f(xs)
+                let ay = self.ascii_f(ys)
+                let ar = self.ascii_f(r)
+                self.defs.push(F.or_([ax.not_(), ay.not_(), ar]))
+                return V.Str(n, r)
+            case _:
+                return self.fresh_val(Ty.Str, name)
 
     fn const_val(ref self, id: int) -> V:
         let c = self.info.consts[id]
@@ -4509,7 +4727,7 @@ struct Vf:
             case ConstVal.Bool(b):
                 return V.Bool(F.from_bool(b))
             case ConstVal.Str(s):
-                return V.Str(Lin.konst(i128(len(s))))
+                return self.str_lit(s)
             case ConstVal.Float(x):
                 if c.ty == Ty.Float(FloatTy.F64):
                     return float_const(x)
@@ -4757,7 +4975,22 @@ struct Vf:
     fn convert(ref self, target: Ty, a: Expr, whole: Expr) -> V:
         let v = self.eval(a)
         let n0 = self.nobl
+        # the same conversion of the same value gives the same result
+        # (`len(str(i).bytes()) == len(str(i))`)
+        var key = ""
+        if target == Ty.Str:
+            match val_key(v):
+                case Some(vk):
+                    key = "str|" + self.info.ty_name(a.ty) + "=" + vk
+                case None:
+                    pass
+        if key != "" and key in self.memo:
+            let r0 = self.memo[key]
+            self.table_checks(whole.span, convert_stops(target, a.ty), n0)
+            return self.copy_val(r0, self.name_of(whole))
         let r = self.convert_val(target, a, whole, v)
+        if key != "":
+            self.memo[key] = r
         self.table_checks(whole.span, convert_stops(target, a.ty), n0)
         return r
 
@@ -4805,6 +5038,17 @@ struct Vf:
                 return V.Int(r)
             case (Ty.Str, Ty.Str, _):
                 return v
+            # a number or a truth value as text is ASCII
+            case (Ty.Str, Ty.Int(_), _) | (Ty.Str, Ty.Float(_), _) | (Ty.Str, Ty.Bool, _):
+                let nm = self.name_of(whole)
+                let r = self.fresh_val(target, nm)
+                match r:
+                    case V.Str(_, id):
+                        let af = self.ascii_f(id)
+                        self.defs.push(af)
+                    case _:
+                        pass
+                return r
             case _:
                 let nm = self.name_of(whole)
                 return self.fresh_val(target, nm)
@@ -4879,19 +5123,27 @@ struct Vf:
                 match rv:
                     case V.Arr(_, x):
                         l = Some(x)
-                    case V.Str(x):
+                    case V.Str(x, _):
                         l = Some(x)
                     case _:
                         pass
+                var start = Lin.konst(0)
                 if len(vals) > 1 and l.is_some():
                     let k = self.as_int(vals[1], args[1].expr.ty)
                     self.kept(e.span, F.and_([F.ge(k), F.le(k, l.unwrap())]), "start check")
+                    start = k
+                if b == Builtin.Str(StrM.FindFrom) and len(vals) > 1:
+                    return self.found(rv, vals[0], start, e)
+                return self.fresh_val(e.ty, self.name_of(e))
+            case Builtin.Str(StrM.Find):
+                if len(vals) == 1:
+                    return self.found(rv, vals[0], Lin.konst(0), e)
                 return self.fresh_val(e.ty, self.name_of(e))
             # an empty pattern is an error
             case Builtin.Str(StrM.Split) | Builtin.Str(StrM.Replace) | Builtin.Str(StrM.Count):
                 if len(vals) > 0:
                     match vals[0]:
-                        case V.Str(pl):
+                        case V.Str(pl, _):
                             self.kept(
                                 e.span,
                                 F.ge(pl.add_c(-1).unwrap_or(pl)),
@@ -4903,14 +5155,16 @@ struct Vf:
             # one byte per byte
             case Builtin.Str(StrM.Bytes):
                 match rv:
-                    case V.Str(l):
-                        return V.Arr(self.fresh_content(self.name_of(e)), l)
+                    case V.Str(l, sid):
+                        let c = self.fresh_content(self.name_of(e))
+                        self.bytes_of[c] = sid
+                        return V.Arr(c, l)
                     case _:
                         return self.fresh_val(e.ty, self.name_of(e))
             # one to four bytes per character, each a character
             case Builtin.Str(StrM.Chars):
                 match rv:
-                    case V.Str(l):
+                    case V.Str(l, _):
                         let nm = self.name_of(e)
                         let c = self.fresh_content(nm)
                         self.chars[c] = true
@@ -4924,13 +5178,22 @@ struct Vf:
                         return V.Arr(c, n)
                     case _:
                         return self.fresh_val(e.ty, self.name_of(e))
-            # true: at least as long as the prefix
+            # true: at least as long as the prefix, and a character starts
+            # where the prefix ends (or the suffix starts)
             case Builtin.Str(StrM.StartsWith) | Builtin.Str(StrM.EndsWith):
                 let r = self.fresh_bool(self.name_of(e))
                 if len(vals) == 1:
                     match (rv, vals[0]):
-                        case (V.Str(l), V.Str(p)):
-                            self.defs.push(F.or_([r.not_(), F.le(p, l)]))
+                        case (V.Str(l, sid), V.Str(p, _)):
+                            var at = p
+                            if b == Builtin.Str(StrM.EndsWith):
+                                at = self.lin(
+                                    l.sub(p),
+                                    "len(" + self.content_names[sid] + ") - len(suffix)"
+                                )
+                            self.defs.push(
+                                F.or_([r.not_(), F.and_([F.le(p, l), self.bnd_f(sid, at)])])
+                            )
                         case _:
                             pass
                 return V.Bool(r)
@@ -4939,7 +5202,7 @@ struct Vf:
                     match vals[0]:
                         case V.Arr(_, l):
                             return V.Int(l)
-                        case V.Str(l):
+                        case V.Str(l, _):
                             return V.Int(l)
                         case _:
                             pass
@@ -5029,7 +5292,7 @@ struct Vf:
             case Builtin.Ord:
                 if len(vals) > 0:
                     match vals[0]:
-                        case V.Str(l):
+                        case V.Str(l, _):
                             # one byte surely is one character; passing only says
                             # it was one UTF-8 character of 1 to 4 bytes
                             let one = F.equal(l, Lin.konst(1))
@@ -5470,6 +5733,8 @@ fn val_key(v: V) -> Option[str]:
             return f_key(f)
         case V.Arr(c, l):
             return Some(f"a{c}," + lin_key(l))
+        case V.Str(l, c):
+            return Some(f"s{c}," + lin_key(l))
         case V.Agg(vs):
             var k = "("
             for x in vs:
@@ -5523,7 +5788,7 @@ fn val_eq(a: V, b: V) -> Option[F]:
             return Some(bool_eq(x, y))
         case (V.Arr(_, x), V.Arr(_, y)):
             return Some(F.equal(x, y))
-        case (V.Str(x), V.Str(y)):
+        case (V.Str(x, _), V.Str(y, _)):
             return Some(F.equal(x, y))
         case (V.Flt(x, nx, bx, ax), V.Flt(y, ny, by, ay)):
             return Some(F.and_([F.equal(x, y), F.equal(bx, by), F.equal(ax, ay), bool_eq(nx, ny)]))
@@ -5922,7 +6187,7 @@ fn hull_facts(nv: V, va: V, vb: V, ref out: [F]):
             hull_lin(n, x, y, ref out)
         case (V.Arr(_, n), V.Arr(_, x), V.Arr(_, y)):
             hull_lin(n, x, y, ref out)
-        case (V.Str(n), V.Str(x), V.Str(y)):
+        case (V.Str(n, _), V.Str(x, _), V.Str(y, _)):
             hull_lin(n, x, y, ref out)
         case (V.Agg(ns), V.Agg(xs), V.Agg(ys)):
             if len(ns) == len(xs) and len(xs) == len(ys):
