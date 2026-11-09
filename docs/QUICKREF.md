@@ -683,7 +683,9 @@ a call under a condition that depends on `world.rank()` (or received values,
 `clock()`, ...), or after a rank-dependent `return`, `break` or `exit`, is an
 error (E0510). Results of `sum`/`min`/`max`/`any`/`all`/`broadcast`/
 `gather_all` are the same on every rank, so loops like
-`while world.max(err) > tol:` are fine. At run time, each message also carries
+`while world.max(err) > tol:` are fine. So are branches that make the same
+calls in the same order (`world.sum(10)` in one, `world.sum(1)` in the other),
+and code that only runs with one rank (`... if world.size() > 1 else v`). At run time, each message also carries
 its call site, so a mismatch is a clear panic naming both calls.
 
 ## Proofs: rules that can't be broken
