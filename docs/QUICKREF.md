@@ -16,7 +16,9 @@ brine fmt                      # format               brine fmt --check
 brine spec-diff --base main    # which specs got weaker since a git revision
 brine run --ranks 4            # 4 cooperating processes (world module)
 brine debug file.br            # debug build in gdb/lldb: break file.br:12, step, print x
-                               # (it also stops at a panic, once it is printed)
+                               # (it also stops at a panic, once it is printed; gdb
+                               # selects the frame that panicked; with no terminal it runs the
+                               # commands piped in, or runs to the panic and prints `bt`)
 brine explain E0601            # explain any error code
 brine run --target wasm        # WebAssembly, run with Node.js (needs wasi-sdk, $WASI_SDK_PATH)
 brine build --target web -o d  # d/: index.html + brine.js + program.wasm, for a browser
