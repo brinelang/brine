@@ -99,6 +99,11 @@ struct ArrCache:
     arr: int
     data: int
     len: int
+    # passed as a `ref` argument in the loop: each such call may replace the
+    # array, so after it the three are loaded again (and, when `uniq`, the
+    # array made unique again)
+    refresh: bool
+    uniq: bool
 
 struct Loop:
     depth: int
@@ -4760,7 +4765,8 @@ struct Lower:
             decl={},
             fseen={},
             fwritten={},
-            whole=[]
+            whole=[],
+            refd={}
         )
         if own >= 0:
             u.decl[own] = true
@@ -4783,12 +4789,13 @@ struct Lower:
             match info.ty:
                 case Ty.Array(_):
                     let p = self.local_ptr(l)
-                    if l in u.written and l not in self.cx.stack_arrs:
+                    let uniq = l in u.written and l not in self.cx.stack_arrs
+                    if uniq:
                         self.cx.fb.call_void("brine_arr_unique", [p])
                     let a = self.cx.fb.load(K.Ptr, p, 0)
                     let n = self.cx.fb.load(K.I64, a, 8)
                     let d = self.cx.fb.load(K.Ptr, a, 48)
-                    self.cx.arrc[l] = ArrCache(arr=a, data=d, len=n)
+                    self.cx.arrc[l] = ArrCache(arr=a, data=d, len=n, refresh=l in u.refd, uniq=uniq)
                 case _:
                     pass
         # array fields (`self.stack`), when the loop uses nothing that holds
@@ -4825,7 +4832,7 @@ struct Lower:
             let a = self.cx.fb.load(K.Ptr, fp, 0)
             let n = self.cx.fb.load(K.I64, a, 8)
             let d = self.cx.fb.load(K.Ptr, a, 48)
-            self.cx.arrc[key] = ArrCache(arr=a, data=d, len=n)
+            self.cx.arrc[key] = ArrCache(arr=a, data=d, len=n, refresh=false, uniq=false)
         return saved
 
     # The local array or array field `e` names, when an enclosing loop cached it.
@@ -6122,6 +6129,30 @@ struct Lower:
                 return self.cx.fb.cmp(cmp_op(op), a, b)
 
     fn call_fn(ref self, id: int, recv: Option[Expr], args: [Arg], span: Span) -> int:
+        let r = self.call_fn_only(id, recv, args, span)
+        if len(self.cx.arrc) > 0:
+            for a in args:
+                if not a.by_ref:
+                    continue
+                match local_of(a.expr):
+                    case Some(l):
+                        match self.cx.arrc.get(l):
+                            case Some(c):
+                                if c.refresh:
+                                    let p = self.local_ptr(l)
+                                    if c.uniq:
+                                        self.cx.fb.call_void("brine_arr_unique", [p])
+                                    self.cx.fb.load_to(c.arr, p, 0)
+                                    self.cx.fb.load_to(c.len, c.arr, 8)
+                                    self.cx.fb.load_to(c.data, c.arr, 48)
+                            case None:
+                                pass
+                    case None:
+                        pass
+        return r
+
+    # (`call_fn` without reloading the arrays loops cache)
+    fn call_fn_only(ref self, id: int, recv: Option[Expr], args: [Arg], span: Span) -> int:
         var sig = self.info.fns[id]
         if len(self.cx.nc_calls) > 0 and ranges.key(span) in self.cx.nc_calls:
             sig.c_name = sig.c_name + "__nc"
@@ -6582,6 +6613,9 @@ struct Lower:
             case Builtin.Len:
                 match self.cached_arr(args[0].expr):
                     case Some(c):
+                        # (a `ref` call reloads c.len: `let n = len(a)` keeps its value)
+                        if c.refresh:
+                            return self.cx.fb.copy_of(c.len)
                         return c.len
                     case None:
                         pass
@@ -9078,6 +9112,9 @@ struct IndexUse:
     fseen: {str: Expr}
     fwritten: {str: bool}
     whole: [(int, [int])]
+    # local arrays passed alone as a `ref` argument to a function, which
+    # `call_fn` loads again after the call
+    refd: {int: bool}
 
     fn expr(ref self, e: Expr):
         match e.kind:
@@ -9119,10 +9156,24 @@ struct IndexUse:
                 for a in args:
                     if a.by_ref:
                         self.target(a.expr)
-            case ExprKind.Call(_, args):
+                match e.cres:
+                    case CallRes.Method(_):
+                        self.expr(recv)
+                        self.args(args)
+                        return
+                    case _:
+                        pass
+            case ExprKind.Call(callee, args):
                 for a in args:
                     if a.by_ref:
                         self.target(a.expr)
+                match e.cres:
+                    case CallRes.Fn(_):
+                        self.expr(callee)
+                        self.args(args)
+                        return
+                    case _:
+                        pass
                 match e.cres:
                     case CallRes.Builtin(b):
                         match b:
@@ -9151,6 +9202,20 @@ struct IndexUse:
                 pass
         for c in children(e):
             self.expr(c)
+
+    # A user function's arguments: an array variable passed alone by `ref`
+    # can stay cached (see `refd`); its fields can't.
+    fn args(ref self, args: [Arg]):
+        for a in args:
+            match local_of(a.expr):
+                case Some(l):
+                    if a.by_ref:
+                        self.refd[l] = true
+                        self.whole.push((l, []))
+                        continue
+                case None:
+                    pass
+            self.expr(a.expr)
 
     fn block(ref self, b: Block):
         for s in b.stmts:

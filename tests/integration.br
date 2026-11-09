@@ -351,6 +351,7 @@ fn features() -> [str]:
         "tests/programs/native_regs.br",
         "tests/programs/jump_tables.br",
         "tests/programs/match_loops.br",
+        "tests/programs/cow_loops.br",
         "tests/programs/inline_small.br",
         "tests/programs/rc_threads.br",
         "tests/programs/empty_arrays.br",
@@ -3114,6 +3115,37 @@ test "release builds jump straight to a match's case, as dev builds do":
         let at = ir.out.find(f"fn main__{f}(").unwrap()
         let body = ir.out[at:]
         assert "\n  switch " in body[:body.find("\n\n").unwrap()], f
+
+test "loops check once that the arrays they write aren't shared":
+    let ir = brine(["emit-ir", "--release", "--opt", "tests/programs/cow_loops.br"])
+    assert ir.code == 0, ir.all()
+    for f in ["swaps", "stack", "nested"]:
+        let at = ir.out.find(f"fn main__{f}(").unwrap()
+        let body = ir.out[at:]
+        let lines = body[:body.find("\n\n").unwrap()].split("\n")
+        # in a loop: from a label to a jump back to it
+        var label: {str: int} = {}
+        var looped = [false] * len(lines)
+        for i, l in enumerate(lines):
+            if l.starts_with("L"):
+                label[l[:len(l) - 1]] = i
+            elif l.starts_with("  jmp ") or l.starts_with("  br ") or l.starts_with("  brnot "):
+                let ws = l.split(" ")
+                match label.get(ws[len(ws) - 1]):
+                    case Some(h):
+                        for k in h..i:
+                            looped[k] = true
+                    case None:
+                        pass
+        # the only checks left in a loop follow a call that may replace the array
+        var after = false
+        for i, l in enumerate(lines):
+            if l.starts_with("L"):
+                after = false
+            elif "call main__grow(" in l or "call main__reset(" in l:
+                after = true
+            elif "brine_arr_unique" in l:
+                assert not looped[i] or after, f"{f}: {l}\n{body}"
 
 # Data is C string literals; a big `embed` is compiled once, not per CPU level.
 test "embedded files survive every backend":

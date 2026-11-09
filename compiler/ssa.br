@@ -2589,9 +2589,14 @@ fn uniques(ref sf: SF):
     if not any(any(is_unique(x) for x in b.code) for b in sf.bs):
         return
     preheaders(ref sf)
-    let key = addr_keys(sf)
-    hoist_uniques(ref sf, key)
-    drop_uniques(ref sf, key)
+    var glob = [false] * len(sf.f.vk)
+    for b in sf.bs:
+        for x in b.code:
+            if x.op == Op.Global and x.d >= 0:
+                glob[x.d] = true
+    var key = addr_keys(sf)
+    hoist_uniques(ref sf, ref key, ref glob)
+    drop_uniques(ref sf, key, glob)
 
 # The same number for addresses that are the same: a copy, or a constant
 # offset from the same address. (Constants aren't shared on x86-64, so two
@@ -2630,11 +2635,13 @@ fn addr_keys(sf: SF) -> [int]:
 fn is_unique(x: Inst) -> bool:
     return x.op == Op.Call and x.b == 0 and x.s == "brine_arr_unique" and len(x.args) == 1
 
-# Could x share or replace an array a check made unique?
-fn shares(x: Inst, vk: [K]) -> bool:
+# Could x share or replace an array a check made unique? (A call can reach
+# one only through a pointer it is given: not through numbers, or the
+# address of a constant or a function; there are no mutable globals.)
+fn shares(x: Inst, vk: [K], glob: [bool]) -> bool:
     match x.op:
         case Op.Call:
-            return not is_unique(x)
+            return not is_unique(x) and any(vk[a] == K.Ptr and not glob[a] for a in x.args)
         case Op.CallInd | Op.Copy | Op.Zero:
             return true
         case Op.Store:
@@ -2642,7 +2649,7 @@ fn shares(x: Inst, vk: [K]) -> bool:
         case _:
             return false
 
-fn hoist_uniques(ref sf: SF, key: [int]):
+fn hoist_uniques(ref sf: SF, ref key: [int], ref glob: [bool]):
     var loops = find_loops(sf)
     if len(loops) == 0:
         return
@@ -2699,7 +2706,7 @@ fn hoist_uniques(ref sf: SF, key: [int]):
         var ok = true
         for b in lp.body:
             for x in sf.bs[b].code:
-                if shares(x, sf.f.vk):
+                if shares(x, sf.f.vk, glob):
                     ok = false
         if not ok:
             continue
@@ -2713,7 +2720,16 @@ fn hoist_uniques(ref sf: SF, key: [int]):
                 if not is_unique(x):
                     continue
                 let p = x.args[0]
-                if root[p] and not (def_b[p] >= 0 and inb[def_b[p]]) and key[p] not in ks:
+                if not root[p] or key[p] in ks:
+                    continue
+                if not (def_b[p] >= 0 and inb[def_b[p]]):
+                    ps.push(p)
+                    ks.push(key[p])
+                    continue
+                # a field's address the loop computes (licm hasn't run yet):
+                # computed again before it
+                let e = sf.bs[def_b[p]].code[def_i[p]]
+                if e.op == Op.Elem and not (def_b[e.a] >= 0 and inb[def_b[e.a]]):
                     ps.push(p)
                     ks.push(key[p])
         if len(ps) == 0:
@@ -2721,15 +2737,32 @@ fn hoist_uniques(ref sf: SF, key: [int]):
         var pc = sf.bs[pre].code
         let t = pc.pop()
         for p in ps:
+            var q = p
+            if def_b[p] >= 0 and inb[def_b[p]]:
+                let e = sf.bs[def_b[p]].code[def_i[p]]
+                var kc = sf.bs[def_b[e.b]].code[def_i[e.b]]
+                kc.d = len(sf.f.vk)
+                sf.f.vk.push(sf.f.vk[e.b])
+                q = len(sf.f.vk)
+                sf.f.vk.push(K.Ptr)
+                for v in [kc.d, q]:
+                    key.push(v)
+                    glob.push(false)
+                    def_b.push(pre)
+                    def_i.push(len(pc) + (1 if v == q else 0))
+                    root.push(v == q)
+                key[q] = key[p]
+                pc.push(kc)
+                pc.push(mk(Op.Elem, q, e.a, kc.d, -1, e.n))
             var c = mk(Op.Call, -1, -1, 0, -1, 0)
             c.s = "brine_arr_unique"
-            c.args = [p]
+            c.args = [q]
             pc.push(c)
         pc.push(t)
         sf.bs[pre].code = pc
 
 # The checks one on every path here already did.
-fn drop_uniques(ref sf: SF, key: [int]):
+fn drop_uniques(ref sf: SF, key: [int], glob: [bool]):
     let n = len(sf.bs)
     let po = postorder(sf.bs)
     # the addresses (keys) whose arrays are unique at the end of each block (none:
@@ -2747,7 +2780,7 @@ fn drop_uniques(ref sf: SF, key: [int]):
                 if is_unique(x):
                     if key[x.args[0]] not in s:
                         s.push(key[x.args[0]])
-                elif shares(x, sf.f.vk):
+                elif shares(x, sf.f.vk, glob):
                     s = []
             if out[b] != Some(s):
                 out[b] = Some(s)
@@ -2760,7 +2793,7 @@ fn drop_uniques(ref sf: SF, key: [int]):
                 if key[x.args[0]] in s:
                     continue
                 s.push(key[x.args[0]])
-            elif shares(x, sf.f.vk):
+            elif shares(x, sf.f.vk, glob):
                 s = []
             code.push(x)
         sf.bs[b].code = code
