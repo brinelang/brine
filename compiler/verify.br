@@ -3276,6 +3276,40 @@ struct Vf:
             case _:
                 pass
 
+    # The values a loop made at its head (atoms from `na` on) keep the facts
+    # assumed there (from `k` on: invariants, monotone steps) wherever they
+    # are used, so those facts can narrow their ranges. A range survives a
+    # merge in the body that drops what the branches knew (MERGE_MAX), so
+    # `invariant i >= 0` still proves `i >= 0` after a long `elif` chain.
+    # Only facts about one new value and older ones: a `for` loop's variable
+    # is new too, and stands for another value after the loop.
+    fn narrow_looped(ref self, na: int, k: int):
+        if not self.live:
+            return
+        var by: {int: [F]} = {}
+        for i in k..len(self.st.facts):
+            var parts: [F] = []
+            conjuncts(self.st.facts[i], ref parts)
+            for f in parts:
+                var s = AtomSet.new()
+                f.atoms(ref s)
+                var only = -1
+                for a in s.xs:
+                    if a >= na:
+                        only = a if only == -1 or only == a else -2
+                if only >= 0:
+                    match by.get(only):
+                        case Some(fs):
+                            var fs2 = fs
+                            fs2.push(f)
+                            by[only] = fs2
+                        case None:
+                            by[only] = [f]
+        var ks = by.keys()
+        ks.sort()
+        for a in ks:
+            self.narrow(a, by[a])
+
     # The name and type of field `k` of a struct or tuple type.
     fn field_of(self, ty: Ty, k: int) -> Option[(str, Ty)]:
         match ty:
@@ -3775,11 +3809,13 @@ struct Vf:
         effs_block(body, self.info, ref effs)
         effs_expr(cond, self.info, ref effs)
         let starts = self.mono_starts(body, Some(cond))
+        let na = len(self.atom_names)
         self.havoc_effs(effs)
         self.mono_facts(starts)
         for inv in invs:
             let f = self.spec_cond(inv)
             self.assume(f)
+        self.narrow_looped(na, k)
         let c = self.cond(cond)
         let head0 = self.take()
         if head0.is_none():
@@ -3958,6 +3994,8 @@ struct Vf:
                     case None:
                         pass
         let mono = self.mono_starts(body, None)
+        let na = len(self.atom_names)
+        let kh = len(self.st.facts) if self.live else 0
         self.havoc(body)
         self.mono_facts(mono)
         let head = self.cur()
@@ -4054,6 +4092,7 @@ struct Vf:
         for inv in invs:
             let f = self.spec_cond(inv)
             self.assume(f)
+        self.narrow_looped(na, kh)
         var is_range = false
         match dom:
             case D.Range(_, _, _):
