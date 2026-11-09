@@ -419,6 +419,8 @@ const PROVED = 1
 const NOT_PROVED = 0
 # the search ran out of budget: the claim may still be true
 const GAVE_UP = 2
+# no limit on the work of one proof (see `prove_capped`)
+const NO_CAP = 4611686018427387904
 
 fn prove_full(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> int:
     var work = 0
@@ -428,6 +430,19 @@ fn prove_full(facts: [F], goal: F, ranges: [Option[(i128, i128)]]) -> int:
 # (in the facts, the search and Fourier–Motzkin), a measure of time that is
 # the same on every run.
 fn prove_work(facts: [F], goal: F, ranges: [Option[(i128, i128)]], ref work: int) -> int:
+    return prove_capped(facts, goal, ranges, ref work, NO_CAP)
+
+# `prove_work` that gives up once it has done `cap` work, so a caller with a
+# budget is not overrun by one proof (the search alone may take 2 × MAX_NODES
+# nodes, each a Fourier–Motzkin run).
+fn prove_capped(
+    facts: [F],
+    goal: F,
+    ranges: [Option[(i128, i128)]],
+    ref work: int,
+    cap: int
+) -> int:
+    let w0 = work
     match prepare(facts, goal, ranges, ref work):
         case Prep.Proved:
             return PROVED
@@ -435,10 +450,11 @@ fn prove_work(facts: [F], goal: F, ranges: [Option[(i128, i128)]], ref work: int
             return NOT_PROVED
         case Prep.Used(used, _):
             var leaf = Leaf.new(false)
+            leaf.cap = cap - (work - w0)
             var budget = MAX_NODES
             var b = Branch.new()
             var r = refute(ref b, used, ref budget, false, 0, ref leaf)
-            if r.is_none() and budget < 0:
+            if r.is_none() and budget < 0 and leaf.work <= leaf.cap:
                 # out of budget: try once more, splitting where it decides most
                 budget = MAX_NODES
                 var b2 = Branch.new()
@@ -512,11 +528,12 @@ struct Leaf:
     want: bool
     found: bool
     b: Branch
-    # the work done (see `prove_work`)
+    # the work done (see `prove_work`), and where the search stops
     work: int
+    cap: int
 
     fn new(want: bool) -> Leaf:
-        return Leaf(want=want, found=false, b=Branch.new(), work=0)
+        return Leaf(want=want, found=false, b=Branch.new(), work=0, cap=NO_CAP)
 
     fn keep(ref self, b: Branch):
         if self.want and not self.found:
@@ -1024,6 +1041,9 @@ fn refute(
 ) -> Option[bool]:
     budget -= 1
     leaf.work += 1
+    if leaf.work > leaf.cap:
+        # out of work: as out of nodes
+        budget = -1
     if budget < 0:
         return None
     # flatten conjunctions and literals first; collect disjunctions for later
@@ -1105,7 +1125,13 @@ fn refute(
         let o2 = live[n]
         var alts2: [F] = []
         for alt2 in o2:
-            if probes > 0 and len(o2) > 1 and budget > 0 and (thorough or from_goal[n]):
+            if (
+                probes > 0
+                and len(o2) > 1
+                and budget > 0
+                and leaf.work <= leaf.cap
+                and (thorough or from_goal[n])
+            ):
                 probes -= 1
                 if contradicts(b, alt2, ref budget, ref leaf.work):
                     continue

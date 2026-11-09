@@ -17,7 +17,7 @@ from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pat
 from ast import children, left_chain, left_spine, stmt_exprs, stmt_blocks, lvalue_root, local_of
 from info import ProgramInfo, ConstVal, PRELUDE, RT
 from rules import builtin_effect, os_effect
-from solver import Lin, F, AtomSet, prove_work, local_facts, atoms_of, counterexample, PROVED, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
+from solver import Lin, F, AtomSet, prove_work, prove_capped, local_facts, atoms_of, counterexample, PROVED, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
 from checks import Check, Stop, builtin_stops, reduce_stops, convert_stops, world_stops, os_stops
 
 struct Report:
@@ -137,6 +137,10 @@ const LOCAL_MAX = 64
 # Past WORK_MAX, these proofs may still do this much work in all: they are
 # small, and often enough.
 const EXTRA_MAX = 2000000
+# Past WORK_MAX, the proof from the facts about the goal's own values
+# (`by_own`) gives up after this much work: it runs for every check, so the
+# time past the limit grows with their number, not their product.
+const PAST_MAX = 20000
 # Largest disjunction (in formula nodes) a merge of two branches keeps. Past
 # that the solver spends its time re-reading it; dropping it only loses facts.
 const MERGE_MAX = 256
@@ -1925,9 +1929,13 @@ struct Vf:
             var nw = 0
             for f in near:
                 nw += weight(f)
-            # (not when it's most of what is known: that would be the same work twice)
-            if nw <= NEAR_MAX or (not over and 2 * len(near) <= nall):
-                if prove_work(near, goal, self.ranges, ref self.work) == PROVED:
+            # (not when it's most of what is known: that would be the same work twice;
+            # past the limit, only up to a small extra amount of work)
+            if (
+                (nw <= NEAR_MAX and (not over or self.extra < EXTRA_MAX))
+                or (not over and 2 * len(near) <= nall)
+            ):
+                if self.prove_in(near, goal, max(EXTRA_MAX - self.extra, 1)) == PROVED:
                     return PROVED
             # then what is linked to them, except through values most facts mention
             # (past the limit, only up to a small extra amount of work)
@@ -1938,20 +1946,35 @@ struct Vf:
                 var r = GAVE_UP
                 match local_facts(all, goal, HUB_MAX, LOCAL_MAX, ref self.work):
                     case Some(loc):
+                        if over:
+                            self.extra += self.work - w0
                         if len(near) < len(loc) < len(all):
-                            r = prove_work(loc, goal, self.ranges, ref self.work)
+                            r = self.prove_in(loc, goal, max(EXTRA_MAX - self.extra, 1))
                     case None:
-                        pass
-                if over:
-                    self.extra += self.work - w0
+                        if over:
+                            self.extra += self.work - w0
                 if r == PROVED:
                     return PROVED
-        if over:
+        if self.work > WORK_MAX:
             self.limited = true
             return GAVE_UP
         var all = self.st.facts
         all.extend(self.defs)
-        return prove_work(all, goal, self.ranges, ref self.work)
+        let r = self.prove_in(all, goal, 0)
+        # (it stopped at the limit)
+        self.limited = r == GAVE_UP and self.work > WORK_MAX
+        return r
+
+    # `prove_work` that stops at the function's limit, so one proof can't
+    # overrun it many times over: before WORK_MAX, at WORK_MAX; past it,
+    # after `past` more work, counted in `extra`.
+    fn prove_in(ref self, fs: [F], goal: F, past: int) -> int:
+        let w0 = self.work
+        if w0 <= WORK_MAX:
+            return prove_capped(fs, goal, self.ranges, ref self.work, WORK_MAX + 1 - w0)
+        let r = prove_capped(fs, goal, self.ranges, ref self.work, past)
+        self.extra += self.work - w0
+        return r
 
     # `goal` follows from the facts about its values alone (each conjunct of
     # them that mentions no other value): the facts an error lists. A small
@@ -1972,7 +1995,7 @@ struct Vf:
         if len(own) == 0 or w > NEAR_MAX:
             return false
         var work = 0
-        let r = prove_work(own, goal, self.ranges, ref work)
+        let r = prove_capped(own, goal, self.ranges, ref work, PAST_MAX)
         self.extra += work
         return r == PROVED
 
@@ -1988,10 +2011,10 @@ struct Vf:
             return true
         if len(self.st.facts) + len(self.defs) > NEAR_MIN:
             let near = self.near(goal)
-            return prove_work(near, goal, self.ranges, ref self.work) == PROVED
+            return self.prove_in(near, goal, max(EXTRA_MAX - self.extra, 1)) == PROVED
         var all = self.st.facts
         all.extend(self.defs)
-        return prove_work(all, goal, self.ranges, ref self.work) == PROVED
+        return self.prove_in(all, goal, max(EXTRA_MAX - self.extra, 1)) == PROVED
 
     # `f` follows from the ranges of its values alone (interval arithmetic).
     fn by_ranges(self, f: F) -> bool:
@@ -2563,7 +2586,8 @@ struct Vf:
                 var all = self.st.facts
                 all.extend(self.defs)
                 var w = 0
-                let gave_up = prove_work(all, goal, self.ranges, ref w) == GAVE_UP
+                let room = max(WORK_MAX - self.work, PAST_MAX)
+                let gave_up = prove_capped(all, goal, self.ranges, ref w, room) == GAVE_UP
                 if not gave_up:
                     match self.values_note(all, open):
                         case Some(n):
