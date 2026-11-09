@@ -1902,19 +1902,26 @@ struct Vf:
         self.limited = false
         if not self.live:
             return PROVED
+        # the ranges of its values are often enough (and the solver can lose
+        # its way in bounds near the limits of 64-bit types); they cost nothing,
+        # so past the limits too
+        if self.by_ranges(goal):
+            return PROVED
         if self.weight > WEIGHT_MAX or len(self.atom_names) > ATOMS_MAX:
             self.too_big = true
         if self.too_big:
+            # what the facts about its values alone imply, as past WORK_MAX:
+            # a goal that a fact the error would list implies is no error
+            if self.by_own(self.near(goal), goal):
+                return PROVED
             self.limited = true
             return GAVE_UP
         let over = self.work > WORK_MAX
-        # the ranges of its values are often enough (and the solver can lose
-        # its way in bounds near the limits of 64-bit types)
-        if self.by_ranges(goal):
-            return PROVED
         let nall = len(self.st.facts) + len(self.defs)
-        if nall > NEAR_MIN:
+        if nall > NEAR_MIN or over:
             let near = self.near(goal)
+            if over and self.by_own(near, goal):
+                return PROVED
             var nw = 0
             for f in near:
                 nw += weight(f)
@@ -1945,6 +1952,29 @@ struct Vf:
         var all = self.st.facts
         all.extend(self.defs)
         return prove_work(all, goal, self.ranges, ref self.work)
+
+    # `goal` follows from the facts about its values alone (each conjunct of
+    # them that mentions no other value): the facts an error lists. A small
+    # proof, tried past the limits, so a goal they imply never fails there.
+    fn by_own(ref self, near: [F], goal: F) -> bool:
+        let ga = atoms_of(goal)
+        if ga.is_empty() or ga.contains(ATOM_UNKNOWN):
+            return false
+        var own: [F] = []
+        var w = 0
+        for f in near:
+            var parts: [F] = []
+            conjuncts(f, ref parts)
+            for x in parts:
+                if within(x, ga):
+                    own.push(x)
+                    w += weight(x)
+        if len(own) == 0 or w > NEAR_MAX:
+            return false
+        var work = 0
+        let r = prove_work(own, goal, self.ranges, ref work)
+        self.extra += work
+        return r == PROVED
 
     # `goal` follows from the ranges of its values or the facts about them
     # (all facts, in a short function): for what is seldom true, like a check
@@ -7782,6 +7812,11 @@ fn hull_lin(n: Lin, x: Lin, y: Lin, ref out: [F]):
                     pass
         case None:
             pass
+
+# Every value `f` mentions is in `s`.
+fn within(f: F, s: AtomSet) -> bool:
+    let fa = atoms_of(f)
+    return all(s.contains(a) for a in fa.xs)
 
 # `f` split at its top-level `and`s.
 fn conjuncts(f: F, ref out: [F]):
