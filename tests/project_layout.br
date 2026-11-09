@@ -1,0 +1,104 @@
+# End-to-end tests of how brine finds a program's files: imports, RULES.br,
+# and which files `check` treats as programs. Imported by integration.br, so
+# `brine test tests/integration.br` runs them; scratch files go to target/it/.
+
+struct Run:
+    code: int
+    out: str
+    err: str
+
+    fn all(self) -> str:
+        return self.out + self.err
+
+fn brine(args: [str]) -> Run:
+    var cmd = [getenv("BRINE").unwrap_or("brine")]
+    cmd.extend(args)
+    var h = 0
+    match os.spawn(cmd, {"NO_COLOR": "1"}, true, false):
+        case Ok(p):
+            h = p
+        case Err(msg):
+            panic(f"cannot run {cmd[0]}: {msg}")
+    let code = os.wait(h)
+    let (o, e) = os.output(h)
+    return Run(code=code, out=o.replace("\r\n", "\n"), err=e.replace("\r\n", "\n"))
+
+fn scratch(name: str) -> str:
+    let d = f"target/it/{name}-{os.pid()}"
+    mkdir(d)
+    return d
+
+fn mkdir(d: str):
+    match os.make_dir(d):
+        case _:
+            pass
+
+fn write(path: str, t: str):
+    match write_file(path, t):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+
+fn cd(d: str):
+    match os.set_cwd(d):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+
+fn count(s: str, part: str) -> int:
+    return len(s.split(part)) - 1
+
+test "imports are found from the importing file's directory too":
+    let d = scratch("import-dirs")
+    write(d + "/brine.toml", "[package]\nname = \"q\"\n")
+    mkdir(d + "/src")
+    mkdir(d + "/src/bin")
+    mkdir(d + "/src/core")
+    mkdir(d + "/bench")
+    write(d + "/src/main.br", "import util\n\nfn main():\n    print(util.twice(2))\n")
+    # util and its neighbour, found from src/ by the main file and from util.br
+    # by the others
+    write(
+        d + "/src/util.br",
+        "import more\n\nfn twice(x: int) -> int:\n    return more.add(x, x)\n"
+    )
+    write(d + "/src/more.br", "fn add(a: int, b: int) -> int:\n    return a + b\n")
+    write(d + "/src/core/store.br", "import keys\n\nfn get() -> int:\n    return keys.KEY\n")
+    write(d + "/src/core/keys.br", "const KEY = 7\n")
+    write(d + "/src/bin/tool.br", "import ..util\n\nfn main():\n    print(util.twice(3))\n")
+    write(
+        d + "/bench/b.br",
+        "import ..src.util\nimport ..src.core.store\n\nfn main():\n    print(util.twice(4), store.get())\n"
+    )
+    let c = brine(["check", d])
+    assert c.code == 0, c.all()
+    let t = brine(["run", d + "/src/bin/tool.br"])
+    assert t.code == 0 and t.out == "6\n", t.all()
+    let b = brine(["run", d + "/bench/b.br"])
+    assert b.code == 0 and b.out == "8 7\n", b.all()
+    # a missing module says where it was looked for
+    write(d + "/src/core/bad.br", "import nothere\n")
+    write(d + "/src/bin/bad.br", "import ..core.bad\n\nfn main():\n    pass\n")
+    let e = brine(["check", d + "/src/bin/bad.br"])
+    assert e.code == 1 and "E0701" in e.err and "the importing file's" in e.err, e.all()
+
+test "a module RULES.br imports is checked once":
+    let d = scratch("rules-dup")
+    write(d + "/brine.toml", "[package]\nname = \"dup\"\n")
+    mkdir(d + "/src")
+    write(d + "/src/main.br", "import m\n\nfn main():\n    print(m.get([1, 2], 1).unwrap_or(0))\n")
+    write(
+        d + "/src/m.br",
+        "fn get(a: [int], i: int) -> Option[int]:\n    ensures result.is_none() or result.unwrap() >= 0\n    if 0 <= i < len(a) and a[i] >= 0:\n        return Some(a[i])\n    return None\n"
+    )
+    write(d + "/RULES.br", "import m\n\nrule \"m never crashes\":\n    proven m\n")
+    # E0606 for each of the two calls in the `ensures`, once each
+    for args in [["check", d + "/src/m.br"], ["check", d]]:
+        let o = brine(args)
+        assert o.code == 1 and count(o.err, "error[E0606]") == 2, o.all()
+    # and the rule still covers m when it is the file being checked
+    write(d + "/src/m.br", "fn get(a: [int], i: int) -> Option[int]:\n    return Some(a[i])\n")
+    let p = brine(["check", d + "/src/m.br"])
+    assert p.code == 1 and count(p.err, "error[E0607]") == 1, p.all()
