@@ -466,7 +466,7 @@ int64_t brine_start_chk(int64_t start, int64_t len, const char *loc);
 /* ------------------------------------------------------------ arrays */
 brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_fn rl, const char *loc);
 brine_arr *brine_bits_new(int64_t len, int64_t fill, const char *loc);
-brine_arr *brine_bytes_new(int64_t len, const char *loc);
+brine_arr *brine_bytes_new(int64_t len, int64_t esz, const char *loc);
 void brine_arr_unique(brine_arr **pa);
 
 /* Loops the compiler recognizes (idiom.br), done in one step when every
