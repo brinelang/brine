@@ -1189,7 +1189,10 @@ fn new_vf(
         muls=[],
         mul_keys=[],
         mul_seen={},
-        from_call={}
+        from_call={},
+        from_spec={},
+        flt_cmps={},
+        ins={}
     )
 
 struct Vf:
@@ -1298,6 +1301,14 @@ struct Vf:
     # atoms made for the result of a call to a function without `ensures`,
     # and the function
     from_call: {int: int}
+    # the same for functions with `ensures`: when a proof fails on such a
+    # value, what the `ensures` says may be too little
+    from_spec: {int: int}
+    # the truth values of comparisons of floats: not values a reader could
+    # check, and what the prover knows of them is rough
+    flt_cmps: {int: bool}
+    # the truth values of `x in xs`: the prover doesn't follow `in` yet
+    ins: {int: bool}
 
     # The state, leaving none behind.
     fn take(ref self) -> Option[St]:
@@ -2147,7 +2158,7 @@ struct Vf:
         var out: [str] = []
         for a2 in ga.xs:
             let n2 = self.atom_name(a2)
-            if newest.get(n2) != Some(a2):
+            if newest.get(n2) != Some(a2) or a2 in self.flt_cmps or a2 in self.ins:
                 continue
             match m.ints.get(a2):
                 case Some(v):
@@ -2163,6 +2174,55 @@ struct Vf:
         return Some("values the prover can't rule out: " + ", ".join(out))
 
     fn fail(ref self, d0: Diag, goal: F):
+        let renamed = self.unclash(goal)
+        self.fail_named(d0, goal)
+        for r in renamed:
+            self.atom_names[r.0] = r.1
+
+    # Two values in a message with the same name (`len(xs)` before and after
+    # `xs` changed: `len(xs) >= len(xs)`): show an older one by the name of a
+    # local that holds it (`n`), for this message. The old names, to put back.
+    fn unclash(ref self, goal: F) -> [(int, str)]:
+        var out: [(int, str)] = []
+        if not self.live:
+            return out
+        var ga = AtomSet.new()
+        goal.atoms(ref ga)
+        var near = AtomSet.new()
+        for a0 in ga.xs:
+            near.insert(a0)
+        var facts: [F] = []
+        for f0 in self.st.facts:
+            conjuncts(f0, ref facts)
+        for f in facts:
+            var fa = AtomSet.new()
+            f.atoms(ref fa)
+            if any(ga.contains(x) for x in fa.xs):
+                for x2 in fa.xs:
+                    near.insert(x2)
+        var newest: {str: int} = {}
+        for a1 in near.xs:
+            let n1 = self.atom_name(a1)
+            if a1 > newest.get(n1).unwrap_or(-1):
+                newest[n1] = a1
+        for a2 in near.xs:
+            let n2 = self.atom_name(a2)
+            if newest.get(n2) == Some(a2):
+                continue
+            for id in self.st.env.keys():
+                match self.st.env[id]:
+                    case V.Int(l):
+                        if len(l.t) == 1 and l.c == 0 and l.t[0] == (a2, i128(1)):
+                            let ln = self.shown_local(id)
+                            if ln != "" and ln != n2 and ln not in newest:
+                                out.push((a2, n2))
+                                self.atom_names[a2] = ln
+                                break
+                    case _:
+                        pass
+        return out
+
+    fn fail_named(ref self, d0: Diag, goal: F):
         var d = d0
         # the proof just tried stopped at a limit of the function
         let limited = self.limited
@@ -2210,6 +2270,21 @@ struct Vf:
                             d = d.note(cap_note(n))
                         case None:
                             pass
+                    var ga = AtomSet.new()
+                    open.atoms(ref ga)
+                    for a in ga.xs:
+                        if a in self.ins:
+                            d = d.note(
+                                f"the prover doesn't follow `in` yet: to it, `{self.atom_names[a]}` is a truth value it knows nothing about"
+                            )
+                            d.help = [
+                                "say it in terms the prover follows (`0 <= i < len(xs)` and `xs[i] == x`), or check it at runtime with `assert` instead"
+                            ]
+                            break
+                    if any(a in self.flt_cmps for a in ga.xs):
+                        d = d.note(
+                            "the prover knows floats only roughly (their sign, whole part and whether they are NaN), so this may be true and still not proven; a NaN makes every comparison but `!=` false"
+                        )
                 if gave_up:
                     d = d.note(
                         "the prover gave up: what it knows here splits into too many cases to check them all, so this may well be true"
@@ -2219,6 +2294,31 @@ struct Vf:
                         "check it with `assert` (at runtime) instead, or move the branches before this point into a function whose `ensures` states just what is needed here"
                     ]
             d = self.from_call_notes(d, open)
+        # false whenever this point is reached: more facts can't help, the
+        # code or the claim is wrong
+        var never = goal == F.False
+        if not never and self.live and not limited:
+            never = self.holds(goal.not_())
+            if never:
+                d = d.note("whenever this point is reached, this is false")
+        if never:
+            match d.code:
+                case "E0602":
+                    d.help = [
+                        "this `return` never gives a value that meets the `ensures`: fix the value it returns, or the `ensures`"
+                    ]
+                case "E0601":
+                    d.help = [
+                        "this call never meets the `requires`: fix the arguments, or the `requires`"
+                    ]
+                case "E0603":
+                    d.help = ["fix the values the loop starts with, or the invariant"]
+                case "E0604":
+                    d.help = [
+                        "the loop body always breaks the invariant: fix the body, or the invariant"
+                    ]
+                case _:
+                    pass
         self.diags.push(d)
 
     # A value the proof needs is the result of a call to a function without
@@ -2255,6 +2355,49 @@ struct Vf:
                         )
                     help.extend(d.help)
                     d.help = help
+                case None:
+                    pass
+        if len(done) > 0 or not self.live:
+            return d
+        # a call's result in the goal, or in a fact about the goal's values:
+        # what its `ensures` says is all the prover knows, and may be too
+        # little (`ensures result >= 0` on `return self.end`)
+        var near = AtomSet.new()
+        for a0 in s.xs:
+            near.insert(a0)
+        var facts: [F] = []
+        for f0 in self.st.facts:
+            conjuncts(f0, ref facts)
+        for f in facts:
+            var fa = AtomSet.new()
+            f.atoms(ref fa)
+            if any(s.contains(x) for x in fa.xs):
+                for x2 in fa.xs:
+                    near.insert(x2)
+        for a2 in near.xs:
+            match self.from_spec.get(a2):
+                case Some(id2):
+                    if id2 in done or len(done) >= 2:
+                        continue
+                    done[id2] = true
+                    let fname = self.info.fns[id2].name
+                    match self.specs[id2]:
+                        case Some(sp):
+                            if len(sp.ensures) > 0:
+                                d = d.label(
+                                    sp.ensures[0].span,
+                                    f"all the prover knows about what `{fname}` returns"
+                                )
+                        case None:
+                            pass
+                    d = d.note(
+                        f"`{self.atom_names[a2]}` comes from `{fname}`: the prover knows only what its `ensures` says about it, which may be too little here"
+                    )
+                    var help2 = [
+                        f"if `{fname}` returns more than its `ensures` says, say it there (`ensures result == ...`)"
+                    ]
+                    help2.extend(d.help)
+                    d.help = help2
                 case None:
                     pass
         return d
@@ -4190,7 +4333,17 @@ struct Vf:
                                     return V.Int(x)
                                 # in two's complement the low k bits are x mod 2^k
                                 if c > 0 and log2_exact(c + 1) > 0:
-                                    return self.arith_val(BinOp.Mod, x, Lin.konst(c + 1), k)
+                                    let na = len(self.atom_names)
+                                    let mv = self.arith_val(BinOp.Mod, x, Lin.konst(c + 1), k)
+                                    # in messages, as written
+                                    let ms = f" % {c + 1}"
+                                    for ma in na..len(self.atom_names):
+                                        let an = self.atom_names[ma]
+                                        if an.ends_with(ms):
+                                            self.atom_names[ma] = (
+                                                an[0:len(an) - len(ms)] + f" & {c}"
+                                            )
+                                    return mv
                                 if c < 0 and log2_exact(-c) > 0:
                                     match self.arith_val(BinOp.Mod, x, Lin.konst(-c), k):
                                         case V.Int(ml):
@@ -4562,6 +4715,7 @@ struct Vf:
             case ExprKind.Compare(first, rest):
                 var prev = self.eval(first)
                 var pt = first.ty
+                var pe = first
                 var fs: [F] = []
                 var forks: [(Fork, F)] = []
                 for op, x in rest:
@@ -4599,7 +4753,13 @@ struct Vf:
                                 f = eq if op == CmpOp.Eq else eq.not_()
                                 done = true
                         case (V.Flt(_, _, _, _, _), V.Flt(_, _, _, _, _)):
-                            f = self.float_cmp(op, prev, v, self.name_of(e))
+                            # each link of `a <= b <= c` by its own name
+                            let cn = (
+                                self.name_of(e)
+                                if len(rest) == 1
+                                else self.name_of(pe) + " " + op.sym() + " " + self.name_of(x)
+                            )
+                            f = self.float_cmp(op, prev, v, cn, zero_lit(pe), zero_lit(x))
                             done = true
                         case _:
                             pass
@@ -4608,6 +4768,7 @@ struct Vf:
                     fs.push(f)
                     prev = v
                     pt = x.ty
+                    pe = x
                 # the paths that stopped early, innermost first
                 var j = len(forks)
                 while j > 0:
@@ -4787,7 +4948,13 @@ struct Vf:
             case ExprKind.Contains(item, coll, _):
                 self.eval(item)
                 self.eval(coll)
-                return V.Bool(self.fresh_bool("in"))
+                let r = self.fresh_bool(self.name_of(e))
+                match r:
+                    case F.B(ra, _):
+                        self.ins[ra] = true
+                    case _:
+                        pass
+                return V.Bool(r)
             case ExprKind.Array(es):
                 var vals: [V] = []
                 for x in es:
@@ -5173,10 +5340,47 @@ struct Vf:
     # `a op b` for floats: a truth value of its own, which says what it can
     # about `int` of both when it's true and when it's false (rounding toward
     # zero keeps the order).
-    fn float_cmp(ref self, op: CmpOp, a: V, b: V, name: str) -> F:
+    fn float_cmp(ref self, op: CmpOp, a: V, b: V, name: str, za: bool, zb: bool) -> F:
         match (a, b):
             case (V.Flt(x, na, xb, xa, xn), V.Flt(y, nb, yb, ya, yn)):
                 let r = self.fresh_bool(name)
+                match r:
+                    case F.B(ra, _):
+                        self.flt_cmps[ra] = true
+                    case _:
+                        pass
+                if za or zb:
+                    # with `0.0` a comparison is about the sign (`neg`)
+                    let s = yn if za else xn
+                    let okv = (nb if za else na).not_()
+                    var o = op
+                    if za:
+                        o = flip_cmp(op)
+                    match o:
+                        case CmpOp.Lt:
+                            self.defs.push(F.or_([r.not_(), s]))
+                            self.defs.push(F.or_([r, okv.not_(), s.not_()]))
+                        case CmpOp.Ge:
+                            self.defs.push(F.or_([r.not_(), s.not_()]))
+                            self.defs.push(F.or_([r, okv.not_(), s]))
+                        case CmpOp.Gt | CmpOp.Eq:
+                            self.defs.push(F.or_([r.not_(), s.not_()]))
+                        case CmpOp.Le:
+                            self.defs.push(F.or_([r, okv.not_(), s.not_()]))
+                        case CmpOp.Ne:
+                            self.defs.push(F.or_([r, okv.not_(), s.not_()]))
+                elif same_flt(a, b):
+                    # a value and itself (not two constants that look alike)
+                    let ok1 = na.not_()
+                    match op:
+                        case CmpOp.Lt | CmpOp.Gt:
+                            self.defs.push(r.not_())
+                        case CmpOp.Ne:
+                            self.defs.push(F.or_([r, ok1]))
+                            self.defs.push(F.or_([r.not_(), ok1.not_()]))
+                        case _:
+                            self.defs.push(F.or_([r.not_(), ok1]))
+                            self.defs.push(F.or_([r, ok1.not_()]))
                 # a NaN makes every comparison false but `!=`
                 let ok = F.and_([na.not_(), nb.not_()])
                 # `a <= b` keeps the sign: `0.0 <= a` says `a` isn't negative
@@ -6094,6 +6298,8 @@ struct Vf:
                 result = self.eval(ie)
                 self.spec = was
                 self.alt_env = saved
+                if result == V.Opaque:
+                    result = self.fresh_val(ret, nm)
             case None:
                 pass
         match key:
@@ -6117,6 +6323,9 @@ struct Vf:
         if not says:
             for a in na..len(self.atom_names):
                 self.from_call[a] = id
+        elif inline.is_none() and not pins_result(spec):
+            for a in na..len(self.atom_names):
+                self.from_spec[a] = id
         match spec:
             case Some(sp):
                 # after a failed precondition the postcondition may be contradictory;
@@ -6141,6 +6350,73 @@ struct Vf:
             case None:
                 pass
         return result
+
+# `a op b` as `b op' a`
+fn flip_cmp(op: CmpOp) -> CmpOp:
+    match op:
+        case CmpOp.Lt:
+            return CmpOp.Gt
+        case CmpOp.Gt:
+            return CmpOp.Lt
+        case CmpOp.Le:
+            return CmpOp.Ge
+        case CmpOp.Ge:
+            return CmpOp.Le
+        case _:
+            return op
+
+# A float literal zero: `0.0`, `-0.0`, `f32(0.0)`
+fn zero_lit(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Float(x):
+            return x == 0.0
+        case ExprKind.Unary(_, y):
+            return zero_lit(y)
+        case _:
+            return false
+
+# The same float value twice: the same fields, made from values of their
+# own (constants with the same fields, 0.0 and 0.5, may differ)
+fn same_flt(a: V, b: V) -> bool:
+    match (a, b):
+        case (V.Flt(x, nx, bx, ax, gx), V.Flt(y, ny, by, ay, gy)):
+            if len(x.t) == 0 or gx == F.True or gx == F.False or not (nx == ny and gx == gy):
+                return false
+            return (
+                lin_key(x) == lin_key(y)
+                and lin_key(bx) == lin_key(by)
+                and lin_key(ax) == lin_key(ay)
+            )
+        case _:
+            return false
+
+# An `ensures` that says what the result is (`result == self.end`): then a
+# failed proof isn't for want of facts about it.
+fn pins_result(spec: Option[FnSpec]) -> bool:
+    match spec:
+        case Some(sp):
+            match sp.result:
+                case Some(r):
+                    for e in sp.ensures:
+                        match e.kind:
+                            case ExprKind.Compare(first, rest):
+                                if len(rest) == 1 and rest[0].0 == CmpOp.Eq:
+                                    if is_local(first, r) or is_local(rest[0].1, r):
+                                        return true
+                            case _:
+                                pass
+                case None:
+                    pass
+        case None:
+            pass
+    return false
+
+fn is_local(e: Expr, id: int) -> bool:
+    match (e.kind, e.res):
+        case (ExprKind.Ident(_), Res.Local(l)):
+            return l == id
+        case _:
+            return false
 
 # `e` when `f` is a method without `ensures` whose body is just `return e`
 # for an `e` made of its parameters, fields, elements, constants,
