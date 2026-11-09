@@ -161,6 +161,8 @@ struct Fields:
     off: [[int]]
     kind: [[K]]
     calls: [bool]
+    # the address is used for nothing else
+    ok: [bool]
 
 fn field_of(fs: Fields, s: int, n: int) -> int:
     for i, o in enumerate(fs.off[s]):
@@ -168,12 +170,15 @@ fn field_of(fs: Fields, s: int, n: int) -> int:
             return i
     return -1
 
-fn promotable(f: Func, slot: [int]) -> Fields:
+# (`skip`: instructions to leave out, by index, or [])
+fn promotable(f: Func, slot: [int], skip: [bool]) -> Fields:
     let ns = len(f.slots)
     let nv = len(f.vk)
     var ok = [true] * ns
-    var fs = Fields(off=[[] for _ in 0..ns], kind=[[] for _ in 0..ns], calls=[false] * ns)
-    for x in f.code:
+    var fs = Fields(off=[[] for _ in 0..ns], kind=[[] for _ in 0..ns], calls=[false] * ns, ok=[])
+    for xi, x in enumerate(f.code):
+        if len(skip) > 0 and skip[xi]:
+            continue
         if x.op == Op.SlotAddr:
             # (an address in a vreg set more than once: not followed)
             if slot[x.d] < 0:
@@ -220,6 +225,7 @@ fn promotable(f: Func, slot: [int]) -> Fields:
         if not ok[s] or len(fs.off[s]) == 0:
             fs.off[s] = []
             fs.kind[s] = []
+    fs.ok = ok
     return fs
 
 # A float written to a slot and read as an integer of its size, or the other
@@ -477,6 +483,93 @@ struct Piece:
     off: int
     size: int
     v: int
+
+# Whole copies from one slot to another (a struct returned by an inlined
+# function: built in its slot, copied to the caller's result slot, then to the
+# variable's) keep both slots in memory. When every slot such copies connect
+# could live in vregs but for them, and none is passed to a call, each copy
+# becomes a load and a store per field instead, and they all go to vregs.
+# (Bytes no field covers are never read then: only padding.)
+fn split_copies(f: Func) -> Func:
+    let slot = slot_vregs(f)
+    let ns = len(f.slots)
+    var skip = [false] * len(f.code)
+    var up = [0] * ns
+    for s in 0..ns:
+        up[s] = s
+    var member = [false] * ns
+    var some = false
+    for i, x in enumerate(f.code):
+        if x.op != Op.Copy or slot[x.a] < 0 or slot[x.b] < 0 or slot[x.a] == slot[x.b]:
+            continue
+        let a = slot[x.a]
+        let b = slot[x.b]
+        if x.n == f.slots[a].size and x.n == f.slots[b].size:
+            skip[i] = true
+            some = true
+            member[a] = true
+            member[b] = true
+            let ra = root(up, a)
+            let rb = root(up, b)
+            if ra != rb:
+                up[ra] = rb
+    if not some:
+        return f
+    let fs = promotable(f, slot, skip)
+    # each group's fields, by its root; bad: not all of it can go to vregs
+    var off: [[int]] = [[] for _ in 0..ns]
+    var kind: [[K]] = [[] for _ in 0..ns]
+    var bad = [false] * ns
+    for s in 0..ns:
+        if not member[s]:
+            continue
+        let r = root(up, s)
+        if not fs.ok[s] or fs.calls[s]:
+            bad[r] = true
+            continue
+        for j, o in enumerate(fs.off[s]):
+            let k = fs.kind[s][j]
+            var found = false
+            for m, p in enumerate(off[r]):
+                if p == o:
+                    found = true
+                    if kind[r][m] != k:
+                        bad[r] = true
+            if not found:
+                off[r].push(o)
+                kind[r].push(k)
+    for r in 0..ns:
+        if not member[r]:
+            continue
+        if len(off[r]) == 0:
+            bad[r] = true
+        for i, a in enumerate(off[r]):
+            for j, b in enumerate(off[r]):
+                if i != j and a <= b and b < a + kind[r][i].size():
+                    bad[r] = true
+    var g = f
+    var code: [Inst] = []
+    for i, x in enumerate(f.code):
+        if not skip[i]:
+            code.push(x)
+            continue
+        let r = root(up, slot[x.a])
+        if bad[r]:
+            code.push(x)
+            continue
+        for j, o in enumerate(off[r]):
+            let t = len(g.vk)
+            g.vk.push(kind[r][j])
+            code.push(Inst(op=Op.Load, d=t, a=x.b, b=-1, c=-1, n=o, s="", args=[]))
+            code.push(Inst(op=Op.Store, d=-1, a=x.a, b=t, c=-1, n=o, s="", args=[]))
+    g.code = code
+    return g
+
+fn root(up: [int], s: int) -> int:
+    var r = s
+    while up[r] != r:
+        r = up[r]
+    return r
 
 # A copy out of a slot just after stores to it (an Option or a Result made
 # to be returned or kept: `store [s + 0], tag; store [s + 4], x; copy p <- s, 8`)
@@ -737,9 +830,15 @@ fn borrowed_rc(f: Func) -> Func:
     return g
 
 fn promote(f0: Func) -> Func:
-    let f = pack_copies(copy_chains(copy_forward(f0)))
+    return promote_with(f0, true)
+
+# (`pack`: false for a body to be inlined, whose copies out are better kept as
+# they are until the caller's slots are promoted: see split_copies)
+fn promote_with(f0: Func, pack: bool) -> Func:
+    let f1 = split_copies(copy_chains(copy_forward(f0)))
+    let f = pack_copies(f1) if pack else f1
     let slot = slot_vregs(f)
-    let fs = promotable(f, slot)
+    let fs = promotable(f, slot, [])
     var g = f
     # the vreg of each field: home[s] + field
     var home = [-1] * len(f.slots)
@@ -1154,6 +1253,25 @@ fn inlinable(f: Func, hot: {str: bool}) -> bool:
         return false
     return not calls or len(f.code) <= INLINE_CALLS
 
+# A function small enough to be worth promoting for a second look: one that
+# calls nothing but `cheap_call`s.
+fn leaf(f: Func, hot: {str: bool}) -> bool:
+    if f.public or f.export or f.cold or len(f.code) > INLINE_HOT:
+        return false
+    # and no loop: one inlined into a caller ran slower there (lpc's
+    # `wrapping` form, 230 -> 365 ms)
+    var placed: {int: bool} = {}
+    for x in f.code:
+        if x.op == Op.CallInd or x.op == Op.Switch:
+            return false
+        if x.op == Op.Call and not cheap_call(x, hot):
+            return false
+        if x.op == Op.Label:
+            placed[x.n] = true
+        elif (x.op == Op.Jmp or x.op == Op.Br or x.op == Op.BrNot) and x.n in placed:
+            return false
+    return true
+
 # With `borrow` (optimized builds), the retains and releases a read-only
 # function needs for what it borrows are dropped first, so they don't count
 # against it as calls (`Lin.coef`'s loop over its terms is inlined then).
@@ -1201,11 +1319,19 @@ fn inline_round(fs: [Func]) -> ([Func], bool):
         # measured that way too, as the loads and stores of its variables
         # are gone then
         if f.hot:
-            let p = promote(f)
+            let p = promote_with(f, false)
             if inlinable(p, hot):
                 small[f.name] = p
         elif inlinable(f, hot):
-            small[f.name] = promote(f)
+            small[f.name] = promote_with(f, false)
+        elif leaf(f, hot):
+            # measured promoted too: a helper returning a tuple or struct
+            # (BLAKE2b's G, a rolling checksum step) is mostly the loads and
+            # stores of its variables until then, and inlined its result
+            # stays in registers instead of going through memory
+            let p = promote_with(f, false)
+            if inlinable(p, hot):
+                small[f.name] = p
     var changed = false
     var out: [Func] = []
     for f in fs:
