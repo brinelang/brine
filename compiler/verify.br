@@ -17,7 +17,7 @@ from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pat
 from ast import children, left_chain, left_spine, stmt_exprs, stmt_blocks, lvalue_root, local_of
 from info import ProgramInfo, ConstVal, PRELUDE, RT
 from rules import builtin_effect, os_effect
-from solver import Lin, F, AtomSet, prove_work, near_facts, local_facts, counterexample, PROVED, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
+from solver import Lin, F, AtomSet, prove_work, local_facts, atoms_of, counterexample, PROVED, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
 from checks import Check, Stop, builtin_stops, reduce_stops, convert_stops, world_stops, os_stops
 
 struct Report:
@@ -1228,8 +1228,59 @@ fn new_vf(
         from_call={},
         from_spec={},
         flt_cmps={},
-        ins={}
+        ins={},
+        fix=new_ix(),
+        ix_ok=0,
+        dix=new_ix()
     )
+
+# The facts that mention each atom, by their positions in a list of facts,
+# so finding the facts about a goal's values doesn't read all of them.
+struct FactIx:
+    at: [[int]]
+    unknown: [int]
+    # the atoms of each fact indexed, by position
+    of: [[int]]
+
+    fn add(ref self, f: F):
+        let p = len(self.of)
+        let s = atoms_of(f)
+        for a in s.xs:
+            if a == ATOM_UNKNOWN:
+                self.unknown.push(p)
+            else:
+                while len(self.at) <= a:
+                    self.at.push([])
+                self.at[a].push(p)
+        self.of.push(s.xs)
+
+    fn drop_last(ref self):
+        let xs = self.of.pop()
+        for a in xs:
+            if a == ATOM_UNKNOWN:
+                self.unknown.pop()
+            else:
+                self.at[a].pop()
+
+    # The positions of the facts that mention an atom of `s`, in order.
+    fn find(self, s: AtomSet) -> [int]:
+        var ps: [int] = []
+        for a in s.xs:
+            if a == ATOM_UNKNOWN:
+                ps.extend(self.unknown)
+            elif a < len(self.at):
+                ps.extend(self.at[a])
+        if len(s.xs) > 1:
+            ps.sort()
+            var out: [int] = []
+            for p in ps:
+                if len(out) == 0 or out[len(out) - 1] != p:
+                    out.push(p)
+            return out
+        return ps
+
+fn new_ix() -> FactIx:
+    return FactIx(at=[], unknown=[], of=[])
 
 struct Vf:
     info: ProgramInfo
@@ -1339,6 +1390,12 @@ struct Vf:
     muls: [(Lin, Lin, Lin)]
     mul_keys: [(str, str, str)]
     mul_seen: {str: bool}
+    # `near`'s index of `st.facts` (its first `ix_ok` facts are the ones
+    # indexed: whatever changes an earlier one says so with `touch`) and of
+    # `defs` (which only grow)
+    fix: FactIx
+    ix_ok: int
+    dix: FactIx
     # atoms made for the result of a call to a function without `ensures`,
     # and the function
     from_call: {int: int}
@@ -1359,12 +1416,45 @@ struct Vf:
         return Some(self.st)
 
     fn put(ref self, s: Option[St]):
+        self.put_at(s, 0)
+
+    # `put`, where the first `k` facts of `s` are the current state's.
+    fn put_at(ref self, s: Option[St], k: int):
         match s:
             case Some(x):
+                self.touch(k)
                 self.st = x
                 self.live = true
             case None:
                 self.live = false
+
+    # Facts of the state from position `n` on may change (see `fix`).
+    fn touch(ref self, n: int):
+        if n < self.ix_ok:
+            self.ix_ok = n
+
+    fn sync_ix(ref self):
+        let n = len(self.st.facts)
+        let m = min(self.ix_ok, n)
+        while len(self.fix.of) > m:
+            self.fix.drop_last()
+        for i in m..n:
+            self.fix.add(self.st.facts[i])
+        self.ix_ok = n
+        while len(self.dix.of) < len(self.defs):
+            self.dix.add(self.defs[len(self.dix.of)])
+
+    # The facts (of the state, then `defs`) that mention a value of `goal`:
+    # `near_facts` of them all, without reading them all.
+    fn near(ref self, goal: F) -> [F]:
+        self.sync_ix()
+        let ga = atoms_of(goal)
+        var out: [F] = []
+        for p in self.fix.find(ga):
+            out.push(self.st.facts[p])
+        for p in self.dix.find(ga):
+            out.push(self.defs[p])
+        return out
 
     fn cur(self) -> Option[St]:
         return Some(self.st) if self.live else None
@@ -1817,25 +1907,26 @@ struct Vf:
         if self.too_big:
             self.limited = true
             return GAVE_UP
-        var all = self.st.facts
-        all.extend(self.defs)
         let over = self.work > WORK_MAX
         # the ranges of its values are often enough (and the solver can lose
         # its way in bounds near the limits of 64-bit types)
         if self.by_ranges(goal):
             return PROVED
-        if len(all) > NEAR_MIN:
-            let near = near_facts(all, goal)
+        let nall = len(self.st.facts) + len(self.defs)
+        if nall > NEAR_MIN:
+            let near = self.near(goal)
             var nw = 0
             for f in near:
                 nw += weight(f)
             # (not when it's most of what is known: that would be the same work twice)
-            if nw <= NEAR_MAX or (not over and 2 * len(near) <= len(all)):
+            if nw <= NEAR_MAX or (not over and 2 * len(near) <= nall):
                 if prove_work(near, goal, self.ranges, ref self.work) == PROVED:
                     return PROVED
             # then what is linked to them, except through values most facts mention
             # (past the limit, only up to a small extra amount of work)
             if not over or self.extra < EXTRA_MAX:
+                var all = self.st.facts
+                all.extend(self.defs)
                 let w0 = self.work
                 var r = GAVE_UP
                 match local_facts(all, goal, HUB_MAX, LOCAL_MAX, ref self.work):
@@ -1851,6 +1942,8 @@ struct Vf:
         if over:
             self.limited = true
             return GAVE_UP
+        var all = self.st.facts
+        all.extend(self.defs)
         return prove_work(all, goal, self.ranges, ref self.work)
 
     # `goal` follows from the ranges of its values or the facts about them
@@ -1863,10 +1956,11 @@ struct Vf:
             return false
         if self.by_ranges(goal):
             return true
+        if len(self.st.facts) + len(self.defs) > NEAR_MIN:
+            let near = self.near(goal)
+            return prove_work(near, goal, self.ranges, ref self.work) == PROVED
         var all = self.st.facts
         all.extend(self.defs)
-        if len(all) > NEAR_MIN:
-            all = near_facts(all, goal)
         return prove_work(all, goal, self.ranges, ref self.work) == PROVED
 
     # `f` follows from the ranges of its values alone (interval arithmetic).
@@ -1908,6 +2002,7 @@ struct Vf:
         self.assume(extra)
         let r = self.holds(goal)
         if self.live:
+            self.touch(n)
             self.st.facts = self.st.facts[:n]
         return r
 
@@ -2145,9 +2240,10 @@ struct Vf:
 
     fn end_assume(ref self, saved: (Option[St], int)):
         if self.live:
+            self.touch(saved.1)
             self.st.facts = self.st.facts[:saved.1]
         else:
-            self.put(saved.0)
+            self.put_at(saved.0, saved.1)
 
     # ------------------------------------------------------------ display
     fn atom_name(self, a: int) -> str:
@@ -2873,7 +2969,7 @@ struct Vf:
                     case _:
                         pass
             case StmtKind.If(branches, els):
-                self.if_chain(branches, els)
+                self.if_chain(branches, 0, els)
             case StmtKind.Match(scrut, cases):
                 self.match_stmt(scrut, cases)
             case StmtKind.While(cond, invariants, body):
@@ -2948,14 +3044,29 @@ struct Vf:
             return a0
         let a = a0.unwrap()
         let b = b0.unwrap()
-        let n0 = len(self.atom_names)
-        let (env, ea, eb, hull) = self.merge_env(a.env, b.env)
         let k = min(k0, min(len(a.facts), len(b.facts)))
+        let (env, add) = self.meet_paths(a.env, a.facts[k:], b.env, b.facts[k:])
         var facts = a.facts[:k]
-        var fa = a.facts[k:]
+        facts.extend(add)
+        return Some(St(env=env, facts=facts))
+
+    # Two paths that share the facts before some point meet: from their
+    # environments and the facts each learned since, the environment there
+    # and the facts to add to the shared ones.
+    fn meet_paths(
+        ref self,
+        ea_env: {int: V},
+        fa0: [F],
+        eb_env: {int: V},
+        fb0: [F]
+    ) -> ({int: V}, [F]):
+        let n0 = len(self.atom_names)
+        let (env, ea, eb, hull) = self.merge_env(ea_env, eb_env)
+        var fa = fa0
         fa.extend(ea)
-        var fb = b.facts[k:]
+        var fb = fb0
         fb.extend(eb)
+        var facts: [F] = []
         let both = F.or_([F.and_(fa), F.and_(fb)])
         if both.size() <= MERGE_MAX:
             facts.push(both)
@@ -2966,7 +3077,47 @@ struct Vf:
                     facts.push(f)
             self.drop_from(n0)
         facts.extend(hull)
-        return Some(St(env=env, facts=facts))
+        return (env, facts)
+
+    # Branches run in place, on the facts they share. `cut` takes the current
+    # path off (None where it can't run) as its environment and the facts it
+    # learned since there were `k`; the state keeps the facts before `k` for
+    # the next branch (`resume`) and where they meet (`meet`). Copying all the
+    # facts for every branch made a long function quadratic.
+    fn cut(ref self, k: int) -> Option[St]:
+        let live = self.live
+        self.live = false
+        let env = self.st.env
+        var tail: [F] = []
+        if len(self.st.facts) > k:
+            self.touch(k)
+            tail = self.st.facts[k:]
+            while len(self.st.facts) > k:
+                self.st.facts.pop()
+        if not live:
+            return None
+        return Some(St(env=env, facts=tail))
+
+    # Continue on path `p` (from `cut` or `meet`), after the facts kept.
+    fn resume(ref self, p: Option[St]):
+        match p:
+            case Some(x):
+                self.st.env = x.env
+                self.st.facts.extend(x.facts)
+                self.live = true
+            case None:
+                self.live = false
+
+    # Where paths `a0` and `b0` (from `cut`) meet.
+    fn meet(ref self, a0: Option[St], b0: Option[St]) -> Option[St]:
+        if a0.is_none():
+            return b0
+        if b0.is_none():
+            return a0
+        let a = a0.unwrap()
+        let b = b0.unwrap()
+        let (env, add) = self.meet_paths(a.env, a.facts, b.env, b.facts)
+        return Some(St(env=env, facts=add))
 
     fn has_dropped(self, v: V) -> bool:
         if len(self.dropped) == 0:
@@ -3189,7 +3340,7 @@ struct Vf:
                 if ng != F.True:
                     other.facts.push(ng)
                 let joined = self.join(fk, s1, guard, Some(other), ng)
-                self.put(joined)
+                self.put_at(joined, fk.k)
                 return v
             case None:
                 let s = self.begin_assume(guard)
@@ -3197,73 +3348,70 @@ struct Vf:
                 self.end_assume(s)
                 return v
 
-    fn if_chain(ref self, branches: [(Expr, Block)], els: Option[Block]):
-        let c = self.cond(branches[0].0)
-        let base0 = self.take()
-        if base0.is_none():
+    # Branch `i` on (an index, not a slice: the rest of a long `elif` chain
+    # copied at every level took memory quadratic in its length).
+    fn if_chain(ref self, branches: [(Expr, Block)], i: int, els: Option[Block]):
+        let c = self.cond(branches[i].0)
+        if not self.live:
             return
-        let base = base0.unwrap()
-        let k = len(base.facts)
-        var t = base
+        let k = len(self.st.facts)
+        let env0 = self.st.env
         if c != F.True:
-            t.facts.push(c)
-        self.put(Some(t))
-        self.block(branches[0].1)
-        let s1 = self.take()
-        var e = base
+            self.st.facts.push(c)
+        self.block(branches[i].1)
+        let s1 = self.cut(k)
+        self.resume(Some(St(env=env0, facts=[])))
         let nc = c.not_()
         if nc != F.True:
-            e.facts.push(nc)
-        self.put(Some(e))
-        if len(branches) > 1:
-            self.if_chain(branches[1:], els)
+            self.st.facts.push(nc)
+        if i + 1 < len(branches):
+            self.if_chain(branches, i + 1, els)
         else:
             match els:
                 case Some(b):
                     self.block(b)
                 case None:
                     pass
-        let s2 = self.take()
-        let m = self.merge(s1, s2, k)
-        self.put(m)
+        let s2 = self.cut(k)
+        self.resume(self.meet(s1, s2))
 
     # Cases are tried in order: each case sees the facts of its own pattern and
     # (when expressible) that the earlier patterns didn't match.
     fn match_stmt(ref self, scrut: Expr, cases: [Case]):
         let sv = self.eval(scrut)
-        let base0 = self.take()
-        if base0.is_none():
+        if not self.live:
             return
-        var cur = base0.unwrap()
-        let k = len(cur.facts)
+        let k = len(self.st.facts)
+        # the path where no case so far matched, and the paths after the
+        # cases (both as `cut` makes them)
+        var cur = self.cut(k).unwrap()
         var out: Option[St] = None
         for c in cases:
             let hit = self.pat_cond(c.pat, sv)
-            var t = cur
+            self.resume(Some(cur))
             match hit:
                 case Some(h):
                     if h != F.True:
-                        t.facts.push(h)
+                        self.st.facts.push(h)
                 case None:
                     pass
-            self.put(Some(t))
             self.bind_pattern(c.pat, sv, scrut.ty)
             var gcond = F.True
-            # the state after a guard that changes something
+            # the path after a guard that changes something
             var after_guard: Option[St] = None
             match c.guard:
                 case Some(g):
                     var gm: {int: int} = {}
                     mods_expr(g, self.info, ref gm)
                     gcond = self.cond(g)
-                    if len(gm) > 0:
-                        after_guard = self.cur()
+                    if len(gm) > 0 and self.live:
+                        after_guard = Some(St(env=self.st.env, facts=self.st.facts[k:]))
                     self.assume(gcond)
                 case None:
                     pass
             self.block(c.body)
-            let s = self.take()
-            out = self.merge(out, s, k)
+            let s = self.cut(k)
+            out = self.meet(out, s)
             # later cases run only if this one didn't match
             match after_guard:
                 case Some(ag0):
@@ -3281,7 +3429,7 @@ struct Vf:
                     let ng = gcond.not_()
                     if ng != F.True:
                         ag.facts.push(ng)
-                    match self.merge(Some(miss), Some(ag), len(cur.facts)):
+                    match self.meet_at(miss, ag, len(cur.facts)):
                         case Some(m):
                             cur = m
                         case None:
@@ -3294,7 +3442,15 @@ struct Vf:
                                 cur.facts.push(n)
                         case None:
                             pass
-        self.put(out)
+        self.resume(out)
+
+    # `meet` of two paths that also share their first `k` facts.
+    fn meet_at(ref self, a: St, b: St, k0: int) -> Option[St]:
+        let k = min(k0, min(len(a.facts), len(b.facts)))
+        let (env, add) = self.meet_paths(a.env, a.facts[k:], b.env, b.facts[k:])
+        var facts = a.facts[:k]
+        facts.extend(add)
+        return Some(St(env=env, facts=facts))
 
     # Exact condition for `p` matching `v`, when it can be expressed.
     fn pat_cond(ref self, p: Pattern, v: V) -> Option[F]:
@@ -3633,7 +3789,7 @@ struct Vf:
         exit.facts.push(c.not_())
         var b = head
         b.facts.push(c)
-        self.put(Some(b))
+        self.put_at(Some(b), len(head.facts))
         self.loops.push(LoopCx(invs=invs, next=None, breaks=[], asc=None, asc_ok=false))
         self.block(body)
         let end = body.stmts[len(body.stmts) - 1].span if len(body.stmts) > 0 else body.span
@@ -3642,7 +3798,7 @@ struct Vf:
         var out: Option[St] = Some(exit)
         for br in cx.breaks:
             out = self.merge(out, Some(br), k)
-        self.put(out)
+        self.put_at(out, k)
 
     # `range(a, b, s)`: `s != 0`; `counted`: its elements are counted in an
     # int (a comprehension or a `par for`), so there can't be more than 2^63 - 1.
@@ -3926,7 +4082,7 @@ struct Vf:
         self.check_preserved(end)
         let cx = self.loops.pop()
         # after the loop
-        self.put(head)
+        self.put_at(head, k)
         var out: Option[St] = None
         if len(invs) == 0:
             out = self.take()
@@ -3977,7 +4133,7 @@ struct Vf:
                 pass
         for br in cx.breaks:
             out = self.merge(out, Some(br), k)
-        self.put(out)
+        self.put_at(out, k)
 
     # ------------------------------------------------------------ lvalues
     # `insert`: `e` is assigned with `=`, so if it's `m[k]` the key needn't exist.
@@ -4870,7 +5026,7 @@ struct Vf:
                     let saved = self.cur()
                     self.check_own_inv(e.span)
                     self.check_ensures(None, e.span)
-                    self.put(saved)
+                    self.put_at(saved, len(saved.unwrap().facts))
                 # an `Option` the prover models (`found`): it was `Some`
                 match (x.ty, xv):
                     case (Ty.Enum(eid), V.Agg(parts)):
@@ -4991,7 +5147,7 @@ struct Vf:
                     if ng != F.True:
                         other.facts.push(ng)
                     let joined = self.join(fk, s1, g, Some(other), ng)
-                    self.put(joined)
+                    self.put_at(joined, fk.k)
                 return V.Bool(F.and_(fs))
             case ExprKind.IfElse(cond, then, els):
                 let c = self.cond(cond)
@@ -5004,11 +5160,11 @@ struct Vf:
                         var other = fk.base
                         if nc != F.True:
                             other.facts.push(nc)
-                        self.put(Some(other))
+                        self.put_at(Some(other), fk.k)
                         let b = self.eval(els)
                         let s2 = self.take()
                         let joined = self.join(fk, s1, c, s2, nc)
-                        self.put(joined)
+                        self.put_at(joined, fk.k)
                         return self.ite(c, a, b, e.ty, self.name_of(e))
                     case None:
                         let s1 = self.begin_assume(c)
@@ -5749,7 +5905,7 @@ struct Vf:
                 self.eval(c.body)
         self.end_assume(s)
         if len(effs) > 0 and head.is_some():
-            self.put(head)
+            self.put_at(head, len(head.unwrap().facts))
         match count:
             case Some(n):
                 if c.filter.is_none():
