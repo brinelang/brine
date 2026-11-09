@@ -1708,9 +1708,52 @@ struct Vf:
         let s = self.sel(c, i, ety)
         match val_eq(s, v):
             case Some(f):
-                self.defs.push(f)
+                self.define(s, [v], f)
             case None:
                 pass
+
+    # Fact `f` says what `nv`, a value just made, is: one of `vs`. It is a
+    # fact of the whole function only when the ranges of `nv`'s atoms allow
+    # every value of `vs`: then it says nothing about older values. Else
+    # (`x * 2` stored as a `u8`) it holds only where the values were made and
+    # checked: a fact of this path, which a sibling path, or an arm that
+    # can't run, must not see, or it would prove anything there. In a
+    # specification, whose arithmetic isn't checked, not even that.
+    fn define(ref self, nv: V, vs: [V], f: F):
+        if all(self.covers(nv, v) for v in vs):
+            self.defs.push(f)
+        elif not self.spec:
+            self.assume(f)
+
+    # The ranges of `nv`'s atoms allow every value of `v` (by their ranges).
+    fn covers(self, nv: V, v: V) -> bool:
+        match (nv, v):
+            case (V.Int(a), V.Int(b)):
+                return self.lin_covers(a, b)
+            case (V.Arr(_, a), V.Arr(_, b)):
+                return self.lin_covers(a, b)
+            case (V.Str(a, _), V.Str(b, _)):
+                return self.lin_covers(a, b)
+            case (V.Flt(a, _, _, _, _), V.Flt(b, _, _, _, _)):
+                return self.lin_covers(a, b)
+            case (V.Bool(_), V.Bool(_)):
+                return true
+            case (V.Agg(xs), V.Agg(ys)):
+                if len(xs) != len(ys):
+                    return false
+                for i in 0..len(xs):
+                    if not self.covers(xs[i], ys[i]):
+                        return false
+                return true
+            case _:
+                return false
+
+    fn lin_covers(self, a: Lin, b: Lin) -> bool:
+        let ra = self.range_of(a)
+        let rb = self.range_of(b)
+        let lo_ok = ra.0.is_none() or (rb.0.is_some() and rb.0.unwrap() >= ra.0.unwrap())
+        let hi_ok = ra.1.is_none() or (rb.1.is_some() and rb.1.unwrap() <= ra.1.unwrap())
+        return lo_ok and hi_ok
 
     # ------------------------------------------------------------ facts and proofs
     fn assume(ref self, f: F):
@@ -2914,6 +2957,8 @@ struct Vf:
                         let hi = min(r.1, max(xh, yh))
                         if lo <= hi:
                             self.ranges[a] = Some((lo, hi))
+                    case (None, Some(xl), Some(xh), Some(yl), Some(yh)):
+                        self.ranges[a] = Some((min(xl, yl), max(xh, yh)))
                     case _:
                         pass
             case _:
@@ -5316,10 +5361,15 @@ struct Vf:
             case _:
                 pass
         let r = self.fresh_val(ty, name)
+        # In a specification, whose arithmetic isn't checked, `r` is only
+        # what its definition says, not a value of its type.
+        if self.spec:
+            for at in range_atoms(r):
+                self.ranges[at] = None
         self.range_hull(r, a, b)
         match (val_eq(r, a), val_eq(r, b)):
             case (Some(fa), Some(fb)):
-                self.defs.push(F.or_([F.and_([c, fa]), F.and_([c.not_(), fb])]))
+                self.define(r, [a, b], F.or_([F.and_([c, fa]), F.and_([c.not_(), fb])]))
             case _:
                 pass
         # the range of both, which products and bit operations use
@@ -5465,14 +5515,17 @@ struct Vf:
                 match span:
                     case Some(sp):
                         let ne = F.le(a, b) if inclusive else F.lt(a, b)
-                        self.defs.push(
-                            F.or_([F.and_([ne, F.equal(n, sp)]), F.and_([ne.not_(), F.eq(n)])])
-                        )
-                        # its elements are counted, in an int
+                        # its elements are counted, in an int (checked
+                        # first: the count's range would prove it)
                         self.kept(
                             c.iter.span,
                             F.or_([ne.not_(), F.le(sp, Lin.konst(I64_BOUND))]),
                             "range size check"
+                        )
+                        self.define(
+                            V.Int(n),
+                            [V.Int(sp), V.Int(Lin.konst(0))],
+                            F.or_([F.and_([ne, F.equal(n, sp)]), F.and_([ne.not_(), F.eq(n)])])
                         )
                     case None:
                         pass
@@ -6632,18 +6685,11 @@ fn val_eq(a: V, b: V) -> Option[F]:
             return Some(F.equal(x, y))
         case (V.Str(x, _), V.Str(y, _)):
             return Some(F.equal(x, y))
-        case (V.Flt(x, nx, bx, ax, gx), V.Flt(y, ny, by, ay, gy)):
-            return Some(
-                F.and_(
-                    [
-                        F.equal(x, y),
-                        F.equal(bx, by),
-                        F.equal(ax, ay),
-                        bool_eq(nx, ny),
-                        bool_eq(gx, gy)
-                    ]
-                )
-            )
+        # the value, its NaN and its sign, not the bounds comparisons use:
+        # those of `float(n)` and of a value just made differ, and equating
+        # them would be false
+        case (V.Flt(x, nx, _, _, gx), V.Flt(y, ny, _, _, gy)):
+            return Some(F.and_([F.equal(x, y), bool_eq(nx, ny), bool_eq(gx, gy)]))
         case (V.Agg(xs), V.Agg(ys)):
             if len(xs) != len(ys):
                 return None
@@ -7172,6 +7218,32 @@ fn fresh_atoms(v: V) -> [int]:
         case _:
             pass
     return []
+
+# The atoms with a range a value just made (`fresh_val`) is made of.
+fn range_atoms(v: V) -> [int]:
+    var out: [int] = []
+    var l: Option[Lin] = None
+    match v:
+        case V.Int(x):
+            l = Some(x)
+        case V.Arr(_, x):
+            l = Some(x)
+        case V.Str(x, _):
+            l = Some(x)
+        case V.Flt(x, _, _, _, _):
+            l = Some(x)
+        case V.Agg(vs):
+            for x in vs:
+                out.extend(range_atoms(x))
+        case _:
+            pass
+    match l:
+        case Some(x):
+            if len(x.t) == 1 and x.c == 0 and x.t[0].1 == 1:
+                out.push(x.t[0].0)
+        case None:
+            pass
+    return out
 
 # Facts that hold on both paths of a merge, for a value `nv` that is `va` on
 # one and `vb` on the other: when they differ by a constant, `nv` is between
