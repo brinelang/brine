@@ -436,11 +436,13 @@ static void br_stack_leave(void) {
 
 #ifndef BRINE_RT_BR
 static void br_world_finish(const char *how);
+static void br_exit_record(int64_t code);
 #endif
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_exit(int64_t code) {
     br_flush();
     br_gpu_settle();
+    if (code != 0) br_exit_record(code);
     /* like returning from `main`: every rank waits for the others */
     br_world_finish("it called `exit`");
     br_flush();
@@ -5006,6 +5008,18 @@ static br_msg *br_recv(int64_t src, int64_t kind, const char *loc) {
     return m;
 }
 
+/* `brine run` stops the other ranks when one fails; a rank in `exit` waits
+   for them first, so it says so in the file BRINE_EXIT_FILE named */
+static char *br_exit_file;
+
+static void br_exit_record(int64_t code) {
+    if (!br_exit_file || br_size <= 1) return;
+    FILE *f = fopen(br_exit_file, "wb");
+    if (!f) return;
+    fprintf(f, "%lld", (long long)code);
+    fclose(f);
+}
+
 #ifdef BR_WASM
 static void br_world_init(void) {
     const char *es = getenv("BRINE_WORLD_SIZE");
@@ -5125,6 +5139,11 @@ static void br_world_init(void) {
     br_unsetenv("BRINE_RANK");
     br_unsetenv("BRINE_WORLD_SIZE");
     br_unsetenv("BRINE_PEERS");
+    const char *ef = getenv("BRINE_EXIT_FILE");
+    if (ef) {
+        if (size > 1) br_exit_file = strdup(ef);
+        br_unsetenv("BRINE_EXIT_FILE");
+    }
     if (size <= 1) {
         br_size = 1;
         br_rank = 0;

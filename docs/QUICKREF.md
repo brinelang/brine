@@ -656,8 +656,9 @@ Message types: integers and floats of any width (`[u8]` travels as bytes), `bool
 `str`, and arrays of those (`[[float]]`, ...). A float `sum` adds the ranks'
 values in a fixed tree: the same result on every rank and every run.
 Run with `brine run --ranks N` (each rank gets cores / N `par` threads unless
-`--threads` says otherwise). Without it, `world.size() == 1`. If a rank fails,
-`brine run` stops the others and exits with that rank's exit code.
+`--threads` says otherwise). Without it, `world.size() == 1`. If a rank fails
+(it panics, or calls `exit` with a code other than 0), `brine run` stops the
+others and exits with that rank's exit code.
 
 Across machines, start the built program once per rank yourself, with three
 environment variables (what `--ranks` sets for local ranks):
