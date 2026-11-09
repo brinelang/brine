@@ -7316,6 +7316,19 @@ int64_t brine_os_thread_count(void) { return br_threads(); }
 void brine_os_sleep(double seconds) {
     if (!(seconds > 0)) return;
 #ifdef _WIN32
+    /* Sleep wakes on the next 15.6 ms tick; a high-resolution timer
+       (Windows 10 1803 and later) within about half a millisecond */
+    HANDLE t = CreateWaitableTimerExW(NULL, NULL, 0x2, 0x1F0003);
+    if (t) {
+        double s = seconds > 9e11 ? 9e11 : seconds;
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(s * 1e7);
+        if (due.QuadPart > -1) due.QuadPart = -1;
+        BOOL ok = SetWaitableTimer(t, &due, 0, NULL, NULL, FALSE);
+        if (ok) WaitForSingleObject(t, INFINITE);
+        CloseHandle(t);
+        if (ok) return;
+    }
     double ms = ceil(seconds * 1000.0);
     while (ms > 0) {
         DWORD part = ms > 4000000000.0 ? 4000000000u : (DWORD)ms;
