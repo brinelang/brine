@@ -1,0 +1,592 @@
+from diag import Span, Diag
+
+# What brine writes for the names of other languages (Python, Rust, Go, JS):
+# unknown functions, modules and methods. Each entry is a help, and a fix
+# only where the replacement always checks.
+#
+# In the texts, `{r}` is the receiver as written, `{a0}`, `{a1}` the
+# arguments and `{zero}` a value of the element type; `fill` puts them in.
+
+# A help, and the text that replaces the whole call (`whole`) or only the
+# method's name; `fix` is "" when there is none.
+struct Foreign:
+    help: str
+    fix: str
+    whole: bool
+
+fn help_only(h: str) -> Option[Foreign]:
+    return Some(Foreign(help=h, fix="", whole=false))
+
+fn rename(to: str) -> Option[Foreign]:
+    return Some(Foreign(help=f"use `{to}`", fix=to, whole=false))
+
+fn rewrite(h: str, to: str) -> Option[Foreign]:
+    return Some(Foreign(help=h, fix=to, whole=true))
+
+# `t` with `{r}`, `{a0}`, `{a1}` and `{zero}` put in; "" when one of them is
+# needed but unknown (`r`, `args` or `zero` is "")
+fn fill(t: str, r: str, args: [str], zero: str) -> str:
+    var out = t
+    let names = [("{r}", r), ("{zero}", zero)]
+    for n, v in names:
+        if n in out:
+            if v == "":
+                return ""
+            out = out.replace(n, v)
+    if "{go}" in out:
+        let g = go_format(args)
+        if g == "":
+            return ""
+        out = out.replace("{go}", g)
+    for i in 0..2:
+        let n = "{a" + str(i) + "}"
+        if n in out:
+            if i >= len(args) or args[i] == "":
+                return ""
+            out = out.replace(n, args[i])
+    return out
+
+# A function or value that isn't defined: `set()`, `zip(a, b)`, `sys`, `fmt`.
+fn foreign_name(name: str) -> Option[Foreign]:
+    match name:
+        case "set" | "frozenset" | "HashSet" | "BTreeSet":
+            return help_only(
+                "brine has no sets: use a map to `bool`, `var seen: {int: bool} = {}`, with `seen[x] = true` and `x in seen`"
+            )
+        case "zip":
+            return help_only(
+                "loop over the indexes: `for i in 0..min(len({a0}), len({a1})):` and use `{a0}[i]` and `{a1}[i]`"
+            )
+        case "isinstance" | "type" | "typeof" | "instanceof":
+            return help_only(
+                "every value's type is known when compiling, so there is nothing to test; for a value of one of several kinds, use an `enum` and `match` on its variants"
+            )
+        case "append":
+            # `xs = append(xs, x)` is the usual shape, so no fix: `push` returns nothing
+            return help_only(
+                "write `{a0}.push({a1})` on a line of its own: it changes `{a0}` in place (`xs = append(xs, x)` becomes `xs.push(x)`)"
+            )
+        case "make":
+            return help_only(
+                "`make([]int, n)` is `[0] * n` (any first value), an empty array is `var xs: [int] = []` and an empty map `var m: {str: int} = {}`"
+            )
+        case "list" | "Vec" | "vec" | "Array":
+            return help_only(
+                "arrays are values: `let ys = xs` is a copy; `s.chars()` gives a string's characters, `m.keys()` a map's keys, and an empty array is `var xs: [int] = []`"
+            )
+        case "dict" | "HashMap" | "BTreeMap" | "Map" | "defaultdict" | "OrderedDict":
+            return help_only(
+                "a map is written `{\"a\": 1}`; an empty one needs its type: `var m: {str: int} = {}`; a missing key is handled with `m.get(k, 0)`"
+            )
+        case "Counter":
+            return help_only(
+                "count with a map: `var counts: {str: int} = {}`, then `counts[w] = counts.get(w, 0) + 1`"
+            )
+        case "tuple":
+            return help_only("a tuple is written `(a, b)`")
+        case "String":
+            return help_only("a string literal is already a `str`; `str(x)` converts any value")
+        case "open" | "fopen":
+            return help_only(
+                "read a file with `read_file(path)` (a `Result[str, str]`) and write one with `write_file(path, text)`; nothing needs opening or closing"
+            )
+        case "reversed":
+            return help_only("reverse a copy: `var ys = {a0}`, then `ys.reverse()`")
+        case "hex" | "bin" | "oct":
+            return help_only("format with an f-string: `f\"{n:x}\"` (hex) or `f\"{n:b}\"` (binary)")
+        case "repr":
+            return rewrite("use `str({a0})`", "str({a0})")
+        case "next" | "iter":
+            return help_only("brine has no iterators: loop with `for x in xs:`, or index the array")
+        case "divmod":
+            return rewrite("write `({a0} / {a1}, {a0} % {a1})`", "({a0} / {a1}, {a0} % {a1})")
+        case "quit":
+            return help_only("use `exit(0)`")
+        case "assert_eq":
+            return rewrite("write `assert {a0} == {a1}`", "assert {a0} == {a1}")
+        case "ValueError" | "Exception" | "TypeError" | "KeyError" | "IndexError" | "RuntimeError" | "Error":
+            return help_only(
+                "brine has no exceptions: return `Err(\"...\")` from a function that returns `Result[T, str]`, or stop with `panic(\"...\")`"
+            )
+        case "this":
+            return help_only("a method's receiver is `self`, declared as its first parameter")
+        case "undefined":
+            return help_only("brine has no null value; every variable holds a real value")
+        case "str" | "int" | "float" | "bool":
+            return help_only(
+                f"`{name}` is a type; convert a value by calling it, `{name}(x)`, and every element with `[{name}(x) for x in xs]`"
+            )
+        case "math" | "Math":
+            return help_only(
+                "the math functions are built in, with no module: `sqrt(x)`, `floor(x)`, `pow(x, y)`, `sin(x)`, `log(x)`, `abs(x)`, `min(a, b)`"
+            )
+        case _:
+            match module_help(name):
+                case Some(h):
+                    return help_only(h)
+                case None:
+                    return None
+
+# `name` as a module of another language: what brine has instead
+fn module_help(name: str) -> Option[str]:
+    match name:
+        case "sys":
+            return Some(
+                "brine has no `sys` module: `args()` is `sys.argv[1:]`, `exit(n)` is `sys.exit(n)`, `read_line()` reads standard input"
+            )
+        case "fmt":
+            return Some(
+                "brine has no `fmt` package: `print(a, b)` prints, and an f-string formats: `f\"n={n}\"`"
+            )
+        case "strconv":
+            return Some(
+                "brine has no `strconv` package: `s.to_int()` parses (an `Option[int]`) and `str(n)` formats"
+            )
+        case "strings":
+            return Some(
+                "brine has no `strings` package: the functions are methods of `str`, such as `s.split(\",\")`, `s.strip()`, `s.contains(t)`, `\", \".join(xs)`"
+            )
+        case "re" | "regexp" | "Regex":
+            return Some(
+                "brine has no regular expressions: use `find`, `split`, `starts_with`, `replace` or a loop over the string"
+            )
+        case "json" | "JSON":
+            return Some(
+                "brine has no JSON module: build the text with an f-string, and parse it with `split` and `find`"
+            )
+        case "time":
+            return Some(
+                "brine has no `time` module: `clock()` gives seconds as a `float`, and `os.sleep(s)` waits"
+            )
+        case "random" | "rand":
+            return Some(
+                "brine has no random numbers built in: write a small generator, such as an xorshift on a `u64`"
+            )
+        case "collections":
+            return Some(
+                "brine has no `collections` module: count with a map (`counts[k] = counts.get(k, 0) + 1`), and use an array as a stack or queue"
+            )
+        case "itertools" | "functools":
+            return Some(
+                f"brine has no `{name}` module: write the loop, or a comprehension `[f(x) for x in xs]`"
+            )
+        case "io" | "bufio" | "std":
+            return Some(
+                "there is no standard library to import: `print`, `read_line()`, `read_file`, `write_file` and `args()` are built in (`brine guide` lists them)"
+            )
+        case "subprocess":
+            return Some(
+                "run a program with `os.spawn(cmd, env, capture_out, capture_err)`, then `os.wait(h)`"
+            )
+        case "pathlib":
+            return Some(
+                "paths are strings: join them with `+ \"/\" +`, and test them with `os.is_file(p)`, `os.is_dir(p)`"
+            )
+        case "typing":
+            return Some(
+                "brine needs no `typing` import: write `Option[int]`, `[int]`, `{str: int}`, `(int, str)` directly"
+            )
+        case "console":
+            return Some("use `print(...)`")
+        case _:
+            return None
+
+# `module.member` where `module` isn't defined: `sys.argv`, `fmt.Println`.
+fn foreign_member(module: str, member: str) -> Option[Foreign]:
+    match module:
+        case "sys":
+            match member:
+                case "argv":
+                    return help_only(
+                        "use `args()`: the command-line arguments without the program's name, like `sys.argv[1:]`"
+                    )
+                case "exit":
+                    return rewrite("use `exit({a0})`", "exit({a0})")
+                case "stdin":
+                    return help_only(
+                        "read standard input with `read_line()` (an `Option[str]`) or `read_stdin()` (all of it)"
+                    )
+                case _:
+                    pass
+        case "fmt":
+            match member:
+                case "Println":
+                    return rename("print")
+                case "Print":
+                    return help_only("use `print(..., end=\"\")`; `print` alone adds a line break")
+                case "Sprintf":
+                    return rewrite("use an f-string: `{go}`", "{go}")
+                case "Printf":
+                    return rewrite(
+                        "use `print` with an f-string: `print({go}, end=\"\")`",
+                        "print({go}, end=\"\")"
+                    )
+                case "Fprintf" | "Sprint" | "Sprintln":
+                    return help_only(
+                        "use an f-string: `f\"n={n}\"` (`{x:.2f}` for 2 decimals); `print` adds the line break"
+                    )
+                case "Errorf":
+                    return help_only(
+                        "return `Err(f\"...\")` from a function that returns `Result[T, str]`"
+                    )
+                case "Fprintln" | "Fprintf":
+                    return help_only("`eprint(...)` prints to stderr")
+                case _:
+                    pass
+        case "strconv":
+            match member:
+                case "Atoi" | "ParseInt":
+                    return help_only(
+                        "use `{a0}.to_int()`: an `Option[int]`, `None` if it isn't a number"
+                    )
+                case "ParseFloat":
+                    return help_only(
+                        "use `{a0}.to_float()`: an `Option[float]`, `None` if it isn't a number"
+                    )
+                case "Itoa" | "FormatInt" | "FormatFloat":
+                    return rewrite("use `str({a0})`", "str({a0})")
+                case _:
+                    pass
+        case "strings":
+            match member:
+                case "Split":
+                    return rewrite("use `{a0}.split({a1})`", "{a0}.split({a1})")
+                case "Join":
+                    return rewrite("use `{a1}.join({a0})`", "{a1}.join({a0})")
+                case "Contains":
+                    return rewrite("use `{a1} in {a0}`", "{a1} in {a0}")
+                case "TrimSpace":
+                    return rewrite("use `{a0}.strip()`", "{a0}.strip()")
+                case "ToUpper":
+                    return rewrite("use `{a0}.upper()`", "{a0}.upper()")
+                case "ToLower":
+                    return rewrite("use `{a0}.lower()`", "{a0}.lower()")
+                case "HasPrefix":
+                    return rewrite("use `{a0}.starts_with({a1})`", "{a0}.starts_with({a1})")
+                case "HasSuffix":
+                    return rewrite("use `{a0}.ends_with({a1})`", "{a0}.ends_with({a1})")
+                case "Fields":
+                    return rewrite("use `{a0}.split()`", "{a0}.split()")
+                case "Repeat":
+                    return rewrite("use `{a0}.repeat({a1})`", "{a0}.repeat({a1})")
+                case _:
+                    pass
+        case "math" | "Math":
+            match member:
+                case "sqrt" | "floor" | "ceil" | "exp" | "log" | "log2" | "log10" | "sin" | "cos" | "tan" | "fabs" | "abs" | "cbrt" | "atan":
+                    let f = "abs" if member == "fabs" else member
+                    return rewrite(f"use `{f}(x)`, built in", f + "({a0})")
+                case "Sqrt" | "Floor" | "Ceil" | "Abs" | "Exp" | "Log" | "Sin" | "Cos" | "Pow" | "Max" | "Min":
+                    return help_only(f"use `{member.lower()}(...)`, built in")
+                case "pow" | "atan2" | "hypot":
+                    return rewrite(f"use `{member}(x, y)`, built in", member + "({a0}, {a1})")
+                case "pi" | "PI" | "Pi":
+                    return help_only("write the constant: `const PI = 3.141592653589793`")
+                case "inf" | "Inf":
+                    return help_only("use `float(\"inf\")`")
+                case _:
+                    pass
+        case "time":
+            match member:
+                case "time" | "perf_counter" | "monotonic" | "Now":
+                    return rewrite("use `clock()`: seconds, as a `float`", "clock()")
+                case "sleep" | "Sleep":
+                    return help_only("use `os.sleep(seconds)`")
+                case _:
+                    pass
+        case _:
+            pass
+    match foreign_name(module):
+        case Some(f):
+            return help_only(f.help)
+        case None:
+            return None
+
+# A method that `kind` ("array", "map", "str", "option", "result", "int",
+# "float") doesn't have. `str_elems`: an array of strings.
+fn foreign_method(kind: str, name: str, nargs: int, str_elems: bool) -> Option[Foreign]:
+    match kind:
+        case "array":
+            match name:
+                case "join":
+                    if str_elems:
+                        return rewrite(
+                            "strings join an array: write `{a0}.join({r})`",
+                            "{a0}.join({r})"
+                        )
+                    return rewrite(
+                        "strings join an array of strings: write `{a0}.join([str(x) for x in {r}])`",
+                        "{a0}.join([str(x) for x in {r}])"
+                    )
+                case "is_empty" | "isEmpty" | "empty":
+                    return rewrite("write `len({r}) == 0`", "len({r}) == 0")
+                case "iter" | "into_iter" | "iter_mut" | "each" | "forEach" | "for_each":
+                    return help_only(
+                        "loop over the array itself, `for x in {r}:`; a comprehension builds a new one: `[f(x) for x in {r}]`"
+                    )
+                case "map" | "filter" | "collect" | "filter_map" | "flat_map":
+                    return help_only(
+                        "use a comprehension: `[f(x) for x in {r}]`, `[x for x in {r} if p(x)]`"
+                    )
+                case "copy" | "clone" | "to_vec" | "to_owned" | "slice":
+                    if nargs == 0:
+                        return rewrite(
+                            "arrays are values: `{r}` itself is a copy (made only when one of them changes)",
+                            "{r}"
+                        )
+                    return help_only("take a part with a slice: `{r}[a:b]`")
+                case "first":
+                    return help_only("index it: `{r}[0]`, after checking `len({r}) > 0`")
+                case "last":
+                    return help_only("index it: `{r}[len({r}) - 1]`, after checking `len({r}) > 0`")
+                case "get":
+                    return help_only("index it: `{r}[i]`, after checking `i < len({r})`")
+                case "sum":
+                    return rewrite("use `sum({r})`", "sum({r})")
+                case "min" | "max":
+                    return rewrite(f"use `{name}(x for x in {{r}})`", f"{name}(x for x in {{r}})")
+                case "sort_by" | "sort_by_key" | "sort_unstable_by":
+                    return help_only(
+                        "`sort()` orders by `<`: sort an array of `(key, value)` tuples, which compare key first"
+                    )
+                case "reversed" | "rev":
+                    return help_only("reverse a copy: `var ys = {r}`, then `ys.reverse()`")
+                case "includes":
+                    return rewrite("use `{a0} in {r}`", "{a0} in {r}")
+                case "indexOf" | "index_of" | "position":
+                    return rename("index")
+                case "concat":
+                    return rewrite("use `{r} + {a0}`", "{r} + {a0}")
+                case "dedup" | "unique":
+                    return help_only(
+                        "keep the first of each with a map: `var seen: {int: bool} = {}`, pushing `x` only when `x not in seen`"
+                    )
+                case "count":
+                    if nargs == 1:
+                        return help_only(
+                            "count with a comprehension: `len([y for y in {r} if y == {a0}])`"
+                        )
+                    return None
+                case _:
+                    return None
+        case "map":
+            match name:
+                case "update" | "extend" | "putAll":
+                    return help_only(
+                        "copy the entries in a loop: `for k, v in {a0}.items():` with `{r}[k] = v` in its body"
+                    )
+                case "setdefault" | "entry" | "or_insert":
+                    return help_only(
+                        "test the key first: `if k not in {r}:` then `{r}[k] = ...`; to count, `{r}[k] = {r}.get(k, 0) + 1`"
+                    )
+                case "is_empty" | "isEmpty":
+                    return rewrite("write `len({r}) == 0`", "len({r}) == 0")
+                case "clear":
+                    return help_only("assign an empty map: `{r} = {}`")
+                case "copy" | "clone":
+                    if nargs == 0:
+                        return rewrite(
+                            "maps are values: `{r}` itself is a copy (made only when one of them changes)",
+                            "{r}"
+                        )
+                    return None
+                case "get_or_default" | "getOrDefault" | "get_or":
+                    return rewrite("use `{r}.get({a0}, {a1})`", "{r}.get({a0}, {a1})")
+                case "iter" | "into_iter":
+                    return help_only("loop over the entries: `for k, v in {r}.items():`")
+                case "containsKey" | "contains_key" | "has_key" | "has" | "contains":
+                    return rewrite("use `{a0} in {r}`", "{a0} in {r}")
+                case _:
+                    return None
+        case "str":
+            match name:
+                case "push_str" | "push" | "append" | "concat" | "add":
+                    return help_only("strings are values: `s += t` makes the longer one")
+                case "into" | "to_owned" | "to_string" | "clone" | "as_str" | "copy" | "toString" | "String":
+                    if nargs == 0:
+                        return rewrite("it already is a `str`: drop the call", "{r}")
+                    return None
+                case "is_empty" | "isEmpty":
+                    return rewrite("write `{r} == \"\"`", "{r} == \"\"")
+                case "to_uppercase" | "toUpperCase" | "toupper":
+                    return rename("upper")
+                case "to_lowercase" | "toLowerCase" | "tolower":
+                    return rename("lower")
+                case "trimStart" | "trimLeft":
+                    return rename("lstrip")
+                case "trimEnd" | "trimRight":
+                    return rename("rstrip")
+                case "startsWith":
+                    return rename("starts_with")
+                case "endsWith":
+                    return rename("ends_with")
+                case "includes":
+                    return rename("contains")
+                case "indexOf" | "index_of":
+                    return rename("find")
+                case "split_whitespace" | "fields":
+                    return rename("split")
+                case "isnumeric" | "isdecimal":
+                    return rename("is_digit")
+                case "char_at" | "charAt" | "at":
+                    return help_only(
+                        "index it: `{r}[i]` is the byte at `i` as a one-byte string; `{r}.chars()` gives the characters"
+                    )
+                case "substring" | "substr" | "slice":
+                    return help_only("slice it: `{r}[a:b]` (byte offsets)")
+                case "parse" | "parseInt":
+                    return help_only("use `{r}.to_int()` (an `Option[int]`) or `{r}.to_float()`")
+                case "rev" | "reverse" | "reversed":
+                    return help_only(
+                        "reverse its characters: `var cs = {r}.chars()`, `cs.reverse()`, then `\"\".join(cs)`"
+                    )
+                case "removeprefix" | "strip_prefix" | "trim_start_matches":
+                    return help_only("`if {r}.starts_with(p):` then `{r}[len(p):]`")
+                case "removesuffix" | "strip_suffix" | "trim_end_matches":
+                    return help_only("`if {r}.ends_with(p):` then `{r}[:len({r}) - len(p)]`")
+                case "zfill" | "rjust" | "ljust" | "center" | "padStart" | "padEnd":
+                    return help_only(
+                        "pad with an f-string width: `f\"{x:>8}\"`, `f\"{x:<8}\"`, `f\"{n:08}\"`"
+                    )
+                case "encode" | "as_bytes":
+                    return rename("bytes")
+                case "isupper":
+                    return rewrite("write `{r} == {r}.upper()`", "{r} == {r}.upper()")
+                case "islower":
+                    return rewrite("write `{r} == {r}.lower()`", "{r} == {r}.lower()")
+                case "equals":
+                    return rewrite("write `{r} == {a0}`", "{r} == {a0}")
+                case "char_indices":
+                    return help_only(
+                        "loop with `for i, c in enumerate({r}.chars()):` (character positions, not bytes)"
+                    )
+                case _:
+                    return None
+        case "option":
+            match name:
+                case "unwrap_or_default":
+                    return rewrite("use `unwrap_or({zero})`", "{r}.unwrap_or({zero})")
+                case "expect":
+                    return help_only(
+                        "`unwrap()` stops with a generic message; for your own, `match` it with `case None: panic(\"...\")`"
+                    )
+                case "map" | "and_then" | "filter" | "ok_or" | "ok_or_else" | "is_some_and" | "is_none_or" | "map_or":
+                    return help_only(
+                        "use `match {r}:` with a `case Some(v):` line and a `case None:` line"
+                    )
+                case "unwrap_or_else":
+                    return help_only("use `unwrap_or(value)`, or `match` when the value takes work")
+                case "isPresent":
+                    return rename("is_some")
+                case "get":
+                    return rename("unwrap")
+                case _:
+                    return None
+        case "result":
+            match name:
+                case "unwrap_or_default":
+                    return rewrite("use `unwrap_or({zero})`", "{r}.unwrap_or({zero})")
+                case "expect":
+                    return help_only(
+                        "`unwrap()` stops with the error; for your own message, `match` it with `case Err(e): panic(...)`"
+                    )
+                case "map" | "map_err" | "and_then" | "or_else" | "err" | "is_ok_and":
+                    return help_only(
+                        "use `match {r}:` with a `case Ok(v):` line and a `case Err(e):` line"
+                    )
+                case _:
+                    return None
+        case "int" | "float":
+            match name:
+                case "to_float" | "as_f64" | "to_f64":
+                    return rewrite("use `float({r})`", "float({r})")
+                case "to_int" | "as_i64" | "to_i64" | "as_int":
+                    return rewrite("use `int({r})`", "int({r})")
+                case "checked_add" | "checked_sub" | "checked_mul" | "saturating_add" | "saturating_sub":
+                    return help_only(
+                        "arithmetic stops the program on overflow; `wrapping_add` and the like wrap around"
+                    )
+                case "min" | "max":
+                    return rewrite(f"use `{name}({{r}}, {{a0}})`", f"{name}({{r}}, {{a0}})")
+                case "is_integer":
+                    return rewrite("write `{r} == floor({r})`", "{r} == floor({r})")
+                case _:
+                    return None
+        case _:
+            return None
+
+# `d` with the help of `f`, and its fix when every name it needs is known.
+# `r` is the receiver as written ("" if unknown, then `generic` stands in),
+# `args` the arguments; the fix replaces `call` (whole) or `name`.
+fn with_foreign(
+    d: Diag,
+    f: Foreign,
+    r: str,
+    generic: str,
+    args: [str],
+    zero: str,
+    name: Span,
+    call: Span
+) -> Diag:
+    var h = fill(f.help, r, args, zero)
+    if h == "":
+        var gs: [str] = []
+        for i in 0..2:
+            gs.push(args[i] if i < len(args) and args[i] != "" else ["a", "b"][i])
+        let t = f.help.replace("{go}", "f\"n={n}\"")
+        h = fill(t, r if r != "" else generic, gs, zero if zero != "" else "0")
+    var out = d.with_help(h)
+    if f.fix != "":
+        let rep = fill(f.fix, r, args, zero)
+        if rep != "":
+            out = out.fix(call if f.whole else name, rep, f"write `{rep}`")
+    return out
+
+# Go's `Sprintf("n=%d", n)` as an f-string, or "" when it can't be one.
+fn go_format(args: [str]) -> str:
+    if (
+        len(args) == 0
+        or len(args[0]) < 2
+        or not args[0].starts_with("\"")
+        or not args[0].ends_with("\"")
+    ):
+        return ""
+    let f = args[0][1:len(args[0]) - 1]
+    var out = ""
+    var k = 1
+    var i = 0
+    while i < len(f):
+        let c = f[i]
+        if c == "{" or c == "}":
+            out += c + c
+            i += 1
+            continue
+        if c != "%":
+            out += c
+            i += 1
+            continue
+        if i + 1 < len(f) and f[i + 1] == "%":
+            out += "%"
+            i += 2
+            continue
+        var j = i + 1
+        while j < len(f) and (f[j] == "." or f[j].is_digit()):
+            j += 1
+        # an argument with a quote can't go inside the f-string
+        if j >= len(f) or k >= len(args) or "\"" in args[k]:
+            return ""
+        let prec = f[i + 1:j]
+        let verb = f[j]
+        if (verb == "d" or verb == "s" or verb == "v") and prec == "":
+            out += "{" + args[k] + "}"
+        elif verb == "f" and prec == "":
+            out += "{" + args[k] + "}"
+        elif verb == "f" and prec.starts_with(".") and len(prec) > 1 and prec[1:].is_digit():
+            out += "{" + args[k] + ":" + prec + "f}"
+        else:
+            return ""
+        k += 1
+        i = j + 1
+    if k != len(args):
+        return ""
+    return "f\"" + out + "\""
