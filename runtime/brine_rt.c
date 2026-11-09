@@ -5978,12 +5978,20 @@ static int64_t br_flen(FILE *f) {
     return back != 0 ? -2 : n;
 }
 
+static int br_kind(const char *p);
+
 /* All of the file at `path` (malloc'd, in *buf and *len, the block's size
  * in *capp), or false with the message in *err. */
 static bool br_slurp(brine_str *path, char **buf, size_t *len, size_t *capp, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
         *err = br_strf("cannot read a path containing a NUL byte");
+        return false;
+    }
+    /* (Windows says "Permission denied", Linux opens it and fails to read) */
+    if (br_kind(p) == 2) {
+        *err = br_strf("cannot read %s: it is a directory, not a file", p);
+        free(p);
         return false;
     }
     FILE *f = br_open(p, "rb");
