@@ -6,21 +6,47 @@
 # prover, not by comparing text: each old and new clause becomes a small
 # function, added to the new program, that assumes one side and proves the
 # other. `a >= 0 and a < n` and `0 <= a < n` are the same spec.
-from ast import Program, FnDecl, Param
+#
+# Renaming must not be a way past it. An item that is gone from the new
+# version is paired with a new one and compared with it: a type or function
+# under the same name in another module (it moved), else one in the same module
+# (and of the same type, for a method) with the same body or fields, else the
+# only one with the same signature, else the only one added where it was the
+# only one removed. A changed signature is compared too: old parameter names
+# are matched to new ones by name, else by position. An item that can't be
+# paired and promised something (an `ensures` or an `invariant`) is weaker;
+# one that only had `requires` asked something of its callers, which are gone
+# too. A clause the prover can't be asked about (generic code, a name that is
+# gone, a new version that doesn't compile) counts as weaker when it could be.
+from ast import Program, FnDecl, Param, TypeExpr
 from diag import Span, Diag, SourceMap
 from lexer import lex, Tok
 from driver import Frontend, FrontOpts, Source
 from info import builtin_module
+import diag
 import driver
 from verify import split_ws
+
+# Where a finding points: `loc` for the terminal, `span` for `--json` (the
+# inside of a diagnostic's span object, diag.span_json), and the revision of a
+# place in the old version ("" in the new one).
+struct At:
+    loc: str
+    span: str
+    rev: str
 
 # The contracts of one function, as text.
 struct FnSpec:
     module: str
     # `S.f` for a method
     name: str
-    # parameters and return type, which the clauses' names refer to
-    sig: str
+    # the type a method belongs to, "" for a function
+    owner: str
+    short: str
+    # the parameters' names (`self` too) and types, and the return type
+    pnames: [str]
+    ptypes: [str]
+    ret: str
     generic: bool
     # the parameters of a generated function: a `ref` parameter `p` is `p` after
     # the call and `p__in` before it
@@ -28,18 +54,26 @@ struct FnSpec:
     refs: [str]
     requires: [str]
     ensures: [str]
-    loc: str
+    # the body, to recognize a renamed function
+    body: str
+    at: At
     # where each clause is
-    req_locs: [str]
-    ens_locs: [str]
+    req_at: [At]
+    ens_at: [At]
 
+# A struct's invariants (an enum is here too, with none, so that its methods
+# follow it when it is renamed).
 struct InvSpec:
     module: str
     name: str
+    # struct or enum: one is never paired with the other
+    kind: str
     generic: bool
+    # the fields or variants as text, to recognize a renamed type
+    shape: str
     invariants: [str]
-    loc: str
-    inv_locs: [str]
+    at: At
+    inv_at: [At]
 
 struct Specs:
     fns: [FnSpec]
@@ -47,15 +81,20 @@ struct Specs:
 
 # One change, in words.
 struct Finding:
-    # weakened, narrowed, widened, stronger, unknown, skipped, removed
+    # weakened, narrowed, widened, stronger, inv-weakened, inv-added, unknown,
+    # removed, inv-removed, renamed
     kind: str
     # a weaker promise: what `brine spec-diff` fails on
     bad: bool
     subject: str
     clause: str
-    loc: str
+    at: At
     # more to say: for a weaker `ensures`, what the function promises now
     note: str
+    # `unknown`: the kind it would have been, and why the prover wasn't asked;
+    # `renamed`: how the two were paired
+    was: str
+    why: str
 
     fn message(self) -> str:
         let s = self.subject
@@ -73,9 +112,21 @@ struct Finding:
         if self.kind == "inv-added":
             return f"`{s}` has a new invariant `{c}`"
         if self.kind == "unknown":
-            return f"`{c}` of `{s}` could not be compared: it doesn't check against the new code"
-        if self.kind == "skipped":
-            return f"the signature of `{s}` changed, so its specs were not compared"
+            if self.was == "weakened":
+                return f"`{s}` may no longer promise `{c}`: {self.why}"
+            if self.was == "narrowed":
+                return f"`{s}` may now require `{c}`: {self.why}"
+            if self.was == "inv-weakened":
+                return f"`{s}` may no longer keep `{c}`: {self.why}"
+            return f"`{c}` of `{s}` could not be compared: {self.why}"
+        if self.kind == "renamed":
+            if c == s:
+                return f"`{s}` moved {self.why}; its specs are compared with what they were"
+            return f"`{c}` is now `{s}` (paired by {self.why}); its specs are compared with `{c}`'s"
+        if self.kind == "removed" and c != "":
+            return f"`{s}` was removed, and with it its promise `{c}`"
+        if self.kind == "inv-removed":
+            return f"`{s}` was removed, and with it its invariant `{c}`"
         return f"`{s}` was removed"
 
 struct Outcome:
@@ -93,9 +144,19 @@ struct Query:
     assume: [str]
     goal: str
     finding: Finding
+    # why the prover can't be asked, or "" if it can
+    why: str
+
+# Why a question wasn't asked, after "may no longer promise `x`: ".
+const WHY_BROKEN = "it doesn't check against the new code"
+const WHY_ERRORS = "the new code has errors, so the prover could not compare the specs"
 
 fn text_of(sm: SourceMap, s: Span) -> str:
     return split_ws(sm.snippet(s))
+
+fn at(sm: SourceMap, s: Span, rev: str) -> At:
+    let loc = sm.loc(s)
+    return At(loc=rev + ":" + loc if rev != "" else loc, span=diag.span_json(sm, s), rev=rev)
 
 fn type_text(sm: SourceMap, p: Param, self_ty: str) -> str:
     match p.ty:
@@ -104,16 +165,18 @@ fn type_text(sm: SourceMap, p: Param, self_ty: str) -> str:
         case None:
             return self_ty
 
-fn fn_spec(sm: SourceMap, module: str, f: FnDecl, generic_owner: bool) -> FnSpec:
+fn fn_spec(sm: SourceMap, rev: str, module: str, f: FnDecl, generic_owner: bool) -> FnSpec:
     let owner = f.method_of.unwrap_or("")
     let name = owner + "." + f.name if owner != "" else f.name
-    var sig: [str] = []
+    var pnames: [str] = []
+    var ptypes: [str] = []
     var params: [str] = []
     var refs: [str] = []
     for p in f.params:
         let ty = type_text(sm, p, owner)
         let pre = "ref " if p.by_ref else ("mut " if p.mutable else "")
-        sig.push(pre + p.name + ": " + ty)
+        pnames.push(p.name)
+        ptypes.push(pre + ty)
         let n = "__self" if p.name == "self" else p.name
         if p.by_ref:
             params.push(n + "__in: " + ty)
@@ -129,18 +192,34 @@ fn fn_spec(sm: SourceMap, module: str, f: FnDecl, generic_owner: bool) -> FnSpec
     return FnSpec(
         module=module,
         name=name,
-        sig="(" + ", ".join(sig) + ") -> " + ret,
+        owner=owner,
+        short=f.name,
+        pnames=pnames,
+        ptypes=ptypes,
+        ret=ret,
         generic=generic_owner or len(f.tparams) > 0,
         params=params,
         refs=refs,
         requires=[text_of(sm, e.span) for e in f.requires],
         ensures=[text_of(sm, e.span) for e in f.ensures],
-        loc=sm.loc(f.name_span),
-        req_locs=[sm.loc(e.span) for e in f.requires],
-        ens_locs=[sm.loc(e.span) for e in f.ensures]
+        body=body_text(sm, f),
+        at=at(sm, f.name_span, rev),
+        req_at=[at(sm, e.span, rev) for e in f.requires],
+        ens_at=[at(sm, e.span, rev) for e in f.ensures]
     )
 
-fn specs_of(prog: Program, sm: SourceMap) -> Specs:
+# The statements, without the contract lines the block's span starts with.
+fn body_text(sm: SourceMap, f: FnDecl) -> str:
+    if len(f.body.stmts) == 0:
+        return ""
+    let s = f.body.span
+    return sm.snippet(Span(file=s.file, lo=f.body.stmts[0].span.lo, hi=s.hi))
+
+fn field_text(sm: SourceMap, name: str, ty: TypeExpr) -> str:
+    return name + ": " + text_of(sm, ty.span())
+
+# `rev`: the git revision these come from, "" for the files on disk.
+fn specs_of(prog: Program, sm: SourceMap, rev: str) -> Specs:
     var out = Specs(fns=[], invs=[])
     for m in prog.modules:
         if builtin_module(m.name):
@@ -152,22 +231,42 @@ fn specs_of(prog: Program, sm: SourceMap) -> Specs:
                 InvSpec(
                     module=m.name,
                     name=s.name,
+                    kind="struct",
                     generic=len(s.tparams) > 0,
+                    shape=", ".join([field_text(sm, f.name, f.ty) for f in s.fields]),
                     invariants=[text_of(sm, e.span) for e in s.invariants],
-                    loc=sm.loc(s.span),
-                    inv_locs=[sm.loc(e.span) for e in s.invariants]
+                    at=at(sm, s.span, rev),
+                    inv_at=[at(sm, e.span, rev) for e in s.invariants]
                 )
             )
         for e in m.enums:
             generic[e.name] = len(e.tparams) > 0
+            var vs: [str] = []
+            for v in e.variants:
+                vs.push(
+                    v.name + "(" + ", ".join([field_text(sm, f.name, f.ty) for f in v.fields]) + ")"
+                )
+            out.invs.push(
+                InvSpec(
+                    module=m.name,
+                    name=e.name,
+                    kind="enum",
+                    generic=len(e.tparams) > 0,
+                    shape=", ".join(vs),
+                    invariants=[],
+                    at=at(sm, e.span, rev),
+                    inv_at=[]
+                )
+            )
         for f in m.fns:
             let owner = f.method_of.unwrap_or("")
-            out.fns.push(fn_spec(sm, m.name, f, generic.get(owner).unwrap_or(false)))
+            out.fns.push(fn_spec(sm, rev, m.name, f, generic.get(owner).unwrap_or(false)))
     return out
 
-# A clause in the generated functions' names: `self` and `result` become
-# parameters, and before the call (`pre`) a `ref` parameter is its `__in` copy.
-fn rename(text: str, pre: bool, refs: [str]) -> str:
+# `text` with names outside a `.` replaced by `names`. For a generated function
+# (`gen`), `self` and `result` become parameters, and before the call (`pre`)
+# a `ref` parameter is its `__in` copy.
+fn rename(text: str, pre: bool, refs: [str], names: {str: str}, gen: bool) -> str:
     let (toks, ds) = lex(text, 0, 0, false, false)
     if len(ds) > 0:
         return text
@@ -178,13 +277,15 @@ fn rename(text: str, pre: bool, refs: [str]) -> str:
         match t.tok:
             case Tok.Ident(n):
                 if not after_dot:
-                    var m = n
-                    if n == "self":
-                        m = "__self"
-                    elif n == "result":
-                        m = "__result"
-                    if pre and n in refs:
-                        m = m + "__in"
+                    let b = names.get(n).unwrap_or(n)
+                    var m = b
+                    if gen:
+                        if b == "self":
+                            m = "__self"
+                        elif b == "result":
+                            m = "__result"
+                        if pre and b in refs:
+                            m = m + "__in"
                     if m != n:
                         out += text[at:t.lo] + m
                         at = t.hi
@@ -197,103 +298,341 @@ fn rename(text: str, pre: bool, refs: [str]) -> str:
                 after_dot = false
     return out + text[at:]
 
-fn finding(kind: str, bad: bool, subject: str, clause: str, loc: str) -> Finding:
-    return Finding(kind=kind, bad=bad, subject=subject, clause=clause, loc=loc, note="")
+# A clause of the old version in the new one's names.
+fn mapped(text: str, names: {str: str}) -> str:
+    return rename(text, false, [], names, false)
 
-# The questions that tell how `old` became `new` (same signature).
-fn fn_queries(old: FnSpec, new: FnSpec, ref qs: [Query]):
-    let pre0 = [rename(c, true, new.refs) for c in old.requires]
-    let pre1 = [rename(c, true, new.refs) for c in new.requires]
-    let post0 = [rename(c, false, new.refs) for c in old.ensures]
-    let post1 = [rename(c, false, new.refs) for c in new.ensures]
+# Code as its tokens, with names outside a `.` replaced: two bodies are the
+# same when these are, whatever their layout and comments.
+fn canon(text: str, names: {str: str}) -> str:
+    let (toks, ds) = lex(text, 0, 0, false, false)
+    if len(ds) > 0:
+        return split_ws(text)
+    var parts: [str] = []
+    var after_dot = false
+    for t in toks:
+        var s = text[t.lo:t.hi]
+        match t.tok:
+            case Tok.Ident(n):
+                if not after_dot:
+                    s = names.get(n).unwrap_or(n)
+            case _:
+                pass
+        match t.tok:
+            case Tok.Dot:
+                after_dot = true
+            case _:
+                after_dot = false
+        parts.push(s)
+    return " ".join(parts)
+
+fn finding(kind: str, bad: bool, subject: str, clause: str, where: At) -> Finding:
+    return Finding(
+        kind=kind,
+        bad=bad,
+        subject=subject,
+        clause=clause,
+        at=where,
+        note="",
+        was="",
+        why=""
+    )
+
+# The questions that tell how `old` became `new`. `names` puts the old
+# clauses in the new version's names; `why` says why the prover can't be asked.
+fn fn_queries(old: FnSpec, new: FnSpec, names: {str: str}, why: str, ref qs: [Query]):
+    let oreq = [mapped(c, names) for c in old.requires]
+    let oens = [mapped(c, names) for c in old.ensures]
+    let pre0 = [rename(c, true, new.refs, names, true) for c in old.requires]
+    let pre1 = [rename(c, true, new.refs, {}, true) for c in new.requires]
+    let post0 = [rename(c, false, new.refs, names, true) for c in old.ensures]
+    let post1 = [rename(c, false, new.refs, {}, true) for c in new.ensures]
     for i, c in enumerate(new.requires):
-        if c not in old.requires:
-            qs.push(query(new, pre0, pre1[i], "narrowed", true, c, new.req_locs[i]))
+        if c not in oreq:
+            qs.push(query(new, pre0, pre1[i], "narrowed", true, c, new.req_at[i], why))
     for i, c in enumerate(old.requires):
-        if c not in new.requires:
-            qs.push(query(new, pre1, pre0[i], "widened", false, c, new.loc))
+        if oreq[i] not in new.requires:
+            qs.push(query(new, pre1, pre0[i], "widened", false, c, new.at, why))
     var both = pre0
     both.extend(pre1)
     # what a weaker promise became, so the reader sees both sides
-    let added = [f"`{c}`" for c in new.ensures if c not in old.ensures]
+    let added = [f"`{c}`" for c in new.ensures if c not in oens]
     var now = f"`{new.name}` now promises " + " and ".join(added)
     if len(added) == 0:
         now = f"`{new.name}` promises nothing in its place"
     for i, c in enumerate(old.ensures):
-        if c not in new.ensures:
+        if oens[i] not in new.ensures:
             var a = both
             a.extend(post1)
-            var q = query(new, a, post0[i], "weakened", true, c, new.loc)
+            var q = query(new, a, post0[i], "weakened", true, c, new.at, why)
             q.finding.note = now
             qs.push(q)
     for i, c in enumerate(new.ensures):
-        if c not in old.ensures:
+        if c not in oens:
             var a = both
             a.extend(post0)
-            qs.push(query(new, a, post1[i], "stronger", false, c, new.ens_locs[i]))
+            qs.push(query(new, a, post1[i], "stronger", false, c, new.ens_at[i], why))
 
-fn query(f: FnSpec, assume: [str], goal: str, kind: str, bad: bool, clause: str, loc: str) -> Query:
+fn query(
+    f: FnSpec,
+    assume: [str],
+    goal: str,
+    kind: str,
+    bad: bool,
+    clause: str,
+    where: At,
+    why: str
+) -> Query:
     return Query(
         module=f.module,
         params=f.params,
         assume=assume,
         goal=goal,
-        finding=finding(kind, bad, f.name, clause, loc)
+        finding=finding(kind, bad, f.name, clause, where),
+        why=why
     )
 
 # Every new value of the type keeps the new invariants, so a generated
 # function's `__self` parameter already knows them: it proves each old one.
 # That also means an added invariant can't be checked against the old ones,
 # so it is only noted.
-fn inv_queries(old: InvSpec, new: InvSpec, ref qs: [Query], ref out: [Finding]):
-    for c in old.invariants:
-        if c not in new.invariants:
+fn inv_queries(
+    old: InvSpec,
+    new: InvSpec,
+    names: {str: str},
+    why: str,
+    ref qs: [Query],
+    ref out: [Finding]
+):
+    let olds = [mapped(c, names) for c in old.invariants]
+    for i, c in enumerate(old.invariants):
+        if olds[i] not in new.invariants:
             qs.push(
                 Query(
                     module=new.module,
                     params=["__self: " + new.name],
                     assume=[],
-                    goal=rename(c, false, []),
-                    finding=finding("inv-weakened", true, new.name, c, new.loc)
+                    goal=rename(c, false, [], names, true),
+                    finding=finding("inv-weakened", true, new.name, c, new.at),
+                    why=why
                 )
             )
     for i, c in enumerate(new.invariants):
-        if c not in old.invariants:
-            out.push(finding("inv-added", false, new.name, c, new.inv_locs[i]))
+        if c not in olds:
+            out.push(finding("inv-added", false, new.name, c, new.inv_at[i]))
 
-fn compare(old: Specs, new: Specs, base: str, ref qs: [Query]) -> [Finding]:
+# An item for pairing: the old ones in the new version's names.
+struct Cand:
+    module: str
+    # a method's type, "" for a function; `struct` or `enum` for a type
+    owner: str
+    name: str
+    # the body or fields
+    shape: str
+    sig: str
+    # an old item with specs to follow, or any new one
+    want: bool
+
+fn same_group(a: Cand, b: Cand) -> bool:
+    return a.module == b.module and a.owner == b.owner
+
+# Pairs each old item without a partner (`to[i] < 0`) that `want`s one with a
+# new item that has none, as the header says; `how[i]` says how.
+fn pair(olds: [Cand], news: [Cand], ref to: [int], ref how: [str], shape_word: str):
+    var taken = [false for _ in news]
+    for j in to:
+        if j >= 0:
+            taken[j] = true
+    # moved to another module under the same name
+    for i, o in enumerate(olds):
+        if to[i] >= 0 or not o.want:
+            continue
+        for j, n in enumerate(news):
+            if not taken[j] and n.name == o.name and n.owner == o.owner:
+                to[i] = j
+                taken[j] = true
+                how[i] = f"from module `{o.module}` to `{n.module}`"
+                break
+    # the same body or fields
+    for i, o in enumerate(olds):
+        if to[i] >= 0 or not o.want or o.shape == "":
+            continue
+        for j, n in enumerate(news):
+            if not taken[j] and same_group(o, n) and n.shape == o.shape:
+                to[i] = j
+                taken[j] = true
+                how[i] = f"its {shape_word}"
+                break
+    # the only one with the same signature, on both sides
+    for i, o in enumerate(olds):
+        if to[i] >= 0 or not o.want or o.sig == "":
+            continue
+        var found = -1
+        var count = 0
+        for j, n in enumerate(news):
+            if not taken[j] and same_group(o, n) and n.sig == o.sig:
+                found = j
+                count += 1
+        var others = 0
+        for k, p in enumerate(olds):
+            if to[k] < 0 and p.want and same_group(o, p) and p.sig == o.sig:
+                others += 1
+        if count == 1 and others == 1:
+            to[i] = found
+            taken[found] = true
+            how[i] = "its signature"
+    # the only one removed and the only one added
+    for i, o in enumerate(olds):
+        if to[i] >= 0 or not o.want:
+            continue
+        var found = -1
+        var count = 0
+        for j, n in enumerate(news):
+            if not taken[j] and same_group(o, n):
+                found = j
+                count += 1
+        var others = 0
+        for k, p in enumerate(olds):
+            if to[k] < 0 and p.want and same_group(o, p):
+                others += 1
+        if count == 1 and others == 1:
+            to[i] = found
+            taken[found] = true
+            how[i] = "being the only one removed where one was added"
+
+fn compare(old: Specs, new: Specs, ref qs: [Query]) -> [Finding]:
     var out: [Finding] = []
-    var by_key: {str: int} = {}
-    for i, f in enumerate(new.fns):
-        by_key[f.module + ":" + f.name] = i
-    for o in old.fns:
-        match by_key.get(o.module + ":" + o.name):
-            case Some(i):
-                let n = new.fns[i]
-                if o.requires == n.requires and o.ensures == n.ensures:
-                    continue
-                if o.sig != n.sig or o.generic or n.generic:
-                    out.push(finding("skipped", false, n.name, "", n.loc))
-                else:
-                    fn_queries(o, n, ref qs)
-            case None:
-                if len(o.requires) + len(o.ensures) > 0:
-                    out.push(finding("removed", false, o.name, "", base + ":" + o.loc))
+    # ---- types first, since methods follow their type
     var inv_key: {str: int} = {}
     for i, s in enumerate(new.invs):
         inv_key[s.module + ":" + s.name] = i
-    for o in old.invs:
-        match inv_key.get(o.module + ":" + o.name):
-            case Some(i):
-                let n = new.invs[i]
-                if o.invariants == n.invariants:
-                    continue
-                if o.generic or n.generic:
-                    out.push(finding("skipped", false, n.name, "", n.loc))
-                else:
-                    inv_queries(o, n, ref qs, ref out)
+    var tto = [inv_key.get(s.module + ":" + s.name).unwrap_or(-1) for s in old.invs]
+    var thow = ["" for _ in old.invs]
+    pair(
+        [
+            Cand(module=s.module, owner=s.kind, name=s.name, shape=s.shape, sig="", want=true)
+            for s in old.invs
+        ],
+        [
+            Cand(module=s.module, owner=s.kind, name=s.name, shape=s.shape, sig="", want=true)
+            for s in new.invs
+        ],
+        ref tto,
+        ref thow,
+        "fields"
+    )
+    # old names in the new version's, for each old module: its renamed types
+    # and functions (a name in a clause is one of its own module's)
+    var names: {str: {str: str}} = {}
+    # `module:Type` of the old version -> where the type is now
+    var owner_at: {str: (str, str)} = {}
+    for i, s in enumerate(old.invs):
+        if tto[i] >= 0:
+            let n = new.invs[tto[i]]
+            owner_at[s.module + ":" + s.name] = (n.module, n.name)
+            if n.name != s.name:
+                var m = names.get(s.module).unwrap_or({})
+                m[s.name] = n.name
+                names[s.module] = m
+    # ---- functions
+    var fn_key: {str: int} = {}
+    for i, f in enumerate(new.fns):
+        fn_key[f.module + ":" + f.name] = i
+    var olds: [Cand] = []
+    for f in old.fns:
+        var module = f.module
+        var owner = f.owner
+        match owner_at.get(f.module + ":" + f.owner):
+            case Some(p):
+                module = p.0
+                owner = p.1
             case None:
                 pass
+        var nm = names.get(f.module).unwrap_or({})
+        nm[f.short] = "__fn"
+        olds.push(
+            Cand(
+                module=module,
+                owner=owner,
+                name=f.short,
+                shape=canon(f.body, nm),
+                sig=canon(
+                    "(" + ", ".join(f.ptypes) + ") -> " + f.ret,
+                    names.get(f.module).unwrap_or({})
+                ),
+                want=len(f.requires) + len(f.ensures) > 0
+            )
+        )
+    let news = [
+        Cand(
+            module=f.module,
+            owner=f.owner,
+            name=f.short,
+            shape=canon(f.body, {f.short: "__fn"}),
+            sig=canon("(" + ", ".join(f.ptypes) + ") -> " + f.ret, {}),
+            want=true
+        )
+        for f in new.fns
+    ]
+    var fto: [int] = []
+    for c in olds:
+        let key = c.module + ":" + (c.owner + "." + c.name if c.owner != "" else c.name)
+        fto.push(fn_key.get(key).unwrap_or(-1))
+    var fhow = ["" for _ in olds]
+    pair(olds, news, ref fto, ref fhow, "body")
+    for i, f in enumerate(old.fns):
+        if fto[i] >= 0 and f.owner == "" and new.fns[fto[i]].short != f.short:
+            var m = names.get(f.module).unwrap_or({})
+            m[f.short] = new.fns[fto[i]].short
+            names[f.module] = m
+    for i, o in enumerate(old.fns):
+        if fto[i] < 0:
+            # gone: what it promised is lost
+            for k, c in enumerate(o.ensures):
+                out.push(finding("removed", true, o.name, c, o.ens_at[k]))
+            if len(o.ensures) == 0 and len(o.requires) > 0:
+                out.push(finding("removed", false, o.name, "", o.at))
+            continue
+        let n = new.fns[fto[i]]
+        if fhow[i] != "" and len(o.requires) + len(o.ensures) > 0:
+            var r = finding("renamed", false, n.name, o.name, n.at)
+            r.why = fhow[i]
+            out.push(r)
+        # parameters: the same name, else the one in the same place
+        var nm = names.get(o.module).unwrap_or({})
+        for k, p in enumerate(o.pnames):
+            if p in n.pnames:
+                nm[p] = p
+            elif k < len(n.pnames) and n.pnames[k] not in o.pnames:
+                nm[p] = n.pnames[k]
+            else:
+                nm[p] = p
+        let oreq = [mapped(c, nm) for c in o.requires]
+        let oens = [mapped(c, nm) for c in o.ensures]
+        if oreq == n.requires and oens == n.ensures:
+            continue
+        var why = ""
+        if o.generic or n.generic:
+            why = f"`{n.name}` is generic, which the prover can't compare specs of"
+        fn_queries(o, n, nm, why, ref qs)
+    # ---- invariants
+    for i, o in enumerate(old.invs):
+        if tto[i] < 0:
+            for k, c in enumerate(o.invariants):
+                out.push(finding("inv-removed", true, o.name, c, o.inv_at[k]))
+            continue
+        let n = new.invs[tto[i]]
+        if thow[i] != "" and len(o.invariants) > 0:
+            var r = finding("renamed", false, n.name, o.name, n.at)
+            r.why = thow[i]
+            out.push(r)
+        let tn = names.get(o.module).unwrap_or({})
+        if [mapped(c, tn) for c in o.invariants] == n.invariants:
+            continue
+        var why = ""
+        if o.generic or n.generic:
+            why = f"`{n.name}` is generic, which the prover can't compare specs of"
+        inv_queries(o, n, tn, why, ref qs, ref out)
     return out
 
 # The generated functions, one module's source each, and where each query's
@@ -351,7 +690,24 @@ fn opts(verify: bool) -> FrontOpts:
         strict_rules=false
     )
 
-# Compares `entry` on disk with the same file in git revision `base`.
+# What the questions found: the ones the prover couldn't be asked count by
+# the text alone, as `unknown`, and are weaker when their answer could be.
+fn answers(qs: [Query], live: [bool], failed: [bool], whys: [str]) -> [Finding]:
+    var out: [Finding] = []
+    for i, q in enumerate(qs):
+        if not live[i]:
+            var f = q.finding
+            f.was = f.kind
+            f.kind = "unknown"
+            f.why = whys[i]
+            out.push(f)
+        elif failed[i]:
+            out.push(q.finding)
+    return out
+
+# Compares `entry` on disk with the same file in git revision `base`. The
+# findings come with the new program's errors, if it has any: the diff is
+# most wanted when a weaker spec breaks a proof or the build.
 fn run(entry: str, base: str) -> Result[Outcome, str]:
     let old_fe = driver.frontend_at(entry, opts(true), Source(rev=Some(base), extra={}, also=[]))
     var old_prog: Option[Program] = old_fe.prog
@@ -364,16 +720,18 @@ fn run(entry: str, base: str) -> Result[Outcome, str]:
     var ds: [Diag] = []
     let new_prog = driver.load(entry, ref sm, ref ds)
     if new_prog.is_none() or driver.has_errors(ds):
+        # it doesn't parse, so there are no specs to compare
         let fe = driver.frontend(entry, opts(false))
         return Ok(Outcome(findings=[], fe=Some(fe), checks_before=None, checks_after=None))
-    let old = specs_of(old_prog.unwrap(), old_fe.sm)
-    let new = specs_of(new_prog.unwrap(), sm)
+    let old = specs_of(old_prog.unwrap(), old_fe.sm, base)
+    let new = specs_of(new_prog.unwrap(), sm, "")
     var qs: [Query] = []
-    var out = compare(old, new, base, ref qs)
+    var out = compare(old, new, ref qs)
     # A clause that doesn't check against the new program (it names something
     # that is gone) can't be asked about, and stops verification: it is
     # dropped and the rest run again. Each round drops one, so this ends.
-    var live = [true for _ in qs]
+    var live = [q.why == "" for q in qs]
+    var whys = [q.why for q in qs]
     while true:
         let g = generate(qs, live)
         var fe = driver.frontend_at(entry, opts(true), Source(rev=None, extra=g.extra, also=[]))
@@ -394,27 +752,26 @@ fn run(entry: str, base: str) -> Result[Outcome, str]:
                     real.push(d)
         for i in broken:
             live[i] = false
+            whys[i] = WHY_BROKEN
         if fe.report.is_none():
             if len(broken) > 0:
                 continue
-            # the new program itself has errors
-            fe.diags = real
-            return Ok(Outcome(findings=[], fe=Some(fe), checks_before=None, checks_after=None))
+            # the new program has errors that stop the prover before it
+            # answers: what it would have been asked counts by its text
+            for i in 0..len(qs):
+                if live[i]:
+                    live[i] = false
+                    whys[i] = WHY_ERRORS
+            failed = [false for _ in qs]
         fe.diags = real
-        for i, q in enumerate(qs):
-            if not live[i]:
-                var f = q.finding
-                f.kind = "unknown"
-                f.bad = false
-                out.push(f)
-            elif failed[i]:
-                out.push(q.finding)
+        out.extend(answers(qs, live, failed, whys))
+        let ran = fe.report.is_some()
         return Ok(
             Outcome(
                 findings=out,
                 fe=Some(fe),
-                checks_before=checks_by_kind(old_fe),
-                checks_after=checks_by_kind(fe)
+                checks_before=checks_by_kind(old_fe) if ran else None,
+                checks_after=checks_by_kind(fe) if ran else None
             )
         )
     return Err("unreachable")
