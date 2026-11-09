@@ -857,10 +857,13 @@ fn tmp_beside(out: str) -> str:
     let n = project.file_name(out).unwrap_or(out)
     return out[:len(out) - len(n)] + f".{os.pid()}.{n}"
 
-# Renames `tmp` over `out`, unless (`same`) `out` has the same bytes already:
-# another brine made it, and may be starting it. Removes `tmp` either way.
-fn place(tmp: str, out: str, same: bool) -> Result[(), Diag]:
-    if same and file_exists(out) and file_hash(out) == file_hash(tmp):
+# Renames `tmp` over `out`, and removes `tmp` either way. With `before` (the
+# hash `out` had when this build started; "" if it didn't exist), a build of
+# the same program by another brine wins: `out` is kept when it has the same
+# bytes already, or when it changed since and can't be replaced (Windows: it
+# runs). A C linker stamps the time into a program, so two builds differ.
+fn place(tmp: str, out: str, before: Option[str]) -> Result[(), Diag]:
+    if before.is_some() and file_exists(out) and file_hash(out) == file_hash(tmp):
         match os.remove_file(tmp):
             case _:
                 pass
@@ -883,6 +886,12 @@ fn place(tmp: str, out: str, same: bool) -> Result[(), Diag]:
                 case _:
                     pass
             move_back(out, moved)
+            match before:
+                case Some(h):
+                    if file_exists(out) and file_hash(out) != h:
+                        return Ok(())
+                case None:
+                    pass
             return Err(
                 diag.error("E0704", f"cannot write `{display_path(out)}`").note(e).with_help(
                     "is the program still running? Stop it and build again, or build somewhere else with `-o`"
@@ -1163,6 +1172,7 @@ fn compile_levels(
     # building the same program at once each start the one they made
     # (v091#3: they wrote one file together and ran it half-written)
     let tmp = tmp_beside(out_exe)
+    let before = file_hash(out_exe) if file_exists(out_exe) else ""
     var link = [cc]
     if plat.is_wasm():
         link.push(flags[0])
@@ -1177,7 +1187,7 @@ fn compile_levels(
                 case _:
                     pass
             return Err(cc_failed("linking the program failed", e, out_exe))
-    place(tmp, out_exe, true)?
+    place(tmp, out_exe, Some(before))?
     phase_time(t, "link")
     if plat == Platform.Web:
         web_files(dest)?
@@ -1238,7 +1248,7 @@ fn link_native(o: ObjFile, out_exe: str) -> Result[bool, Diag]:
             return Err(io_diag(e))
     if os.name() != "windows" and not runs_ok(["chmod", "+x", tmp]):
         return Err(diag.error("E0704", f"cannot make `{display_path(out_exe)}` executable"))
-    place(tmp, out_exe, false)?
+    place(tmp, out_exe, None)?
     phase_time(t, "link")
     return Ok(true)
 
