@@ -141,6 +141,8 @@ const EXTRA_MAX = 2000000
 # (`by_own`) gives up after this much work: it runs for every check, so the
 # time past the limit grows with their number, not their product.
 const PAST_MAX = 20000
+# The work of the proof that a check always fails (E0614)
+const PROBE_MAX = 20000
 # Largest disjunction (in formula nodes) a merge of two branches keeps. Past
 # that the solver spends its time re-reading it; dropping it only loses facts.
 const MERGE_MAX = 256
@@ -1931,10 +1933,9 @@ struct Vf:
                 nw += weight(f)
             # (not when it's most of what is known: that would be the same work twice;
             # past the limit, only up to a small extra amount of work)
-            if (
-                (nw <= NEAR_MAX and (not over or self.extra < EXTRA_MAX))
-                or (not over and 2 * len(near) <= nall)
-            ):
+            # (and not when it's all that is known: the proof from all of it follows)
+            let room = self.extra < EXTRA_MAX if over else len(near) < nall
+            if (nw <= NEAR_MAX and room) or (not over and 2 * len(near) <= nall):
                 if self.prove_in(near, goal, max(EXTRA_MAX - self.extra, 1)) == PROVED:
                     return PROVED
             # then what is linked to them, except through values most facts mention
@@ -2000,8 +2001,10 @@ struct Vf:
         return r == PROVED
 
     # `goal` follows from the ranges of its values or the facts about them
-    # (all facts, in a short function): for what is seldom true, like a check
-    # that always fails, whose proof would cost a long function the most.
+    # (all facts, in a short function), in a small proof: for what is seldom
+    # true, like a check that always fails, tried on every check that isn't
+    # proven. Its proofs are short; the others would cost a long function
+    # the most, so not from more than NEAR_MAX of facts.
     fn holds_near(ref self, goal: F) -> bool:
         if not self.live:
             return true
@@ -2009,12 +2012,21 @@ struct Vf:
             return false
         if self.by_ranges(goal):
             return true
+        var fs = self.st.facts
         if len(self.st.facts) + len(self.defs) > NEAR_MIN:
-            let near = self.near(goal)
-            return self.prove_in(near, goal, max(EXTRA_MAX - self.extra, 1)) == PROVED
-        var all = self.st.facts
-        all.extend(self.defs)
-        return self.prove_in(all, goal, max(EXTRA_MAX - self.extra, 1)) == PROVED
+            fs = self.near(goal)
+            var w = 0
+            for f in fs:
+                w += weight(f)
+            if w > NEAR_MAX:
+                return false
+        else:
+            fs.extend(self.defs)
+        let w0 = self.work
+        let r = prove_capped(fs, goal, self.ranges, ref self.work, PROBE_MAX)
+        if w0 > WORK_MAX:
+            self.extra += self.work - w0
+        return r == PROVED
 
     # `f` follows from the ranges of its values alone (interval arithmetic).
     fn by_ranges(self, f: F) -> bool:
