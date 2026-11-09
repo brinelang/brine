@@ -2035,7 +2035,7 @@ struct X:
         self.rows = []
         if self.dbg and f.dline > 0 and not f.dfile.starts_with("<"):
             let fi = self.dw.file(f.dfile)
-            self.rows.push(DRow(pc=self.u.start, file=fi, line=f.dline))
+            self.rows.push(DRow(pc=self.u.start, file=fi, line=f.dline, stmt=true))
         self.thread_jumps(f.nlabels)
         var i = 0
         while i < ncode:
@@ -2057,8 +2057,12 @@ struct X:
         # cold stubs (the operands go through scratch registers first, since
         # they may be in argument registers; nothing is kept around the calls)
         self.cur = -1
+        var cold: [(int, int, int)] = []
         for s in self.stubs:
             set32(ref self.o.text, s.at, self.pos() - (s.at + 4))
+            let start = self.pos()
+            if self.dbg:
+                self.stub_row(s.at)
             self.cpos = -1
             self.site = s.site
             if s.kind == S_IDX:
@@ -2091,7 +2095,14 @@ struct X:
                         CArg(how=A_REG, v=R11, fl=0)
                     ]
                 )
+            cold.push((s.at, start, self.pos()))
         self.site = ""
+        # a call that never returns may end the function: its return address
+        # is then the next function's start, and a debugger's backtrace goes
+        # wrong from there (int3 keeps it inside)
+        let nc = len(self.calls)
+        if nc > 0 and self.calls[nc - 1].0 == self.pos():
+            self.b(0xCC)
         for j in 0..len(self.jat):
             set32(ref self.o.text, self.jat[j], self.lpos[self.jlab[j]] - (self.jat[j] + 4))
         for j in 0..len(self.tat):
@@ -2101,7 +2112,7 @@ struct X:
         else:
             self.unwind_elf()
         if self.dbg:
-            self.debug_func(f)
+            self.debug_func(f, cold)
 
     # A stub's b to r10 and c to r11 (b or c may be in r10 or r11 themselves)
     fn stub_bc(ref self, s: Stub):
@@ -2837,7 +2848,7 @@ struct X:
         if x.s.starts_with("<"):
             return
         let fi = self.dw.file(x.s)
-        let row = DRow(pc=self.pos(), file=fi, line=x.n)
+        let row = DRow(pc=self.pos(), file=fi, line=x.n, stmt=true)
         let n = len(self.rows)
         if n > 0:
             let last = self.rows[n - 1]
@@ -2852,6 +2863,24 @@ struct X:
     # A variable is visible from the line after its declaration (the
     # first line row after `pc`, at most `hi`): on the declaration's own line
     # it is not set yet.
+    # A stub's code is on the line it is jumped to from.
+    fn stub_row(ref self, at: int):
+        var line = -1
+        var fi = -1
+        for r in self.rows:
+            if r.pc > at:
+                break
+            line = r.line
+            fi = r.file
+        let n = len(self.rows)
+        if line < 0 or (self.rows[n - 1].line == line and self.rows[n - 1].file == fi):
+            return
+        let row = DRow(pc=self.pos(), file=fi, line=line, stmt=false)
+        if self.rows[n - 1].pc == row.pc:
+            self.rows[n - 1] = row
+        else:
+            self.rows.push(row)
+
     fn next_row(self, pc: int, hi: int) -> int:
         for r in self.rows:
             if r.pc > pc:
@@ -2862,7 +2891,8 @@ struct X:
         return loc_breg(dwarf_reg(self.slot_base[s]), self.slot_off[s])
 
     # The function's entry in the debug info: its range, lines and variables.
-    fn debug_func(ref self, f: Func):
+    # `cold`: each stub's jump to it, its start and its end
+    fn debug_func(ref self, f: Func, cold: [(int, int, int)]):
         let end = self.pos()
         for j in 1..len(self.ipos):
             if self.ipos[j] < 0:
@@ -2891,6 +2921,14 @@ struct X:
                     hi = self.ipos[v.hi]
                 lo = self.next_row(self.ipos[v.lo], hi)
             locals.push(DLocal(name=v.name, ty=v.ty, param=v.param, loc=loc, lo=lo, hi=hi))
+        # the stubs come after the body, outside every scope: each has the
+        # variables in scope where it is jumped to from (a panic stops there)
+        let nl = len(locals)
+        for at, lo, hi in cold:
+            for i in 0..nl:
+                let v = locals[i]
+                if v.lo >= 0 and v.lo <= at and at < v.hi and v.hi <= lo:
+                    locals.push(DLocal(name=v.name, ty=v.ty, param=false, loc=v.loc, lo=lo, hi=hi))
         if f.public and f.dname == "" and self.entry_main:
             # The C entry point that calls brine's `main` comes right before
             # it (see `emit_order`) and is described as a second range of it:

@@ -187,11 +187,39 @@ def lookup(v):
     return None
 
 
+def _user_frame(f):
+    # the first frame of brine source: the runtime's frames have no lines, or
+    # lines in the C runtime
+    while f is not None:
+        st = f.find_sal().symtab
+        if st is not None:
+            n = st.filename.replace("\\", "/")
+            if not n.startswith("<") and not n.endswith(("/brine_rt.c", "/brine_rt.h")):
+                return f
+        f = f.older()
+    return None
+
+
+def _on_stop(ev):
+    # a panic stops in the runtime (`panic_stop`): show the code that panicked
+    try:
+        f = gdb.newest_frame()
+        if f.name() != "panic_stop":
+            return
+        u = _user_frame(f)
+        if u is not None:
+            u.select()
+            gdb.execute("frame")
+    except gdb.error:
+        pass
+
+
 def _setup():
     gdb.pretty_printers.append(lookup)
     # don't step into the C runtime
     for f in ("brine_rt.c", "brine_rt.h"):
         gdb.execute("skip -gfi */" + f, to_string=True)
+    gdb.events.stop.connect(_on_stop)
 
 
 _setup()
