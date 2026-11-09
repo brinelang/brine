@@ -12336,6 +12336,17 @@ fn gplan_make(p: ptr, k: ptr, ctx: ptr, deadline: float) -> bool:
             store_i64(g, GA_DOFF, load_i64(g, GA_DOFF) + at)
     return load_i64(p, GP_OK) != 0
 
+# whether a construct's context has arrays of arrays (see gplan_make)
+fn gplan_nested(k: ptr) -> bool:
+    let ptrs = load_ptr(k, K_PTRS)
+    let nf = load_i64(ptrs, 0)
+    let nodes = ptrs + (1 + 3 * nf) * 8
+    for f in 0..nf:
+        let node = load_i64(ptrs, (1 + 3 * f) * 8 + 16)
+        if load_i64(nodes + node * 8, 8) != 0:
+            return true
+    return false
+
 # Plans the copies for the `rest` elements still to do (p: GP_SIZE bytes);
 # false, with the reason in `why`, when that fails. Walking arrays of
 # arrays visits every inner array, which can cost more than running the
@@ -12348,7 +12359,11 @@ fn gpu_plan(p: ptr, k: ptr, st: ptr, ctx: ptr, rest: int, why: ptr) -> bool:
     let cpu_ns = load_f64(st, KS_CPU)
     let plan_ns = load_f64(st, KS_PLAN)
     unlock(g + G_MU)
-    let slow = cz("copying its arrays of arrays to the GPU takes longer than running it on the CPU")
+    let slow = cz(
+        "copying its arrays of arrays to the GPU takes longer than running it on the CPU"
+        if gplan_nested(k)
+        else "preparing its copies to the GPU takes longer than running it on the CPU"
+    )
     if auto and plan_ns > 0.0 and plan_ns >= 0.75 * cpu_ns:
         memset(p, 0, u64(GP_SIZE))
         store_ptr(why, 0, slow)
@@ -12600,7 +12615,9 @@ fn gpu_choose(k: ptr, st: ptr, rest: int, bytes: int, launches: int, c: ptr):
     let soon = not ready and gpu_s < 0.75 * cpu_s
     if soon and cpu_s > 2.0e-3:
         gpu_start(code)
-    store_ptr(c, CH_WHY, cz("starting the GPU") if soon else cz("faster on the CPU"))
+    # (not started for less than 2 ms of work: this one is faster as it is)
+    let starting = soon and gpu_state() == GS_INIT
+    store_ptr(c, CH_WHY, cz("starting the GPU") if starting else cz("faster on the CPU"))
 
 # Runs elements [lo, n) of a `par for` sequentially on this thread until
 # about `secs` have passed; returns where it stopped (the time per element
