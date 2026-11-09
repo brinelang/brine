@@ -157,6 +157,10 @@ test "world programs run on several processes":
     run_ok("tests/programs/world_ops.br", text("tests/programs/world_ops5.out"), ["--ranks", "5"])
     run_ok("tests/programs/world_child.br", "inherited: [false, false, false]\n", ["--ranks", "3"])
     run_ok("tests/programs/world_exit.br", "total 3 true\n", ["--ranks", "3"])
+    # branches that make the same calls, and code only one rank runs
+    let arms = "tests/programs/world_same_arms.br"
+    run_ok(arms, "[12, 6, 21, 12, 4, 12, 15, 18, 3]\n", ["--ranks", "3"])
+    run_ok(arms, "[10, 1, 1, 3, 1, 10, 5, 6, 1]\n", [])
 
 test "world runtime failures are clear":
     # every rank exits with the same code: it's the launcher's
@@ -167,6 +171,12 @@ test "world runtime failures are clear":
     assert p.code == 101, p.all()
     assert "panic (rank 1): rank 1 gives up" in p.err, p.all()
     assert "error: rank 1 failed (exit code 101), so the other ranks were stopped" in p.err, p.all()
+    # so is one that calls `exit` with an error code, though `exit` waits
+    let t0 = clock()
+    let x = brine(["run", "-q", "--ranks", "2", "tests/programs/world_fail_exit.br"])
+    assert x.code == 3, x.all()
+    assert "error: rank 1 failed (exit code 3), so the other ranks were stopped" in x.err, x.all()
+    assert "should have been stopped" not in x.out and clock() - t0 < 15.0, x.all()
     # ranks in different collectives (two programs in one world: the compiler
     # rejects a program that could do this) panic, naming both call sites
     let d = scratch("mismatch")
@@ -201,6 +211,33 @@ test "world runtime failures are clear":
     assert "mismatched communication: this rank is in `world.sum`, but rank 1 is in `world.barrier` at " in e0, e0
     assert "b.br:2:5" in e0, e0
     assert "this rank is in `world.barrier`, but rank 0 is in `world.sum` at " in e1, e1
+    # a rank started with a wrong world says so instead of crashing or waiting
+    let bad = [
+        (
+            {"BRINE_RANK": "2", "BRINE_WORLD_SIZE": "2", "BRINE_PEERS": peers},
+            "BRINE_RANK=2 is not below BRINE_WORLD_SIZE=2"
+        ),
+        (
+            {"BRINE_RANK": "x", "BRINE_WORLD_SIZE": "2", "BRINE_PEERS": peers},
+            "BRINE_RANK=x is not a number"
+        ),
+        (
+            {"BRINE_RANK": "0", "BRINE_WORLD_SIZE": "2"},
+            "BRINE_WORLD_SIZE=2 is set, but BRINE_PEERS is not"
+        ),
+        (
+            {"BRINE_RANK": "0", "BRINE_WORLD_SIZE": "3", "BRINE_PEERS": peers},
+            "BRINE_PEERS lists 2 ranks"
+        )
+    ]
+    for env, want in bad:
+        match os.spawn([exes[0]], env, true, false):
+            case Ok(k):
+                let code = os.wait(k)
+                let (_, er) = os.output(k)
+                assert code == 2 and f"brine: {want}" in er, er
+            case Err(e):
+                panic(e)
 
 fn features() -> [str]:
     return [
@@ -1035,13 +1072,16 @@ test "deadlocks are rejected":
             "E0510@38"
         ]
     )
-    # every line marked `# E05..` in the file, and nothing else
-    let file = "tests/programs/deadlock_errors2.br"
-    var want: [str] = []
-    for i, l in enumerate(read_file(file).unwrap().lines()):
-        if "# E05" in l:
-            want.push(l[l.find("# E05").unwrap() + 2:].strip() + "@" + str(i + 1))
-    assert error_codes(file) == want
+    # every line marked `# E05..` in the files, and nothing else
+    for file in ["tests/programs/deadlock_errors2.br", "tests/programs/world_arms_errors.br"]:
+        var want: [str] = []
+        for i, l in enumerate(read_file(file).unwrap().lines()):
+            if "# E05" in l:
+                want.push(l[l.find("# E05").unwrap() + 2:].strip() + "@" + str(i + 1))
+        assert error_codes(file) == want, file
+    # E0511 shows where the callee needs the value
+    let e = brine(["check", "tests/programs/world_arms_errors.br"]).err
+    assert "`work` decides with it here" in e and "`work` calls `world.sum`" in e, e
 
 test "par bodies that could race are rejected":
     # every line marked `# E05..` in the file, and nothing else
@@ -1527,6 +1567,11 @@ test "struct invariants are kept by every value":
     assert (
         error_codes("tests/programs/invariant_fields.br")
         == ["E0406@17", "E0406@18", "E0406@19", "E0406@20", "E0406@45", "E0406@46"]
+    )
+    # ... and of those, only the paths read; for `len(...)` only the length
+    assert (
+        error_codes("tests/programs/invariant_paths.br")
+        == ["E0406@31", "E0406@32", "E0406@33", "E0406@34", "E0406@35"]
     )
     let fe = brine(["check", "tests/programs/invariant_fields.br"]).err
     assert "`hi` is in an `invariant` of `Tagged`" in fe, fe

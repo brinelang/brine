@@ -9989,17 +9989,12 @@ fn world_recv(src: int, kind: int, loc: ptr) -> ptr:
     let w = wd()
     let cur = load_i64(w, WD_OP)
     let op = load_i64(m, MS_OP)
-    # returning from `main` and `exit` are the same call
+    # returning from `main` and `exit` are the same call; and the same
+    # operation from different lines is too (both branches of an `if` may
+    # make it), so the site is only for the message
     var same = cur == OP_FINISH
     if op != OP_FINISH:
-        let here = cur_site()
-        let sl = load_i64(m, MS_SLEN)
-        same = (
-            op == cur
-            and load_i64(m, MS_SEQ) == load_i64(w, WD_SEQ)
-            and sl == int(strlen(here))
-            and memcmp(m + MS_DATA + load_i64(m, MS_LEN), here, u64(sl)) == 0
-        )
+        same = op == cur and load_i64(m, MS_SEQ) == load_i64(w, WD_SEQ)
     if not same:
         mismatch(src, m, loc)
     let mk = load_i64(m, MS_KIND)
@@ -10084,24 +10079,70 @@ fn world_unsetenv(name: str, assign: str):
 fn brine_x_world_abort_flush(sig: i32):
     fflush(c_stderr())
 
+# A world variable's number: only digits (at most 9 of them), else -1.
+fn env_num(p: ptr) -> int:
+    var n = 0
+    var i = 0
+    while load_u8(p, i) != 0:
+        let c = int(load_u8(p, i))
+        if c < 48 or c > 57 or i >= 9:
+            return -1
+        n = n * 10 + c - 48
+        i += 1
+    return n if i > 0 else -1
+
 fn brine_x_world_init():
     let w = wd()
     store_i64(w, WD_SIZE, 1)
     let er = getenv(lit("BRINE_RANK"))
     let es = getenv(lit("BRINE_WORLD_SIZE"))
     let ep = getenv(lit("BRINE_PEERS"))
-    if addr(er) == 0 or addr(es) == 0 or addr(ep) == 0:
+    if addr(er) == 0 and addr(es) == 0 and addr(ep) == 0:
         return
-    let rank = atoi(er)
-    let size = atoi(es)
-    let ln = int(strlen(ep))
-    let list = malloc(u64(ln + 1))
-    memcpy(list, ep, u64(ln + 1))
+    # (whoever started this rank got them wrong: say so instead of crashing
+    # or waiting for peers that never come)
+    if addr(es) == 0:
+        world_fail("brine: BRINE_RANK or BRINE_PEERS is set, but BRINE_WORLD_SIZE is not\n")
+    let size = env_num(es)
+    if size < 1:
+        world_fail(f"brine: BRINE_WORLD_SIZE={c_str(es)} is not a positive number\n")
+    var rank = 0
+    if addr(er) != 0:
+        rank = env_num(er)
+        if rank < 0:
+            world_fail(f"brine: BRINE_RANK={c_str(er)} is not a number\n")
+        if rank >= size:
+            world_fail(f"brine: BRINE_RANK={c_str(er)} is not below BRINE_WORLD_SIZE={c_str(es)}\n")
+    elif size > 1:
+        world_fail(f"brine: BRINE_WORLD_SIZE={c_str(es)} is set, but BRINE_RANK is not\n")
+    if size > 1:
+        if addr(ep) == 0:
+            world_fail(f"brine: BRINE_WORLD_SIZE={c_str(es)} is set, but BRINE_PEERS is not\n")
+        var n = 1
+        var i = 0
+        while load_u8(ep, i) != 0:
+            if load_u8(ep, i) == 44:
+                n += 1
+            i += 1
+        if n != size:
+            world_fail(f"brine: BRINE_PEERS lists {n} ranks, but BRINE_WORLD_SIZE={c_str(es)}\n")
+    var list = null_ptr()
+    if size > 1:
+        let ln = int(strlen(ep))
+        list = malloc(u64(ln + 1))
+        memcpy(list, ep, u64(ln + 1))
     world_unsetenv("BRINE_RANK", "BRINE_RANK=")
     world_unsetenv("BRINE_WORLD_SIZE", "BRINE_WORLD_SIZE=")
     world_unsetenv("BRINE_PEERS", "BRINE_PEERS=")
+    let ef = getenv(lit("BRINE_EXIT_FILE"))
+    if addr(ef) != 0:
+        if size > 1:
+            let n = int(strlen(ef))
+            let cp = malloc(u64(n + 1))
+            memcpy(cp, ef, u64(n + 1))
+            store_ptr(global_mem("world_exit_file", 8), 0, cp)
+        world_unsetenv("BRINE_EXIT_FILE", "BRINE_EXIT_FILE=")
     if size <= 1:
-        free(list)
         return
     store_i64(w, WD_RANK, rank)
     store_i64(w, WD_SIZE, size)
@@ -10129,8 +10170,9 @@ fn brine_x_world_init():
         var colon = n - 1
         while colon >= 0 and load_u8(p, colon) != 58:
             colon -= 1
-        if colon < 0:
-            world_fail(f"brine: invalid BRINE_PEERS entry '{c_str(p)}'\n")
+        let pn = env_num(p + colon + 1) if colon >= 0 else -1
+        if pn < 1 or pn > 65535:
+            world_fail(f"brine: invalid BRINE_PEERS entry '{c_str(p)}' (expected host:port)\n")
         store_u8(p, colon, u8(0))
         store_ptr(hosts, i * 8, p)
         store_ptr(ports, i * 8, p + colon + 1)
@@ -10233,6 +10275,18 @@ fn brine_world_barrier(loc: ptr):
 
 # The end of the program (returning from `main`, or `exit`): wait until
 # every rank gets there, so no rank leaves while others still talk to it.
+# `brine run` stops the other ranks when one fails; a rank in `exit` waits
+# for them first, so it says so in the file BRINE_EXIT_FILE named
+fn exit_record(code: int):
+    let path = load_ptr(global_mem("world_exit_file", 8), 0)
+    if addr(path) == u64(0) or brine_world_size() <= 1:
+        return
+    let f = os_fopen(path, "wb")
+    if addr(f) == u64(0):
+        return
+    file_text(f, f"{code}")
+    fclose(f)
+
 fn brine_x_world_finish(how: ptr):
     let w = wd()
     if load_i64(w, WD_SIZE) <= 1 or load_i64(w, WD_DONE) != 0:
@@ -15312,6 +15366,8 @@ fn brine_unreachable():
 fn brine_exit(code: int):
     brine_flush()
     brine_x_gpu_settle()
+    if code != 0:
+        exit_record(code)
     # like returning from `main`: every rank waits for the others
     brine_x_world_finish(lit("it called `exit`"))
     brine_flush()

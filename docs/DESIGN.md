@@ -318,7 +318,10 @@ calls to make, so the compiler checks that they can't (`compiler/uniform.br`):
   Results of `sum`/`min`/`max`/`broadcast`/`gather_all` are uniform.
 * A communication call whose control dependence is varying is an error (E0510). This
   covers `if`/`while`/`for` conditions, `and`/`or`, conditional expressions, early
-  `return`/`break`/`continue`, and calls into functions that communicate.
+  `return`/`break`/`continue`, and calls into functions that communicate. Branches
+  that make the same calls in the same order (same operations, argument types,
+  `broadcast` roots and `shift` distances) are fine, as is code that only runs when
+  `world.size()` is 1.
 * Arguments that steer communication must be uniform: the `broadcast` root, the `shift`
   distance, and any parameter a communicating function branches on (E0511). Function
   summaries record these requirements, so the check is modular and handles recursion.

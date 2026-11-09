@@ -8,7 +8,7 @@ from ast import TypeExpr, ConstDecl, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Co
 from ast import LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, stmt, pattern
 from ast import children, stmt_exprs, stmt_blocks, local_of, lvalue_root, parse_fmt_spec
 from ast import Param, FnDecl, FieldDecl, StructDecl, EnumDecl, Module, Program, Import, module_name
-from info import StructInfo, VariantInfo, EnumInfo, ParamSig, FnSig, ConstVal, ConstInfo, ProgramInfo
+from info import StructInfo, InvRead, VariantInfo, EnumInfo, ParamSig, FnSig, ConstVal, ConstInfo, ProgramInfo
 from info import TryKind, try_kind, new_info, mangle_module, PRELUDE, RT, builtin_module
 import num
 
@@ -436,7 +436,8 @@ struct Checker:
                         invariants=[],
                         inv_self=-1,
                         inv_fields=[],
-                        inv_all=false
+                        inv_all=false,
+                        inv_reads=[]
                     )
                 )
                 self.info.struct_names.push(s.name)
@@ -1368,6 +1369,10 @@ struct Checker:
             inv_reads(e, id, ref fields, ref all)
         self.info.structs[sid].inv_fields = fields
         self.info.structs[sid].inv_all = all
+        var reads: [InvRead] = []
+        for e in s.invariants:
+            inv_paths(e, id, ref reads)
+        self.info.structs[sid].inv_reads = reads
         self.locals = []
 
     fn check_fn(ref self, ref f: FnDecl, params: [ParamSig], ret: Ty):
@@ -3299,33 +3304,57 @@ struct Checker:
     # those. (A copy of `self` is a value of its own, checked by nobody.)
     fn inv_fields_ok(ref self, e: Expr) -> bool:
         var cur = e
+        # the path from `cur` down to the place written: field names, and
+        # "[]" for an element of an array
+        var below: [str] = []
         while true:
             match cur.kind:
                 case ExprKind.Field(b, name, _):
+                    var path = [name]
+                    path.extend(below)
                     match b.ty:
                         case Ty.Struct(sid):
                             let own = (
                                 local_of(b) == Some(self.own_self.0) and self.own_self.1 == sid
                             )
                             let si = self.info.structs[sid]
-                            let kept = si.inv_all or name in si.inv_fields
-                            if len(si.invariants) > 0 and kept and not own:
-                                let n = self.info.struct_names[sid]
-                                self.err(
-                                    diag.error("E0406", f"cannot change a field of `{n}` here")
-                                    .label(e.span, f"`{name}` is in an `invariant` of `{n}`")
-                                    .note(
-                                        f"only the methods of `{n}` change the fields its invariants read, through `self`, so the invariants can be proven when they return"
+                            if len(si.invariants) > 0 and not own:
+                                var what = ""
+                                if si.inv_all:
+                                    what = f"`{name}`"
+                                else:
+                                    for r in si.inv_reads:
+                                        if what == "" and inv_write_hits(r, path):
+                                            let p = ".".join(r.path)
+                                            what = (
+                                                f"the length of `{p}`" if r.len_only else f"`{p}`"
+                                            )
+                                if what != "":
+                                    let n = self.info.struct_names[sid]
+                                    self.err(
+                                        diag.error("E0406", f"cannot change a field of `{n}` here")
+                                        .label(e.span, f"{what} is in an `invariant` of `{n}`")
+                                        .note(
+                                            f"only the methods of `{n}` change what its invariants read, through `self`, so the invariants can be proven when they return"
+                                        )
+                                        .with_help(
+                                            f"call a `ref self` method of `{n}` that makes the change, or assign a whole new value: `x = {n}(...)`"
+                                        )
                                     )
-                                    .with_help(
-                                        f"call a `ref self` method of `{n}` that makes the change, or assign a whole new value: `x = {n}(...)`"
-                                    )
-                                )
-                                return false
+                                    return false
                         case _:
                             pass
+                    below = path
                     cur = b
                 case ExprKind.Index(b, _):
+                    match b.ty:
+                        case Ty.Array(_):
+                            var path = ["[]"]
+                            path.extend(below)
+                            below = path
+                        case _:
+                            # storing into a map may add a key: the map changes as a whole
+                            below = []
                     cur = b
                 case _:
                     return true
@@ -7669,7 +7698,8 @@ struct Checker:
                     invariants=[],
                     inv_self=-1,
                     inv_fields=[],
-                    inv_all=false
+                    inv_all=false,
+                    inv_reads=[]
                 )
             )
             self.info.struct_names.push(display)
@@ -9415,6 +9445,76 @@ fn compare_const(op: CmpOp, a: ConstVal, b: ConstVal) -> Option[bool]:
             return Some(c > 0)
         case CmpOp.Ge:
             return Some(c >= 0)
+
+# The places an invariant reads from `self` (the local `me`), into `reads`.
+fn inv_paths(e: Expr, me: int, ref reads: [InvRead]):
+    # `len(self.keys)` reads only the length
+    var arg: Option[Expr] = None
+    match e.cres:
+        case CallRes.Builtin(Builtin.Len):
+            match e.kind:
+                case ExprKind.Call(_, args):
+                    if len(args) == 1:
+                        arg = Some(args[0].expr)
+                case ExprKind.MethodCall(recv, _, _, args):
+                    if len(args) == 0:
+                        arg = Some(recv)
+                case _:
+                    pass
+        case _:
+            pass
+    match arg:
+        case Some(a):
+            match self_path(a, me):
+                case Some(p):
+                    if len(p) > 0:
+                        reads.push(InvRead(path=p, len_only=true))
+                        return
+                case None:
+                    pass
+        case None:
+            pass
+    match self_path(e, me):
+        case Some(p):
+            # (`self` itself is `inv_all`)
+            if len(p) > 0:
+                reads.push(InvRead(path=p, len_only=false))
+            return
+        case None:
+            pass
+    for c in children(e):
+        inv_paths(c, me, ref reads)
+
+# The fields from `self` (the local `me`) to the place `e`, if it is one.
+fn self_path(e: Expr, me: int) -> Option[[str]]:
+    match e.kind:
+        case ExprKind.Field(b, name, _):
+            match self_path(b, me):
+                case Some(p):
+                    var q = p
+                    q.push(name)
+                    return Some(q)
+                case None:
+                    return None
+        case ExprKind.Ident(_):
+            if local_of(e) == Some(me):
+                return Some([])
+            return None
+        case _:
+            return None
+
+# Whether writing the place `w` (a path from the struct, "[]" for an array
+# element) may change what the read `r` sees.
+fn inv_write_hits(r: InvRead, w: [str]) -> bool:
+    for i in 0..min(len(r.path), len(w)):
+        if r.path[i] != w[i]:
+            # different fields
+            return false
+    if len(w) <= len(r.path):
+        # the place read, or one around it
+        return true
+    # a place inside the one read: storing an element keeps the length
+    return not (r.len_only and w[len(r.path)] == "[]")
 
 # The fields of `self` (the local `me`) an invariant reads, into `fields`;
 # `all` when it uses `self` other than through a field (`self.ok()`, `f(self)`),

@@ -210,8 +210,9 @@ print(p, p.energy())                 # Particle(pos=0.2, vel=2.0) 2.0
 An `invariant` in a struct is a fact about `self` that every value of the type
 keeps. It is proven where a value is built and where a `ref self` method
 returns (or uses `self` whole); everywhere else it is a known fact. Only the
-struct's own methods change the fields its invariants read, through `self`
-(E0406); other fields anyone can change. Inside a method, a loop that changes
+struct's own methods change what its invariants read, through `self`
+(E0406); other fields anyone can change, and so the elements of an array
+when an invariant reads only its `len`. Inside a method, a loop that changes
 `self` only through its `ref self` methods (or fields no invariant reads) keeps
 the invariant. Build values from untrusted input behind a check:
 
@@ -655,8 +656,9 @@ Message types: integers and floats of any width (`[u8]` travels as bytes), `bool
 `str`, and arrays of those (`[[float]]`, ...). A float `sum` adds the ranks'
 values in a fixed tree: the same result on every rank and every run.
 Run with `brine run --ranks N` (each rank gets cores / N `par` threads unless
-`--threads` says otherwise). Without it, `world.size() == 1`. If a rank fails,
-`brine run` stops the others and exits with that rank's exit code.
+`--threads` says otherwise). Without it, `world.size() == 1`. If a rank fails
+(it panics, or calls `exit` with a code other than 0), `brine run` stops the
+others and exits with that rank's exit code.
 
 Across machines, start the built program once per rank yourself, with three
 environment variables (what `--ranks` sets for local ranks):
@@ -682,7 +684,9 @@ a call under a condition that depends on `world.rank()` (or received values,
 `clock()`, ...), or after a rank-dependent `return`, `break` or `exit`, is an
 error (E0510). Results of `sum`/`min`/`max`/`any`/`all`/`broadcast`/
 `gather_all` are the same on every rank, so loops like
-`while world.max(err) > tol:` are fine. At run time, each message also carries
+`while world.max(err) > tol:` are fine. So are branches that make the same
+calls in the same order (`world.sum(10)` in one, `world.sum(1)` in the other),
+and code that only runs with one rank (`... if world.size() > 1 else v`). At run time, each message also carries
 its call site, so a mismatch is a clear panic naming both calls.
 
 ## Proofs: rules that can't be broken

@@ -19,7 +19,7 @@
 from diag import Span, Diag
 import diag
 from types import Res, CallRes, Builtin, Reducer, WorldOp, world_ops, Ty
-from ast import BinOp, Arg, Comp, Expr, ExprKind, Pattern, PatKind, Stmt, StmtKind, Block, FnDecl, Program, LetPat, children, stmt_exprs, stmt_blocks, lvalue_root
+from ast import BinOp, UnOp, CmpOp, Case, Arg, Comp, Expr, ExprKind, Pattern, PatKind, Stmt, StmtKind, Block, FnDecl, Program, LetPat, children, stmt_exprs, stmt_blocks, lvalue_root
 from info import ProgramInfo, FnSig
 
 # Values nested deeper than this are tracked as one piece.
@@ -44,11 +44,12 @@ struct Dep:
         if not self.vary and self.params == u64(0):
             return o
         if not self.vary:
+            # (a decision that depends on parameters: kept for E0511's notes)
             return Dep(
                 vary=o.vary,
                 params=self.params | o.params,
                 src=o.src,
-                via=o.via,
+                via=o.via if o.vary or o.via.is_some() else self.via,
                 exit=o.exit
             )
         var src = self.src
@@ -69,11 +70,11 @@ struct Dep:
     fn is_none(self) -> bool:
         return not self.vary and self.params == u64(0)
 
-    # A decision: if it varies, blame it.
+    # A decision: if it varies (or depends on parameters), blame it.
     fn at(self, span: Span, what: str) -> Dep:
-        if self.vary:
+        if self.vary or self.params != u64(0):
             return Dep(
-                vary=true,
+                vary=self.vary,
                 params=self.params,
                 src=self.src,
                 via=Some((span, what)),
@@ -156,6 +157,10 @@ struct Val:
                 return false
         return true
 
+    # The same shape, with every part the same on every rank.
+    fn uniform(self) -> Val:
+        return Val(d=none(), parts=[p.uniform() for p in self.parts])
+
     # The same value, tracked as one piece below `depth` levels.
     fn capped(self, depth: int) -> Val:
         if len(self.parts) == 0:
@@ -182,23 +187,32 @@ fn same_states(a: [Val], b: [Val]) -> bool:
             return false
     return true
 
-# A program state where some ranks may be (`live`).
+# A program state where some ranks may be (`live`). A `solo` state is only
+# reached when `world.size()` is 1: with one rank, every value is the same on
+# every rank and nothing can deadlock.
 struct St:
     vals: [Val]
     live: bool
+    solo: bool
 
     fn join(self, o: St) -> St:
         if not o.live:
             return self
         if not self.live:
             return o
-        return St(vals=join_states(self.vals, o.vals), live=true)
+        # the size is the same everywhere: with more ranks, all of them come
+        # from the other state
+        if o.solo:
+            return self
+        if self.solo:
+            return o
+        return St(vals=join_states(self.vals, o.vals), live=true, solo=false)
 
     fn same(self, o: St) -> bool:
-        return self.live == o.live and same_states(self.vals, o.vals)
+        return self.live == o.live and self.solo == o.solo and same_states(self.vals, o.vals)
 
 fn dead() -> St:
-    return St(vals=[], live=false)
+    return St(vals=[], live=false, solo=false)
 
 # A part of a parameter with its own dependence bit.
 struct Slot:
@@ -301,6 +315,16 @@ fn project(vs: [Val], s: Slot) -> Dep:
         v = v.part(step)
     return v.flat()
 
+# Why a function needs a parameter slot to be the same on every rank, for
+# E0511: the statement that needs it, and the decision on the way.
+struct Why:
+    span: Span
+    # e.g. "communicates here"
+    what: str
+    cond: Option[Span]
+    # it passes the value on to this function's slot
+    next: Option[(int, int)]
+
 struct Summary:
     # the function (transitively) communicates
     comm: bool
@@ -308,6 +332,8 @@ struct Summary:
     comm_site: Option[Span]
     # parameter slots that must be the same on every rank
     need: u64
+    # why, per slot (for messages)
+    why: {int: Why}
     ret: Val
     # what each `ref` parameter may hold afterwards
     outs: [Val]
@@ -335,10 +361,15 @@ struct Summary:
         var outs = self.outs
         for i in 0..min(len(outs), len(o.outs)):
             outs[i] = outs[i].join(o.outs[i]).capped(MAX_DEPTH)
+        var why = self.why
+        for k, w in o.why.items():
+            if k not in why:
+                why[k] = w
         return Summary(
             comm=self.comm or o.comm,
             comm_site=self.comm_site if self.comm_site.is_some() else o.comm_site,
             need=self.need | o.need,
+            why=why,
             ret=self.ret.join(o.ret).capped(MAX_DEPTH),
             outs=outs,
             exits=self.exits or o.exits,
@@ -437,6 +468,7 @@ fn check(prog: Program, info: ProgramInfo) -> [Diag]:
                 comm=false,
                 comm_site=None,
                 need=u64(0),
+                why={},
                 ret=ret,
                 outs=[atom(none())] * len(s.params),
                 exits=false,
@@ -470,7 +502,7 @@ fn check(prog: Program, info: ProgramInfo) -> [Diag]:
         queued[id] = false
         match decls.get(id):
             case Some(f):
-                var a = new_fa(info, sums, slots, f, false)
+                var a = new_fa(info, sums, slots, decls, f, false)
                 a.run(f)
                 let s = sums[id].join(a.summary(f, [p.by_ref for p in info.fns[id].params]))
                 if not s.same(sums[id]):
@@ -487,19 +519,27 @@ fn check(prog: Program, info: ProgramInfo) -> [Diag]:
         var all: [FnDecl] = [f for f in m.fns if not f.is_extern]
         all.extend(m.tests)
         for f in all:
-            var a = new_fa(info, sums, slots, f, true)
+            var a = new_fa(info, sums, slots, decls, f, true)
             a.run(f)
             for d in a.diags:
                 var key = d.code
                 if len(d.labels) > 0:
                     let s = d.labels[0].span
-                    key = f"{d.code} {s.file} {s.lo} {s.hi}"
+                    # (each part of one argument that must match is its own error)
+                    key = f"{d.code} {s.file} {s.lo} {s.hi} {d.msg}"
                 if key not in reported:
                     reported[key] = true
                     diags.push(d)
     return diags
 
-fn new_fa(info: ProgramInfo, sums: [Summary], slots: [ParamSlots], f: FnDecl, report: bool) -> Fa:
+fn new_fa(
+    info: ProgramInfo,
+    sums: [Summary],
+    slots: [ParamSlots],
+    decls: {int: FnDecl},
+    f: FnDecl,
+    report: bool
+) -> Fa:
     var vals = [atom(none())] * len(f.locals)
     if 0 <= f.id < len(slots):
         let pv = slots[f.id].vals
@@ -510,8 +550,13 @@ fn new_fa(info: ProgramInfo, sums: [Summary], slots: [ParamSlots], f: FnDecl, re
         info=info,
         sums=sums,
         slots=slots,
+        decls=decls,
+        traces={},
+        tracing={},
         vals=vals,
         live=true,
+        solo=false,
+        arm=none(),
         report=report,
         diags=[],
         ret_poison=none(),
@@ -526,6 +571,7 @@ fn new_fa(info: ProgramInfo, sums: [Summary], slots: [ParamSlots], f: FnDecl, re
         comm=false,
         comm_site=None,
         need=u64(0),
+        why={},
         exits=false,
         exit_dep=none(),
         par=0,
@@ -537,10 +583,20 @@ struct Fa:
     info: ProgramInfo
     sums: [Summary]
     slots: [ParamSlots]
+    decls: {int: FnDecl}
+    # the communication each function does, when it is always the same
+    traces: {int: Tr}
+    tracing: {int: bool}
     # what each local holds here
     vals: [Val]
     # false after `return`, `break`, ...: no rank gets here
     live: bool
+    # only reached when `world.size()` is 1
+    solo: bool
+    # the conditions of the branches we are in whose every branch does the
+    # same communication: what is computed in them may differ between ranks,
+    # but each rank communicates either way
+    arm: Dep
     report: bool
     diags: [Diag]
     # control dependence added by `return`s (and `exit`s) seen so far
@@ -561,6 +617,7 @@ struct Fa:
     comm: bool
     comm_site: Option[Span]
     need: u64
+    why: {int: Why}
     exits: bool
     exit_dep: Dep
     par: int
@@ -584,6 +641,7 @@ struct Fa:
             comm=self.comm,
             comm_site=self.comm_site,
             need=self.need,
+            why=self.why,
             ret=self.ret.capped(MAX_DEPTH),
             outs=outs,
             exits=self.exits,
@@ -593,20 +651,26 @@ struct Fa:
     fn st(self) -> St:
         if not self.live:
             return dead()
-        return St(vals=self.vals, live=true)
+        return St(vals=self.vals, live=true, solo=self.solo)
 
     fn restore(ref self, s: St):
         if s.live:
             self.vals = s.vals
         self.live = s.live
+        self.solo = s.solo
 
     fn set(ref self, l: int, v: Val):
         if 0 <= l < len(self.vals):
             self.vals[l] = v.capped(MAX_DEPTH)
 
     # Control dependence in effect: the given context plus everything that
-    # makes some ranks leave the function, loop or loop body early.
+    # makes some ranks leave the function, loop or loop body early, and the
+    # branches that communicate the same either way.
     fn eff(self, ctx: Dep) -> Dep:
+        return self.eff_comm(ctx).join(self.arm)
+
+    # ... without those branches: what decides whether a rank communicates.
+    fn eff_comm(self, ctx: Dep) -> Dep:
         var e = ctx.join(self.ret_poison).join(self.cont_poison)
         for l in self.loops:
             match self.loop_poison.get(l):
@@ -636,6 +700,9 @@ struct Fa:
 
     # Some ranks may leave the function here.
     fn leave(ref self, here: Dep):
+        if self.solo:
+            # (the ref parameters' values: a solo state adds nothing)
+            return
         self.ret_poison = self.ret_poison.join(here)
         self.poison_loop(here, true)
         self.ret_st = self.ret_st.join(self.st())
@@ -668,6 +735,11 @@ struct Fa:
             case StmtKind.ExprStmt(e):
                 self.expr(e, ctx)
             case StmtKind.If(branches, els):
+                # when every branch communicates the same way, which one a
+                # rank takes doesn't decide whether it communicates
+                let same = self.same_comm_if(branches, els)
+                let arm0 = self.arm
+                var armd = none()
                 var c = ctx
                 var out = dead()
                 # an early exit in one branch can't stop a rank that takes another
@@ -678,15 +750,24 @@ struct Fa:
                         .flat()
                         .at(cond.span, "this condition may differ between ranks")
                     )
-                    c = c.join(d)
+                    if same:
+                        armd = armd.join(d)
+                        self.arm = arm0.join(armd)
+                    else:
+                        c = c.join(d)
+                    let g = size_guard(cond)
                     let before = self.st()
                     # (the ranks that go on to the next branch evaluated this condition)
                     let pc = self.poison()
+                    if g == SOLO_IF_TRUE:
+                        self.solo = true
                     self.block(body, c)
                     out = out.join(self.st())
                     pout = join_poison(pout, self.poison())
                     self.restore(before)
                     self.set_poison(pc)
+                    if g == SOLO_IF_FALSE:
+                        self.solo = true
                 match els:
                     case Some(b):
                         self.block(b, c)
@@ -695,6 +776,7 @@ struct Fa:
                 out = out.join(self.st())
                 self.restore(out)
                 self.set_poison(join_poison(pout, self.poison()))
+                self.arm = arm0
             case StmtKind.Match(scrut, cases):
                 let sv = self.expr(scrut, ctx)
                 # which case runs depends on what the patterns look at
@@ -702,7 +784,14 @@ struct Fa:
                 for case_ in cases:
                     md = md.join(pat_dep(case_.pat, sv))
                 md = md.at(scrut.span, "which case runs may differ between ranks")
-                var c = ctx.join(md)
+                # as for `if`: cases that all communicate the same way
+                let same = self.same_comm_match(cases)
+                let arm0 = self.arm
+                var c = ctx
+                if same:
+                    self.arm = arm0.join(md)
+                else:
+                    c = ctx.join(md)
                 var cur = self.st()
                 var out = dead()
                 let bind = self.eff(ctx)
@@ -720,7 +809,10 @@ struct Fa:
                                 .flat()
                                 .at(g.span, "this condition may differ between ranks")
                             )
-                            c = c.join(gd)
+                            if same:
+                                self.arm = self.arm.join(gd)
+                            else:
+                                c = c.join(gd)
                         case None:
                             pass
                     cur = self.st()
@@ -730,6 +822,7 @@ struct Fa:
                     pout = join_poison(pout, self.poison())
                 self.restore(out)
                 self.set_poison(pout)
+                self.arm = arm0
             case StmtKind.While(_, _, _):
                 self.run_loop(s, ctx, none(), atom(none()))
             case StmtKind.For(_, _, _, iter, _, _, _):
@@ -744,12 +837,14 @@ struct Fa:
                     case None:
                         pass
                 let e = self.eff(ctx)
-                self.ret = self.ret.join(v.spread(e))
+                if not self.solo:
+                    self.ret = self.ret.join(v.spread(e))
                 self.leave(e.exits_at(s.span, "some ranks may return here"))
                 self.live = false
             case StmtKind.Break:
                 let here = self.eff(ctx).exits_at(s.span, "some ranks may leave the loop here")
-                self.poison_loop(here, false)
+                if not self.solo:
+                    self.poison_loop(here, false)
                 let k = len(self.brk)
                 if k > 0:
                     self.brk[k - 1] = self.brk[k - 1].join(self.st())
@@ -760,7 +855,8 @@ struct Fa:
                 ).exits_at(s.span, "some ranks may skip the rest of the loop body here")
                 # every rank still evaluates the loop condition: only the rest
                 # of this pass through the body is affected
-                self.cont_poison = self.cont_poison.join(here)
+                if not self.solo:
+                    self.cont_poison = self.cont_poison.join(here)
                 let k = len(self.cont)
                 if k > 0:
                     self.cont[k - 1] = self.cont[k - 1].join(self.st())
@@ -935,7 +1031,8 @@ struct Fa:
                 let xv = self.expr(x, ctx)
                 let tag = xv.d.at(x.span, "this may succeed on some ranks and fail on others")
                 let ef = self.eff(ctx.join(tag))
-                self.ret = self.ret.join(Val(d=ef, parts=[xv.part(0).spread(ef)]))
+                if not self.solo:
+                    self.ret = self.ret.join(Val(d=ef, parts=[xv.part(0).spread(ef)]))
                 let q = Span(file=e.span.file, lo=max(e.span.lo, e.span.hi - 1), hi=e.span.hi)
                 self.leave(ef.exits_at(q, "so some ranks may return early here (`?`)"))
                 return xv.part(0)
@@ -1019,13 +1116,30 @@ struct Fa:
                     .flat()
                     .at(cond.span, "this condition may differ between ranks")
                 )
-                let inner = ctx.join(c)
+                let same = not c.is_none() and self.same_comm_expr(then, els)
+                let arm0 = self.arm
+                var inner = ctx
+                if same:
+                    self.arm = arm0.join(c)
+                else:
+                    inner = ctx.join(c)
+                let g = size_guard(cond)
                 let before = self.st()
-                let t = self.expr(then, inner)
+                if g == SOLO_IF_TRUE:
+                    self.solo = true
+                var t = self.expr(then, inner)
+                if g == SOLO_IF_TRUE:
+                    # with one rank, it is the same everywhere
+                    t = t.uniform()
                 let after_t = self.st()
                 self.restore(before)
-                let f = self.expr(els, inner)
+                if g == SOLO_IF_FALSE:
+                    self.solo = true
+                var f = self.expr(els, inner)
+                if g == SOLO_IF_FALSE:
+                    f = f.uniform()
                 self.restore(after_t.join(self.st()))
+                self.arm = arm0
                 return t.join(f).spread(c)
             case ExprKind.Comp(c):
                 return self.comp(c, e.local, None, ctx)
@@ -1172,13 +1286,15 @@ struct Fa:
                                 self.same_on_all(
                                     args[0].expr,
                                     vs[0].flat(),
-                                    "the root rank of `world.broadcast`"
+                                    "the root rank of `world.broadcast`",
+                                    None
                                 )
                             case WorldOp.Shift:
                                 self.same_on_all(
                                     args[1].expr,
                                     vs[1].flat(),
-                                    "the distance of `world.shift`"
+                                    "the distance of `world.shift`",
+                                    None
                                 )
                             case _:
                                 pass
@@ -1219,7 +1335,8 @@ struct Fa:
             case Builtin.Exit:
                 let here = ef.exits_at(e.span, "some ranks may exit here")
                 self.exits = true
-                self.exit_dep = self.exit_dep.join(here)
+                if not self.solo:
+                    self.exit_dep = self.exit_dep.join(here)
                 self.leave(here)
                 self.live = false
                 return atom(none())
@@ -1368,7 +1485,7 @@ struct Fa:
                     var what = f"argument `{pname}` of `{name}`"
                     if len(sl.path) > 0:
                         what = f"`{sl.name}` in argument `{pname}` of `{name}`"
-                    self.same_on_all(ae, project(vs, sl), what)
+                    self.same_on_all(ae, project(vs, sl), what, Some((id, i)))
         # `ref` arguments may come back changed
         let ef = self.eff(ctx)
         for i, p in enumerate(sig.params):
@@ -1394,26 +1511,31 @@ struct Fa:
                 self.subst(s.exit_dep, vs, slots, e.span)
             ).exits_at(e.span, f"`{name}` may exit here on some ranks")
             self.exits = true
-            self.exit_dep = self.exit_dep.join(here)
+            if not self.solo:
+                self.exit_dep = self.exit_dep.join(here)
             if here.vary or here.params != u64(0):
                 self.leave(here)
         return self.subst_val(s.ret, vs, slots, e.span)
 
     # A communication call at `span`: every rank must get here.
     fn communicate(ref self, span: Span, ctx: Dep, what: str, inner: Option[Span]):
-        self.comm = true
-        if self.comm_site.is_none():
-            self.comm_site = Some(span)
-        let c = self.eff(ctx)
-        self.need = self.need | c.params
-        if not self.report:
-            return
-        if self.par > 0:
+        if self.report and self.par > 0:
             self.diags.push(
                 diag.error("E0503", f"can't call {what} inside a `par` body")
                 .label(span, "communication inside a parallel section")
                 .with_help("communicate before or after the parallel section")
             )
+            return
+        if self.solo:
+            # with one rank there is nobody to wait for
+            return
+        self.comm = true
+        if self.comm_site.is_none():
+            self.comm_site = Some(span)
+        let c = self.eff_comm(ctx)
+        self.need = self.need | c.params
+        self.note_why(c, span, f"calls {what}", None)
+        if not self.report:
             return
         if c.vary:
             var d = diag.error(
@@ -1470,9 +1592,27 @@ struct Fa:
                     )
             self.diags.push(d)
 
+    # Record why the parameter slots in `d` must be the same on every rank.
+    fn note_why(ref self, d: Dep, span: Span, what: str, next: Option[(int, int)]):
+        if d.params == u64(0):
+            return
+        var cond: Option[Span] = None
+        match d.via:
+            case Some((s, _)):
+                cond = Some(s)
+            case None:
+                pass
+        for k in 0..64:
+            if d.params & bit(k) != u64(0) and k not in self.why:
+                self.why[k] = Why(span=span, what=what, cond=cond, next=next)
+
     # `e` (with dependencies `d`) must have the same value on every rank.
-    fn same_on_all(ref self, e: Expr, d: Dep, what: str):
+    # `next`: it is slot `next.1` of the function `next.0`, which needs it.
+    fn same_on_all(ref self, e: Expr, d: Dep, what: str, next: Option[(int, int)]):
+        if self.solo:
+            return
         self.need = self.need | d.params
+        self.note_why(d, e.span, f"needs {what} to be the same on every rank", next)
         if self.report and d.vary:
             var dg = diag.error(
                 "E0511",
@@ -1490,13 +1630,636 @@ struct Fa:
                 case Some(s):
                     if not inside(s, used):
                         dg = dg.label(s, "because this depends on which rank is running")
+                        used.push(s)
                 case None:
                     pass
+            # where the callee needs it, following the calls that pass it on
+            var cur = next
+            var steps = 0
+            var why_note = ""
+            while steps < 8:
+                steps += 1
+                match cur:
+                    case Some((fid, k)):
+                        match self.sums[fid].why.get(k):
+                            case Some(w):
+                                let fname = self.info.fns[fid].name
+                                match w.cond:
+                                    case Some(cs):
+                                        if cs not in used:
+                                            dg = dg.label(cs, f"`{fname}` decides with it here")
+                                            used.push(cs)
+                                    case None:
+                                        pass
+                                if w.span not in used:
+                                    match w.next:
+                                        case Some((g, _)):
+                                            let gname = self.info.fns[g].name
+                                            dg = dg.label(
+                                                w.span,
+                                                f"`{fname}` passes it to `{gname}` here"
+                                            )
+                                        case None:
+                                            dg = dg.label(w.span, f"`{fname}` {w.what}")
+                                    used.push(w.span)
+                                if w.next.is_none():
+                                    if w.cond.is_some():
+                                        why_note = f"`{fname}` {w.what} under a decision that depends on it: every rank must make the same `world` calls"
+                                    else:
+                                        why_note = f"`{fname}` {w.what}"
+                                cur = w.next
+                            case None:
+                                cur = None
+                    case None:
+                        break
+            if why_note != "":
+                dg = dg.note(why_note)
             self.diags.push(
                 dg.with_help(
                     "compute it from values that are the same everywhere, e.g. `world.size()`, constants, or the result of `world.broadcast`"
                 )
             )
+
+    # ------------------------------------------------ the same communication
+    # A piece of code is described by the communication it does on every
+    # path through it, as text: `world` calls with their argument types (and
+    # the values that must be the same everywhere), calls of functions that
+    # communicate, and loops around them. Branches with equal descriptions
+    # make the same calls in the same order, whichever one a rank takes.
+    # Early exits aren't in the description: those still count as decided
+    # by the branch conditions (`arm`), so communication after them is
+    # checked as before.
+
+    # Does `e` (or `b`) communicate?
+    fn ecomm(self, e: Expr) -> bool:
+        match e.cres:
+            case CallRes.World(op):
+                if op != WorldOp.Rank and op != WorldOp.Size:
+                    return true
+            case CallRes.Fn(id):
+                if self.sums[id].comm:
+                    return true
+            case CallRes.Method(id):
+                if self.sums[id].comm:
+                    return true
+            case _:
+                pass
+        for c in children(e):
+            if self.ecomm(c):
+                return true
+        return false
+
+    fn bcomm(self, b: Block) -> bool:
+        for s in b.stmts:
+            for e in stmt_exprs(s):
+                if self.ecomm(e):
+                    return true
+            for sb in stmt_blocks(s):
+                if self.bcomm(sb):
+                    return true
+        return false
+
+    fn same_comm_if(ref self, branches: [(Expr, Block)], els: Option[Block]) -> bool:
+        var any = false
+        for _, b in branches:
+            any = any or self.bcomm(b)
+        match els:
+            case Some(b):
+                any = any or self.bcomm(b)
+            case None:
+                pass
+        if not any:
+            return false
+        var arms: [Tr] = []
+        for i, br in enumerate(branches):
+            # only the ranks that skip the earlier branches evaluate it
+            if i > 0 and self.ecomm(br.0):
+                return false
+            arms.push(self.tr_of(br.1))
+        match els:
+            case Some(b):
+                arms.push(self.tr_of(b))
+            case None:
+                arms.push(Tr(st=T_ON, evs=[]))
+        return combine(arms).st != T_FAIL
+
+    fn same_comm_match(ref self, cases: [Case]) -> bool:
+        var any = false
+        for c in cases:
+            any = any or self.bcomm(c.body)
+        if not any:
+            return false
+        var arms: [Tr] = []
+        for c in cases:
+            match c.guard:
+                case Some(g):
+                    if self.ecomm(g):
+                        return false
+                case None:
+                    pass
+            arms.push(self.tr_of(c.body))
+        return combine(arms).st != T_FAIL
+
+    fn same_comm_expr(ref self, a: Expr, b: Expr) -> bool:
+        if not self.ecomm(a) and not self.ecomm(b):
+            return false
+        let ta = self.tr_expr_of(a)
+        let tb = self.tr_expr_of(b)
+        return combine([ta, tb]).st != T_FAIL
+
+    fn tr_of(ref self, b: Block) -> Tr:
+        var evs: [str] = []
+        let st = self.tr_block(b, ref evs)
+        return Tr(st=st, evs=evs)
+
+    fn tr_expr_of(ref self, e: Expr) -> Tr:
+        var evs: [str] = []
+        let st = self.tr_expr(e, ref evs)
+        return Tr(st=st, evs=evs)
+
+    fn tr_block(ref self, b: Block, ref out: [str]) -> int:
+        for s in b.stmts:
+            let r = self.tr_stmt(s, ref out)
+            if r != T_ON:
+                return r
+        return T_ON
+
+    fn tr_stmt(ref self, s: Stmt, ref out: [str]) -> int:
+        match s.kind:
+            case StmtKind.Let(_, _, _, init, _):
+                return self.tr_expr(init, ref out)
+            case StmtKind.Assign(target, _, value):
+                if self.ecomm(target):
+                    return T_FAIL
+                return self.tr_expr(value, ref out)
+            case StmtKind.ExprStmt(e):
+                return self.tr_expr(e, ref out)
+            case StmtKind.If(branches, els):
+                var arms: [Tr] = []
+                for i, br in enumerate(branches):
+                    if i == 0:
+                        let r = self.tr_expr(br.0, ref out)
+                        if r != T_ON:
+                            return r
+                    elif self.ecomm(br.0):
+                        return T_FAIL
+                    arms.push(self.tr_of(br.1))
+                match els:
+                    case Some(b):
+                        arms.push(self.tr_of(b))
+                    case None:
+                        arms.push(Tr(st=T_ON, evs=[]))
+                return merge(combine(arms), ref out)
+            case StmtKind.Match(scrut, cases):
+                let r = self.tr_expr(scrut, ref out)
+                if r != T_ON:
+                    return r
+                var arms: [Tr] = []
+                for c in cases:
+                    match c.guard:
+                        case Some(g):
+                            if self.ecomm(g):
+                                return T_FAIL
+                        case None:
+                            pass
+                    arms.push(self.tr_of(c.body))
+                return merge(combine(arms), ref out)
+            case StmtKind.While(cond, _, body):
+                if not self.ecomm(cond) and not self.bcomm(body):
+                    return T_ON
+                var evs: [str] = []
+                if self.tr_expr(cond, ref evs) == T_FAIL or self.tr_block(body, ref evs) == T_FAIL:
+                    return T_FAIL
+                out.push("while " + ekey(cond) + " {" + "; ".join(evs) + "}")
+                return T_ON
+            case StmtKind.For(_, _, _, iter, _, body, _):
+                let r = self.tr_expr(iter, ref out)
+                if r != T_ON:
+                    return r
+                if self.bcomm(body):
+                    var evs: [str] = []
+                    if self.tr_block(body, ref evs) == T_FAIL:
+                        return T_FAIL
+                    out.push("for " + ekey(iter) + " {" + "; ".join(evs) + "}")
+                return T_ON
+            case StmtKind.Return(value):
+                match value:
+                    case Some(e):
+                        let r = self.tr_expr(e, ref out)
+                        if r != T_ON:
+                            return r
+                    case None:
+                        pass
+                return T_END
+            case StmtKind.Break | StmtKind.Continue:
+                return T_END
+            case StmtKind.Assert(cond, msg):
+                match msg:
+                    case Some(m):
+                        if self.ecomm(m):
+                            return T_FAIL
+                    case None:
+                        pass
+                return self.tr_expr(cond, ref out)
+            case _:
+                return T_ON
+
+    fn tr_expr(ref self, e: Expr, ref out: [str]) -> int:
+        if not self.ecomm(e):
+            return end_of(e)
+        match e.kind:
+            case ExprKind.Binary(op, l, r):
+                if op == BinOp.And or op == BinOp.Or:
+                    # the right side runs on some ranks only
+                    if self.ecomm(r):
+                        return T_FAIL
+                    return self.tr_expr(l, ref out)
+            case ExprKind.Compare(first, rest):
+                let r = self.tr_expr(first, ref out)
+                if r != T_ON:
+                    return r
+                for i, p in enumerate(rest):
+                    if i == 0:
+                        let r2 = self.tr_expr(p.1, ref out)
+                        if r2 != T_ON:
+                            return r2
+                    elif self.ecomm(p.1):
+                        return T_FAIL
+                return T_ON
+            case ExprKind.IfElse(c, t, f):
+                let r = self.tr_expr(c, ref out)
+                if r != T_ON:
+                    return r
+                let tt = self.tr_expr_of(t)
+                let tf = self.tr_expr_of(f)
+                return merge(combine([tt, tf]), ref out)
+            case ExprKind.Comp(c):
+                let r = self.tr_expr(c.iter, ref out)
+                if r != T_ON:
+                    return r
+                if self.ecomm(c.body):
+                    return T_FAIL
+                match c.filter:
+                    case Some(fl):
+                        if self.ecomm(fl):
+                            return T_FAIL
+                    case None:
+                        pass
+                return T_ON
+            case ExprKind.ParTuple(_):
+                return T_FAIL
+            case _:
+                pass
+        var args: [Arg] = []
+        match e.kind:
+            case ExprKind.Call(_, a):
+                args = a
+            case ExprKind.MethodCall(_, _, _, a):
+                args = a
+            case _:
+                pass
+        for a in args:
+            # (in which order named arguments run is not the order written)
+            if a.name.is_some() and self.ecomm(a.expr):
+                return T_FAIL
+        # the parts, in the order they run
+        for c in children(e):
+            let r = self.tr_expr(c, ref out)
+            if r != T_ON:
+                return r
+        match e.cres:
+            case CallRes.World(op):
+                if op != WorldOp.Rank and op != WorldOp.Size:
+                    var ev = (
+                        world_name(op)
+                        + "("
+                        + ", ".join([self.info.ty_name(a.expr.ty) for a in args])
+                        + ")"
+                    )
+                    if op == WorldOp.Broadcast and len(args) > 0:
+                        ev += " root " + ekey(args[0].expr)
+                    if op == WorldOp.Shift and len(args) > 1:
+                        ev += " by " + ekey(args[1].expr)
+                    out.push(ev)
+            case CallRes.Fn(id):
+                self.tr_call(e, id, ref out)
+            case CallRes.Method(id):
+                self.tr_call(e, id, ref out)
+            case _:
+                pass
+        return end_of(e)
+
+    # A call of function `id`: what it does, or else the function and the
+    # arguments its communication depends on.
+    fn tr_call(ref self, e: Expr, id: int, ref out: [str]):
+        let s = self.sums[id]
+        if not s.comm:
+            return
+        if s.need == u64(0) and not s.exits:
+            let t = self.fn_trace(id)
+            if t.st == T_ON or t.st == T_END:
+                out.extend(t.evs)
+                return
+        var ins: [Expr] = []
+        match e.kind:
+            case ExprKind.Call(_, a):
+                ins = [x.expr for x in a]
+            case ExprKind.MethodCall(r, _, _, a):
+                ins = [r]
+                ins.extend([x.expr for x in a])
+            case _:
+                pass
+        var ps: [int] = []
+        let sl = self.slots[id].slots
+        for i in 0..min(64, len(sl)):
+            if s.need & bit(i) != u64(0) and sl[i].param not in ps:
+                ps.push(sl[i].param)
+        ps.sort()
+        var ks: [str] = []
+        for p in ps:
+            ks.push(ekey(ins[p]) if p < len(ins) else "?")
+        out.push(f"call {id}(" + ", ".join(ks) + ")")
+
+    # What function `id` always does, if it has no early exits.
+    fn fn_trace(ref self, id: int) -> Tr:
+        match self.traces.get(id):
+            case Some(t):
+                return t
+            case None:
+                pass
+        if self.tracing.get(id, false):
+            return Tr(st=T_FAIL, evs=[])
+        var t = Tr(st=T_FAIL, evs=[])
+        match self.decls.get(id):
+            case Some(f):
+                if not early_exit(f.body, true):
+                    self.tracing[id] = true
+                    t = self.tr_of(f.body)
+                    self.tracing[id] = false
+            case None:
+                pass
+        self.traces[id] = t
+        return t
+
+# A description of the communication of some code (see `Fa.tr_block`), and
+# how its paths end.
+struct Tr:
+    st: int
+    evs: [str]
+
+# goes on after it
+const T_ON = 0
+# leaves early on every path (`return`, `break`, `continue`, `exit`)
+const T_END = 1
+# panics on every path
+const T_PANIC = 2
+# paths through it communicate differently, or it can't tell
+const T_FAIL = 3
+
+# The branches `arms`, one of which runs: the same description for all of
+# them, or T_FAIL. A branch that panics may stop early.
+fn combine(arms: [Tr]) -> Tr:
+    var first: Option[[str]] = None
+    var on = false
+    for a in arms:
+        if a.st == T_FAIL:
+            return Tr(st=T_FAIL, evs=[])
+        if a.st != T_PANIC:
+            match first:
+                case Some(r):
+                    if not same_strs(r, a.evs):
+                        return Tr(st=T_FAIL, evs=[])
+                case None:
+                    first = Some(a.evs)
+            if a.st == T_ON:
+                on = true
+    match first:
+        case Some(r):
+            for a in arms:
+                if a.st == T_PANIC and not (
+                    len(a.evs) <= len(r) and same_strs(a.evs, r[:len(a.evs)])
+                ):
+                    return Tr(st=T_FAIL, evs=[])
+            return Tr(st=T_ON if on else T_END, evs=r)
+        case None:
+            for a in arms:
+                if not same_strs(a.evs, arms[0].evs):
+                    return Tr(st=T_FAIL, evs=[])
+            return Tr(st=T_PANIC, evs=arms[0].evs if len(arms) > 0 else [])
+
+fn merge(t: Tr, ref out: [str]) -> int:
+    if t.st == T_FAIL:
+        return T_FAIL
+    out.extend(t.evs)
+    return t.st
+
+fn same_strs(a: [str], b: [str]) -> bool:
+    if len(a) != len(b):
+        return false
+    for i in 0..len(a):
+        if a[i] != b[i]:
+            return false
+    return true
+
+# How a path ends at `e`: `exit(...)` and `panic(...)` end it.
+fn end_of(e: Expr) -> int:
+    match e.cres:
+        case CallRes.Builtin(Builtin.Exit):
+            return T_END
+        case CallRes.Builtin(Builtin.Panic):
+            return T_PANIC
+        case _:
+            return T_ON
+
+# Can the code leave early (other than with a last `return`)?
+fn early_exit(b: Block, top: bool) -> bool:
+    for i, s in enumerate(b.stmts):
+        match s.kind:
+            case StmtKind.Return(_):
+                if not (top and i == len(b.stmts) - 1):
+                    return true
+            case StmtKind.Break | StmtKind.Continue:
+                return true
+            case _:
+                pass
+        for e in stmt_exprs(s):
+            if exits_in(e):
+                return true
+        for sb in stmt_blocks(s):
+            if early_exit(sb, false):
+                return true
+    return false
+
+fn exits_in(e: Expr) -> bool:
+    match e.kind:
+        case ExprKind.Try(_):
+            return true
+        case _:
+            pass
+    if end_of(e) == T_END:
+        return true
+    for c in children(e):
+        if exits_in(c):
+            return true
+    return false
+
+# The expression as text: equal texts compute the same value from the same
+# variables.
+fn ekey(e: Expr) -> str:
+    match e.kind:
+        case ExprKind.Int(v):
+            return f"{v}"
+        case ExprKind.UInt(v):
+            return f"{v}u"
+        case ExprKind.Float(v):
+            return f"{v}f"
+        case ExprKind.Bool(b):
+            return f"{b}"
+        case ExprKind.Str(s):
+            return f"s{len(s)}:{s}"
+        case ExprKind.Ident(n):
+            match e.res:
+                case Res.Local(l):
+                    return f"${l}"
+                case _:
+                    return n
+        case ExprKind.Unary(op, x):
+            var o = "-"
+            if op == UnOp.Not:
+                o = "not "
+            elif op == UnOp.BitNot:
+                o = "~"
+            return "(" + o + ekey(x) + ")"
+        case ExprKind.Try(x):
+            return ekey(x) + "?"
+        case ExprKind.Binary(op, l, r):
+            return "(" + ekey(l) + " " + op.sym() + " " + ekey(r) + ")"
+        case ExprKind.Compare(first, rest):
+            var s = "(" + ekey(first)
+            for op, x in rest:
+                s += " " + op.sym() + " " + ekey(x)
+            return s + ")"
+        case ExprKind.IfElse(c, t, f):
+            return "(" + ekey(t) + " if " + ekey(c) + " else " + ekey(f) + ")"
+        case ExprKind.Call(c, args):
+            return ekey(c) + "(" + arg_keys(args) + ")"
+        case ExprKind.MethodCall(r, n, _, args):
+            return ekey(r) + "." + n + "(" + arg_keys(args) + ")"
+        case ExprKind.Field(x, n, _):
+            return ekey(x) + "." + n
+        case ExprKind.Index(x, i):
+            return ekey(x) + "[" + ekey(i) + "]"
+        case ExprKind.Slice(x, lo, hi):
+            var a = ""
+            var b = ""
+            match lo:
+                case Some(v):
+                    a = ekey(v)
+                case None:
+                    pass
+            match hi:
+                case Some(v):
+                    b = ekey(v)
+                case None:
+                    pass
+            return ekey(x) + "[" + a + ":" + b + "]"
+        case ExprKind.Array(es):
+            return "[" + ", ".join([ekey(x) for x in es]) + "]"
+        case ExprKind.Tuple(es):
+            return "(" + ", ".join([ekey(x) for x in es]) + ",)"
+        case ExprKind.Contains(x, c, neg):
+            return "(" + ekey(x) + (" not in " if neg else " in ") + ekey(c) + ")"
+        case ExprKind.Range(lo, hi, incl):
+            return "(" + ekey(lo) + ("..=" if incl else "..") + ekey(hi) + ")"
+        case ExprKind.Repeat(x, n):
+            return "([" + ekey(x) + "] * " + ekey(n) + ")"
+        case _:
+            # (never equal to another one)
+            return f"?{e.span.file}:{e.span.lo}"
+
+fn arg_keys(args: [Arg]) -> str:
+    var out: [str] = []
+    for a in args:
+        var k = ekey(a.expr)
+        if a.by_ref:
+            k = "ref " + k
+        match a.name:
+            case Some((n, _)):
+                k = n + "=" + k
+            case None:
+                pass
+        out.push(k)
+    return ", ".join(out)
+
+const SOLO_IF_TRUE = 1
+const SOLO_IF_FALSE = 2
+
+# Whether `cond` holds exactly when `world.size()` is 1 (SOLO_IF_TRUE),
+# exactly when it isn't (SOLO_IF_FALSE), or neither (0): `world.size() > 1`.
+fn size_guard(cond: Expr) -> int:
+    match cond.kind:
+        case ExprKind.Unary(op, x):
+            if op == UnOp.Not:
+                let g = size_guard(x)
+                return 0 if g == 0 else 3 - g
+        case ExprKind.Compare(first, rest):
+            if len(rest) != 1:
+                return 0
+            let op = rest[0].0
+            var k: Option[int] = None
+            var flip = false
+            if is_size(first):
+                k = small_int(rest[0].1)
+            elif is_size(rest[0].1):
+                k = small_int(first)
+                flip = true
+            match k:
+                case Some(n):
+                    let t1 = cmp_holds(1, op, n, flip)
+                    # beyond n + 1 nothing changes
+                    for s in 2..max(n, 2) + 2:
+                        if cmp_holds(s, op, n, flip) == t1:
+                            return 0
+                    return SOLO_IF_TRUE if t1 else SOLO_IF_FALSE
+                case None:
+                    pass
+        case _:
+            pass
+    return 0
+
+fn is_size(e: Expr) -> bool:
+    match e.cres:
+        case CallRes.World(WorldOp.Size):
+            return true
+        case _:
+            return false
+
+fn small_int(e: Expr) -> Option[int]:
+    match e.kind:
+        case ExprKind.Int(v):
+            if -1024 <= v <= 1024:
+                return Some(int(v))
+        case _:
+            pass
+    return None
+
+# `size op n` (or `n op size`)
+fn cmp_holds(size: int, op: CmpOp, n: int, flip: bool) -> bool:
+    let a = n if flip else size
+    let b = size if flip else n
+    match op:
+        case CmpOp.Eq:
+            return a == b
+        case CmpOp.Ne:
+            return a != b
+        case CmpOp.Lt:
+            return a < b
+        case CmpOp.Le:
+            return a <= b
+        case CmpOp.Gt:
+            return a > b
+        case CmpOp.Ge:
+            return a >= b
 
 # Whether pattern `p` matches a value with dependence `v`.
 fn pat_dep(p: Pattern, v: Val) -> Dep:

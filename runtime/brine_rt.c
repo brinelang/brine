@@ -436,11 +436,13 @@ static void br_stack_leave(void) {
 
 #ifndef BRINE_RT_BR
 static void br_world_finish(const char *how);
+static void br_exit_record(int64_t code);
 #endif
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_exit(int64_t code) {
     br_flush();
     br_gpu_settle();
+    if (code != 0) br_exit_record(code);
     /* like returning from `main`: every rank waits for the others */
     br_world_finish("it called `exit`");
     br_flush();
@@ -4995,15 +4997,27 @@ static br_msg *br_recv(int64_t src, int64_t kind, const char *loc) {
     pr->head = m->next;
     if (pr->tail == m) pr->tail = NULL;
     br_unlock(&pr->mu);
-    /* returning from `main` and `exit` are the same call */
-    bool same = m->op == BR_OP_FINISH ? br_cur_op == BR_OP_FINISH
-                                      : m->op == br_cur_op && m->seq == br_cur_seq && m->slen == (int64_t)strlen(br_cur_site) &&
-                                            memcmp(m->data + m->len, br_cur_site, (size_t)m->slen) == 0;
+    /* returning from `main` and `exit` are the same call; and the same
+       operation from different lines is too (both branches of an `if` may
+       make it), so the site is only for the message */
+    bool same = m->op == BR_OP_FINISH ? br_cur_op == BR_OP_FINISH : m->op == br_cur_op && m->seq == br_cur_seq;
     if (!same) br_mismatch(src, m, loc);
     if (m->kind != kind)
         br_panicf(loc, "type mismatch: rank %lld sent %s, but this rank expects %s", (long long)src, br_kind_name(m->kind),
                   br_kind_name(kind));
     return m;
+}
+
+/* `brine run` stops the other ranks when one fails; a rank in `exit` waits
+   for them first, so it says so in the file BRINE_EXIT_FILE named */
+static char *br_exit_file;
+
+static void br_exit_record(int64_t code) {
+    if (!br_exit_file || br_size <= 1) return;
+    FILE *f = fopen(br_exit_file, "wb");
+    if (!f) return;
+    fprintf(f, "%lld", (long long)code);
+    fclose(f);
 }
 
 #ifdef BR_WASM
@@ -5066,21 +5080,77 @@ static void br_unsetenv(const char *name) {
 #endif
 }
 
+/* A world variable's number: only digits (at most 9 of them), else -1. */
+static int64_t br_env_num(const char *p) {
+    int64_t n = 0;
+    int i = 0;
+    for (; p[i]; i++) {
+        if (p[i] < '0' || p[i] > '9' || i >= 9) return -1;
+        n = n * 10 + (p[i] - '0');
+    }
+    return i > 0 ? n : -1;
+}
+
+static BR_NORETURN void br_world_fail(const char *msg) {
+    fputs(msg, stderr);
+    exit(2);
+}
+
 static void br_world_init(void) {
     const char *er = getenv("BRINE_RANK"), *es = getenv("BRINE_WORLD_SIZE"), *ep = getenv("BRINE_PEERS");
-    if (!er || !es || !ep) return;
-    br_rank = atoll(er);
-    br_size = atoll(es);
-    char *list = strdup(ep);
+    if (!er && !es && !ep) return;
+    /* whoever started this rank got them wrong: say so instead of crashing
+       or waiting for peers that never come */
+    char msg[512];
+    if (!es) br_world_fail("brine: BRINE_RANK or BRINE_PEERS is set, but BRINE_WORLD_SIZE is not\n");
+    int64_t size = br_env_num(es), rank = 0;
+    if (size < 1) {
+        snprintf(msg, sizeof msg, "brine: BRINE_WORLD_SIZE=%.100s is not a positive number\n", es);
+        br_world_fail(msg);
+    }
+    if (er) {
+        rank = br_env_num(er);
+        if (rank < 0) {
+            snprintf(msg, sizeof msg, "brine: BRINE_RANK=%.100s is not a number\n", er);
+            br_world_fail(msg);
+        }
+        if (rank >= size) {
+            snprintf(msg, sizeof msg, "brine: BRINE_RANK=%.100s is not below BRINE_WORLD_SIZE=%.100s\n", er, es);
+            br_world_fail(msg);
+        }
+    } else if (size > 1) {
+        snprintf(msg, sizeof msg, "brine: BRINE_WORLD_SIZE=%.100s is set, but BRINE_RANK is not\n", es);
+        br_world_fail(msg);
+    }
+    if (size > 1) {
+        if (!ep) {
+            snprintf(msg, sizeof msg, "brine: BRINE_WORLD_SIZE=%.100s is set, but BRINE_PEERS is not\n", es);
+            br_world_fail(msg);
+        }
+        int64_t n = 1;
+        for (const char *q = ep; *q; q++)
+            if (*q == ',') n++;
+        if (n != size) {
+            snprintf(msg, sizeof msg, "brine: BRINE_PEERS lists %lld ranks, but BRINE_WORLD_SIZE=%.100s\n", (long long)n, es);
+            br_world_fail(msg);
+        }
+    }
+    char *list = size > 1 ? strdup(ep) : NULL;
     br_unsetenv("BRINE_RANK");
     br_unsetenv("BRINE_WORLD_SIZE");
     br_unsetenv("BRINE_PEERS");
-    if (br_size <= 1) {
+    const char *ef = getenv("BRINE_EXIT_FILE");
+    if (ef) {
+        if (size > 1) br_exit_file = strdup(ef);
+        br_unsetenv("BRINE_EXIT_FILE");
+    }
+    if (size <= 1) {
         br_size = 1;
         br_rank = 0;
-        free(list);
         return;
     }
+    br_rank = rank;
+    br_size = size;
     /* ranks share stderr: write each message whole (panics and `eprint` flush) */
     static char errbuf[1 << 14];
     setvbuf(stderr, errbuf, _IOFBF, sizeof errbuf);
@@ -5098,8 +5168,9 @@ static void br_world_init(void) {
         char *comma = strchr(p, ',');
         if (comma) *comma = 0;
         char *colon = strrchr(p, ':');
-        if (!colon) {
-            fprintf(stderr, "brine: invalid BRINE_PEERS entry '%s'\n", p);
+        int64_t pn = colon ? br_env_num(colon + 1) : -1;
+        if (pn < 1 || pn > 65535) {
+            fprintf(stderr, "brine: invalid BRINE_PEERS entry '%s' (expected host:port)\n", p);
             exit(2);
         }
         *colon = 0;
