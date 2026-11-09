@@ -210,8 +210,9 @@ print(p, p.energy())                 # Particle(pos=0.2, vel=2.0) 2.0
 An `invariant` in a struct is a fact about `self` that every value of the type
 keeps. It is proven where a value is built and where a `ref self` method
 returns (or uses `self` whole); everywhere else it is a known fact. Only the
-struct's own methods change the fields its invariants read, through `self`
-(E0406); other fields anyone can change. Inside a method, a loop that changes
+struct's own methods change what its invariants read, through `self`
+(E0406); other fields anyone can change, and so the elements of an array
+when an invariant reads only its `len`. Inside a method, a loop that changes
 `self` only through its `ref self` methods (or fields no invariant reads) keeps
 the invariant. Build values from untrusted input behind a check:
 
