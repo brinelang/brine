@@ -15412,63 +15412,131 @@ fn panic_text_cold(loc: ptr, msg: str):
     exit(i32(101))
 
 # ------------------------------------------------------------ call chains
-# x86-64 code keeps rbp chained through every frame (the saved rbp at [rbp],
-# the return address above it), and the backend writes a table of where each
-# function starts (x64.br, `frame_table`), so a panic can name the functions
-# it came through. Nothing of this runs until a panic.
+# Native code keeps its frame pointer (rbp, x29) chained through every frame
+# (the saved one at [fp], the return address above it), and the backend writes a table of where each
+# function starts and where its calls return to, with their sites: the lines
+# of the calls and the functions inlined there (obj.br, `fn_table`), so a
+# panic can name the functions it came through and the lines it came
+# through them at. Nothing of this runs until a panic.
 
 extern fn brine_frame_ptr() -> ptr
 
-# this function's rbp (0 where there is no table: other CPUs)
+# this function's frame pointer (0 where there is no table: other CPUs)
 fn frame_ptr() -> ptr:
-    if os_is("x86_64"):
+    if os_is("x86_64") or os_is("aarch64"):
         return brine_frame_ptr()
     return null_ptr()
 
-# The function the code at address a is in: the address of its name in the
-# table, 0 for the runtime's and generated code, -1 outside the program.
+# the table's header words: the address of .text, the number of functions,
+# the size of .text, of calls, of names, the size of the sites
+const FT_TEXT = 0
+const FT_FUNCS = 8
+const FT_SIZE = 16
+const FT_CALLS = 24
+const FT_NAMES = 32
+const FT_SITES = 40
+const FT_HEAD = 48
+
+fn fn_table() -> ptr:
+    return symbol("brine_fn_table")
+
+# where the sites start in the table
+fn ft_sites(t: ptr) -> ptr:
+    return (
+        t
+        + FT_HEAD
+        + 8 * (load_i64(t, FT_FUNCS) + load_i64(t, FT_CALLS))
+        + 4 * load_i64(t, FT_NAMES)
+    )
+
+# The last of n 8-byte entries at t + at whose first u32 is <= off (0 if none is).
+fn ft_find(t: ptr, at: int, n: int, off: int) -> int:
+    var lo = 0
+    var hi = n - 1
+    while lo < hi:
+        let mid = (lo + hi + 1) / 2
+        if int(load_u32(t, at + 8 * mid)) <= off:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+# The function the code at address a is in: its site (its name and `fn`
+# line), 0 for the runtime's, the prelude's and generated code, -1 outside
+# the program.
 fn frame_at(a: u64) -> int:
-    # (only x86-64 code has the table)
-    if os_is("x86_64"):
-        let t = symbol("brine_fn_table")
-        let text = load_u64(t, 0)
-        let n = load_i64(t, 8)
-        if a <= text or a > text + load_u64(t, 16) or n == 0:
+    # (only native code has the table)
+    if os_is("x86_64") or os_is("aarch64"):
+        let t = fn_table()
+        let text = load_u64(t, FT_TEXT)
+        let n = load_i64(t, FT_FUNCS)
+        if a <= text or a > text + load_u64(t, FT_SIZE) or n == 0:
             return -1
         # (a return address is just after its call)
-        let off = int(a - text - u64(1))
-        var lo = 0
-        var hi = n - 1
-        while lo < hi:
-            let mid = (lo + hi + 1) / 2
-            if int(load_u32(t, 24 + 8 * mid)) <= off:
-                lo = mid
-            else:
-                hi = mid - 1
-        let at = int(load_u32(t, 28 + 8 * lo))
-        if at == 0:
-            return 0
-        return int(addr(t)) + 24 + 8 * n + at
+        let i = ft_find(t, FT_HEAD, n, int(a - text - u64(1)))
+        return int(load_u32(t, FT_HEAD + 4 + 8 * i))
     return -1
 
-# Prints the functions a panic came through, innermost first: from the frame
-# at fp (and, when pc isn't 0, the function at pc, which may not have set up
-# its frame yet). A `par` body or task ends it, since which thread ran it, and
-# so what called it, varies from run to run.
+# The site of the call that returns to address a (0: none).
+fn site_at(a: u64) -> int:
+    if os_is("x86_64") or os_is("aarch64"):
+        let t = fn_table()
+        let text = load_u64(t, FT_TEXT)
+        let nc = load_i64(t, FT_CALLS)
+        let off = int(a - text)
+        let c = FT_HEAD + 8 * load_i64(t, FT_FUNCS)
+        if a <= text or nc == 0 or int(load_u32(t, c)) > off:
+            return 0
+        let i = ft_find(t, c, nc, off)
+        return int(load_u32(t, c + 4 + 8 * i))
+    return 0
+
+# The LEB128 number at p + at, and where the next one starts.
+fn uleb_at(p: ptr, at: int) -> (int, int):
+    var v = 0
+    var sh = 0
+    var i = at
+    while true:
+        let b = int(load_u8(p, i))
+        i += 1
+        v = v | ((b & 127) << sh)
+        sh += 7
+        if b < 128:
+            break
+    return (v, i)
+
+# name n of the table ("name (file")
+fn ft_name(t: ptr, n: int) -> str:
+    let at = FT_HEAD + 8 * (load_i64(t, FT_FUNCS) + load_i64(t, FT_CALLS)) + 4 * n
+    let names = ft_sites(t) + load_i64(t, FT_SITES)
+    return c_text(names + int(load_u32(t, at)))
+
+# Prints the functions a panic came through, innermost first, each with the
+# line it was at: from the frame at fp (and, when pc isn't 0, the function at
+# pc, which may not have set up its frame yet). A call's site names the
+# functions inlined there too; the runtime's and the prelude's frames are left
+# out (the user's call into them names the line). A `par` body or task ends
+# it, since which thread ran it, and so what called it, varies from run to run.
 fn call_chain(fp0: ptr, pc: u64, out: ptr):
     if addr(fp0) == u64(0):
         return
+    let t = fn_table()
+    let sites = ft_sites(t)
     var lines = 0
-    var last = 0
+    var last = -1
+    var last_line = -1
     var same = 0
     var fp = addr(fp0)
     var a = pc
     var steps = 0
     while steps < 10000000:
         steps += 1
+        # (pc is where a fault was, not a return address)
+        var ret = false
         if a == u64(0):
-            # a frame: the saved rbp, then the return address
+            # a frame: the saved frame pointer, then the return address
             a = load_u64(null_ptr() + int(fp), 8)
+            ret = true
             let next = load_u64(null_ptr() + int(fp), 0)
             if next <= fp or next - fp > u64(1073741824) or (next & u64(7)) != u64(0):
                 # the last frame: what it returns to isn't ours
@@ -15476,40 +15544,49 @@ fn call_chain(fp0: ptr, pc: u64, out: ptr):
             else:
                 fp = next
         let at = frame_at(a)
-        a = u64(0)
         if at < 0:
             break
-        if at > 0 and at == last:
-            same += 1
-        elif at > 0:
-            if same > 0:
-                chain_again(last, same, out)
+        if at > 0:
+            let site = site_at(a) if ret else 0
+            let (nf, i0) = uleb_at(sites, site if site > 0 else at)
+            var i = i0
+            for _ in 0..nf:
+                let (name, i1) = uleb_at(sites, i)
+                let (line, i2) = uleb_at(sites, i1)
+                i = i2
+                if name == last and line == last_line:
+                    same += 1
+                    continue
+                if same > 0:
+                    chain_again(t, last, last_line, same, out)
+                    lines += 1
+                    same = 0
+                if lines >= 20:
+                    file_text(out, "  ...\n")
+                    return
+                let s = ft_name(t, name)
+                if lines == 0:
+                    file_text(out, f"  in {s}:{line})\n")
+                else:
+                    file_text(out, f"  called from {s}:{line})\n")
                 lines += 1
-                same = 0
-            if lines >= 20:
-                file_text(out, "  ...\n")
-                return
-            let name = c_text(null_ptr() + at)
-            if lines == 0:
-                file_text(out, f"  in {name}\n")
-            else:
-                file_text(out, f"  called from {name}\n")
-            lines += 1
-            last = at
-            if name.starts_with("a `par` body in ") or name.starts_with("a task in "):
-                break
+                last = name
+                last_line = line
+                if s.starts_with("a `par` body in ") or s.starts_with("a task in "):
+                    return
+        a = u64(0)
         if fp == u64(0):
             break
     if same > 0:
-        chain_again(last, same, out)
+        chain_again(t, last, last_line, same, out)
 
-# the function at `at` called itself n more times
-fn chain_again(at: int, n: int, out: ptr):
-    let name = c_text(null_ptr() + at)
+# frame `name` at `line` called itself n more times
+fn chain_again(t: ptr, name: int, line: int, n: int, out: ptr):
+    let s = ft_name(t, name)
     if n == 1:
-        file_text(out, f"  called from {name}, 1 more time\n")
+        file_text(out, f"  called from {s}:{line}), 1 more time\n")
     else:
-        file_text(out, f"  called from {name}, {n} more times\n")
+        file_text(out, f"  called from {s}:{line}), {n} more times\n")
 
 fn file_text(f: ptr, s: str):
     let p = ptr_of(s)
@@ -15632,6 +15709,13 @@ fn brine_x_on_segv(sig: i32, si: ptr, uc: ptr):
         # Linux x86-64: rbp and rip in the ucontext's registers
         if os_is("linux") and os_is("x86_64"):
             stack_overflow(load_u64(uc, 120), load_u64(uc, 168))
+        # Linux AArch64: x29 and pc in the ucontext's sigcontext
+        if os_is("linux") and os_is("aarch64"):
+            stack_overflow(load_u64(uc, 416), load_u64(uc, 440))
+        # macOS AArch64: x29 and pc in the thread state the ucontext points to
+        if os_is("macos") and os_is("aarch64"):
+            let m = load_ptr(uc, 48)
+            stack_overflow(load_u64(m, 248), load_u64(m, 272))
         stack_overflow(u64(0), u64(0))
     # anything else crashes as it would without the handler (SIG_DFL)
     signal(sig, null_ptr())

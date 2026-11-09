@@ -9,7 +9,7 @@
 # appender of `s += t[i]`, to the runtime's slow paths) is in memory only
 # during those calls.
 
-from ir import K, Op, Inst, Func, Module
+from ir import K, Op, Inst, Func, Module, site_text
 
 # m without the runtime module's functions (runtime/rt.br) that nothing
 # reaches. The roots are the program's own functions, everything data points
@@ -1391,8 +1391,12 @@ fn direct_calls(f: Func, names: {str: bool}) -> (Func, bool):
     return (g, done)
 
 # Appends a copy of `c`'s body for `call` to `code`, with c's vregs, labels
-# and slots after g's.
+# and slots after g's. Its calls and checks keep their frames for a panic's
+# call chain: each site is c's, then the call's (`Func.sites`). The
+# runtime's and the prelude's have no frames: theirs are the call's own.
 fn inline_call(ref g: Func, ref code: [Inst], call: Inst, c: Func):
+    let outer = site_text(call, g.sites)
+    var smap: {int: int} = {}
     let vb = len(g.vk)
     g.vk.extend(c.vk)
     let lb = g.nlabels
@@ -1420,9 +1424,11 @@ fn inline_call(ref g: Func, ref code: [Inst], call: Inst, c: Func):
                 y.n += lb
             case Op.Call:
                 y.args = [a + vb for a in y.args]
+                y.n = inline_site(ref g, ref smap, call, outer, c, x)
             case Op.CallInd:
                 y.a += vb
                 y.args = [a + vb for a in y.args]
+                y.n = inline_site(ref g, ref smap, call, outer, c, x)
             case Op.Ret:
                 if y.a >= 0 and call.d >= 0:
                     code.push(Inst(op=Op.Mov, d=call.d, a=y.a + vb, b=-1, c=-1, n=0, s="", args=[]))
@@ -1433,10 +1439,25 @@ fn inline_call(ref g: Func, ref code: [Inst], call: Inst, c: Func):
                     y.a += vb
                 if y.b >= 0:
                     y.b += vb
-                if (
-                    (y.op == Op.AddO or y.op == Op.SubO or y.op == Op.MulO or y.op == Op.IdxChk)
-                    and y.c >= 0
-                ):
-                    y.c += vb
+                if y.op == Op.AddO or y.op == Op.SubO or y.op == Op.MulO or y.op == Op.IdxChk:
+                    if y.c >= 0:
+                        y.c += vb
+                    y.n = inline_site(ref g, ref smap, call, outer, c, x)
         code.push(y)
     code.push(Inst(op=Op.Label, d=-1, a=-1, b=-1, c=-1, n=end, s="", args=[]))
+
+# The site (its n) in g of x, a call or check of c inlined at `call`.
+fn inline_site(ref g: Func, ref smap: {int: int}, call: Inst, outer: str, c: Func, x: Inst) -> int:
+    if c.trace == "":
+        return call.n if outer != "" else 0
+    let k = x.n if x.n > 0 and x.n <= len(c.sites) else 0
+    match smap.get(k):
+        case Some(n):
+            return n
+        case None:
+            pass
+    # (a call without a site: c's own frame, at its `fn` line)
+    let inner = c.sites[k - 1] if k > 0 else c.trace
+    g.sites.push(inner if outer == "" else inner + "\n" + outer)
+    smap[k] = len(g.sites)
+    return len(g.sites)

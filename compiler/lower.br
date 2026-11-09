@@ -190,6 +190,14 @@ struct FnCx:
     # span; and the loops being versioned
     nochk: {str: bool}
     bv_keys: {str: bool}
+    # how a panic's call chain names this body ("" for none: the runtime, the
+    # prelude, generated code), the sites of its calls so far by file and
+    # line (see `at`), and the last line looked up: its file, start and end
+    sname: str
+    sites: {int: int}
+    sfile: int
+    slo: int
+    shi: int
 
 # The lanes of an interleaved loop (see jam.br): vregs, one per lane.
 struct JamCx:
@@ -210,7 +218,7 @@ fn no_jam() -> JamCx:
 
 fn new_cx(f: Func) -> FnCx:
     return FnCx(
-        fb=FB(f=f),
+        fb=FB(f=f, site=0),
         frames=[],
         scopes=[],
         loops=[],
@@ -251,7 +259,12 @@ fn new_cx(f: Func) -> FnCx:
         own_mask=0,
         bret=false,
         nochk={},
-        bv_keys={}
+        bv_keys={},
+        sname="",
+        sites={},
+        sfile=-1,
+        slo=0,
+        shi=0
     )
 
 # An iteration domain: a range of integers, or the elements of an array.
@@ -1178,6 +1191,28 @@ struct Lower:
         self.cx = saved
 
     # ============================================================ emission helpers
+    # The calls and checks emitted from here on are at the line of `span`
+    # (their site, see `Func.sites`), for a panic's call chain.
+    fn at(ref self, span: Span):
+        if self.cx.sname == "" or not self.sm.has_file(span.file):
+            return
+        if span.file == self.cx.sfile and self.cx.slo <= span.lo and span.lo < self.cx.shi:
+            return
+        let file = self.sm.file(span.file)
+        let l = file.line_at(span.lo)
+        self.cx.sfile = span.file
+        self.cx.slo = file.line_starts[l - 1]
+        self.cx.shi = file.line_starts[l] if l < len(file.line_starts) else len(file.text) + 1
+        let key = span.file * 4294967296 + l
+        match self.cx.sites.get(key):
+            case Some(n):
+                self.cx.fb.site = n
+            case None:
+                self.cx.fb.f.sites.push(f"{self.cx.sname} ({file.path}:{l})")
+                let n = len(self.cx.fb.f.sites)
+                self.cx.sites[key] = n
+                self.cx.fb.site = n
+
     fn loc(ref self, span: Span) -> int:
         if self.cx.loc >= 0:
             match self.fnd:
@@ -1841,9 +1876,11 @@ struct Lower:
         self.cx.fb.f.dname = name
         self.cx.fb.f.dfile = file.path
         self.cx.fb.f.dline = l
-        # (the runtime's own functions stay out of call chains)
-        if not self.rt_body:
+        # (the runtime's and the prelude's functions stay out of call chains:
+        # a chain names the user's call into them)
+        if not self.rt_body and (is_test or not self.tracks_caller(f.id)):
             self.cx.fb.f.trace = f"{name} ({file.path}:{l})"
+            self.cx.sname = name
 
     fn dbg_func(ref self, f: FnDecl, is_test: bool):
         if not is_test:
@@ -3092,6 +3129,8 @@ struct Lower:
         self.pop_scope()
 
     fn stmt(ref self, s: Stmt):
+        let site = self.cx.fb.site
+        self.at(s.span)
         let ids = self.open_apps(s)
         self.stmt_in(s)
         for id in ids:
@@ -3099,6 +3138,7 @@ struct Lower:
                 let home = self.local_ptr(id)
                 self.cx.fb.rt_void("brine_app_close", [home, self.cx.apps[id]])
             self.cx.apps.remove(id)
+        self.cx.fb.site = site
 
     fn stmt_in(ref self, s: Stmt):
         if self.opts.debug:
@@ -5224,6 +5264,15 @@ struct Lower:
 
     # ============================================================ expressions
     fn expr(ref self, e: Expr) -> int:
+        if self.cx.sname == "":
+            return self.expr_in(e)
+        let site = self.cx.fb.site
+        self.at(e.span)
+        let v = self.expr_in(e)
+        self.cx.fb.site = site
+        return v
+
+    fn expr_in(ref self, e: Expr) -> int:
         match e.kind:
             case ExprKind.Int(v):
                 return self.int_lit(v, e.ty)
@@ -7732,9 +7781,9 @@ struct Lower:
         self.cx.lifted = true
         let outer = saved.fb.f.trace
         if outer != "":
-            self.cx.fb.f.trace = (
-                ("a task in " if name.starts_with("br_task_") else "a `par` body in ") + outer
-            )
+            let what = "a task in " if name.starts_with("br_task_") else "a `par` body in "
+            self.cx.fb.f.trace = what + outer
+            self.cx.sname = what + saved.sname
         for w in par_writes:
             self.cx.par_writes[w] = true
         for c in captures:

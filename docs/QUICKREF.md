@@ -60,9 +60,10 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
   unless the compiler proved they can't happen, in which case the check is removed.
   The message has the values involved (`integer overflow in addition:
   9223372036854775807 + 1`, `integer conversion out of range for u8: 300`) and
-  the source location. On x86-64, the functions the panic came through follow,
-  innermost first (`in at (app.br:7)`, `called from main (app.br:11)`); a
-  small function the compiler inlined is part of its caller there. A chain
+  the source location. In native code (x86-64 and AArch64; not the C
+  backend), the functions the panic came through follow, innermost first, each
+  at the line it was at (`in at (app.br:9)`, `called from main (app.br:14)`),
+  functions the compiler inlined included. A chain
   ends at a `par` body or task, since the thread that ran it varies.
   Only the first panic is reported, even when many `par` threads fail at once:
   that is the first one to fail in time, not necessarily the lowest index, so
