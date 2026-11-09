@@ -4064,6 +4064,169 @@ fn rev_first(ref sf: SF):
             if x.op == Op.Conv and x.a == v and sf.f.vk[x.d] == K.I64:
                 sf.bs[s].code[i] = mk(Op.Mov, x.d, r, -1, -1, 0)
 
+# Byte scans: innermost loops that only look for a byte, or for one that
+# isn't it,
+#
+#     while i < hi:                       while j < e and b[j] != 32:
+#         if b[i] == c:                       j += 1
+#             return i
+#         i += 1
+#
+# (`index`, a find helper, a tokenizer). Before the loop, `brine_find_u8` (or
+# `brine_skip_u8` for the second kind) moves i to the first byte that ends it,
+# or to the end; x64.br does that 16 bytes at a time. The loop then goes on
+# from there as written, so it ends, or fails its bounds check, where it
+# would have.
+fn scans(ref sf: SF):
+    preheaders(ref sf)
+    let loops = find_loops(sf)
+    let nv = len(sf.f.vk)
+    var def_b = [-1] * nv
+    var one = [false] * nv
+    for b in 0..len(sf.bs):
+        for x in sf.bs[b].code:
+            if x.d >= 0:
+                def_b[x.d] = b
+                if x.op == Op.Const and x.n == 1:
+                    one[x.d] = true
+    for lp in loops:
+        scan_loop(ref sf, lp, def_b, one)
+
+fn scan_loop(ref sf: SF, lp: Loop, def_b: [int], one: [bool]):
+    let nb = len(sf.bs)
+    let h = lp.header
+    if len(lp.body) > 4:
+        return
+    var inb = [false] * nb
+    for b in lp.body:
+        inb[b] = true
+    # the header: j = phi(lo, j + 1); j < hi; the branch
+    var hx: [Inst] = []
+    var phis: [Inst] = []
+    var phi_at = -1
+    for i, x in enumerate(sf.bs[h].code):
+        if x.op == Op.Phi:
+            phis.push(x)
+            phi_at = i
+        elif x.op != Op.Line:
+            hx.push(x)
+    if len(phis) != 1 or len(hx) != 2:
+        return
+    let phi = phis[0]
+    let lt = hx[0]
+    let br = hx[1]
+    if lt.op != Op.Lt or lt.a != phi.d or sf.f.vk[lt.a] != K.I64:
+        return
+    if (br.op != Op.Br and br.op != Op.BrNot) or br.a != lt.d:
+        return
+    let first = br.c if br.op == Op.BrNot else br.n
+    let out = br.n if br.op == Op.BrNot else br.c
+    if first < 0 or sf.lab[first] < 0 or not inb[sf.lab[first]]:
+        return
+    if out < 0 or sf.lab[out] < 0 or inb[sf.lab[out]]:
+        return
+    let pre_q = outside_arg(sf, phi, inb)
+    if pre_q < 0:
+        return
+    let pre = sf.lab[phi.args[pre_q - 1]]
+    if pre < 0 or len(sf.bs[pre].succ) != 1:
+        return
+    let jn = phi.args[4 - pre_q]
+    let hi = lt.b
+    if def_b[hi] >= 0 and inb[def_b[hi]]:
+        return
+    # the body: blocks in a row back to the header, doing nothing but this
+    let j = phi.d
+    var ix = j
+    var len_v = -1
+    var base = -1
+    var addr = -1
+    var byte = -1
+    var test = -1
+    var c = -1
+    var eq = true
+    var tested = false
+    var inc = false
+    var skip = false
+    var b = sf.lab[first]
+    var seen = 1
+    while true:
+        let code = sf.bs[b].code
+        for i in 0..len(code) - 1:
+            let x = code[i]
+            match x.op:
+                case Op.Line:
+                    pass
+                case Op.IdxChk:
+                    if x.a != j or len_v >= 0 or (def_b[x.b] >= 0 and inb[def_b[x.b]]):
+                        return
+                    len_v = x.b
+                    ix = x.d
+                case Op.Elem:
+                    if x.b != ix or x.n != 1 or base >= 0 or (def_b[x.a] >= 0 and inb[def_b[x.a]]):
+                        return
+                    base = x.a
+                    addr = x.d
+                case Op.Load:
+                    if addr < 0 or x.a != addr or x.n != 0 or byte >= 0 or sf.f.vk[x.d] != K.U8:
+                        return
+                    byte = x.d
+                case Op.Eq | Op.Ne:
+                    if byte < 0 or test >= 0 or (x.a != byte and x.b != byte):
+                        return
+                    let o = x.b if x.a == byte else x.a
+                    if sf.f.vk[o] != K.U8 or (def_b[o] >= 0 and inb[def_b[o]]):
+                        return
+                    test = x.d
+                    c = o
+                    eq = x.op == Op.Eq
+                case Op.Add:
+                    if inc or x.d != jn or not ((x.a == j and one[x.b]) or (x.b == j and one[x.a])):
+                        return
+                    inc = true
+                case _:
+                    return
+        let t = code[len(code) - 1]
+        var next = -1
+        if t.op == Op.Jmp:
+            next = sf.lab[t.n]
+        elif (t.op == Op.Br or t.op == Op.BrNot) and t.a == test and test >= 0 and not tested:
+            tested = true
+            let yes = t.n if t.op == Op.Br else t.c
+            let no = t.c if t.op == Op.Br else t.n
+            if yes < 0 or no < 0 or sf.lab[yes] < 0 or sf.lab[no] < 0:
+                return
+            let in_yes = inb[sf.lab[yes]]
+            if in_yes == inb[sf.lab[no]]:
+                return
+            # the loop goes on while the test is `in_yes`: it ends at the
+            # first byte that is c (find) or that isn't (skip)
+            skip = in_yes == eq
+            next = sf.lab[yes] if in_yes else sf.lab[no]
+        else:
+            return
+        if next < 0:
+            return
+        if next == h:
+            break
+        if not inb[next] or next == b or seen >= len(lp.body):
+            return
+        b = next
+        seen += 1
+    if not tested or not inc or seen + 1 != len(lp.body):
+        return
+    var code = sf.bs[pre].code
+    let term = code.pop()
+    let r = new_v(ref sf, K.I64)
+    let n = len_v if len_v >= 0 else hi
+    let name = "brine_skip_u8" if skip else "brine_find_u8"
+    code.push(
+        Inst(op=Op.Call, d=r, a=-1, b=1, c=-1, n=0, s=name, args=[base, phi.args[pre_q], hi, n, c])
+    )
+    code.push(term)
+    sf.bs[pre].code = code
+    sf.bs[h].code[phi_at].args[pre_q] = r
+
 # v at byte off of the block: booleans as -1 or 0.
 fn lane_store(ref sf: SF, ref code: [Inst], blk: int, v: int, off: int):
     var w = v
@@ -4305,6 +4468,9 @@ fn optimize(f: Func, vw: int, a64: bool) -> (Func, [KFunc]):
     rev_first(ref sf)
     while bool_ifs(ref sf):
         relink(ref sf)
+    # (after bool_ifs: `while j < e and b[j] != c` is a plain loop then)
+    if not a64:
+        scans(ref sf)
     # (x64.br makes the same as a bt and an adc)
     if a64 and cond_incs(ref sf):
         relink(ref sf)
