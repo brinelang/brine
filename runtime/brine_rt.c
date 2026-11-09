@@ -596,6 +596,28 @@ void brine_assert_fail(const char *loc, const char *src, brine_str *msg) {
         br_panicf(loc, "assertion failed: %s\n  message: %.*s", src, (int)msg->len, msg->data);
     br_panicf(loc, "assertion failed: %s", src);
 }
+/* A failed `assert a <op> b`, with the values of a and b (lower.br,
+ * `assert_values`). */
+void brine_panic_assert_text(const char *loc, const char *src, brine_str *msg, brine_str *a, brine_str *b) {
+    if (msg)
+        br_panicf(loc, "assertion failed: %s\n  left: %.*s\n  right: %.*s\n  message: %.*s", src, (int)a->len, a->data,
+                  (int)b->len, b->data, (int)msg->len, msg->data);
+    br_panicf(loc, "assertion failed: %s\n  left: %.*s\n  right: %.*s", src, (int)a->len, a->data, (int)b->len, b->data);
+}
+#define BR_ASSERT_VALUES(name, type, fmt)                                                  \
+    void name(const char *loc, const char *src, brine_str *msg, type a, type b) {           \
+        brine_sb sa, sb;                                                                   \
+        brine_sb_init(&sa);                                                                \
+        fmt(&sa, a);                                                                       \
+        brine_sb_init(&sb);                                                                \
+        fmt(&sb, b);                                                                       \
+        brine_panic_assert_text(loc, src, msg, brine_sb_finish(&sa), brine_sb_finish(&sb)); \
+    }
+BR_ASSERT_VALUES(brine_panic_assert_i, int64_t, brine_sb_i64)
+BR_ASSERT_VALUES(brine_panic_assert_u, uint64_t, brine_sb_u64)
+BR_ASSERT_VALUES(brine_panic_assert_f, double, brine_sb_f64)
+BR_ASSERT_VALUES(brine_panic_assert_f32, float, brine_sb_f32)
+BR_ASSERT_VALUES(brine_panic_assert_b, bool, brine_sb_bool)
 #endif
 /* ------------------------------------------------------------ stack overflow */
 /* Deep recursion runs into the guard page under the stack. Instead of dying

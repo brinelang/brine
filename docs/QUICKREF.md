@@ -729,7 +729,9 @@ fn index_of(xs: [int], target: int) -> int:
   `requires n < 0` is an error (E0608), since every claim in the body would be
   proven without meaning anything.
 * `assert e` checks at runtime (always, in every build) and is a known fact
-  afterwards. Use it to hand the prover a fact it can't derive itself.
+  afterwards. Use it to hand the prover a fact it can't derive itself. When
+  `assert a == b` (or another single comparison) fails, the panic shows both
+  values (`left: 6`, `right: 10`).
 * Specs may use arithmetic, comparisons, `and`/`or`/`not`, `len`, `abs`, `min`,
   `max`, fields, indexing, constants and `result`.
 * In `for i in a..b` loops, invariants may mention `i`: they must hold at the start

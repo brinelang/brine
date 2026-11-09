@@ -3306,7 +3306,23 @@ struct Lower:
                 if s.proven:
                     return
                 self.push_frame()
-                let c = self.expr(cond)
+                # `assert a == b` (or another comparison) shows both values
+                # when it fails
+                var c = -1
+                var a = -1
+                var b = -1
+                var vt = Ty.Unit
+                match cond.kind:
+                    case ExprKind.Compare(first, rest):
+                        if len(rest) == 1 and shows_value(first.ty):
+                            a = self.expr(first)
+                            b = self.expr(rest[0].1)
+                            vt = first.ty
+                            c = self.cmp_code(rest[0].0, a, b, vt)
+                    case _:
+                        pass
+                if c < 0:
+                    c = self.expr(cond)
                 let ok = self.cx.fb.label()
                 self.cx.fb.br(c, ok)
                 self.push_frame()
@@ -3318,7 +3334,10 @@ struct Lower:
                         m = self.cx.fb.konst(K.Ptr, 0)
                 let loc = self.loc(s.span)
                 let src = self.cstr(self.sm.snippet(cond.span))
-                self.cx.fb.call_void("brine_assert_fail", [loc, src, m])
+                if a >= 0:
+                    self.assert_values(loc, src, m, a, b, vt)
+                else:
+                    self.cx.fb.call_void("brine_assert_fail", [loc, src, m])
                 self.cx.fb.unreachable()
                 self.cx.frames.pop()
                 self.cx.fb.place(ok)
@@ -5662,6 +5681,39 @@ struct Lower:
                 return self.par_tuple(elems, e.caps, e)
             case _:
                 return self.unit()
+
+    # A failed `assert a <op> b`: a and b (of type t) go to the runtime,
+    # which prints them. Numbers and bools go as they are (a GPU kernel can
+    # report them too); other values as their text.
+    fn assert_values(ref self, loc: int, src: int, m: int, a: int, b: int, t: Ty):
+        # (the runtime's `brine_panic_assert_<kind>`)
+        var kind = "text"
+        var x = a
+        var y = b
+        match t:
+            case Ty.Int(IntTy.I128) | Ty.Int(IntTy.U128):
+                pass
+            case Ty.Int(k):
+                kind = "i" if k.signed() else "u"
+                let kk = K.I64 if k.signed() else K.U64
+                x = self.cx.fb.conv(kk, a)
+                y = self.cx.fb.conv(kk, b)
+            case Ty.Float(FloatTy.F64):
+                kind = "f"
+            case Ty.Float(FloatTy.F32):
+                kind = "f32"
+            case Ty.Bool:
+                kind = "b"
+            case _:
+                pass
+        if kind == "text":
+            let sa = self.sb_new()
+            self.fmt_code(sa, a, t, true)
+            x = self.sb_finish(sa)
+            let sb = self.sb_new()
+            self.fmt_code(sb, b, t, true)
+            y = self.sb_finish(sb)
+        self.cx.fb.call_void("brine_panic_assert_" + kind, [loc, src, m, x, y])
 
     # A string builder's contents as a new string (an owned temp).
     fn sb_finish(ref self, sb: int) -> int:
@@ -8392,6 +8444,16 @@ fn kind_code(k: K) -> int:
             return 12
         case K.Bool:
             return 13
+
+# Whether a failed `assert` shows a value of type t (see `assert_values`).
+fn shows_value(t: Ty) -> bool:
+    match t:
+        case Ty.Int(_) | Ty.Float(_) | Ty.Bool | Ty.Str:
+            return true
+        case Ty.Array(_) | Ty.Map(_, _) | Ty.Tuple(_) | Ty.Struct(_) | Ty.Enum(_):
+            return true
+        case _:
+            return false
 
 fn cmp_op(op: CmpOp) -> Op:
     match op:
