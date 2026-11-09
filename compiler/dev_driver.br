@@ -1,7 +1,7 @@
 # Unit tests for the C build's cache files in driver.br.
 #
 #   brine test compiler/dev_driver.br        (from the repository root)
-from driver import settle, unreadable_input, cache_file_diag
+from driver import settle, unreadable_input, cache_file_diag, prune_cache, cache_start
 import project
 
 fn scratch(name: str) -> str:
@@ -65,3 +65,39 @@ test "a link that can't open a cached object is told apart":
     let dg = cache_file_diag(obj, ld, "D:\\a\\brine\\target\\brine-cache")
     assert dg.code == "E0704"
     assert "cache" in dg.msg, dg.msg
+
+# v091#3: a build pins its cache entries before it makes them; a prune by
+# another build (which rewrites the log) dropped the pins of entries not on
+# disk yet, so a later prune cleared the folder the build was writing
+test "a pin on an entry that isn't made yet survives a prune":
+    let d = scratch("pins")
+    let t = int(clock())
+    for e in ["b", "b/dev"]:
+        match os.make_dir(project.join(d, e)):
+            case _:
+                pass
+    put(project.join(d, "b/dev/x.exe"), "bbbb")
+    # build 7 pinned a/dev and still links it; build 8 finished b/dev
+    put(project.join(d, "uses.log"), f"# 0\na/dev - {t} 7\nb/dev 4 {t} 8\n")
+    prune_cache(d, ["b/dev"], 1)
+    assert f"a/dev - {t} 7" in text(project.join(d, "uses.log")), text(project.join(d, "uses.log"))
+    # build 7 made it; build 9 (of the same program) is done, then build 10
+    # of another program prunes: build 7 still pins it
+    for e in ["a", "a/dev"]:
+        match os.make_dir(project.join(d, e)):
+            case _:
+                pass
+    put(project.join(d, "a/dev/x.exe.7.tmp"), "aaaa")
+    match os.append_bytes(project.join(d, "uses.log"), f"a/dev 4 {t} 9\n".bytes()):
+        case _:
+            pass
+    prune_cache(d, ["c/dev"], 1)
+    assert file_exists(project.join(d, "a/dev/x.exe.7.tmp")), text(project.join(d, "uses.log"))
+    assert not file_exists(project.join(d, "b/dev/x.exe"))
+
+test "a C build pins its objects before it makes them":
+    let d = scratch("pin-obj")
+    let exe = project.join(d, "p.exe")
+    cache_start(d, exe)
+    let log = text(project.join(d, "uses.log"))
+    assert "obj-" in log and f" {os.pid()}" in log, log
