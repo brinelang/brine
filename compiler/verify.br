@@ -14,7 +14,7 @@ from diag import Span, Diag, SourceMap
 import diag
 from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, NumM, StrM, Reducer, WorldOp, LocalInfo, LocalKind, int_ty
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
-from ast import children, stmt_exprs, stmt_blocks, lvalue_root, local_of
+from ast import children, left_chain, left_spine, stmt_exprs, stmt_blocks, lvalue_root, local_of
 from info import ProgramInfo, ConstVal, PRELUDE, RT
 from rules import builtin_effect, os_effect
 from solver import Lin, F, AtomSet, prove_work, near_facts, local_facts, counterexample, PROVED, GAVE_UP, wrapping_abs, wrapping_neg, add_i128, mul_i128, neg_i128, ATOM_UNKNOWN, I64_BOUND
@@ -486,6 +486,26 @@ fn apply_stmt(ref s: Stmt, p: {(int, int, int, int): bool}):
         case _:
             pass
 
+# `a + b + c + ...` in a loop, as `apply_expr` would one operation at a time
+fn apply_chain(ref e: Expr, p: {(int, int, int, int): bool}):
+    var (nodes, cur) = left_spine(e)
+    apply_expr(ref cur, p)
+    var i = len(nodes)
+    while i > 0:
+        i -= 1
+        var n = nodes[i]
+        match n.kind:
+            case ExprKind.Binary(op, _, r):
+                if key(n.span, TAG_ARITH) in p:
+                    n.checked = false
+                var b = r
+                apply_expr(ref b, p)
+                n.kind = ExprKind.Binary(op, cur, b)
+            case _:
+                pass
+        cur = n
+    e = cur
+
 fn apply_exprs(ref xs: [Expr], p: {(int, int, int, int): bool}):
     for i in 0..len(xs):
         apply_expr(ref xs[i], p)
@@ -495,6 +515,9 @@ fn apply_args(ref args: [Arg], p: {(int, int, int, int): bool}):
         apply_expr(ref args[i].expr, p)
 
 fn apply_expr(ref e: Expr, p: {(int, int, int, int): bool}):
+    if left_chain(e):
+        apply_chain(ref e, p)
+        return
     let span = e.span
     match e.kind:
         case ExprKind.Binary(op, l, r):
@@ -4648,9 +4671,29 @@ struct Vf:
         return self.show_lin_p(a) + op + self.show_lin_p(b)
 
     fn eval(ref self, e: Expr) -> V:
-        let v = self.eval_(e)
-        # what isn't modelled is still a number or a truth value, named after
-        # the source in messages
+        if left_chain(e):
+            return self.eval_chain(e)
+        return self.modelled(e, self.eval_(e))
+
+    # `a + b + c + ...`, a loop down its left side instead of a frame of
+    # `eval_` (a large one) for each operation
+    fn eval_chain(ref self, e: Expr) -> V:
+        let (nodes, first) = left_spine(e)
+        var v = self.eval(first)
+        var i = len(nodes)
+        while i > 0:
+            i -= 1
+            let n = nodes[i]
+            match n.kind:
+                case ExprKind.Binary(op, l, r):
+                    v = self.modelled(n, self.binary_from(n, op, l, v, r))
+                case _:
+                    pass
+        return v
+
+    # what isn't modelled is still a number or a truth value, named after
+    # the source in messages
+    fn modelled(ref self, e: Expr, v: V) -> V:
         if v == V.Opaque:
             match e.ty:
                 case Ty.Int(_) | Ty.Bool | Ty.Float(_):
@@ -5074,14 +5117,18 @@ struct Vf:
         return V.Agg(vals)
 
     fn binary(ref self, e: Expr, op: BinOp, l: Expr, r: Expr) -> V:
+        let av = self.eval(l)
+        return self.binary_from(e, op, l, av, r)
+
+    # `l op r`, where `l` is evaluated already (to `av`)
+    fn binary_from(ref self, e: Expr, op: BinOp, l: Expr, av: V, r: Expr) -> V:
         if op == BinOp.And or op == BinOp.Or:
-            let a = self.cond(l)
+            let a = self.as_bool(av)
             let and_ = op == BinOp.And
             let guard = a if and_ else a.not_()
             let bv = self.eval_when(guard, r)
             let b = self.as_bool(bv)
             return V.Bool(F.and_([a, b]) if and_ else F.or_([a, b]))
-        let av = self.eval(l)
         let bv = self.eval(r)
         match e.ty:
             case Ty.Int(k):

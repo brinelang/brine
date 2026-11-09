@@ -18,7 +18,7 @@
 from diag import Span, SourceMap
 from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, WorldOp, OsOp, LocalInfo, LocalKind, int_ty, NumM
 from ast import BinOp, CmpOp, UnOp, FSeg, Arg, Comp, Expr, ExprKind, LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, FnDecl, Program
-from ast import FmtSpec, parse_fmt_spec, children, stmt_exprs, stmt_blocks, local_of, lvalue_root
+from ast import FmtSpec, parse_fmt_spec, children, left_chain, left_spine, stmt_exprs, stmt_blocks, local_of, lvalue_root
 from info import ProgramInfo, ConstVal, TryKind, try_kind, mangle_module, PRELUDE, RT
 from num import u128_bits
 from ir import K, Op, Func, Data, Reloc, Module, FB, KFunc, new_func, le_bytes, str_bytes, f64_bits, f32_bits
@@ -5502,6 +5502,64 @@ struct Lower:
         let data = self.cx.fb.load(K.Ptr, a, 48)
         return self.cx.fb.elem(data, ix, self.lay(et).size)
 
+    # `a + b + c + ...`, a loop down its left side instead of a frame of
+    # `expr` (a large one) for each operation
+    fn expr_chain(ref self, e: Expr) -> int:
+        let (nodes, first) = left_spine(e)
+        var a = self.expr(first)
+        var i = len(nodes)
+        while i > 0:
+            i -= 1
+            let n = nodes[i]
+            match n.kind:
+                case ExprKind.Binary(op, _, r):
+                    a = self.binary_from(n, op, a, r)
+                case _:
+                    pass
+        return a
+
+    # `l op r`, where `l` is lowered already (to `a`)
+    fn binary_from(ref self, e: Expr, op: BinOp, a: int, r: Expr) -> int:
+        if op == BinOp.And or op == BinOp.Or:
+            let t = self.cx.fb.copy_of(a)
+            let skip = self.cx.fb.label()
+            if op == BinOp.And:
+                self.cx.fb.brnot(t, skip)
+            else:
+                self.cx.fb.br(t, skip)
+            self.push_frame()
+            let b = self.expr(r)
+            self.cx.fb.mov(t, b)
+            self.pop_frame()
+            self.cx.fb.place(skip)
+            return t
+        if op == BinOp.Add and e.ty == Ty.Str:
+            let b = self.expr(r)
+            let c = self.cx.fb.call(K.Ptr, "brine_str_concat", [a, b])
+            return self.temp(c, Ty.Str)
+        if op == BinOp.Mul and e.ty == Ty.Str:
+            let n0 = self.expr(r)
+            let n = self.cx.fb.conv(K.I64, n0)
+            let loc = self.loc(e.span)
+            let c = self.cx.fb.call(K.Ptr, "brine_s_repeat", [a, n, loc])
+            return self.temp(c, Ty.Str)
+        if op == BinOp.Add and e.ty.elem() != Ty.Error:
+            let b = self.expr(r)
+            let loc = self.loc(e.span)
+            let c = self.cx.fb.call(K.Ptr, "brine_arr_concat", [a, b, loc])
+            return self.temp(c, e.ty)
+        let chk = self.op_checked(Some(op), e.ty, e.checked) and self.idx_chk(e)
+        let sh = -1 if chk else pow2_shift(op, r, e.ty)
+        if sh > 0:
+            let kk = self.kind(e.ty)
+            if op == BinOp.Div:
+                let n = self.cx.fb.konst(kk, sh)
+                return self.cx.fb.bin(Op.Shr, kk, a, n)
+            let m = self.cx.fb.konst(kk, (1 << sh) - 1)
+            return self.cx.fb.bin(Op.And, kk, a, m)
+        let b = self.expr(r)
+        return self.arith(op, a, b, e.ty, chk, e.span)
+
     # ============================================================ expressions
     fn expr(ref self, e: Expr) -> int:
         if self.cx.sname == "":
@@ -5513,6 +5571,8 @@ struct Lower:
         return v
 
     fn expr_in(ref self, e: Expr) -> int:
+        if left_chain(e):
+            return self.expr_chain(e)
         match e.kind:
             case ExprKind.Int(v):
                 return self.int_lit(v, e.ty)
@@ -5581,50 +5641,8 @@ struct Lower:
                     case UnOp.BitNot:
                         return self.cx.fb.un(Op.Not, self.kind(e.ty), v)
             case ExprKind.Binary(op, l, r):
-                if op == BinOp.And or op == BinOp.Or:
-                    let a = self.expr(l)
-                    let t = self.cx.fb.copy_of(a)
-                    let skip = self.cx.fb.label()
-                    if op == BinOp.And:
-                        self.cx.fb.brnot(t, skip)
-                    else:
-                        self.cx.fb.br(t, skip)
-                    self.push_frame()
-                    let b = self.expr(r)
-                    self.cx.fb.mov(t, b)
-                    self.pop_frame()
-                    self.cx.fb.place(skip)
-                    return t
-                if op == BinOp.Add and e.ty == Ty.Str:
-                    let a = self.expr(l)
-                    let b = self.expr(r)
-                    let c = self.cx.fb.call(K.Ptr, "brine_str_concat", [a, b])
-                    return self.temp(c, Ty.Str)
-                if op == BinOp.Mul and e.ty == Ty.Str:
-                    let a = self.expr(l)
-                    let n0 = self.expr(r)
-                    let n = self.cx.fb.conv(K.I64, n0)
-                    let loc = self.loc(e.span)
-                    let c = self.cx.fb.call(K.Ptr, "brine_s_repeat", [a, n, loc])
-                    return self.temp(c, Ty.Str)
-                if op == BinOp.Add and e.ty.elem() != Ty.Error:
-                    let a = self.expr(l)
-                    let b = self.expr(r)
-                    let loc = self.loc(e.span)
-                    let c = self.cx.fb.call(K.Ptr, "brine_arr_concat", [a, b, loc])
-                    return self.temp(c, e.ty)
                 let a = self.expr(l)
-                let chk = self.op_checked(Some(op), e.ty, e.checked) and self.idx_chk(e)
-                let sh = -1 if chk else pow2_shift(op, r, e.ty)
-                if sh > 0:
-                    let kk = self.kind(e.ty)
-                    if op == BinOp.Div:
-                        let n = self.cx.fb.konst(kk, sh)
-                        return self.cx.fb.bin(Op.Shr, kk, a, n)
-                    let m = self.cx.fb.konst(kk, (1 << sh) - 1)
-                    return self.cx.fb.bin(Op.And, kk, a, m)
-                let b = self.expr(r)
-                return self.arith(op, a, b, e.ty, chk, e.span)
+                return self.binary_from(e, op, a, r)
             case ExprKind.Compare(first, rest):
                 let a = self.expr(first)
                 if len(rest) == 1:

@@ -6,7 +6,7 @@ from types import Ty, IntTy, FloatTy, Res, CallRes, Builtin, StrM, Reducer, Worl
 from types import int_ty, float_ty, builtins, world_ops, os_ops, NumM, num_methods
 from ast import TypeExpr, ConstDecl, BinOp, CmpOp, UnOp, FSeg, Arg, CompKind, Comp, Expr, ExprKind, mk
 from ast import LetPat, Pattern, PatKind, Case, Stmt, StmtKind, Block, stmt, pattern
-from ast import children, stmt_exprs, stmt_blocks, local_of, lvalue_root, parse_fmt_spec
+from ast import children, left_chain, left_spine, stmt_exprs, stmt_blocks, local_of, lvalue_root, parse_fmt_spec
 from ast import Param, FnDecl, FieldDecl, StructDecl, EnumDecl, Module, Program, Import, module_name
 from info import StructInfo, InvRead, VariantInfo, EnumInfo, ParamSig, FnSig, ConstVal, ConstInfo, ProgramInfo
 from info import TryKind, try_kind, new_info, mangle_module, PRELUDE, RT, builtin_module
@@ -3686,9 +3686,67 @@ struct Checker:
     fn check_expr(ref self, ref e: Expr, exp: Option[Ty]) -> Ty:
         let allow_gen = self.allow_gen
         self.allow_gen = false
+        if left_chain(e):
+            return self.check_chain(ref e, exp)
         let t = self.expr_inner(ref e, exp, allow_gen)
         e.ty = t
         return t
+
+    # `a + b + c + ...` nests to the left, as deep as it is long: its left
+    # operands are checked here in a loop, innermost first, instead of each
+    # through a frame of `expr_inner` (a large one) of its own.
+    fn check_chain(ref self, ref e: Expr, exp: Option[Ty]) -> Ty:
+        # the operations down the left side, outermost first, and what the
+        # innermost left one's value is expected to be
+        var nodes: [Expr] = []
+        var cur = e
+        var x = exp
+        while left_chain(cur):
+            match cur.kind:
+                case ExprKind.Binary(op, l, _):
+                    nodes.push(cur)
+                    x = left_exp(op, x)
+                    cur = l
+                case _:
+                    pass
+        var t = self.check_expr(ref cur, x)
+        var i = len(nodes)
+        while i > 0:
+            i -= 1
+            var n = nodes[i]
+            match n.kind:
+                case ExprKind.Binary(op, _, r):
+                    var r2 = r
+                    t = self.binary_rest(op, cur, t, ref r2, n.span)
+                    n.kind = ExprKind.Binary(op, cur, r2)
+                case _:
+                    pass
+            n.ty = t
+            cur = n
+        e = cur
+        return t
+
+    # The type of `l2 op r2`, where `l2` (of type `lt`) is checked and isn't
+    # a literal or `[]`: `r2` is checked here.
+    fn binary_rest(ref self, op: BinOp, l2: Expr, lt: Ty, ref r2: Expr, span: Span) -> Ty:
+        if op == BinOp.And or op == BinOp.Or:
+            let rt = self.check_expr(ref r2, Some(Ty.Bool))
+            for t, sp in [(lt, l2.span), (rt, r2.span)]:
+                if not t.is_error() and t != Ty.Bool:
+                    self.err(
+                        diag.error(
+                            "E0305",
+                            f"`{op.sym()}` needs `bool` operands, found " + self.tn(t)
+                        )
+                        .label(sp, "not a bool")
+                        .with_help("use `&` / `|` for bitwise operations on integers")
+                    )
+            return Ty.Bool
+        var rexp: Option[Ty] = None
+        if lt.is_numeric() or op == BinOp.Add and is_array_ty(lt):
+            rexp = Some(lt)
+        let rt = self.check_expr(ref r2, rexp)
+        return self.binop_type(op, lt, rt, span, l2.span, r2.span)
 
     # Checks an argument against its parameter type. Arguments of generic calls
     # were already checked while inferring the type arguments.
@@ -4268,26 +4326,10 @@ struct Checker:
                 var r2 = r
                 if op == BinOp.And or op == BinOp.Or:
                     let lt = self.check_expr(ref l2, Some(Ty.Bool))
-                    let rt = self.check_expr(ref r2, Some(Ty.Bool))
+                    let t = self.binary_rest(op, l2, lt, ref r2, span)
                     e.kind = ExprKind.Binary(op, l2, r2)
-                    for t, sp in [(lt, l2.span), (rt, r2.span)]:
-                        if not t.is_error() and t != Ty.Bool:
-                            self.err(
-                                diag.error(
-                                    "E0305",
-                                    f"`{op.sym()}` needs `bool` operands, found " + self.tn(t)
-                                )
-                                .label(sp, "not a bool")
-                                .with_help("use `&` / `|` for bitwise operations on integers")
-                            )
-                    return Ty.Bool
-                var oexp: Option[Ty] = None
-                match exp:
-                    case Some(t):
-                        if t.is_numeric() or op == BinOp.Add and is_array_ty(t):
-                            oexp = Some(t)
-                    case None:
-                        pass
+                    return t
+                let oexp = left_exp(op, exp)
                 # `[] + xs`: the empty array takes its type from the right
                 var empty_left = false
                 if op == BinOp.Add and oexp.is_none():
@@ -10012,3 +10054,16 @@ fn inv_reads(e: Expr, me: int, ref fields: [str], ref all: bool):
             pass
     for c in children(e):
         inv_reads(c, me, ref fields, ref all)
+
+# What the left operand of `op` is expected to be, when its value is
+# expected to be `exp`.
+fn left_exp(op: BinOp, exp: Option[Ty]) -> Option[Ty]:
+    if op == BinOp.And or op == BinOp.Or:
+        return Some(Ty.Bool)
+    match exp:
+        case Some(t):
+            if t.is_numeric() or op == BinOp.Add and is_array_ty(t):
+                return Some(t)
+        case None:
+            pass
+    return None
