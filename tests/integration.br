@@ -274,9 +274,12 @@ fn features() -> [str]:
         "tests/programs/kernel_regs.br",
         "tests/programs/gpu.br",
         "tests/programs/string_building.br",
+        "tests/programs/str_chars.br",
         "tests/programs/float_text.br",
+        "tests/programs/parse_blank.br",
         "tests/programs/nan_text.br",
         "tests/programs/math_bits.br",
+        "tests/programs/math_round.br",
         "tests/programs/arg_alias.br",
         "tests/programs/deep_drop.br",
         "tests/programs/field_arrays.br",
@@ -294,6 +297,7 @@ fn features() -> [str]:
         "tests/programs/const_patterns.br",
         "tests/programs/const_arrays.br",
         "tests/programs/const_folding.br",
+        "tests/programs/const_values.br",
         "tests/programs/enum_int.br",
         "tests/programs/ordering.br",
         "tests/programs/ref_fields.br",
@@ -638,6 +642,11 @@ test "panics are clear":
             "slice [0:2] splits the character \"é\" (bytes 1..3)"
         ),
         ("tests/programs/panic_str_byte.br", "index 3 is out of bounds"),
+        ("tests/programs/panic_str_mid.br", "index 2 is inside the character \"é\" (bytes 1..3)"),
+        (
+            "tests/programs/panic_str_mid_add.br",
+            "index 2 is inside the character \"€\" (bytes 1..4)"
+        ),
         ("tests/programs/panic_par.br", "out of bounds for an array of length 3"),
         ("tests/programs/panic_unwrap.br", "unwrap() called on Err: not a number: x"),
         (
@@ -1224,6 +1233,26 @@ test "suggested fixes give code that lexes and parses":
                 pass
         n += 1
     assert n > 30
+
+test "a bare name in a case that was meant as a constant warns":
+    # v091#22: `case K_A:` captures every value and hides `case k.K_B:`
+    let d = scratch("case-capture")
+    write(d + "/k.br", "const K_A = 1\nconst K_B = 2\n")
+    write(
+        d + "/main.br",
+        "import k\n\nfn f(x: int) -> str:\n    match x:\n        case K_A:\n            return \"a\"\n        case k.K_B:\n            return \"b\"\n\nfn main():\n    print(f(2))\n"
+    )
+    let o = brine(["check", d + "/main.br"])
+    assert o.code == 0, o.all()
+    assert "warning[W0006]: `case K_A:` captures every value; it doesn't compare with `k.K_A`" in o.err, o.all()
+    assert "`K_A` is a new name: it matches every value" in o.err, o.all()
+    # a constant the module doesn't have
+    write(
+        d + "/z.br",
+        "import k\n\nfn main():\n    match 1:\n        case k.K_Z:\n            pass\n        case _:\n            pass\n"
+    )
+    let z = brine(["check", d + "/z.br"])
+    assert "module `k` has no item `K_Z`" in z.err, z.all()
 
 test "helps say what works for the mistake at hand":
     # (program, code, part of its help): v09#10's wrong or dead-end helps
@@ -2558,7 +2587,7 @@ test "release builds build strings and count them in place":
     let o = brine(["emit-c", "--release", "tests/programs/string_building.br", "-o", c])
     assert o.code == 0, o.all()
     let t = text(c)
-    # `w += t[i]` appends the byte without a one-byte string, and the index in
+    # `w += t[i]` appends the character without a string of it, and the index in
     # `text[i] == " "` is proven (`i` only grows from 0), so no read is checked
     assert t.count("brine_str_at(") == 0, t
     # the `var w = ""` in each loop keeps its block from one iteration to the next
@@ -2571,8 +2600,10 @@ test "release builds build strings and count them in place":
     # but the loop that reads `r` and the `s += "|"` outside the inner loop
     let body2 = t[t.find("static void main__appenders(void) {").unwrap():]
     let g = body2[:body2.find("\n}\n").unwrap()]
-    assert g.count("brine_app_open(") == 5 and g.count("brine_app_byte(") == 6, g
-    assert g.count("brine_app_close(") == 5 and g.count("brine_str_add_byte(") == 3, g
+    let apps = g.count("brine_app_byte(") + g.count("brine_app_char(")
+    let adds = g.count("brine_str_add_byte(") + g.count("brine_str_add_char(")
+    assert g.count("brine_app_open(") == 5 and apps == 6, g
+    assert g.count("brine_app_close(") == 5 and adds == 3, g
 
 test "release builds drop overflow checks a bound rules out":
     let d = scratch("versioned")
@@ -2812,7 +2843,8 @@ test "every error code is explained":
         "W0002",
         "W0003",
         "W0004",
-        "W0005"
+        "W0005",
+        "W0006"
     ]:
         let o = brine(["explain", code])
         assert o.code == 0, f"no explanation for {code}"

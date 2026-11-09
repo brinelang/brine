@@ -4716,28 +4716,40 @@ struct Lower:
             return e
         return -1
 
-    # U8: the byte `v` appends to a string when it is `t[i]` or a one-byte
-    # literal (`s += t[i]` then appends a byte), or -1. Index checks as in
-    # brine_str_at.
-    fn str_byte(ref self, v: Expr) -> int:
+    # `s += v` without building v, when v is a one-byte literal (then
+    # appending a byte) or `t[i]` (the character that starts at byte i, a
+    # byte when it is ASCII): whether it did. Index checks as in brine_str_at.
+    fn str_add_char(ref self, target: Expr, v: Expr) -> bool:
         match v.kind:
             case ExprKind.Str(s):
                 if len(s) == 1:
-                    return self.cx.fb.konst(K.U8, int(s.bytes()[0]))
+                    let c = self.cx.fb.konst(K.U8, int(s.bytes()[0]))
+                    let lp = self.lvalue(target)
+                    match self.app_of(target):
+                        case Some(ap):
+                            self.cx.fb.rt_void("brine_app_byte", [lp, ap, c])
+                        case None:
+                            self.cx.fb.rt_void("brine_str_add_byte", [lp, c])
+                    return true
             case ExprKind.Index(base, idx):
                 if base.ty == Ty.Str:
                     let b = self.expr(base)
                     let i0 = self.expr(idx)
                     var i = self.cx.fb.conv(K.I64, i0)
+                    let loc = self.loc(v.span)
                     if v.checked:
                         let n = self.cx.fb.load(K.I64, b, 8)
-                        let loc = self.loc(v.span)
                         i = self.cx.fb.chk(Op.IdxChk, K.I64, i, n, loc)
-                    let p = self.cx.fb.elem(b, i, 1)
-                    return self.cx.fb.load(K.U8, p, 16)
+                    let lp = self.lvalue(target)
+                    match self.app_of(target):
+                        case Some(ap):
+                            self.cx.fb.rt_void("brine_app_char", [lp, ap, b, i, loc])
+                        case None:
+                            self.cx.fb.rt_void("brine_str_add_char", [lp, b, i, loc])
+                    return true
             case _:
                 pass
-        return -1
+        return false
 
     fn assign(ref self, target: Expr, op: Option[BinOp], value: Expr, checked: bool, span: Span):
         let ty = target.ty
@@ -4839,16 +4851,8 @@ struct Lower:
                     self.cx.fb.store(lp, 0, v)
                     self.release(old, ty)
             case Some(o2):
-                if ty == Ty.Str and o2 == BinOp.Add:
-                    let c = self.str_byte(value)
-                    if c >= 0:
-                        let lp = self.lvalue(target)
-                        match self.app_of(target):
-                            case Some(ap):
-                                self.cx.fb.rt_void("brine_app_byte", [lp, ap, c])
-                            case None:
-                                self.cx.fb.rt_void("brine_str_add_byte", [lp, c])
-                        return
+                if ty == Ty.Str and o2 == BinOp.Add and self.str_add_char(target, value):
+                    return
                 let v = self.expr(value)
                 let lp = self.lvalue(target)
                 if ty == Ty.Str and o2 == BinOp.Mul:
@@ -5456,10 +5460,10 @@ struct Lower:
                     let b = self.expr(base)
                     let i0 = self.expr(idx)
                     let i = self.cx.fb.conv(K.I64, i0)
-                    if e.checked:
-                        let loc = self.loc(e.span)
-                        return self.cx.fb.rt(K.Ptr, "brine_str_at", [b, i, loc])
-                    return self.cx.fb.rt(K.Ptr, "brine_str_byte", [b, i])
+                    # the character at i: a fresh string unless it is ASCII
+                    let loc = self.loc(e.span)
+                    let f = "brine_str_at" if e.checked else "brine_str_char"
+                    return self.temp(self.cx.fb.rt(K.Ptr, f, [b, i, loc]), e.ty)
                 match base.ty:
                     case Ty.Map(_, _):
                         let b = self.expr(base)

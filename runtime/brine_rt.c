@@ -93,6 +93,187 @@ static void br_ws_start(void) {
    runtime/rt.br's port of the same code) */
 #ifndef BRINE_RT_BR
 #include "brine_math.c"
+/* atan2 and hypot, correctly rounded but in very rare cases (musl's were
+ * 1 ulp off for a fifth and a tenth of the inputs, v091#9): double-double
+ * arithmetic in plain doubles, operation for operation the same as rt.br's
+ * f_atan2 and f_hypot, so every backend gives the same bits. No FMA: the
+ * driver compiles with -ffp-contract=off, and the pragma covers clang. */
+#pragma STDC FP_CONTRACT OFF
+#define BR_SPLIT 134217729.0 /* 0x1p27 + 1 */
+#define BR_P700 5.260135901548374e+210
+#define BR_M700 1.90109156629516e-211
+static const uint64_t br_atan_t[130] = {
+    0x0000000000000000ULL, 0x0000000000000000ULL, 0x3f8fff555bbb729bULL, 0xbc2220c39d4dff50ULL,
+    0x3f9ffd55bba97625ULL, 0xbc35ec431444912cULL, 0x3fa7fb818430da2aULL, 0xbc086ef8f794f105ULL,
+    0x3faff55bb72cfdeaULL, 0xbc3c934d86d23f1dULL, 0x3fb3f59f0e7c559dULL, 0x3c5ac4ce285df847ULL,
+    0x3fb7ee182602f10fULL, 0xbc5cfb654c0c3d98ULL, 0x3fbbe39ebe6f07c3ULL, 0x3c5f7b8f29a05987ULL,
+    0x3fbfd5ba9aac2f6eULL, 0xbc4cd37686760c17ULL, 0x3fc1e1fafb043727ULL, 0xbc4b485914dacf8cULL,
+    0x3fc3d6eee8c6626cULL, 0x3c661a3b0ce9281bULL, 0x3fc5c9811e3ec26aULL, 0xbc5054ab2c010f3dULL,
+    0x3fc7b97b4bce5b02ULL, 0x3c5347b0b4f881caULL, 0x3fc9a6a8e96c8626ULL, 0x3c4cf601e7b4348eULL,
+    0x3fcb90d7529260a2ULL, 0x3c217b10d2e0e5abULL, 0x3fcd77d5df205736ULL, 0x3c6c648d1534597eULL,
+    0x3fcf5b75f92c80ddULL, 0x3c68ab6e3cf7afbdULL, 0x3fd09dc597d86362ULL, 0x3c762e47390cb865ULL,
+    0x3fd18bf5a30bf178ULL, 0x3c630ca4748b1bf9ULL, 0x3fd278372057ef46ULL, 0xbc7077cdd36dfc81ULL,
+    0x3fd362773707ebccULL, 0xbc6963a544b672d8ULL, 0x3fd44aa436c2af0aULL, 0xbc75d5e43c55b3baULL,
+    0x3fd530ad9951cd4aULL, 0xbc62566480884082ULL, 0x3fd614840309cfe2ULL, 0xbc7a725715711f00ULL,
+    0x3fd6f61941e4def1ULL, 0xbc7c63aae6f6e918ULL, 0x3fd7d5604b63b3f7ULL, 0x3c769c885c2b249aULL,
+    0x3fd8b24d394a1b25ULL, 0x3c7b6d0ba3748fa8ULL, 0x3fd98cd5454d6b18ULL, 0x3c79e6c988fd0a77ULL,
+    0x3fda64eec3cc23fdULL, 0xbc724dec1b50b7ffULL, 0x3fdb3a911da65c6cULL, 0x3c7ae187b1ca5040ULL,
+    0x3fdc0db4c94ec9f0ULL, 0xbc7cc1ce70934c34ULL, 0x3fdcde53432c1351ULL, 0xbc7a2cfa4418f1adULL,
+    0x3fddac670561bb4fULL, 0x3c7a2b7f222f65e2ULL, 0x3fde77eb7f175a34ULL, 0x3c70e53dc1bf3435ULL,
+    0x3fdf40dd0b541418ULL, 0xbc6a3992dc382a23ULL, 0x3fe0039c73c1a40cULL, 0xbc8b32c949c9d593ULL,
+    0x3fe0657e94db30d0ULL, 0xbc7d5b495f6349e6ULL, 0x3fe0c6145b5b43daULL, 0x3c5974fa13b5404fULL,
+    0x3fe1255d9bfbd2a9ULL, 0xbc52bdaee1c0ee35ULL, 0x3fe1835a88be7c13ULL, 0x3c8c621cec00c301ULL,
+    0x3fe1e00babdefeb4ULL, 0xbc5928df287a668fULL, 0x3fe23b71e2cc9e6aULL, 0x3c6c421c9f38224eULL,
+    0x3fe2958e59308e31ULL, 0xbc709e73b0c6c087ULL, 0x3fe2ee628406cbcaULL, 0x3c8c5d5e9ff0cf8dULL,
+    0x3fe345f01cce37bbULL, 0x3c81021137c71102ULL, 0x3fe39c391cd4171aULL, 0xbc82304331d8bf46ULL,
+    0x3fe3f13fb89e96f4ULL, 0x3c7ecf8b492644f0ULL, 0x3fe445065b795b56ULL, 0xbc7f76d0163f79c8ULL,
+    0x3fe4978fa3269ee1ULL, 0x3c72419a87f2a458ULL, 0x3fe4e8de5bb6ec04ULL, 0x3c84a33dbeb3796cULL,
+    0x3fe538f57b89061fULL, 0xbc81bb74abda520cULL, 0x3fe587d81f732fbbULL, 0xbc75e5c9d8c5a950ULL,
+    0x3fe5d58987169b18ULL, 0x3c60028e4bc5e7caULL, 0x3fe6220d115d7b8eULL, 0xbc62b785350ee8c1ULL,
+    0x3fe66d663923e087ULL, 0xbc76ea6febe8bbbaULL, 0x3fe6b798920b3d99ULL, 0xbc8a80386188c50eULL,
+    0x3fe700a7c5784634ULL, 0xbc78c34d25aadef6ULL, 0x3fe748978fba8e0fULL, 0x3c47b2a6165884a1ULL,
+    0x3fe78f6bbd5d315eULL, 0x3c8406a089803740ULL, 0x3fe7d528289fa093ULL, 0x3c8560821e2f3aa9ULL,
+    0x3fe819d0b7158a4dULL, 0xbc7bf76229d3b917ULL, 0x3fe85d69576cc2c5ULL, 0x3c66b66e7fc8b8c3ULL,
+    0x3fe89ff5ff57f1f8ULL, 0xbc855b9a5e177a1bULL, 0x3fe8e17aa99cc05eULL, 0xbc7ec182ab042f61ULL,
+    0x3fe921fb54442d18ULL, 0x3c81a62633145c07ULL,
+};
+static double br_f64(uint64_t b) {
+    double d;
+    memcpy(&d, &b, 8);
+    return d;
+}
+static uint64_t br_bits(double d) {
+    uint64_t b;
+    memcpy(&b, &d, 8);
+    return b;
+}
+double br_atan2(double y, double x) {
+    if (x != x || y != y) return y + x;
+    double ax = fabs(x), ay = fabs(y);
+    int swap = ay > ax;
+    double num = swap ? ax : ay, den = swap ? ay : ax;
+    double hi = 0.0, lo = 0.0;
+    if (br_bits(den) == 0x7ff0000000000000ULL) {
+        if (num == den) {
+            hi = 0.7853981633974483;
+            lo = 3.061616997868383e-17;
+        }
+    } else if (num != 0.0) {
+        double zh = num / den;
+        if (zh < 8.673617379884035e-19) {
+            hi = zh;
+        } else {
+            if (den > 3.273390607896142e+150) {
+                num *= BR_M700;
+                den *= BR_M700;
+            } else if (den < 3.4395525670743494e-136) {
+                num *= BR_P700;
+                den *= BR_P700;
+            }
+            double c = zh * BR_SPLIT;
+            double zhh = zh - c + c, zhl = zh - zhh;
+            c = den * BR_SPLIT;
+            double dh = den - c + c, dl = den - dh;
+            double ph = zh * den;
+            double pl = zhh * dh - ph + zhh * dl + zhl * dh + zhl * dl;
+            double zl = (num - ph - pl) / den;
+            int64_t i = (int64_t)(zh * 64.0 + 0.5);
+            double ci = (double)i / 64.0;
+            double nh = zh - ci;
+            double s = nh + zl;
+            double nl = zl - (s - nh);
+            nh = s;
+            double cp = zh * ci;
+            c = ci * BR_SPLIT;
+            double cih = ci - c + c, cil = ci - cih;
+            double cpl = zhh * cih - cp + zhh * cil + zhl * cih + zhl * cil;
+            double eh = 1.0 + cp;
+            double el = cp - (eh - 1.0) + (cpl + zl * ci);
+            double th = nh / eh;
+            c = th * BR_SPLIT;
+            double thh = th - c + c, thl = th - thh;
+            c = eh * BR_SPLIT;
+            double ehh = eh - c + c, ehl = eh - ehh;
+            double qh = th * eh;
+            double ql = thh * ehh - qh + thh * ehl + thl * ehh + thl * ehl;
+            double tl = (nh - qh - ql + nl - th * el) / eh;
+            double t2h = th * th;
+            double t2l = thh * thh - t2h + 2.0 * thh * thl + thl * thl;
+            double t3h = t2h * th;
+            c = t2h * BR_SPLIT;
+            double uh = t2h - c + c, ul = t2h - uh;
+            double t3l = uh * thh - t3h + uh * thl + ul * thh + ul * thl + t2l * th;
+            double vh = t3h * 0.3333333333333333;
+            c = vh * BR_SPLIT;
+            double vhh = vh - c + c, vhl = vh - vhh;
+            double wh = vh * 3.0;
+            double wl = vhh * 3.0 - wh + vhl * 3.0;
+            double vl = (t3h - wh - wl + t3l) * 0.3333333333333333;
+            double r5 = t3h * t2h * (0.2 + t2h * (-0.14285714285714285 + t2h * (0.1111111111111111 + t2h * -0.09090909090909091)));
+            double a = th - vh;
+            double al = th - a - vh + (tl - t2h * tl - vl + r5);
+            double ah = br_f64(br_atan_t[2 * i]);
+            hi = ah + a;
+            double bb = hi - ah;
+            lo = ah - (hi - bb) + (a - bb) + (br_f64(br_atan_t[2 * i + 1]) + al);
+        }
+    }
+    if (swap) {
+        double h = 1.5707963267948966 - hi;
+        lo = 1.5707963267948966 - h - hi + (6.123233995736766e-17 - lo);
+        hi = h;
+    }
+    if (br_bits(x) >> 63) {
+        double h = 3.141592653589793 - hi;
+        lo = 3.141592653589793 - h - hi + (1.2246467991473532e-16 - lo);
+        hi = h;
+    }
+    double r = hi + lo;
+    return (br_bits(y) >> 63) ? -r : r;
+}
+double br_hypot(double x0, double y0) {
+    uint64_t uxi = br_bits(x0) & 0x7fffffffffffffffULL, uyi = br_bits(y0) & 0x7fffffffffffffffULL;
+    if (uxi < uyi) {
+        uint64_t ut = uxi;
+        uxi = uyi;
+        uyi = ut;
+    }
+    int ex = (int)(uxi >> 52), ey = (int)(uyi >> 52);
+    double x = br_f64(uxi), y = br_f64(uyi);
+    if (ey == 0x7ff) return y;
+    if (ex == 0x7ff || uyi == 0) return x;
+    if (ex - ey > 64) return x + y;
+    double z = 1.0;
+    if (ex > 0x3ff + 510) {
+        z = BR_P700;
+        x *= BR_M700;
+        y *= BR_M700;
+    } else if (ey < 0x3ff - 450) {
+        z = BR_M700;
+        x *= BR_P700;
+        y *= BR_P700;
+    }
+    double xc = x * BR_SPLIT;
+    double xh = x - xc + xc, xl = x - xh;
+    double hx = x * x;
+    double lx = xh * xh - hx + 2.0 * xh * xl + xl * xl;
+    double yc = y * BR_SPLIT;
+    double yh = y - yc + yc, yl = y - yh;
+    double hy = y * y;
+    double ly = yh * yh - hy + 2.0 * yh * yl + yl * yl;
+    double sh = hx + hy;
+    double sl = hx - sh + hy + (lx + ly);
+    double s2 = sh + sl;
+    sl = sh - s2 + sl;
+    sh = s2;
+    double r = sqrt(sh);
+    double rc = r * BR_SPLIT;
+    double rh = r - rc + rc, rl = r - rh;
+    double rr = r * r;
+    double rrl = rh * rh - rr + 2.0 * rh * rl + rl * rl;
+    double d = sh - rr - rrl + sl;
+    return z * (r + d / (2.0 * r));
+}
 #endif
 
 /* generated code hardcodes these (lower.br) */
@@ -1073,6 +1254,29 @@ static BR_NORETURN BR_COLD void br_slice_splits(brine_str *s, int64_t lo, int64_
     br_panicf(loc, "slice [%lld:%lld] splits the character \"%.*s\" (bytes %lld..%lld)", (long long)lo, (long long)hi, (int)n,
               s->data + a, (long long)a, (long long)(a + n));
 }
+/* the length of the character that starts at byte i (in bounds) of s; a
+   byte inside a character panics, so a string can't be cut into pieces that
+   aren't UTF-8 */
+int64_t brine_char_at_len(brine_str *s, int64_t i, const char *loc) {
+    if (BR_UNLIKELY(br_mid_char(s, i))) {
+        int64_t a = i;
+        while (a > 0 && i - a < 3 && br_mid_char(s, a)) a--;
+        int64_t n = br_utf8_len((const unsigned char *)s->data + a, s->len - a);
+        br_panicf(loc, "index %lld is inside the character \"%.*s\" (bytes %lld..%lld): a string's index must start a character",
+                  (long long)i, (int)n, s->data + a, (long long)a, (long long)(a + n));
+    }
+    return br_utf8_len((const unsigned char *)s->data + i, s->len - i);
+}
+brine_str *brine_str_char_cold(brine_str *s, int64_t i, const char *loc) {
+    return brine_str_new(s->data + i, brine_char_at_len(s, i, loc));
+}
+/* (the bytes are read first: t may be the string appended to, `s += s[i]`) */
+void brine_str_add_char_cold(brine_str **ps, brine_str *t, int64_t i, const char *loc) {
+    int64_t n = brine_char_at_len(t, i, loc);
+    unsigned char b[4];
+    for (int64_t k = 0; k < n; k++) b[k] = (unsigned char)t->data[i + k];
+    for (int64_t k = 0; k < n; k++) brine_str_add_byte(ps, b[k]);
+}
 /* Strings are UTF-8, so a slice must not cut a character in two. */
 brine_str *brine_str_slice(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
     if (BR_UNLIKELY(lo < 0 || lo > hi || hi > s->len))
@@ -1943,8 +2147,11 @@ static bool br_parse_float(brine_str *s, double *out) {
         }
         char *end;
         v = strtod(p, &end);
+        /* end == p: no number (blank text too, which the spaces skipped
+         * below would otherwise make look read to the end) */
+        bool none = end == p;
         while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
-        ok = n != 0 && end == p + n;
+        ok = n != 0 && !none && end == p + n;
         /* the canonical quiet NaN with the text's sign, as native code reads
          * every "nan" (mingw's strtod sets all the mantissa bits, musl's
          * drops the sign) */
@@ -2794,10 +3001,11 @@ void brine_drop_args(int64_t n) {
     }
 }
 #endif
+static brine_str *br_text(const char *p);
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_arr *brine_args(void) {
     brine_arr *a = br_strs();
-    for (int i = 1; i < br_argc; i++) br_push_str(&a, brine_str_new(br_argv[i], (int64_t)strlen(br_argv[i])));
+    for (int i = 1; i < br_argc; i++) br_push_str(&a, br_text(br_argv[i]));
     return a;
 }
 #endif
@@ -5927,16 +6135,36 @@ static brine_str *br_strf(const char *fmt, ...) {
     return brine_str_new(buf, n);
 }
 
-/* the index of the first byte that starts no UTF-8 character, or -1 */
+/* the length of the UTF-8 character at p (2 to 4 bytes, of avail), or 0 when
+   the bytes there aren't one (RFC 3629: no overlong forms, surrogates or code
+   points past U+10FFFF; the second byte's range depends on the first) */
+static int64_t br_utf8_valid_len(const unsigned char *p, int64_t avail) {
+    unsigned char b = p[0], lo = 0x80, hi = 0xBF;
+    int64_t w = (b >= 0xC2 && b <= 0xDF) ? 2 : (b >= 0xE0 && b <= 0xEF) ? 3 : (b >= 0xF0 && b <= 0xF4) ? 4 : 0;
+    if (b == 0xE0) lo = 0xA0;
+    else if (b == 0xED) hi = 0x9F;
+    else if (b == 0xF0) lo = 0x90;
+    else if (b == 0xF4) hi = 0x8F;
+    if (w == 0 || w > avail || p[1] < lo || p[1] > hi) return 0;
+    for (int64_t j = 2; j < w; j++)
+        if ((p[j] & 0xC0) != 0x80) return 0;
+    return w;
+}
+/* the index of the first byte where the n bytes at p stop being UTF-8, or -1;
+   ASCII goes 16 bytes at a time */
 static int64_t br_utf8_bad(const unsigned char *p, int64_t n) {
     int64_t i = 0;
     while (i < n) {
+        if (i + 16 <= n && ((brine_ld8(p + i) | brine_ld8(p + i + 8)) & 0x8080808080808080ULL) == 0) {
+            i += 16;
+            continue;
+        }
         if (p[i] < 0x80) {
             i++;
             continue;
         }
-        int64_t k = br_utf8_len(p + i, n - i);
-        if (k == 1) return i;
+        int64_t k = br_utf8_valid_len(p + i, n - i);
+        if (k == 0) return i;
         i += k;
     }
     return -1;
@@ -5955,20 +6183,13 @@ bool brine_str_from_utf8(brine_arr *a, brine_str **out) {
 }
 
 /* text read from outside as a string: bytes that aren't UTF-8 become U+FFFD */
+static brine_str *br_lossy(const unsigned char *p, size_t n);
 static brine_str *br_lossy_str(const char *p, int64_t n) {
     if (br_utf8_bad((const unsigned char *)p, n) < 0) return brine_str_new(p, n);
-    brine_sb sb;
-    brine_sb_init(&sb);
-    for (int64_t i = 0; i < n;) {
-        int64_t k = ((unsigned char)p[i] < 0x80) ? 1 : br_utf8_len((const unsigned char *)p + i, n - i);
-        if (k == 1 && (unsigned char)p[i] >= 0x80)
-            brine_sb_cat(&sb, "\xef\xbf\xbd", 3);
-        else
-            brine_sb_cat(&sb, p + i, k);
-        i += k;
-    }
-    return brine_sb_finish(&sb);
+    return br_lossy((const unsigned char *)p, (size_t)n);
 }
+/* a C string from the system (a file name, a variable, an argument) */
+static brine_str *br_text(const char *p) { return br_lossy_str(p, (int64_t)strlen(p)); }
 
 #ifdef _WIN32
 static wchar_t *br_wide(const char *s) {
@@ -6321,7 +6542,7 @@ brine_str *brine_getenv(brine_str *name) {
 #else
     const char *v = getenv(n);
     free(n);
-    return v ? brine_str_new(v, (int64_t)strlen(v)) : NULL;
+    return v ? br_text(v) : NULL;
 #endif
 }
 
@@ -6558,7 +6779,7 @@ bool brine_os_list_dir(brine_str *path, brine_arr **out, brine_str **err) {
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
         if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
-        br_push_str(&a, brine_str_new(ent->d_name, (int64_t)strlen(ent->d_name)));
+        br_push_str(&a, br_text(ent->d_name));
     }
     closedir(d);
 #endif
@@ -6740,7 +6961,7 @@ brine_str *brine_os_cwd(void) {
     for (;;) {
         char *buf = (char *)brine_alloc((int64_t)cap);
         if (getcwd(buf, cap)) {
-            brine_str *s = brine_str_new(buf, (int64_t)strlen(buf));
+            brine_str *s = br_text(buf);
             free(buf);
             return s;
         }

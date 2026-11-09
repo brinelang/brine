@@ -280,6 +280,16 @@ static inline void brine_str_add_byte(brine_str **ps, uint8_t c) {
     }
     brine_str_add_byte_slow(ps, c);
 }
+/* `s += t[i]` (i in bounds): the character that starts at byte i */
+void brine_str_add_char_cold(brine_str **ps, brine_str *t, int64_t i, const char *loc);
+static inline void brine_str_add_char(brine_str **ps, brine_str *t, int64_t i, const char *loc) {
+    unsigned char c = (unsigned char)t->data[i];
+    if (BR_UNLIKELY(c >= 0x80)) {
+        brine_str_add_char_cold(ps, t, i, loc);
+        return;
+    }
+    brine_str_add_byte(ps, c);
+}
 /* `var s = lit` run again (a loop body's variable): keeps s's block when
    nothing else holds it, instead of freeing it here and allocating again at
    the next `+=`. lit is a literal, so it needs no reference. */
@@ -353,6 +363,20 @@ static inline void brine_app_byte(brine_str **ps, void *ap, uint8_t c) {
     p->lim = x.lim;
     p->w0 = x.w0;
 }
+/* `s += t[i]` through the appender: the character that starts at byte i
+   (its bytes read first: t may be s) */
+int64_t brine_char_at_len(brine_str *s, int64_t i, const char *loc);
+static inline void brine_app_char(brine_str **ps, void *ap, brine_str *t, int64_t i, const char *loc) {
+    unsigned char c = (unsigned char)t->data[i];
+    if (BR_LIKELY(c < 0x80)) {
+        brine_app_byte(ps, ap, c);
+        return;
+    }
+    int64_t n = brine_char_at_len(t, i, loc);
+    unsigned char b[4];
+    for (int64_t k = 0; k < n; k++) b[k] = (unsigned char)t->data[i + k];
+    for (int64_t k = 0; k < n; k++) brine_app_byte(ps, ap, b[k]);
+}
 static inline void brine_app_close(brine_str **ps, void *ap) {
     brine_app *p = (brine_app *)ap;
     brine_str *a = *ps;
@@ -372,17 +396,25 @@ static inline bool brine_str_eq(brine_str *a, brine_str *b) {
     return brine_str_eq_long(a, b);
 }
 bool brine_str_contains(brine_str *s, brine_str *sub);
-/* `s[i]`: the byte at i as a one-character string, from a table of immortal
-   ones so indexing never allocates */
+/* `s[i]`: the character that starts at byte i. ASCII comes from a table of
+   immortal one-byte strings, so indexing ASCII text never allocates; a byte
+   inside a character panics, as a slice starting there would. */
 typedef struct {
     int64_t rc, len;
     char d[2];
 } brine_str1;
 extern brine_str1 brine_bytes[256];
+/* the byte at i, for code generated before `s[i]` took whole characters (the seed) */
 static inline brine_str *brine_str_byte(brine_str *s, int64_t i) { return (brine_str *)&brine_bytes[(unsigned char)s->data[i]]; }
+brine_str *brine_str_char_cold(brine_str *s, int64_t i, const char *loc);
+static inline brine_str *brine_str_char(brine_str *s, int64_t i, const char *loc) {
+    unsigned char c = (unsigned char)s->data[i];
+    if (BR_UNLIKELY(c >= 0x80)) return brine_str_char_cold(s, i, loc);
+    return (brine_str *)&brine_bytes[c];
+}
 static inline brine_str *brine_str_at(brine_str *s, int64_t i, const char *loc) {
     if (BR_UNLIKELY((uint64_t)i >= (uint64_t)s->len)) brine_panic_idx(i, s->len, loc);
-    return brine_str_byte(s, i);
+    return brine_str_char(s, i, loc);
 }
 brine_str *brine_str_slice(brine_str *s, int64_t lo, int64_t hi, const char *loc);
 int64_t brine_ord(brine_str *s, const char *loc);
@@ -789,11 +821,13 @@ double brine_m_pow(double a, double b);
 double brine_m_atan2(double y, double x);
 double brine_m_hypot(double x, double y);
 static inline double brine_f_pow(double a, double b) { return brine_m_pow(a, b); }
-static inline double brine_f_atan2(double y, double x) { return brine_m_atan2(y, x); }
-static inline double brine_f_hypot(double x, double y) { return brine_m_hypot(x, y); }
+double br_atan2(double y, double x);
+double br_hypot(double x, double y);
+static inline double brine_f_atan2(double y, double x) { return br_atan2(y, x); }
+static inline double brine_f_hypot(double x, double y) { return br_hypot(x, y); }
 static inline float brine_f_powf(float a, float b) { return (float)brine_m_pow((double)a, (double)b); }
-static inline float brine_f_atan2f(float y, float x) { return (float)brine_m_atan2((double)y, (double)x); }
-static inline float brine_f_hypotf(float x, float y) { return (float)brine_m_hypot((double)x, (double)y); }
+static inline float brine_f_atan2f(float y, float x) { return (float)br_atan2((double)y, (double)x); }
+static inline float brine_f_hypotf(float x, float y) { return (float)br_hypot((double)x, (double)y); }
 /* float `%` also takes the sign of the divisor, like Python */
 static inline double brine_f_fmod(double a, double b) { double r = fmod(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
 static inline float brine_f_fmodf(float a, float b) { float r = fmodf(a, b); return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
