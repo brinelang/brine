@@ -1152,12 +1152,14 @@ fn simplify(ref sf: SF):
         sf.bs[0].code = entry
 
 # `(u << s) | (u >> (w - s))`, the shifts `rotate_left` and `rotate_right`
-# lower to (or the same written out) is one rotate: `Rotl` (rol / ror).
-# Unsigned 32- and 64-bit kinds. With constant counts that add up to w, `^`
-# and `+` combine them the same way (no bits overlap); with a variable count
-# (rotate_left's `s = n & (w - 1)` and `(w - s) & (w - 1)`) only `|` does,
-# since s can be 0.
-fn rotates(ref sf: SF):
+# lower to (or the same written out) is one rotate: `Rotl` (rol; with n = 1
+# it rotates right, ror). Unsigned kinds: 32- and 64-bit ones, and on x86-64
+# 8- and 16-bit ones (AArch64 has no such rotates). With constant counts that
+# add up to w, `^` and `+` combine them the same way (no bits overlap); with
+# a variable count (rotate_left's `s = n & (w - 1)` and `(w - s) & (w - 1)`)
+# only `|` does, since s can be 0. rotate_right shifts right by s: a rotate
+# right by s, so the `w - s` goes.
+fn rotates(ref sf: SF, a64: bool):
     let nv = len(sf.f.vk)
     var is_c = [false] * nv
     var cv = [0] * nv
@@ -1178,7 +1180,7 @@ fn rotates(ref sf: SF):
             if x.op != Op.Or and x.op != Op.Xor and x.op != Op.Add:
                 continue
             let k = sf.f.vk[x.d]
-            if k != K.U32 and k != K.U64:
+            if k != K.U32 and k != K.U64 and (a64 or k != K.U8 and k != K.U16):
                 continue
             let w = k.size() * 8
             for flip in [false, true]:
@@ -1193,13 +1195,16 @@ fn rotates(ref sf: SF):
                 if sf.f.vk[p] != k or sf.f.vk[q] != k:
                     continue
                 var ok = false
+                var right = false
                 if is_c[l.b] and is_c[r.b]:
                     ok = cv[l.b] > 0 and cv[l.b] < w and cv[l.b] + cv[r.b] == w
                 elif x.op == Op.Or:
-                    ok = (
-                        rot_pair(sf, db, di, is_c, cv, l.b, r.b, w)
-                        or rot_pair(sf, db, di, is_c, cv, r.b, l.b, w)
-                    )
+                    ok = rot_pair(sf, db, di, is_c, cv, l.b, r.b, w)
+                    if not ok:
+                        right = rot_pair(sf, db, di, is_c, cv, r.b, l.b, w)
+                if right:
+                    sf.bs[bi].code[i] = mk(Op.Rotl, x.d, l.a, r.b, -1, 1)
+                    break
                 if ok:
                     sf.bs[bi].code[i] = mk(Op.Rotl, x.d, l.a, l.b, -1, 0)
                     break
@@ -1670,8 +1675,10 @@ fn gvn_key(x: Inst, vk: [K], consts: bool) -> str:
             let a = min(x.a, x.b)
             let b = max(x.a, x.b)
             return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{a}|{b}"
-        case Op.Sub | Op.Div | Op.Rem | Op.Shl | Op.Shr | Op.Rotl | Op.Lt | Op.Le | Op.Gt | Op.Ge:
+        case Op.Sub | Op.Div | Op.Rem | Op.Shl | Op.Shr | Op.Lt | Op.Le | Op.Gt | Op.Ge:
             return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{x.a}|{x.b}"
+        case Op.Rotl:
+            return f"rotl|{x.n}|{vk[x.d].name()}|{x.a}|{x.b}"
         case Op.Neg | Op.Not | Op.Conv | Op.Bits:
             return f"{x.op.name()}|{vk[x.d].name()}|{vk[x.a].name()}|{x.a}"
         case Op.Elem:
@@ -4476,7 +4483,7 @@ fn optimize(f: Func, vw: int, a64: bool) -> (Func, [KFunc]):
     sccp(ref sf)
     check_ranges(ref sf)
     # (before simplify drops the `& 63` of 64-bit shift counts)
-    rotates(ref sf)
+    rotates(ref sf, a64)
     simplify(ref sf)
     ffold(ref sf)
     rewrites(ref sf)
