@@ -912,6 +912,32 @@ fn plain_path(p: str) -> str:
     let s = p.replace("/", "\\").lower()
     return s[4:] if s.starts_with("\\\\?\\") else s
 
+# The input of a link that the linker says it couldn't open or find ("" if
+# none): `ld: cannot find <path>: Permission denied`, `cannot open <path>`.
+fn unreadable_input(e: str, inputs: [str]) -> str:
+    for l in e.lower().replace("\\", "/").lines():
+        if not any(
+            p in l for p in ["permission denied", "no such file", "not found", "cannot open"]
+        ):
+            continue
+        for p in inputs:
+            if p.lower().replace("\\", "/") in l:
+                return p
+    return ""
+
+# A link that failed on a file of the build cache: not a bug in brine's
+# generated code, so not E0705.
+fn cache_file_diag(bad: str, e: str, dir: str) -> Diag:
+    let ls = e.strip().lines()
+    return (
+        diag.error("E0704", f"cannot read the build cache file `{display_path(bad)}`")
+        .note(ls[0] if len(ls) > 0 else e)
+        .note("another brine building at the same time was most likely changing it")
+        .with_help(
+            f"build again; if it keeps happening, delete the cache folder `{display_path(dir)}` (brine fills it again)"
+        )
+    )
+
 fn cc_failed(what: str, e: str, out: str) -> Diag:
     let ls = e.strip().lines()
     let first = "\n".join(ls[:min(30, len(ls))])
@@ -969,13 +995,19 @@ fn runtime_object(cc: str, flags: [str], key: str, dir: str) -> Result[(str, str
     for name, text in [("brine_rt.h", RT_H), ("brine_rt.c", RT_C), ("brine_math.c", RT_M)]:
         let f = project.join(rt_dir, name)
         var same = false
+        var there = false
         match read_file(f):
             case Ok(t):
+                there = true
                 same = len(t) == len(text)
             case Err(_):
                 pass
         if not same:
-            write_or_diag(f, text)?
+            # written beside it and moved in: a build compiling with it
+            # never reads it half-written
+            let tmp = project.join(rt_dir, f"{name}.{os.pid()}.tmp")
+            write_or_diag(tmp, text)?
+            settle(tmp, f, there)
     let tmp = project.join(rt_dir, f"brine_rt.{os.pid()}.o")
     var cmd = [cc]
     cmd.extend(flags)
@@ -987,10 +1019,28 @@ fn runtime_object(cc: str, flags: [str], key: str, dir: str) -> Result[(str, str
             return Err(
                 diag.error("E0705", "the C compiler failed on the brine runtime").note(e.strip())
             )
-    match os.rename(tmp, rt_obj):
-        case _:
-            pass
+    settle(tmp, rt_obj, false)
     return Ok((rt_dir, rt_obj))
+
+# Moves a finished cache file `tmp` (an object, a runtime source) to `path`,
+# unless `path` exists already: it is named by a hash of its contents, so it
+# has the same bytes. Not renamed over it, because on Windows that holds it
+# for deletion a moment, and a linker opening it then fails with "Permission
+# denied" (v091#3: concurrent builds of one program). `replace`: it exists
+# but is wrong (cut short), so it is replaced.
+fn settle(tmp: str, path: str, replace: bool):
+    if not replace and file_exists(path):
+        match os.remove_file(tmp):
+            case _:
+                pass
+        return
+    match os.rename(tmp, path):
+        case Ok(_):
+            pass
+        case Err(_):
+            match os.remove_file(tmp):
+                case _:
+                    pass
 
 # The x86-64 levels an optimized program is compiled for, as the extra C
 # compiler flags of each: plain x86-64, then x86-64-v3 (AVX2) and x86-64-v4
@@ -1153,9 +1203,7 @@ fn compile_levels(
             if failure == "":
                 failure = err + out
         else:
-            match os.rename(tmp, obj):
-                case _:
-                    pass
+            settle(tmp, obj, false)
             match os.remove_file(c_path):
                 case _:
                     pass
@@ -1181,14 +1229,31 @@ fn compile_levels(
     link.extend(objs)
     link.extend([rt_obj, "-o", tmp])
     link.extend(libs)
-    match run_cc(link):
-        case Ok(_):
-            pass
-        case Err(e):
-            match os.remove_file(tmp):
-                case _:
-                    pass
-            return Err(cc_failed("linking the program failed", e, out_exe))
+    var inputs = objs
+    inputs.push(rt_obj)
+    var tries = 0
+    var failed = ""
+    while tries < 5:
+        tries += 1
+        match run_cc(link):
+            case Ok(_):
+                failed = ""
+            case Err(e):
+                failed = e
+        # the linker couldn't open one of the cached objects: another brine
+        # may be moving it in place or pruning it (Windows holds a file a
+        # moment for that), so try again shortly
+        if failed == "" or tries == 5 or unreadable_input(failed, inputs) == "":
+            break
+        os.sleep(0.05 * float(tries))
+    if failed != "":
+        match os.remove_file(tmp):
+            case _:
+                pass
+        let bad = unreadable_input(failed, inputs)
+        if bad != "":
+            return Err(cache_file_diag(bad, failed, dir))
+        return Err(cc_failed("linking the program failed", failed, out_exe))
     place(tmp, out_exe, Some(before))?
     phase_time(t, "link")
     if plat == Platform.Web:
@@ -1276,8 +1341,10 @@ fn reuse_object(dir: str, obj_dir: str, hash: str) -> bool:
         match os.read_bytes(src):
             case Ok(b):
                 let tmp = project.join(obj_dir, f"{hash}.{os.pid()}.o")
-                if os.write_bytes(tmp, b).is_ok() and os.rename(tmp, obj).is_ok():
-                    return true
+                if os.write_bytes(tmp, b).is_ok():
+                    settle(tmp, obj, false)
+                    if file_exists(obj):
+                        return true
             case Err(_):
                 pass
     return false
