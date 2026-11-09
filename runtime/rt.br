@@ -9125,7 +9125,9 @@ const TH_DROP_DEPTH = 392
 const TH_DROPS = 400
 const TH_NDROPS = 408
 const TH_CAPDROPS = 416
-const TH_SIZE = 424
+# (Windows) the thread's own heap for blocks bigger than SMALL, see `xh_heap`
+const TH_XHEAP = 424
+const TH_SIZE = 432
 
 # past this many nested frees, brine_drop leaves objects for later
 const DROP_DEPTH = 200
@@ -9137,6 +9139,16 @@ extern fn TlsGetValue(i: u32) -> ptr
 extern fn TlsSetValue(i: u32, v: ptr) -> i32
 
 extern fn VirtualAlloc(p: ptr, n: u64, kind: u32, prot: u32) -> ptr
+
+extern fn HeapCreate(opts: u32, init: u64, most: u64) -> ptr
+
+extern fn GetProcessHeap() -> ptr
+
+extern fn HeapAlloc(h: ptr, flags: u32, n: u64) -> ptr
+
+extern fn HeapReAlloc(h: ptr, flags: u32, p: ptr, n: u64) -> ptr
+
+extern fn HeapFree(h: ptr, flags: u32, p: ptr) -> i32
 
 extern fn _write(fd: i32, p: ptr, n: u32) -> i32
 
@@ -9271,10 +9283,81 @@ fn stderr_uint(n: int):
 fn calloc_at(n: int, loc: ptr) -> ptr:
     if n < 0:
         oom_at(n, loc)
-    let p = calloc(u64(max(n, 1)), u64(1))
+    var p = null_ptr()
+    if os_is("windows"):
+        p = xh_alloc(n, true)
+    else:
+        p = calloc(u64(max(n, 1)), u64(1))
     if addr(p) == 0:
         oom_at(n, loc)
     return p
+
+# Windows: blocks bigger than SMALL come from a heap of the thread's own,
+# not the process heap the C library shares. Past the process heap's
+# low-fragmentation sizes (16 KiB) every thread takes one lock and walks
+# one free list, which a big heap built by many threads at once makes
+# long: `par` jobs ran 6-20x slower while such data was alive (v091#12).
+# Each block starts with 16 bytes naming its heap, so any thread frees it.
+fn xh_heap() -> ptr:
+    if load_u64(heap_info(), HI_BASE) == 0:
+        return GetProcessHeap()
+    let h = th_get()
+    let x = load_ptr(h, TH_XHEAP)
+    if addr(x) != 0:
+        return x
+    return xh_new_cold(h)
+
+# A heap from HeapCreate gives freed pages back to the system past 64 KiB
+# free, so a block grown again and again (`+=` on a long string) faults its
+# pages back in each time: 10x slower. RtlCreateHeap (what HeapCreate
+# calls) takes the thresholds: keep free blocks under 1 MiB, and up to
+# 4 MiB free in all.
+fn xh_new_cold(h: ptr) -> ptr:
+    var x = null_ptr()
+    # (ntdll is always loaded: this only finds it)
+    let f = GetProcAddress(LoadLibraryA(lit("ntdll.dll")), lit("RtlCreateHeap"))
+    if addr(f) != 0:
+        # RTL_HEAP_PARAMETERS: its size, then the thresholds at 24 and 32
+        let prm = stack_mem(96)
+        for i in 0..12:
+            store_i64(prm, i * 8, 0)
+        store_u32(prm, 0, u32(96))
+        store_i64(prm, 24, 1048576)
+        store_i64(prm, 32, 4194304)
+        # (HEAP_GROWABLE)
+        x = call_ptr(f, u32(2), null_ptr(), u64(0), u64(0), null_ptr(), prm)
+    if addr(x) == 0:
+        x = HeapCreate(u32(0), u64(0), u64(0))
+    if addr(x) == 0:
+        x = GetProcessHeap()
+    store_ptr(h, TH_XHEAP, x)
+    return x
+
+# n bytes (zeroed when `zero`), or 0
+fn xh_alloc(n: int, zero: bool) -> ptr:
+    if n > 4611686018427387904:
+        return null_ptr()
+    let x = xh_heap()
+    # (HEAP_ZERO_MEMORY)
+    let p = HeapAlloc(x, u32(8) if zero else u32(0), u64(max(n, 1) + 16))
+    if addr(p) == 0:
+        return p
+    store_ptr(p, 0, x)
+    return p + 16
+
+# (like free, it takes null)
+fn xh_free(p: ptr):
+    if addr(p) == 0:
+        return
+    let b = p - 16
+    HeapFree(load_ptr(b, 0), u32(0), b)
+
+fn xh_realloc(p: ptr, n: int) -> ptr:
+    if n > 4611686018427387904:
+        return null_ptr()
+    let b = p - 16
+    let q = HeapReAlloc(load_ptr(b, 0), u32(0), b, u64(max(n, 1) + 16))
+    return q if addr(q) == 0 else q + 16
 
 # len * esz, or -1 when that overflows (no allocation can be that big)
 fn alloc_bytes(len: int, esz: int) -> int:
@@ -9425,6 +9508,11 @@ fn chunk_new(c: int) -> ptr:
     return p
 
 fn big(n: int) -> ptr:
+    if os_is("windows"):
+        let x = xh_alloc(n, false)
+        if addr(x) == 0:
+            oom_cold(n)
+        return x
     let p = malloc(u64(n if n > 0 else 1))
     if addr(p) == 0:
         oom_cold(n)
@@ -9491,7 +9579,10 @@ fn brine_alloc(n: int) -> ptr:
 
 fn free_miss_cold(p: ptr):
     if not in_heap(p):
-        free(p)
+        if os_is("windows"):
+            xh_free(p)
+        else:
+            free(p)
         return
     let hi = heap_info()
     let c = int(load_u8(load_ptr(hi, HI_CLASSES), (addr(p) - load_u64(hi, HI_BASE)) >> 16))
@@ -9512,7 +9603,11 @@ fn brine_x_realloc(p: ptr, n: int) -> ptr:
     if addr(p) == 0:
         return brine_alloc(n)
     if not in_heap(p):
-        let q = realloc(p, u64(n if n > 0 else 1))
+        var q = null_ptr()
+        if os_is("windows"):
+            q = xh_realloc(p, n)
+        else:
+            q = realloc(p, u64(n if n > 0 else 1))
         if addr(q) == 0:
             oom_cold(n)
         return q
