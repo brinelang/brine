@@ -1073,6 +1073,29 @@ static BR_NORETURN BR_COLD void br_slice_splits(brine_str *s, int64_t lo, int64_
     br_panicf(loc, "slice [%lld:%lld] splits the character \"%.*s\" (bytes %lld..%lld)", (long long)lo, (long long)hi, (int)n,
               s->data + a, (long long)a, (long long)(a + n));
 }
+/* the length of the character that starts at byte i (in bounds) of s; a
+   byte inside a character panics, so a string can't be cut into pieces that
+   aren't UTF-8 */
+int64_t brine_char_at_len(brine_str *s, int64_t i, const char *loc) {
+    if (BR_UNLIKELY(br_mid_char(s, i))) {
+        int64_t a = i;
+        while (a > 0 && i - a < 3 && br_mid_char(s, a)) a--;
+        int64_t n = br_utf8_len((const unsigned char *)s->data + a, s->len - a);
+        br_panicf(loc, "index %lld is inside the character \"%.*s\" (bytes %lld..%lld): a string's index must start a character",
+                  (long long)i, (int)n, s->data + a, (long long)a, (long long)(a + n));
+    }
+    return br_utf8_len((const unsigned char *)s->data + i, s->len - i);
+}
+brine_str *brine_str_char_cold(brine_str *s, int64_t i, const char *loc) {
+    return brine_str_new(s->data + i, brine_char_at_len(s, i, loc));
+}
+/* (the bytes are read first: t may be the string appended to, `s += s[i]`) */
+void brine_str_add_char_cold(brine_str **ps, brine_str *t, int64_t i, const char *loc) {
+    int64_t n = brine_char_at_len(t, i, loc);
+    unsigned char b[4];
+    for (int64_t k = 0; k < n; k++) b[k] = (unsigned char)t->data[i + k];
+    for (int64_t k = 0; k < n; k++) brine_str_add_byte(ps, b[k]);
+}
 /* Strings are UTF-8, so a slice must not cut a character in two. */
 brine_str *brine_str_slice(brine_str *s, int64_t lo, int64_t hi, const char *loc) {
     if (BR_UNLIKELY(lo < 0 || lo > hi || hi > s->len))
@@ -2794,10 +2817,11 @@ void brine_drop_args(int64_t n) {
     }
 }
 #endif
+static brine_str *br_text(const char *p);
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_arr *brine_args(void) {
     brine_arr *a = br_strs();
-    for (int i = 1; i < br_argc; i++) br_push_str(&a, brine_str_new(br_argv[i], (int64_t)strlen(br_argv[i])));
+    for (int i = 1; i < br_argc; i++) br_push_str(&a, br_text(br_argv[i]));
     return a;
 }
 #endif
@@ -5927,16 +5951,36 @@ static brine_str *br_strf(const char *fmt, ...) {
     return brine_str_new(buf, n);
 }
 
-/* the index of the first byte that starts no UTF-8 character, or -1 */
+/* the length of the UTF-8 character at p (2 to 4 bytes, of avail), or 0 when
+   the bytes there aren't one (RFC 3629: no overlong forms, surrogates or code
+   points past U+10FFFF; the second byte's range depends on the first) */
+static int64_t br_utf8_valid_len(const unsigned char *p, int64_t avail) {
+    unsigned char b = p[0], lo = 0x80, hi = 0xBF;
+    int64_t w = (b >= 0xC2 && b <= 0xDF) ? 2 : (b >= 0xE0 && b <= 0xEF) ? 3 : (b >= 0xF0 && b <= 0xF4) ? 4 : 0;
+    if (b == 0xE0) lo = 0xA0;
+    else if (b == 0xED) hi = 0x9F;
+    else if (b == 0xF0) lo = 0x90;
+    else if (b == 0xF4) hi = 0x8F;
+    if (w == 0 || w > avail || p[1] < lo || p[1] > hi) return 0;
+    for (int64_t j = 2; j < w; j++)
+        if ((p[j] & 0xC0) != 0x80) return 0;
+    return w;
+}
+/* the index of the first byte where the n bytes at p stop being UTF-8, or -1;
+   ASCII goes 16 bytes at a time */
 static int64_t br_utf8_bad(const unsigned char *p, int64_t n) {
     int64_t i = 0;
     while (i < n) {
+        if (i + 16 <= n && ((brine_ld8(p + i) | brine_ld8(p + i + 8)) & 0x8080808080808080ULL) == 0) {
+            i += 16;
+            continue;
+        }
         if (p[i] < 0x80) {
             i++;
             continue;
         }
-        int64_t k = br_utf8_len(p + i, n - i);
-        if (k == 1) return i;
+        int64_t k = br_utf8_valid_len(p + i, n - i);
+        if (k == 0) return i;
         i += k;
     }
     return -1;
@@ -5955,20 +5999,13 @@ bool brine_str_from_utf8(brine_arr *a, brine_str **out) {
 }
 
 /* text read from outside as a string: bytes that aren't UTF-8 become U+FFFD */
+static brine_str *br_lossy(const unsigned char *p, size_t n);
 static brine_str *br_lossy_str(const char *p, int64_t n) {
     if (br_utf8_bad((const unsigned char *)p, n) < 0) return brine_str_new(p, n);
-    brine_sb sb;
-    brine_sb_init(&sb);
-    for (int64_t i = 0; i < n;) {
-        int64_t k = ((unsigned char)p[i] < 0x80) ? 1 : br_utf8_len((const unsigned char *)p + i, n - i);
-        if (k == 1 && (unsigned char)p[i] >= 0x80)
-            brine_sb_cat(&sb, "\xef\xbf\xbd", 3);
-        else
-            brine_sb_cat(&sb, p + i, k);
-        i += k;
-    }
-    return brine_sb_finish(&sb);
+    return br_lossy((const unsigned char *)p, (size_t)n);
 }
+/* a C string from the system (a file name, a variable, an argument) */
+static brine_str *br_text(const char *p) { return br_lossy_str(p, (int64_t)strlen(p)); }
 
 #ifdef _WIN32
 static wchar_t *br_wide(const char *s) {
@@ -6321,7 +6358,7 @@ brine_str *brine_getenv(brine_str *name) {
 #else
     const char *v = getenv(n);
     free(n);
-    return v ? brine_str_new(v, (int64_t)strlen(v)) : NULL;
+    return v ? br_text(v) : NULL;
 #endif
 }
 
@@ -6558,7 +6595,7 @@ bool brine_os_list_dir(brine_str *path, brine_arr **out, brine_str **err) {
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
         if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
-        br_push_str(&a, brine_str_new(ent->d_name, (int64_t)strlen(ent->d_name)));
+        br_push_str(&a, br_text(ent->d_name));
     }
     closedir(d);
 #endif
@@ -6740,7 +6777,7 @@ brine_str *brine_os_cwd(void) {
     for (;;) {
         char *buf = (char *)brine_alloc((int64_t)cap);
         if (getcwd(buf, cap)) {
-            brine_str *s = brine_str_new(buf, (int64_t)strlen(buf));
+            brine_str *s = br_text(buf);
             free(buf);
             return s;
         }

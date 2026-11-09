@@ -158,15 +158,56 @@ fn str_reset_cold(ps: ptr, lit: ptr):
     release_str(a)
     store_ptr(ps, 0, lit)
 
-# `s[i]` (i in bounds): the byte as a one-character string, from the table
-# of immortal ones (brine_bytes: brine_str1, 24 bytes each)
-fn str_byte(s: ptr, i: int) -> ptr:
-    return byte_strs() + int(load_u8(s, STR_DATA + i)) * 24
+# `s[i]` (i in bounds): the character that starts at byte i. ASCII comes
+# from the table of immortal one-byte strings (brine_bytes: brine_str1, 24
+# bytes each), so indexing ASCII text never allocates.
+fn str_char(s: ptr, i: int, loc: ptr) -> ptr:
+    let c = load_u8(s, STR_DATA + i)
+    if c >= 0x80:
+        return str_char_cold(s, i, loc)
+    return byte_strs() + int(c) * 24
 
 fn str_at(s: ptr, i: int, loc: ptr) -> ptr:
     if u64(i) >= load_u64(s, STR_LEN):
         brine_panic_idx(i, load_i64(s, STR_LEN), loc)
-    return str_byte(s, i)
+    return str_char(s, i, loc)
+
+# The length of the character that starts at byte i (in bounds) of s; a byte
+# inside a character panics, as a slice starting there would, so a string
+# can't be cut into pieces that aren't UTF-8.
+fn char_at_len(s: ptr, i: int, loc: ptr) -> int:
+    if mid_char(s, i):
+        var a = i
+        while a > 0 and i - a < 3 and mid_char(s, a):
+            a -= 1
+        let n = utf8_len(s + STR_DATA + a, load_i64(s, STR_LEN) - a)
+        let c = brine_str_new(s + STR_DATA + a, n)
+        panic_text_cold(
+            loc,
+            f"index {i} is inside the character \"{str_of(c)}\" (bytes {a}..{a + n}): a string's index must start a character"
+        )
+    return utf8_len(s + STR_DATA + i, load_i64(s, STR_LEN) - i)
+
+fn str_char_cold(s: ptr, i: int, loc: ptr) -> ptr:
+    let n = char_at_len(s, i, loc)
+    return brine_str_new(s + STR_DATA + i, n)
+
+# `s += t[i]` (i in bounds): an ASCII byte in place, as str_add_byte
+fn str_add_char(ps: ptr, t: ptr, i: int, loc: ptr):
+    let c = load_u8(t, STR_DATA + i)
+    if c >= 0x80:
+        str_add_char_cold(ps, t, i, loc)
+        return
+    str_add_byte(ps, c)
+
+# (the bytes are read first: t may be the string appended to, `s += s[i]`)
+fn str_add_char_cold(ps: ptr, t: ptr, i: int, loc: ptr):
+    let n = char_at_len(t, i, loc)
+    var w: u64 = 0
+    for k in range(n):
+        w |= u64(load_u8(t, STR_DATA + i + k)) << (k * 8)
+    for k in range(n):
+        str_add_byte(ps, u8((w >> (k * 8)) & 0xff))
 
 # `s += t`, in place when s is unshared, t is at most a word and the word
 # written at s's end and the NUL after t fit in its room
@@ -246,6 +287,22 @@ fn app_byte(ps: ptr, ap: ptr, c: u8):
         store_i64(ap, APP_LEN, n + 1)
         return
     app_more_cold(ps, ap, c)
+
+# `s += t[i]` through the appender: the character that starts at byte i
+fn app_char(ps: ptr, ap: ptr, t: ptr, i: int, loc: ptr):
+    let c = load_u8(t, STR_DATA + i)
+    if c >= 0x80:
+        app_char_cold(ps, ap, t, i, loc)
+        return
+    app_byte(ps, ap, c)
+
+fn app_char_cold(ps: ptr, ap: ptr, t: ptr, i: int, loc: ptr):
+    let n = char_at_len(t, i, loc)
+    var w: u64 = 0
+    for k in range(n):
+        w |= u64(load_u8(t, STR_DATA + i + k)) << (k * 8)
+    for k in range(n):
+        app_byte(ps, ap, u8((w >> (k * 8)) & 0xff))
 
 # app_byte past its fast paths: the 9th byte, a shared string or a full block
 fn app_more_cold(ps: ptr, ap: ptr, c: u8):
@@ -12868,8 +12925,10 @@ fn os_stdio(i: int) -> ptr:
         return load_ptr(symbol("stdout") if i == 1 else symbol("stderr"), 0)
 
 # A C string's text.
+# A C string from the system (a file name, an environment variable, an
+# argument) as a string, which has to be UTF-8: other bytes become U+FFFD.
 fn os_text(p: ptr) -> ptr:
-    return brine_str_new(p, int(strlen(p)))
+    return os_lossy_str(p, int(strlen(p)))
 
 fn os_strerror(e: int) -> ptr:
     return os_text(strerror(i32(e)))
@@ -12947,22 +13006,55 @@ fn os_from_wide(w: ptr, n0: int) -> ptr:
     WideCharToMultiByte(CP_UTF8, 0, w, i32(n), s + STR_DATA, i32(m), null_ptr(), null_ptr())
     return s
 
-# The index of the first of the n bytes at p that starts no UTF-8
-# character, or -1. (ASCII a word at a time.)
+# The index of the first of the n bytes at p where they stop being UTF-8
+# (RFC 3629: no overlong forms, surrogates or code points past U+10FFFF),
+# or -1. ASCII goes 16 bytes at a time.
 fn os_utf8_bad(p: ptr, n: int) -> int:
     var i = 0
     while i < n:
-        if i + 8 <= n and load_u64(p, i) & 0x8080808080808080 == 0:
-            i += 8
+        if i + 16 <= n and (load_u64(p, i) | load_u64(p, i + 8)) & 0x8080808080808080 == 0:
+            i += 16
             continue
         if load_u8(p, i) < 0x80:
             i += 1
             continue
-        let k = utf8_len(p + i, n - i)
-        if k == 1:
+        let k = utf8_valid_len(p + i, n - i)
+        if k == 0:
             return i
         i += k
     return -1
+
+# The length of the UTF-8 character at p (2 to 4 bytes, of `avail`), or 0
+# when the bytes there aren't one (RFC 3629's table: the second byte's range
+# depends on the first).
+fn utf8_valid_len(p: ptr, avail: int) -> int:
+    let b = load_u8(p, 0)
+    var w = 0
+    var lo: u8 = 0x80
+    var hi: u8 = 0xbf
+    if b >= 0xc2 and b <= 0xdf:
+        w = 2
+    elif b >= 0xe0 and b <= 0xef:
+        w = 3
+        if b == 0xe0:
+            lo = 0xa0
+        elif b == 0xed:
+            hi = 0x9f
+    elif b >= 0xf0 and b <= 0xf4:
+        w = 4
+        if b == 0xf0:
+            lo = 0x90
+        elif b == 0xf4:
+            hi = 0x8f
+    if w == 0 or w > avail:
+        return 0
+    let c = load_u8(p, 1)
+    if c < lo or c > hi:
+        return 0
+    for j in 2..w:
+        if load_u8(p, j) & 0xc0 != 0x80:
+            return 0
+    return w
 
 fn brine_str_from_utf8(a: ptr, out: ptr) -> bool:
     let d = load_ptr(a, ARR_DATA)
@@ -12986,18 +13078,7 @@ fn brine_str_from_utf8(a: ptr, out: ptr) -> bool:
 fn os_lossy_str(p: ptr, n: int) -> ptr:
     if os_utf8_bad(p, n) < 0:
         return brine_str_new(p, n)
-    let sb = stack_mem(24)
-    brine_sb_init(sb)
-    var i = 0
-    while i < n:
-        let c = load_u8(p, i)
-        let k = 1 if c < 0x80 else utf8_len(p + i, n - i)
-        if k == 1 and c >= 0x80:
-            sb_lit(sb, "\u{fffd}")
-        else:
-            brine_sb_cat(sb, p + i, k)
-        i += k
-    return brine_sb_finish(sb)
+    return os_lossy(p, n)
 
 # fopen of C strings path and mode
 fn os_fopen(path: ptr, mode: str) -> ptr:

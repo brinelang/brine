@@ -398,10 +398,12 @@ lives in the stack frame: no allocation at all (a traversal stack, a histogram).
 ## Strings
 
 Strings are immutable UTF-8. `len(s)`, `s[i]` and slices count **bytes**;
-`s[i]` is the byte at `i` as a one-byte string: a character for ASCII text
-(the common case), a piece of one otherwise, so scan text byte by byte and
-compare with ASCII (`s[i] == " "`). A slice must not cut a character in two:
-`"aé"[0:2]` panics. `for c in s` / `s.chars()` walk real characters.
+`s[i]` is the character that starts at byte `i` (`"aé"[1]` is `"é"`, 2 bytes
+long), so step through text with `i += len(s[i])` and compare with ASCII
+(`s[i] == " "`). Like a slice, it must not start inside a character:
+`"aé"[2]` and `"aé"[0:2]` panic. To look at single bytes (scanning backwards,
+peeking at a fixed offset of text that may not be ASCII), use `s.bytes()`.
+`for c in s` / `s.chars()` walk the characters.
 
 ```python
 let s = "hello, brine"
