@@ -4995,10 +4995,10 @@ static br_msg *br_recv(int64_t src, int64_t kind, const char *loc) {
     pr->head = m->next;
     if (pr->tail == m) pr->tail = NULL;
     br_unlock(&pr->mu);
-    /* returning from `main` and `exit` are the same call */
-    bool same = m->op == BR_OP_FINISH ? br_cur_op == BR_OP_FINISH
-                                      : m->op == br_cur_op && m->seq == br_cur_seq && m->slen == (int64_t)strlen(br_cur_site) &&
-                                            memcmp(m->data + m->len, br_cur_site, (size_t)m->slen) == 0;
+    /* returning from `main` and `exit` are the same call; and the same
+       operation from different lines is too (both branches of an `if` may
+       make it), so the site is only for the message */
+    bool same = m->op == BR_OP_FINISH ? br_cur_op == BR_OP_FINISH : m->op == br_cur_op && m->seq == br_cur_seq;
     if (!same) br_mismatch(src, m, loc);
     if (m->kind != kind)
         br_panicf(loc, "type mismatch: rank %lld sent %s, but this rank expects %s", (long long)src, br_kind_name(m->kind),
