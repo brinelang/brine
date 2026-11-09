@@ -33,6 +33,65 @@ fn is_ident(t: Tok) -> bool:
 fn empty_block() -> Block:
     return Block(stmts=[], span=Span(file=0, lo=0, hi=0))
 
+# A first value for a variable of type `te`, for helps.
+fn zero_text(te: TypeExpr) -> str:
+    match te:
+        case TypeExpr.Named(path, _, _):
+            let n = path[len(path) - 1]
+            if n == "int" or (len(n) >= 2 and (n[0] == "i" or n[0] == "u") and n[1:].is_digit()):
+                return "0"
+            if n == "float" or n == "f32" or n == "f64":
+                return "0.0"
+            if n == "bool":
+                return "false"
+            if n == "str":
+                return "\"\""
+            if n == "Option":
+                return "None"
+            return f"{n}(...)"
+        case TypeExpr.Array(_, _):
+            return "[]"
+        case TypeExpr.Map(_, _, _):
+            return "{}"
+        case TypeExpr.Tuple(es, _):
+            return "(" + ", ".join([zero_text(e) for e in es]) + ")"
+
+# What to write for Rust's `Name::...` (`after_lt`: `::<T>` follows), or None
+# when `.` is the fix (`Shape::Circle`, `geometry::area`).
+fn rust_path_help(name: str, after_lt: bool) -> Option[str]:
+    match name:
+        case "String":
+            return Some("a string literal is already a `str`: write `\"hi\"` (or `\"\"`)")
+        case "Vec" | "VecDeque":
+            return Some(
+                "arrays are built in: write `[]`, with the element type on the variable: `var xs: [int] = []`; `vec![x; n]` is `[x] * n`"
+            )
+        case "HashMap" | "BTreeMap":
+            return Some(
+                "maps are built in: write `{}`, with the types on the variable: `var m: {str: int} = {}`; `m.insert(k, v)` is `m[k] = v`"
+            )
+        case "HashSet" | "BTreeSet":
+            return Some(
+                "brine has no sets: use a map to `bool`, `var seen: {int: bool} = {}`, with `seen[x] = true` and `x in seen`"
+            )
+        case "std" | "io" | "fs" | "env" | "process" | "mem" | "cmp" | "fmt" | "iter":
+            return Some(
+                "there is no standard library to import from: `print`, `read_file`, `args()`, `exit`, `min`, `max` and the rest are built in (`brine guide` lists them)"
+            )
+        case "collect" | "parse" | "into" | "sum" | "product":
+            return Some(
+                "brine has no `::<T>`: a comprehension builds an array (`[f(x) for x in xs]`), `\"\".join(parts)` a string, `s.to_int()` parses"
+            )
+        case _:
+            if after_lt:
+                return Some(
+                    "brine has no `::<T>`: write the type on the variable instead: `let n: int = ...`"
+                )
+            return None
+
+fn async_help() -> str:
+    return "a call finishes before it returns; to run work at the same time, use `par`: `let (a, b) = par(f(x), g(y))` or `par for i in 0..n:`"
+
 # What a loop or `let` unpacks into: a name, or a parenthesized tuple of targets.
 enum Target:
     Name(name: str, span: Span, ty: Option[TypeExpr])
@@ -124,6 +183,38 @@ struct Parser:
             return false
         return self.toks[i].hi == self.toks[i + 1].lo
 
+    # the index of the layout token that ends the current line
+    fn line_end(self) -> int:
+        var i = self.pos
+        while i < len(self.toks) - 1 and not is_layout(self.toks[i].tok):
+            i += 1
+        return i
+
+    # the source text from the current token to the end of its line
+    fn line_rest(self) -> str:
+        let e = self.line_end()
+        if e <= self.pos:
+            return ""
+        return self.src(self.toks[self.pos].lo, self.toks[e - 1].hi)
+
+    # true if the current token starts a value and can't continue one (`?` then
+    # a name or a literal: a C ternary)
+    fn starts_operand(self) -> bool:
+        match self.peek():
+            case Tok.Ident(_) | Tok.Int(_) | Tok.Float(_) | Tok.Str(_) | Tok.FStr(_):
+                return true
+            case Tok.Keyword(Kw.True) | Tok.Keyword(Kw.False):
+                return true
+            case _:
+                return false
+
+    # true if `t` comes later on the current line
+    fn line_has(self, t: Tok) -> bool:
+        for i in self.pos..self.line_end():
+            if self.toks[i].tok == t:
+                return true
+        return false
+
     # the index of the first token of the current line
     fn line_head(self) -> int:
         var i = self.pos
@@ -187,16 +278,35 @@ struct Parser:
             case Tok.Colon if self.peek_at(1) == Tok.Colon and self.glued(0):
                 let s2 = Span(file=sp.file, lo=sp.lo, hi=self.toks[self.pos + 1].hi)
                 var d = diag.error("E0115", "brine has no `::` paths").label(s2, "`::`")
-                let string_ctor = prev == Tok.Ident("String")
-                if string_ctor:
-                    d = d.with_help(
-                        "a string literal is already a `str`: write `\"hi\"` (or `\"\"`)"
-                    )
-                else:
-                    d = d.with_help(
-                        "use `.`: `Shape.Circle`, `geometry.area(...)`"
-                    ).fix(s2, ".", "replace `::` with `.`")
+                var pw = ""
+                match prev:
+                    case Tok.Ident(w):
+                        pw = w
+                    case _:
+                        pass
+                match rust_path_help(pw, self.peek_at(2) == Tok.Lt):
+                    case Some(h):
+                        d = d.with_help(h)
+                    case None:
+                        d = d.with_help(
+                            "use `.`: `Shape.Circle`, `geometry.area(...)`"
+                        ).fix(s2, ".", "replace `::` with `.`")
                 self.diags.push(d)
+                return true
+            # Go's slice type `[]int`, as in `make([]int, n)`
+            case Tok.Ident(w) if (
+                not in_expr
+                and prev == Tok.RBracket
+                and self.pos >= 2
+                and self.toks[self.pos - 2].tok == Tok.LBracket
+                and self.glued(-1)
+            ):
+                self.push_foreign(
+                    Span(file=sp.file, lo=self.toks[self.pos - 2].lo, hi=sp.hi),
+                    "brine writes an array type as `[T]`",
+                    "a Go slice type",
+                    f"write `[{w}]`; `make([]{w}, n)` is `[0] * n` (any first value), and an empty one is `var xs: [{w}] = []`"
+                )
                 return true
             case Tok.Colon if self.peek_at(1) == Tok.Assign and self.glued(0):
                 let s2 = Span(file=sp.file, lo=sp.lo, hi=self.toks[self.pos + 1].hi)
@@ -317,8 +427,74 @@ struct Parser:
                             "pass the variable with `ref` (`fn bump(ref counter: int)`, called as `bump(ref counter)`), or return the new value"
                         )
                         return true
+                    case "loop":
+                        var d = diag.error("E0115", "brine has no `loop`").label(psp, "`loop`")
+                        d = d.with_help("write `while true:` and leave it with `break`")
+                        if self.at(Tok.Colon):
+                            d = d.fix(psp, "while true", "write `while true`")
+                        self.diags.push(d)
+                        return true
+                    case "defer":
+                        self.push_foreign(
+                            psp,
+                            "brine has no `defer`",
+                            "`defer`",
+                            "nothing needs closing (files are read and written in one call): run the code at the end of the function, before each `return`"
+                        )
+                        return true
+                    case "go" | "spawn":
+                        self.push_foreign(
+                            psp,
+                            "brine has no goroutines or threads to start",
+                            f"`{w}`",
+                            "run calls at the same time with `par`: `let (a, b) = par(f(x), g(y))`, `par for i in 0..n:` or `par [f(x) for x in xs]`"
+                        )
+                        return true
+                    case "yield":
+                        self.push_foreign(
+                            psp,
+                            "brine has no generators",
+                            "`yield`",
+                            "collect the values in an array and return it: `var out: [int] = []`, then `out.push(x)` where you would `yield x`, and `return out` at the end"
+                        )
+                        return true
+                    case "async" | "await":
+                        self.push_foreign(
+                            psp,
+                            "brine has no `async` or `await`",
+                            f"`{w}`",
+                            async_help()
+                        )
+                        return true
+                    case "print":
+                        # Python 2: `print "hi"`
+                        var d = diag.error(
+                            "E0115",
+                            "`print` is a function in brine"
+                        ).label(psp, "call it with `(...)`")
+                        let rest = self.line_rest()
+                        if rest != "":
+                            d = d.with_help(f"write `print({rest})`")
+                            d = d.fix(
+                                Span(file=psp.file, lo=psp.hi, hi=self.toks[self.line_end()].lo),
+                                f"({rest})",
+                                "add the parentheses"
+                            )
+                        else:
+                            d = d.with_help("write `print(x)`")
+                        self.diags.push(d)
+                        return true
                     case _:
                         pass
+                # Python's `total: int = 0`, without `let` or `var`
+                if self.at(Tok.Colon) and self.line_has(Tok.Assign):
+                    self.diags.push(
+                        diag.error("E0110", "a new variable starts with `let` or `var`")
+                        .label(psp, "no `let` or `var`")
+                        .with_help(f"write `var {w}: ...` (`let` if it never changes)")
+                        .fix(Span(file=psp.file, lo=psp.lo, hi=psp.lo), "var ", "add `var`")
+                    )
+                    return true
                 if len(w) >= 3:
                     let kws = [
                         "return",
@@ -362,6 +538,22 @@ struct Parser:
                 Kw.For
             ) | Tok.Keyword(Kw.Match) | Tok.Keyword(Kw.Fn) | Tok.Keyword(Kw.Struct) | Tok.Keyword(Kw.Enum):
                 return false
+            case _:
+                pass
+        # `try {`, `loop {`, `defer {`: a block from another language, not a struct
+        match self.toks[self.pos - 1].tok:
+            case Tok.Ident(w) if w in [
+                "try",
+                "catch",
+                "except",
+                "finally",
+                "loop",
+                "defer",
+                "go",
+                "async",
+                "spawn"
+            ] and self.prev_starts_line():
+                return self.foreign_word()
             case _:
                 pass
         let name = self.prev_span()
@@ -459,8 +651,41 @@ struct Parser:
                 "brine uses indentation for blocks, not braces"
             ).label(self.span(), "unexpected brace")
             d = d.with_help("end the line with `:` and indent the block by 4 spaces")
+            d = self.unbrace(d)
         self.diags.push(d)
         return Err(())
+
+    # At a block's `{`: the fix that makes it `:` and drops its `}`, when the
+    # `}` is alone at the end of its line (not `} else {`).
+    fn unbrace(self, d: Diag) -> Diag:
+        var depth = 0
+        var k = self.pos
+        while k < len(self.toks):
+            match self.toks[k].tok:
+                case Tok.LBrace:
+                    depth += 1
+                case Tok.RBrace:
+                    depth -= 1
+                case _:
+                    pass
+            if depth == 0:
+                break
+            k += 1
+        if k >= len(self.toks) - 1 or k <= self.pos + 1:
+            return d
+        let next = self.toks[k + 1].tok
+        if not (is_layout(next) or next == Tok.Eof):
+            return d
+        let before = self.toks[k - 1]
+        if "\n" not in self.src(before.hi, self.toks[k].lo):
+            return d
+        let lb = self.span()
+        let prev = self.prev_span()
+        return d.fix(
+            Span(file=lb.file, lo=prev.hi, hi=lb.hi),
+            ":",
+            "replace `{` with `:`"
+        ).fix(Span(file=lb.file, lo=before.hi, hi=self.toks[k].hi), "", "remove the `}`")
 
     # A field name: any keyword works too after `.` (`any_kw`) or before `:`
     # in a field declaration, e.g. `requires: [Expr]` and `f.requires`.
@@ -666,6 +891,85 @@ struct Parser:
                 return Err(())
             case Tok.Ident(s) if s == "from":
                 m.imports.push(self.from_import()?)
+            # `async def f(...)`: report `async`, then read the function
+            case Tok.Ident(s) if s == "async":
+                let sp = self.span()
+                let next = self.toks[self.pos + 1]
+                var d = diag.error("E0115", "brine has no `async` or `await`").label(sp, "`async`")
+                d = d.with_help(async_help())
+                if is_ident(next.tok) or next.tok == Tok.Keyword(Kw.Fn):
+                    d = d.fix(Span(file=sp.file, lo=sp.lo, hi=next.lo), "", "remove `async`")
+                    self.diags.push(d)
+                    self.bump()
+                    return self.item(ref m)
+                self.diags.push(d)
+                return Err(())
+            # Go's `type Point struct {` and TypeScript's `type T = ...`
+            case Tok.Ident(s) if s == "type" and is_ident(self.peek_at(1)):
+                let sp = self.span()
+                var name = "Point"
+                match self.peek_at(1):
+                    case Tok.Ident(n):
+                        name = n
+                    case _:
+                        pass
+                self.push_foreign(
+                    sp,
+                    "brine defines types with `struct` and `enum`",
+                    "`type`",
+                    f"write `struct {name}:` with one `field: type` line per field indented below (`x: int`), and the methods after them"
+                )
+                return Err(())
+            # Go's `func (p Point) area() float {`: a method outside its type
+            case Tok.Ident(s) if s == "func" and self.peek_at(1) == Tok.LParen:
+                let sp = self.span()
+                var ty = "Point"
+                var i = self.pos + 2
+                while i < len(self.toks) and self.toks[i].tok != Tok.RParen:
+                    match self.toks[i].tok:
+                        case Tok.Ident(n):
+                            ty = n
+                        case _:
+                            pass
+                    i += 1
+                self.push_foreign(
+                    sp,
+                    "brine writes methods inside their struct",
+                    "a Go method",
+                    f"indent the method under `struct {ty}:`, after its fields, with `self` as the first parameter: `fn area(self) -> float:`"
+                )
+                return Err(())
+            # Python's `if __name__ == "__main__":`
+            case Tok.Keyword(Kw.If) if self.peek_at(1) == Tok.Ident("__name__"):
+                self.push_foreign(
+                    self.span(),
+                    "brine has no `__name__`",
+                    "not needed",
+                    "a program starts at `fn main():`; call your code from there, and remove this `if`"
+                )
+                return Err(())
+            # Go's `package main`, Rust's `use std::...`
+            case Tok.Ident(s) if (s == "package" or s == "use") and is_ident(self.peek_at(1)):
+                let sp = self.span()
+                if s == "package":
+                    self.diags.push(
+                        diag.error("E0115", "brine has no `package` line")
+                        .label(sp, "not needed")
+                        .with_help("a file is a module named after the file; nothing declares it")
+                        .fix(
+                            Span(file=sp.file, lo=sp.lo, hi=self.toks[self.line_end()].lo),
+                            "",
+                            "remove the line"
+                        )
+                    )
+                else:
+                    self.push_foreign(
+                        sp,
+                        "brine imports with `import` or `from`",
+                        "`use`",
+                        "write `import geometry` (the file geometry.br) or `from geometry import area`; the standard library needs no import"
+                    )
+                return Err(())
             case t:
                 let d = self.error_here(
                     "E0110",
@@ -900,6 +1204,34 @@ struct Parser:
                     "take an array instead, `args: [int]`, and call with `log(\"msg\", [1, 2, 3])`"
                 )
                 return Err(())
+            if self.at(Tok.Amp) and not by_ref and not mutable:
+                # Rust's `&self`, `&mut self`, `x: &T`'s cousin `&x`
+                let sp = self.span()
+                var e = self.toks[self.pos + 1].lo
+                if self.peek_at(1) == Tok.Keyword(Kw.Mut):
+                    e = self.toks[self.pos + 2].lo
+                let is_self = (
+                    self.peek_at(1) == Tok.Ident("self") or self.peek_at(2) == Tok.Ident("self")
+                )
+                let help = (
+                    "a method that changes its receiver takes `ref self`; one that only reads it takes `self`"
+                    if is_self
+                    else "a parameter the function changes is declared `ref name: type`; otherwise just `name: type`"
+                )
+                let to = "ref " if self.peek_at(1) == Tok.Keyword(Kw.Mut) or not is_self else ""
+                self.diags.push(
+                    diag.error("E0115", "brine passes references with `ref`, not `&`")
+                    .label(sp, "`&`")
+                    .with_help(help)
+                    .fix(
+                        Span(file=sp.file, lo=sp.lo, hi=e),
+                        to,
+                        "use `ref`" if to != "" else "remove `&`"
+                    )
+                )
+                # read on, so the rest of the function is checked too
+                self.bump()
+                self.eat_kw(Kw.Mut)
             let (name, span) = self.expect_ident("parameter name")?
             if mutable and name == "self":
                 let d = diag.error(
@@ -1386,6 +1718,16 @@ struct Parser:
     fn block(ref self, allow: [ContractKind]) -> Result[(Block, [(ContractKind, Expr)]), ()]:
         let start = self.span()
         var stmts: [Stmt] = []
+        if self.at(Tok.LBrace):
+            # `if x > 0: {`: half-converted C or JavaScript
+            self.diags.push(
+                self.error_here(
+                    "E0106",
+                    "brine uses indentation for blocks, not braces",
+                    "unexpected brace"
+                ).with_help("remove the braces: the `:` ends the line and the block is indented by 4 spaces")
+            )
+            return Err(())
         if not self.at(Tok.Newline):
             # single-line block: `if x: return 1`
             stmts.push(self.simple_stmt()?)
@@ -1483,6 +1825,45 @@ struct Parser:
 
     fn for_stmt(ref self, is_par: bool) -> Result[Stmt, ()]:
         let start = self.bump()
+        # Go's `for i, v := range xs {`
+        for k in self.pos..self.line_end():
+            if self.toks[k].tok == Tok.LBrace or self.toks[k].tok == Tok.Keyword(Kw.In):
+                break
+            if (
+                self.toks[k].tok == Tok.Colon
+                and self.toks[k + 1].tok == Tok.Assign
+                and self.glued(k - self.pos)
+            ):
+                var names: [str] = []
+                for t in self.toks[self.pos:k]:
+                    match t.tok:
+                        case Tok.Ident(n):
+                            names.push(n)
+                        case _:
+                            pass
+                var xs = "xs"
+                if self.toks[k + 2].tok == Tok.Ident("range"):
+                    var e = k + 3
+                    while e < self.line_end() and self.toks[e].tok != Tok.LBrace:
+                        e += 1
+                    if e > k + 3:
+                        let t = self.src(self.toks[k + 3].lo, self.toks[e - 1].hi)
+                        if t != "":
+                            xs = t
+                var write = f"for x in {xs}:"
+                if len(names) == 2 and names[0] == "_":
+                    write = f"for {names[1]} in {xs}:"
+                elif len(names) == 2:
+                    write = f"for {names[0]}, {names[1]} in enumerate({xs}):"
+                elif len(names) == 1:
+                    write = f"for {names[0]} in 0..len({xs}):"
+                self.push_foreign(
+                    Span(file=self.file, lo=self.toks[k].lo, hi=self.toks[k + 1].hi),
+                    "brine's `for` loop is `for x in xs:`",
+                    "`:=`",
+                    f"write `{write}` and indent the body under it"
+                )
+                return Err(())
         let items = self.targets("loop variable", true)?
         let name_span = items[0].span().to(items[len(items) - 1].span())
         var name = ""
@@ -1582,6 +1963,43 @@ struct Parser:
 
     fn case_clause(ref self) -> Result[Case, ()]:
         if not self.at_case():
+            # Rust's `0 => ...` and `_ => ...`
+            for i in self.pos..self.line_end():
+                if (
+                    self.toks[i].tok == Tok.Assign
+                    and self.toks[i + 1].tok == Tok.Gt
+                    and i > self.pos
+                ):
+                    let arrow = Span(file=self.file, lo=self.toks[i].lo, hi=self.toks[i + 1].hi)
+                    let pat = self.src(self.toks[self.pos].lo, self.toks[i - 1].hi)
+                    var d = diag.error(
+                        "E0115",
+                        "brine writes a `match` arm as `case pattern:`"
+                    ).label(arrow, "`=>`")
+                    d = d.with_help(
+                        f"write `case {pat}:` and the arm's code after the `:` or indented below"
+                    )
+                    if pat != "":
+                        let here = self.span()
+                        d = d.fix(
+                            Span(file=here.file, lo=here.lo, hi=here.lo),
+                            "case ",
+                            "add `case`"
+                        )
+                        d = d.fix(
+                            Span(file=here.file, lo=self.toks[i - 1].hi, hi=self.toks[i + 1].hi),
+                            ":",
+                            "replace `=>` with `:`"
+                        )
+                        let last = self.line_end() - 1
+                        if last > i + 1 and self.toks[last].tok == Tok.Comma:
+                            d = d.fix(
+                                Span(file=here.file, lo=self.toks[last].lo, hi=self.toks[last].hi),
+                                "",
+                                "remove the `,`"
+                            )
+                    self.diags.push(d)
+                    return Err(())
             self.report(
                 "E0110",
                 f"expected `case`, found {describe(self.peek())}",
@@ -1612,6 +2030,7 @@ struct Parser:
             self.diags.push(d.with_help("write each case on its own line: `case pattern:`"))
             return Err(())
         var cases: [Case] = []
+        let errors = len(self.diags)
         while not self.at(Tok.Dedent) and not self.at(Tok.Eof):
             if self.eat(Tok.Newline):
                 continue
@@ -1622,7 +2041,7 @@ struct Parser:
                     self.sync_line()
             self.skip_newlines()
         self.eat(Tok.Dedent)
-        if len(cases) == 0:
+        if len(cases) == 0 and len(self.diags) == errors:
             self.diags.push(
                 diag.error("E0110", "`match` needs at least one `case`").label(start, "no cases")
             )
@@ -1853,11 +2272,36 @@ struct Parser:
                             vn = n
                         case _:
                             pass
-                    self.diags.push(
-                        d.with_help(
-                            f"every variable starts with a value: `var {vn} = 0`, or `var {vn}: [int] = []` for an empty array"
-                        )
-                    )
+                    let kw = "var" if mutable else "let"
+                    match ty:
+                        case Some(te):
+                            # keep the written type: `var p: P = P(...)`
+                            let tt = self.src(te.span().lo, te.span().hi)
+                            let v = zero_text(te)
+                            var help = f"every variable starts with a value: `{kw} {vn}: {tt} = {v}`"
+                            if v.ends_with("(...)"):
+                                help += ", with the value you would assign first"
+                            self.diags.push(d.with_help(help))
+                        case None:
+                            # Go's `var x int = 5`: the type needs a `:`
+                            match self.peek():
+                                case Tok.Ident(tn) if self.line_has(Tok.Assign):
+                                    let at = self.prev_span()
+                                    self.diags.push(
+                                        diag.error(
+                                            "E0110",
+                                            "the type of a variable comes after `:`"
+                                        )
+                                        .label(self.span(), "expected `:` before the type")
+                                        .with_help(f"write `{kw} {vn}: {tn} = ...`")
+                                        .fix(Span(file=at.file, lo=at.hi, hi=at.hi), ":", "add `:`")
+                                    )
+                                case _:
+                                    self.diags.push(
+                                        d.with_help(
+                                            f"every variable starts with a value: `{kw} {vn} = 0`, or `{kw} {vn}: [int] = []` for an empty array"
+                                        )
+                                    )
                     return Err(())
                 self.bump()
                 let is_ref = self.eat_kw(Kw.Ref)
@@ -2215,6 +2659,81 @@ struct Parser:
         )
         return Ok(mk(ExprKind.Comp(c), span))
 
+    # C's `c ? a : b`, just after the `?`: say `a if c else b`, and write it
+    # when the condition starts after `=`, `(`, `,`, `return` or the line's start
+    fn ternary(ref self):
+        let q = self.pos - 1
+        var i = q - 1
+        var depth = 0
+        while i > 0:
+            match self.toks[i - 1].tok:
+                case Tok.RParen | Tok.RBracket | Tok.RBrace:
+                    depth += 1
+                case Tok.LParen | Tok.LBracket | Tok.LBrace:
+                    if depth == 0:
+                        break
+                    depth -= 1
+                case Tok.Assign | Tok.Comma | Tok.Keyword(Kw.Return):
+                    if depth == 0:
+                        break
+                case Tok.Newline | Tok.Indent | Tok.Dedent:
+                    break
+                case _:
+                    pass
+            i -= 1
+        var colon = -1
+        depth = 0
+        var j = self.pos
+        let end = self.line_end()
+        while j < end:
+            match self.toks[j].tok:
+                case Tok.LParen | Tok.LBracket | Tok.LBrace:
+                    depth += 1
+                case Tok.RParen | Tok.RBracket | Tok.RBrace:
+                    depth -= 1
+                case Tok.Colon if depth == 0 and colon < 0:
+                    colon = j
+                case _:
+                    pass
+            if depth < 0:
+                break
+            j += 1
+        var help = "write `a if c else b`; `?` after a value passes on its `None` or `Err`"
+        var d = diag.error("E0115", "brine has no `? :` operator").label(self.prev_span(), "`?`")
+        if colon > self.pos and j > colon + 1:
+            let c = self.src(self.toks[i].lo, self.toks[q - 1].hi)
+            let a = self.src(self.toks[self.pos].lo, self.toks[colon - 1].hi)
+            let b = self.src(self.toks[colon + 1].lo, self.toks[j - 1].hi)
+            if c != "" and a != "" and b != "":
+                let rep = f"{a} if {c} else {b}"
+                help = f"write `{rep}`"
+                d = d.fix(
+                    Span(file=self.file, lo=self.toks[i].lo, hi=self.toks[j - 1].hi),
+                    rep,
+                    "write `a if c else b`"
+                )
+        self.diags.push(d.with_help(help))
+
+    # `xs[::-1]`, `xs[a:b:2]`: at the `:` before the step
+    fn slice_step(ref self, e: Expr):
+        let x = self.src(e.span.lo, e.span.hi)
+        let xs = x if x != "" else "xs"
+        var step = ""
+        if self.peek_at(1) == Tok.Minus and self.peek_at(2) == Tok.Int(u128(1)):
+            step = "-1"
+        elif self.peek_at(2) == Tok.Minus and self.peek_at(3) == Tok.Int(u128(1)):
+            step = "-1"
+        let help = (
+            f"to reverse, reverse a copy: `var ys = {xs}`, then `ys.reverse()` (for a string, `var cs = {xs}.chars()`, `cs.reverse()`, then `\"\".join(cs)`)"
+            if step == "-1"
+            else f"pick the elements with a comprehension over a `range` with a step: `[{xs}[i] for i in range(0, len({xs}), 2)]`"
+        )
+        self.diags.push(
+            diag.error("E0115", "brine slices have no step")
+            .label(self.span(), "a step")
+            .with_help(help)
+        )
+
     # the rest of a slice after `:`, up to and including `]`
     fn slice_hi(ref self) -> Result[Option[Expr], ()]:
         if self.at(Tok.RBracket):
@@ -2236,12 +2755,22 @@ struct Parser:
                             e = mk(ExprKind.Call(e, args), span)
                 case Tok.Question:
                     self.bump()
+                    if self.starts_operand() and self.line_has(Tok.Colon):
+                        # C's `c ? a : b`
+                        self.ternary()
+                        return Err(())
                     let span = e.span.to(self.prev_span())
                     e = mk(ExprKind.Try(e), span)
                 case Tok.LBracket:
                     self.bump()
+                    if self.at(Tok.Colon) and self.peek_at(1) == Tok.Colon:
+                        self.slice_step(e)
+                        return Err(())
                     if self.eat(Tok.Colon):
                         let hi = self.slice_hi()?
+                        if self.at(Tok.Colon):
+                            self.slice_step(e)
+                            return Err(())
                         self.expect(Tok.RBracket, "`]`")?
                         let span = e.span.to(self.prev_span())
                         e = mk(ExprKind.Slice(e, None, hi), span)
@@ -2259,11 +2788,7 @@ struct Parser:
                     if self.eat(Tok.Colon):
                         let hi = self.slice_hi()?
                         if self.at(Tok.Colon):
-                            self.report(
-                                "E0110",
-                                "slices with a step are not supported",
-                                "remove the step"
-                            )
+                            self.slice_step(e)
                             return Err(())
                         self.expect(Tok.RBracket, "`]`")?
                         let span = e.span.to(self.prev_span())
@@ -2336,8 +2861,24 @@ struct Parser:
         var entries: [(Expr, Expr)] = []
         while not self.at(Tok.RBrace):
             let k = self.expr()?
+            if self.at_kw(Kw.For) and len(entries) == 0:
+                self.push_foreign(
+                    self.span(),
+                    "brine has no set comprehensions",
+                    "`for` in `{...}`",
+                    "brine has no sets: build a map to `bool` in a loop, `var seen: {int: bool} = {}`, then `seen[x] = true`, and test with `x in seen`"
+                )
+                return Err(())
             self.expect(Tok.Colon, "`:` between the key and value")?
             let v = self.expr()?
+            if self.at_kw(Kw.For) and len(entries) == 0:
+                self.push_foreign(
+                    self.span(),
+                    "brine has no map comprehensions",
+                    "`for` in `{...}`",
+                    "build the map in a loop: `var m: {str: int} = {}`, then `for (k, v) in pairs:` with `m[k] = v` in its body"
+                )
+                return Err(())
             entries.push((k, v))
             if not self.eat(Tok.Comma):
                 break
@@ -2368,6 +2909,14 @@ struct Parser:
                 # Python-style constants that don't exist
                 if name == "True" or name == "False":
                     let f = name.lower()
+                    let p = self.pos
+                    if (
+                        p >= 3
+                        and self.toks[p - 2].tok == Tok.Assign
+                        and self.toks[p - 3].tok == Tok.Ident("reverse")
+                    ):
+                        # `xs.sort(reverse=True)`: the checker says what to write instead
+                        return Ok(mk(ExprKind.Bool(name == "True"), sp))
                     self.diags.push(
                         diag.error("E0201", f"`{name}` is not defined")
                         .label(sp, f"did you mean `{f}`?")
@@ -2439,9 +2988,15 @@ struct Parser:
                             f"`{kw_name(k)}` is a keyword; it can't be used as a value or a name"
                         )
                     case Tok.Star:
-                        d = d.with_help(
-                            "brine has no `**` or `*args`: write `pow(x, y)` on floats, or `x * x`"
-                        )
+                        let p = self.toks[self.pos - 1].tok if self.pos > 0 else Tok.Eof
+                        if p == Tok.LParen or p == Tok.Comma:
+                            d = d.with_help(
+                                "brine has no `*` unpacking: pass the array itself (`print(xs)`), or make one string: `print(\" \".join([str(x) for x in xs]))`"
+                            )
+                        else:
+                            d = d.with_help(
+                                "brine has no `**` or `*args`: write `pow(x, y)` on floats, or `x * x`"
+                            )
                     case _:
                         pass
                 if tok == Tok.Newline:
