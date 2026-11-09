@@ -1966,8 +1966,11 @@ static bool br_parse_float(brine_str *s, double *out) {
         }
         char *end;
         v = strtod(p, &end);
+        /* end == p: no number (blank text too, which the spaces skipped
+         * below would otherwise make look read to the end) */
+        bool none = end == p;
         while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t') end++;
-        ok = n != 0 && end == p + n;
+        ok = n != 0 && !none && end == p + n;
         /* the canonical quiet NaN with the text's sign, as native code reads
          * every "nan" (mingw's strtod sets all the mantissa bits, musl's
          * drops the sign) */
