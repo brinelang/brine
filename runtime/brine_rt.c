@@ -450,12 +450,44 @@ static void br_panic_claim(void) {
     if (__atomic_exchange_n(&br_panicking, 1, __ATOMIC_SEQ_CST)) br_park();
 }
 
+#define BR_STACK_HELP "every thread has a 64 MB stack: check that the recursion ends, or make it a loop"
+#define BR_OOM_HELP "check where the size comes from (often a wrong count or length), or work on the data in smaller parts"
+
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 /* `brine debug` stops here: the panic is printed, the frames that led to it
  * are still there */
 __attribute__((noinline)) void panic_stop(void) { __asm__ volatile(""); }
 
-void brine_panic_at(const char *loc, const char *msg) {
+static int br_starts(const char *s, const char *p) { return strncmp(s, p, strlen(p)) == 0; }
+
+/* How to avoid the runtime's panic with message msg (as runtime/rt.br,
+ * `panic_help`), or NULL. */
+static const char *br_help(const char *msg) {
+    if (br_starts(msg, "index ") && strstr(msg, " is out of bounds for "))
+        return "an index must be at least 0 and less than the length: check it against `len(...)` first";
+    if (br_starts(msg, "slice [")) {
+        if (strstr(msg, " is out of bounds for ")) return "a slice [lo:hi] needs 0 <= lo <= hi <= the length";
+        return "string positions count bytes: cut where a character starts, such as at a position `find()` gave";
+    }
+    if (br_starts(msg, "unwrap() called on None")) return "match on the Option to handle None, or use `unwrap_or(default)`";
+    if (br_starts(msg, "unwrap() called on Err"))
+        return "match on the Result to handle the error, use `unwrap_or(default)`, or pass the error on with `?`";
+    if (br_starts(msg, "division by zero") || br_starts(msg, "remainder by zero")) return "check that the divisor isn't 0 first";
+    if (br_starts(msg, "integer overflow"))
+        return "use a wider type (such as `i128`), or `wrapping_add`, `wrapping_sub` or `wrapping_mul` if it should wrap around";
+    if (br_starts(msg, "integer conversion out of range")) return "check that the value fits in the type before converting it";
+    if (br_starts(msg, "float to integer conversion"))
+        return "check that the value is in the type's range, and isn't NaN, before converting it";
+    if (br_starts(msg, "invalid integer")) return "`s.to_int()` gives None for text that isn't a number, instead of panicking";
+    if (br_starts(msg, "invalid float")) return "`s.to_float()` gives None for text that isn't a number, instead of panicking";
+    if (br_starts(msg, "key ") && strstr(msg, " is not in the map"))
+        return "check with `k in m` first, or use `m.get(k)` (an Option) or `m.get(k, default)`";
+    if (br_starts(msg, "pop() from an empty array") || strstr(msg, "() of an empty sequence")) return "check that it isn't empty first";
+    return NULL;
+}
+
+/* A panic with a line of help (NULL for none). */
+static BR_NORETURN void br_panic_help(const char *loc, const char *msg, const char *help) {
     br_panic_claim();
     /* under the output lock, so other threads' output (the GPU log) can't
      * land in the middle */
@@ -465,20 +497,26 @@ void brine_panic_at(const char *loc, const char *msg) {
         fprintf(stderr, "\npanic (rank %lld): %s\n  --> %s\n", (long long)br_rank, msg, loc);
     else
         fprintf(stderr, "\npanic: %s\n  --> %s\n", msg, loc);
+    if (help) fprintf(stderr, "  = help: %s\n", help);
     fflush(stderr);
     BR_IO_UNLOCK();
-    /* for `brine run --json`: the location, a NUL, the message, a NUL */
+    /* for `brine run --json`: the location, a NUL, the message, a NUL, the
+     * call chain (none here), a NUL, the help */
     const char *rec = getenv("BRINE_PANIC_FILE");
     FILE *rf = rec ? fopen(rec, "wb") : NULL;
     if (rf) {
         fwrite(loc, 1, strlen(loc) + 1, rf);
         fwrite(msg, 1, strlen(msg) + 1, rf);
+        fwrite("", 1, 1, rf);
+        if (help) fwrite(help, 1, strlen(help), rf);
         fclose(rf);
     }
     panic_stop();
     br_gpu_settle();
     exit(101);
 }
+
+void brine_panic_at(const char *loc, const char *msg) { br_panic_help(loc, msg, br_help(msg)); }
 #endif
 
 static BR_NORETURN void br_panicf(const char *loc, const char *fmt, ...) {
@@ -515,7 +553,7 @@ static BR_NORETURN void br_oom(int64_t n, const char *loc) {
         }
     }
     if (loc) fprintf(stderr, "\n  --> %s", loc);
-    fprintf(stderr, "\n");
+    fprintf(stderr, "\n  = help: " BR_OOM_HELP "\n");
     fflush(stderr);
     /* for `brine run --json` (brine_panic_at) */
     const char *rec = getenv("BRINE_PANIC_FILE");
@@ -546,7 +584,13 @@ void brine_panic_ovf_ab(const char *op, int64_t a, int64_t b, const char *loc) {
 void brine_panic_ovf_u(const char *op, int64_t a, int64_t b, const char *loc) {
     br_panicf(loc, "integer overflow in %s: %llu %s %llu", op, (unsigned long long)a, br_ovf_sign(op), (unsigned long long)b);
 }
-void brine_panic_str(const char *loc, brine_str *msg) { br_panicf(loc, "%.*s", (int)msg->len, msg->data); }
+/* `panic(msg)`: the program's own message, so no help, but for the
+ * prelude's `unwrap` */
+void brine_panic_str(const char *loc, brine_str *msg) {
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%.*s", (int)msg->len, msg->data);
+    br_panic_help(loc, buf, br_starts(buf, "unwrap() called on ") ? br_help(buf) : NULL);
+}
 void brine_assert_fail(const char *loc, const char *src, brine_str *msg) {
     if (msg)
         br_panicf(loc, "assertion failed: %s\n  message: %.*s", src, (int)msg->len, msg->data);
@@ -567,6 +611,7 @@ static BR_NORETURN void br_stack_overflow(void) {
     else
         snprintf(m, sizeof m, "\npanic: stack overflow (recursion too deep)\n");
     fputs(m, stderr);
+    fputs("  = help: " BR_STACK_HELP "\n", stderr);
     fflush(stderr);
     _exit(101);
 }

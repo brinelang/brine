@@ -9196,7 +9196,9 @@ fn oom_at(n: int, loc: ptr):
     if addr(loc) != 0:
         stderr_text("\n  --> ")
         fwrite(loc, u64(1), strlen(loc), os_stdio(2))
-    stderr_text("\n")
+    stderr_text(
+        "\n  = help: check where the size comes from (often a wrong count or length), or work on the data in smaller parts\n"
+    )
     fflush(os_stdio(2))
     unlock(io_mu())
     oom_record(n, loc)
@@ -15393,6 +15395,10 @@ fn panic_claim():
         park()
 
 fn panic_text_cold(loc: ptr, msg: str):
+    panic_help_cold(loc, msg, panic_help(msg))
+
+# A panic with a line of help after its call chain ("" for none).
+fn panic_help_cold(loc: ptr, msg: str, help: str):
     panic_claim()
     # under the output lock, so other threads' output (the GPU log) can't
     # land in the middle
@@ -15404,12 +15410,62 @@ fn panic_text_cold(loc: ptr, msg: str):
         stderr_text(f"\npanic: {msg}\n  --> {c_text(loc)}\n")
     let fp = frame_ptr()
     call_chain(fp, u64(0), os_stdio(2))
+    help_line(help)
     fflush(os_stdio(2))
     unlock(io_mu())
-    panic_record(c_text(loc), msg, fp, u64(0))
+    panic_record(c_text(loc), msg, fp, u64(0), help)
     panic_stop()
     brine_x_gpu_settle()
     exit(i32(101))
+
+fn help_line(help: str):
+    if len(help) > 0:
+        stderr_text(f"  = help: {help}\n")
+
+# How to avoid the runtime's panic with message msg, "" when there's nothing
+# short and sure to say.
+fn panic_help(msg: str) -> str:
+    if msg.starts_with("index ") and text_has(msg, " is out of bounds for "):
+        return "an index must be at least 0 and less than the length: check it against `len(...)` first"
+    if msg.starts_with("slice ["):
+        if text_has(msg, " is out of bounds for "):
+            return "a slice [lo:hi] needs 0 <= lo <= hi <= the length"
+        return "string positions count bytes: cut where a character starts, such as at a position `find()` gave"
+    if msg.starts_with("unwrap() called on None"):
+        return "match on the Option to handle None, or use `unwrap_or(default)`"
+    if msg.starts_with("unwrap() called on Err"):
+        return "match on the Result to handle the error, use `unwrap_or(default)`, or pass the error on with `?`"
+    if msg.starts_with("division by zero") or msg.starts_with("remainder by zero"):
+        return "check that the divisor isn't 0 first"
+    if msg.starts_with("integer overflow"):
+        return "use a wider type (such as `i128`), or `wrapping_add`, `wrapping_sub` or `wrapping_mul` if it should wrap around"
+    if msg.starts_with("integer conversion out of range"):
+        return "check that the value fits in the type before converting it"
+    if msg.starts_with("float to integer conversion"):
+        return "check that the value is in the type's range, and isn't NaN, before converting it"
+    if msg.starts_with("invalid integer"):
+        return "`s.to_int()` gives None for text that isn't a number, instead of panicking"
+    if msg.starts_with("invalid float"):
+        return "`s.to_float()` gives None for text that isn't a number, instead of panicking"
+    if msg.starts_with("key ") and text_has(msg, " is not in the map"):
+        return "check with `k in m` first, or use `m.get(k)` (an Option) or `m.get(k, default)`"
+    if msg.starts_with("pop() from an empty array") or text_has(msg, "() of an empty sequence"):
+        return "check that it isn't empty first"
+    return ""
+
+# whether `part` is somewhere in s
+fn text_has(s: str, part: str) -> bool:
+    let p = ptr_of(s) + STR_DATA
+    let q = ptr_of(part) + STR_DATA
+    let n = len(s)
+    let m = len(part)
+    for i in 0..n - m + 1:
+        var j = 0
+        while j < m and load_u8(p, i + j) == load_u8(q, j):
+            j += 1
+        if j == m:
+            return true
+    return false
 
 # ------------------------------------------------------------ call chains
 # Native code keeps its frame pointer (rbp, x29) chained through every frame
@@ -15593,8 +15649,9 @@ fn file_text(f: ptr, s: str):
     fwrite(p + STR_DATA, u64(1), load_u64(p, STR_LEN), f)
 
 # `brine run --json` reads the panic from the file BRINE_PANIC_FILE names:
-# its location, a NUL, its message, a NUL, then its call chain's lines.
-fn panic_record(loc: str, msg: str, fp: ptr, pc: u64):
+# its location, a NUL, its message, a NUL, its call chain's lines, a NUL,
+# then its help.
+fn panic_record(loc: str, msg: str, fp: ptr, pc: u64, help: str):
     let path = getenv(lit("BRINE_PANIC_FILE"))
     if addr(path) == u64(0):
         return
@@ -15608,6 +15665,8 @@ fn panic_record(loc: str, msg: str, fp: ptr, pc: u64):
     file_text(f, msg)
     fwrite(nul, u64(1), u64(1), f)
     call_chain(fp, pc, f)
+    fwrite(nul, u64(1), u64(1), f)
+    file_text(f, help)
     fclose(f)
 
 # `brine debug` stops here: the panic is printed, and the stack still has
@@ -15643,8 +15702,11 @@ fn brine_panic_ovf_u(op: ptr, a: int, b: int, loc: ptr):
     let o = c_text(op)
     panic_text_cold(loc, f"integer overflow in {o}: {u64(a)} {ovf_sign(o)} {u64(b)}")
 
+# `panic(msg)`: the program's own message, so no help, but for the
+# prelude's `unwrap`
 fn brine_panic_str(loc: ptr, msg: ptr):
-    panic_text_cold(loc, str_of(msg))
+    let m = str_of(msg)
+    panic_help_cold(loc, m, panic_help(m) if m.starts_with("unwrap() called on ") else "")
 
 fn brine_assert_fail(loc: ptr, src: ptr, msg: ptr):
     if addr(msg) != 0:
@@ -15671,6 +15733,8 @@ fn brine_exit(code: int):
 # silently (and losing what is still buffered for stdout), report it like
 # a panic. The handler runs on a reserve: on Windows the stack guarantee,
 # on POSIX an alternate signal stack, both set up for each thread.
+const STACK_HELP = "every thread has a 64 MB stack: check that the recursion ends, or make it a loop"
+
 fn stack_overflow(fp: u64, pc: u64):
     panic_claim()
     fflush(os_stdio(1))
@@ -15680,8 +15744,15 @@ fn stack_overflow(fp: u64, pc: u64):
         stderr_text("\npanic: stack overflow (recursion too deep)\n")
     # (pc + 1: the fault may be at a function's first byte)
     call_chain(null_ptr() + int(fp), pc + u64(1), os_stdio(2))
+    help_line(STACK_HELP)
     fflush(os_stdio(2))
-    panic_record("", "stack overflow (recursion too deep)", null_ptr() + int(fp), pc + u64(1))
+    panic_record(
+        "",
+        "stack overflow (recursion too deep)",
+        null_ptr() + int(fp),
+        pc + u64(1),
+        STACK_HELP
+    )
     panic_stop()
     _exit(i32(101))
 
