@@ -1019,7 +1019,10 @@ fn runtime_object(cc: str, flags: [str], key: str, dir: str) -> Result[(str, str
             # never reads it half-written
             let tmp = project.join(rt_dir, f"{name}.{os.pid()}.tmp")
             write_or_diag(tmp, text)?
-            settle(tmp, f, there)
+            if there:
+                settle(tmp, f, true)
+            else:
+                settle_all(dir, [(tmp, f)])
     let tmp = project.join(rt_dir, f"brine_rt.{os.pid()}.o")
     var cmd = [cc]
     cmd.extend(flags)
@@ -1031,7 +1034,7 @@ fn runtime_object(cc: str, flags: [str], key: str, dir: str) -> Result[(str, str
             return Err(
                 diag.error("E0705", "the C compiler failed on the brine runtime").note(e.strip())
             )
-    settle(tmp, rt_obj, false)
+    settle_all(dir, [(tmp, rt_obj)])
     return Ok((rt_dir, rt_obj))
 
 # Moves a finished cache file `tmp` (an object, a runtime source) to `path`,
@@ -1053,6 +1056,18 @@ fn settle(tmp: str, path: str, replace: bool):
             match os.remove_file(tmp):
                 case _:
                     pass
+
+# `settle` for several files of the cache `dir`. Two builds that both find
+# one missing would both move theirs in, the second over the first, so that
+# is done under the cache's lock (taken only when one is missing: on a
+# first build).
+fn settle_all(dir: str, moves: [(str, str)]):
+    var lock: Option[str] = None
+    if any(not file_exists(path) for _, path in moves):
+        lock = cache_lock(dir)
+    for tmp, path in moves:
+        settle(tmp, path, false)
+    cache_unlock(lock)
 
 # The x86-64 levels an optimized program is compiled for, as the extra C
 # compiler flags of each: plain x86-64, then x86-64-v3 (AVX2) and x86-64-v4
@@ -1208,6 +1223,7 @@ fn compile_levels(
                 return Err(diag.error("E0705", f"could not run the C compiler: {e}"))
     var t = clock()
     var failure = ""
+    var made: [(str, str)] = []
     for h, c_path, tmp, obj in jobs:
         let rc = os.wait(h)
         let (out, err) = os.output(h)
@@ -1215,10 +1231,11 @@ fn compile_levels(
             if failure == "":
                 failure = err + out
         else:
-            settle(tmp, obj, false)
+            made.push((tmp, obj))
             match os.remove_file(c_path):
                 case _:
                     pass
+    settle_all(dir, made)
     prune(obj_dir, objs)
     if len(units) > 0:
         t = phase_time(t, f"cc ({len(jobs)}/{len(units)})")
@@ -1354,7 +1371,7 @@ fn reuse_object(dir: str, obj_dir: str, hash: str) -> bool:
             case Ok(b):
                 let tmp = project.join(obj_dir, f"{hash}.{os.pid()}.o")
                 if os.write_bytes(tmp, b).is_ok():
-                    settle(tmp, obj, false)
+                    settle_all(dir, [(tmp, obj)])
                     if file_exists(obj):
                         return true
             case Err(_):
