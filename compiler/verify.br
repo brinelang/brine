@@ -44,8 +44,9 @@ enum V:
     # Of a value less than this one, that is at most `below`; of one greater,
     # at least `above` (both `t`, but for some constants: `int(y) <= 2` when
     # `y < 3.0`). Comparisons give facts about `t`, so `int(x)` can be proven
-    # after a range check.
-    Flt(t: Lin, nan: F, below: Lin, above: Lin)
+    # after a range check. `neg`: it is less than 0 (`int` can't say: it is 0
+    # for -0.5 too), for `floor`, `ceil` and `round`.
+    Flt(t: Lin, nan: F, below: Lin, above: Lin, neg: F)
     Opaque
 
 enum Term:
@@ -935,10 +936,10 @@ fn float_const(c: float) -> V:
     let big = 1267650600228229401496703205376.0
     if c >= big:
         let k = Lin.konst(FLOAT_BIG)
-        return V.Flt(k, F.False, k, k)
+        return V.Flt(k, F.False, k, k, F.False)
     if c <= -big:
         let k = Lin.konst(-FLOAT_BIG)
-        return V.Flt(k, F.False, k, k)
+        return V.Flt(k, F.False, k, k, F.True)
     # `int(c)`, rounded toward zero
     let t = i128(floor(c)) if c >= 0.0 else i128(ceil(c))
     let one: i128 = 1
@@ -950,7 +951,7 @@ fn float_const(c: float) -> V:
             below = t - one
         elif c < 0.0:
             above = t + one
-    return V.Flt(Lin.konst(t), F.False, Lin.konst(below), Lin.konst(above))
+    return V.Flt(Lin.konst(t), F.False, Lin.konst(below), Lin.konst(above), F.from_bool(c < 0.0))
 
 fn nonneg_range() -> Option[(i128, i128)]:
     let z: i128 = 0
@@ -1110,6 +1111,8 @@ enum D:
     Range(lo: Lin, hi: Lin, incl: bool)
     Stepped(lo: Lin, hi: Lin, step: Option[i128])
     Arr(c: int, len: Lin, elem: Ty)
+    # `enumerate(xs)`: pairs of an index and the element there
+    Enum(c: int, len: Lin, elem: Ty)
     Other
 
 # ================================================================ the symbolic executor
@@ -1176,6 +1179,9 @@ fn new_vf(
         pure=[],
         memo={},
         stored={},
+        elems={},
+        lits={},
+        lit_vals={},
         muls=[],
         mul_keys=[],
         mul_seen={},
@@ -1272,6 +1278,15 @@ struct Vf:
     memo: {str: V}
     # a content made by storing into another one at an index (`n[i] = v`)
     stored: {int: (int, Lin)}
+    # the elements read so far that are arrays, strings, structs or tuples,
+    # by content and index: contents don't change, so `es[e].outs` is the
+    # same value each time (`len(es[e].outs) > 0` then `es[e].outs[0]`)
+    elems: {str: V}
+    # array literals by their elements: `P[z]` in a body and in its
+    # `ensures` (a `const P = [...]`) read the same content
+    lits: {str: int}
+    # the elements of short literals of integers (`for i in [p, q]`)
+    lit_vals: {int: [Lin]}
     # the products made so far: the two factors and the product
     muls: [(Lin, Lin, Lin)]
     mul_keys: [(str, str, str)]
@@ -1505,7 +1520,8 @@ struct Vf:
                 return V.Bool(self.fresh_bool(name))
             case Ty.Float(_):
                 let t = Lin.atom(self.new_atom("int(" + name + ")", float_range()))
-                return V.Flt(t, self.fresh_bool(name + " is NaN"), t, t)
+                let nan = self.fresh_bool(name + " is NaN")
+                return V.Flt(t, nan, t, t, self.fresh_bool(name + " < 0"))
             case Ty.Array(_):
                 let c = self.fresh_content(name)
                 return V.Arr(c, self.fresh_len("len(" + name + ")"))
@@ -1584,13 +1600,9 @@ struct Vf:
                 l,
                 self.fresh_content(self.content_names[c] + "[" + self.show_lin(i) + "]")
             )
-        match ety:
-            case Ty.Int(_) | Ty.Bool:
-                let p = self.unstored(c, i)
-                if p != c:
-                    return self.sel(p, i, ety)
-            case _:
-                pass
+        let p = self.unstored(c, i)
+        if p != c:
+            return self.sel(p, i, ety)
         match ety:
             case Ty.Int(k):
                 var r = int_range(k)
@@ -1599,12 +1611,58 @@ struct Vf:
                         r = Some((max(cr.0, k.min()), min(cr.1, k.max())))
                     case None:
                         pass
-                return V.Int(Lin.atom(self.term(Term.Sel(c, i), r)))
+                let t = Term.Sel(c, i)
+                let fresh = term_key(t) not in self.terms
+                let a = Lin.atom(self.term(t, r))
+                # an element of a short literal at an index that isn't a constant: one of them
+                if fresh and i.is_const().is_none() and c in self.lit_vals:
+                    var cases: [F] = []
+                    for j, x in enumerate(self.lit_vals[c]):
+                        cases.push(F.and_([F.equal(i, Lin.konst(i128(j))), F.equal(a, x)]))
+                    self.defs.push(F.or_(cases))
+                return V.Int(a)
             case Ty.Bool:
                 return V.Bool(F.B(self.term(Term.SelB(c, i), None), true))
             case _:
+                let ek = f"{c}|" + lin_key(i)
+                match self.elems.get(ek):
+                    case Some(v):
+                        return v
+                    case None:
+                        pass
                 let n = self.content_names[c] + "[" + self.show_lin(i) + "]"
-                return self.fresh_val(ety, n)
+                let v = self.fresh_val(ety, n)
+                self.elems[ek] = v
+                return v
+
+    # `sel`, with the element called `name` in messages if it is a new value
+    # (a loop's variable)
+    fn sel_named(ref self, c: int, i: Lin, ety: Ty, name: str) -> V:
+        if name == "" or name == "_":
+            return self.sel(c, i, ety)
+        let p = self.unstored(c, i)
+        match ety:
+            case Ty.Int(_):
+                let n0 = len(self.atom_names)
+                let v = self.sel(p, i, ety)
+                match v:
+                    case V.Int(el):
+                        if len(el.t) == 1 and el.t[0].0 >= n0:
+                            self.atom_names[el.t[0].0] = name
+                    case _:
+                        pass
+                return v
+            case Ty.Bool:
+                return self.sel(p, i, ety)
+            case _:
+                if c in self.chars and ety == Ty.Str:
+                    return self.sel(p, i, ety)
+                let ek = f"{p}|" + lin_key(i)
+                if ek in self.elems:
+                    return self.elems[ek]
+                let v = self.fresh_val(ety, name)
+                self.elems[ek] = v
+                return v
 
     # The content element `i` of `c` comes from: past the stores into `c`
     # surely at other indices (`n[0] = 7; n[1] = 9`: `n[0]` is still 7).
@@ -3199,6 +3257,10 @@ struct Vf:
             match self.st.env.get(id):
                 case Some(V.Int(x0)):
                     out.push((id, d, x0))
+                case Some(V.Arr(_, l0)):
+                    out.push((id, d, l0))
+                case Some(V.Str(l1, _)):
+                    out.push((id, d, l1))
                 case _:
                     pass
         return out
@@ -3209,6 +3271,10 @@ struct Vf:
             match self.st.env.get(id):
                 case Some(V.Int(x)):
                     self.assume(F.le(x0, x) if d > 0 else F.le(x, x0))
+                case Some(V.Arr(_, l)):
+                    self.assume(F.le(x0, l))
+                case Some(V.Str(l1, _)):
+                    self.assume(F.le(x0, l1))
                 case _:
                     pass
 
@@ -3327,6 +3393,17 @@ struct Vf:
                     done = true
             case _:
                 pass
+        match (iter.kind, iter.cres):
+            case (ExprKind.Call(_, eargs), CallRes.Builtin(Builtin.Enumerate)):
+                if len(eargs) == 1:
+                    match self.eval(eargs[0].expr):
+                        case V.Arr(c, l):
+                            dom = D.Enum(c, l, eargs[0].expr.ty.elem())
+                        case _:
+                            pass
+                    done = true
+            case _:
+                pass
         if not done:
             match self.eval(iter):
                 case V.Arr(c, l):
@@ -3351,6 +3428,7 @@ struct Vf:
                 pass
         # invariants: entry, using the first value of the loop variable
         var nonempty = F.True
+        var valid = F.True
         var first: Option[V] = None
         var last: Option[V] = None
         match dom:
@@ -3376,7 +3454,6 @@ struct Vf:
                     pass
             # a range loop's invariant describes states between iterations
             # lo..=hi(+1); it need only hold initially when the range is a valid interval
-            var valid = F.True
             match dom:
                 case D.Range(lo, hi, incl):
                     if incl:
@@ -3452,6 +3529,30 @@ struct Vf:
                 let kx = self.fresh_nonneg("index of " + vname)
                 self.assume(F.lt(kx, l))
                 v = self.sel(c, kx, elem)
+                # in messages, the element is the loop variable
+                match v:
+                    case V.Int(el):
+                        if len(el.t) == 1 and el.c == 0 and "'" not in self.local_name(var_id):
+                            let a = el.t[0].0
+                            if self.atom_names[a].ends_with("[index of " + vname + "]"):
+                                self.atom_names[a] = vname
+                    case _:
+                        pass
+            case D.Enum(c, l, elem):
+                # named after their own variables (`for k, x in ...`)
+                var kn = "index of " + vname
+                var xn = ""
+                if len(body.stmts) > 0:
+                    match body.stmts[0].kind:
+                        case StmtKind.Let(_, LetPat.Tuple(names), _, _, _):
+                            if len(names) == 2:
+                                kn = names[0].0
+                                xn = names[1].0
+                        case _:
+                            pass
+                let kx = self.fresh_nonneg(kn)
+                self.assume(F.lt(kx, l))
+                v = V.Agg([V.Int(kx), self.sel_named(c, kx, elem, xn)])
             case D.Other:
                 v = self.fresh_val(vty, vname)
         self.bind(var_id, v)
@@ -3513,6 +3614,18 @@ struct Vf:
                 self.st.env.remove(var_id)
             let full = self.take()
             out = self.merge(Some(empty), full, k)
+            # a valid range that was empty ends where it starts, and the
+            # invariant was proven there: it holds after the loop either way,
+            # as plain facts (not only on one side of the merge)
+            self.put(out)
+            if self.live and last.is_some() and self.holds(valid):
+                self.bind(var_id, last.unwrap())
+                for inv in invs:
+                    let f = self.spec_cond(inv)
+                    self.assume(f)
+                if self.live:
+                    self.st.env.remove(var_id)
+            out = self.take()
         else:
             for inv in invs:
                 let f = self.spec_cond(inv)
@@ -3606,7 +3719,11 @@ struct Vf:
                 let name = self.content_names[c]
                 let c2 = self.fresh_content(name)
                 self.stored[c2] = (c, i)
-                self.define_sel(c2, i, t, ne)
+                match t:
+                    case Ty.Int(_) | Ty.Bool:
+                        self.define_sel(c2, i, t, ne)
+                    case _:
+                        self.elems[f"{c2}|" + lin_key(i)] = ne
                 return V.Arr(c2, l)
             case _:
                 return V.Opaque
@@ -3660,6 +3777,125 @@ struct Vf:
                 lo = add_opt(lo, mul_opt(k, ab.1))
                 hi = add_opt(hi, mul_opt(k, ab.0))
         return (max_opt(b.0, lo), min_opt(b.1, hi))
+
+    # The bounds of `l` by ranges carried through the facts about its values
+    # and the values linked to them, a few rounds: `mid * rec` in a binary
+    # search (`mid = lo + (hi - lo) / 2`, `0 <= lo <= hi <= n`), or `c / 256`
+    # with `0 <= c`, where one step (`bounds_deep`) isn't enough. For
+    # products, bit operations and shifts, which need constant bounds.
+    fn prop_bounds(self, l: Lin) -> (Option[i128], Option[i128]):
+        var fs: [F] = []
+        if self.live:
+            fs = self.st.facts
+        fs.extend(self.defs)
+        var lins: [(Lin, bool)] = []
+        for f in fs:
+            flat_lins(f, ref lins)
+        # the facts each value is in
+        var uslot: {int: int} = {}
+        var users: [[int]] = []
+        for j, (fl, _) in enumerate(lins):
+            for a, _ in fl.t:
+                match uslot.get(a):
+                    case Some(u):
+                        users[u].push(j)
+                    case None:
+                        uslot[a] = len(users)
+                        users.push([j])
+        var slot: {int: int} = {}
+        var atoms: [int] = []
+        var lo: [Option[i128]] = []
+        var hi: [Option[i128]] = []
+        for a, _ in l.t:
+            if a not in slot:
+                self.prop_atom(a, ref slot, ref atoms, ref lo, ref hi)
+        var picked: [int] = []
+        var taken: {int: bool} = {}
+        var next = 0
+        while next < len(atoms):
+            let a = atoms[next]
+            next += 1
+            match uslot.get(a):
+                case Some(u):
+                    for j in users[u]:
+                        if j not in taken and len(picked) < PROP_FACTS:
+                            taken[j] = true
+                            picked.push(j)
+                            for b, _ in lins[j].0.t:
+                                if b not in slot and len(atoms) < PROP_ATOMS:
+                                    self.prop_atom(b, ref slot, ref atoms, ref lo, ref hi)
+                case None:
+                    pass
+        for _ in 0..PROP_ROUNDS:
+            var changed = false
+            for j in picked:
+                let (fl, eq) = lins[j]
+                for a, k in fl.t:
+                    let i = slot.get(a).unwrap_or(-1)
+                    if i < 0:
+                        continue
+                    # k*a + rest >= 0 (or == 0)
+                    var rlo: Option[i128] = Some(fl.c)
+                    var rhi: Option[i128] = Some(fl.c)
+                    for b, kb in fl.t:
+                        if b == a:
+                            continue
+                        let ib = slot.get(b).unwrap_or(-1)
+                        let blo = lo[ib] if ib >= 0 else None
+                        let bhi = hi[ib] if ib >= 0 else None
+                        if kb > 0:
+                            rlo = add_opt(rlo, mul_opt(kb, blo))
+                            rhi = add_opt(rhi, mul_opt(kb, bhi))
+                        else:
+                            rlo = add_opt(rlo, mul_opt(kb, bhi))
+                            rhi = add_opt(rhi, mul_opt(kb, blo))
+                    let nb = solve_bound(k, eq, (rlo, rhi), (lo[i], hi[i]))
+                    if nb.0 != lo[i] or nb.1 != hi[i]:
+                        lo[i] = nb.0
+                        hi[i] = nb.1
+                        changed = true
+            if not changed:
+                break
+        var rl: Option[i128] = Some(l.c)
+        var rh: Option[i128] = Some(l.c)
+        for a, k in l.t:
+            let i = slot.get(a).unwrap_or(-1)
+            if k > 0:
+                rl = add_opt(rl, mul_opt(k, lo[i]))
+                rh = add_opt(rh, mul_opt(k, hi[i]))
+            else:
+                rl = add_opt(rl, mul_opt(k, hi[i]))
+                rh = add_opt(rh, mul_opt(k, lo[i]))
+        return (rl, rh)
+
+    fn prop_atom(
+        self,
+        a: int,
+        ref slot: {int: int},
+        ref atoms: [int],
+        ref lo: [Option[i128]],
+        ref hi: [Option[i128]]
+    ):
+        slot[a] = len(atoms)
+        atoms.push(a)
+        var r: (Option[i128], Option[i128]) = (None, None)
+        if a < len(self.ranges):
+            match self.ranges[a]:
+                case Some(x):
+                    r = (Some(x.0), Some(x.1))
+                case None:
+                    pass
+        lo.push(real_lo(r.0))
+        hi.push(real_hi(r.1))
+
+    # `bounds`, and where they don't say `l >= 0` (with an upper bound when
+    # `both`), also `prop_bounds`.
+    fn bounds_far(self, l: Lin, both: bool) -> (Option[i128], Option[i128]):
+        let b = self.bounds(l)
+        if nonneg(b) and (b.1.is_some() or not both):
+            return b
+        let p = self.prop_bounds(l)
+        return (max_opt(b.0, p.0), min_opt(b.1, p.1))
 
     # `f` about `a` and up to two other atoms, with the others' bounds.
     fn tighten_via(
@@ -3798,7 +4034,17 @@ struct Vf:
             match shared:
                 case Some((s0, u, v)):
                     tried += 1
-                    if not nonneg(self.bounds_deep(s0, self.bounds(s0))):
+                    # `l.r * l.x` and `r * l.x` where `l.r == r`
+                    match v.sub(u):
+                        case Some(d0):
+                            let eb = self.bounds(d0)
+                            if eb.0 == Some(0) and eb.1 == Some(0):
+                                self.assume(F.equal(p, q))
+                                continue
+                        case None:
+                            pass
+                    let sb = self.bounds_deep(s0, self.bounds(s0))
+                    if not nonneg(sb) and not nonneg(self.prop_bounds(s0)):
                         continue
                     match v.sub(u):
                         case Some(d):
@@ -3882,6 +4128,12 @@ struct Vf:
                                     ab = self.bounds_deep(a, ab)
                                     bb = self.bounds_deep(b, bb)
                                     pb = mul_bounds(ab, bb)
+                                if not fits_bounds(pb, k):
+                                    let ap = self.prop_bounds(a)
+                                    let bp = self.prop_bounds(b)
+                                    ab = (max_opt(ab.0, ap.0), min_opt(ab.1, ap.1))
+                                    bb = (max_opt(bb.0, bp.0), min_opt(bb.1, bp.1))
+                                    pb = mul_bounds(ab, bb)
                                 if lin_key(a) == lin_key(b) and not nonneg(pb):
                                     pb = (Some(0), pb.1)
                                 self.assume_bounds(p, pb)
@@ -3949,14 +4201,14 @@ struct Vf:
                                 pass
                 let v = self.bit_term(" & ", k, a, b)
                 for x in [a, b]:
-                    if nonneg(self.bounds(x)):
+                    if nonneg(self.bounds_far(x, false)):
                         self.assume(F.ge(v))
                         self.assume(F.le(v, x))
                 return V.Int(v)
             case BinOp.BitOr | BinOp.BitXor:
                 let v = self.bit_term(" | " if op == BinOp.BitOr else " ^ ", k, a, b)
-                let ab = self.bounds(a)
-                let bb = self.bounds(b)
+                let ab = self.bounds_far(a, true)
+                let bb = self.bounds_far(b, true)
                 if nonneg(ab) and nonneg(bb):
                     self.assume(F.ge(v))
                     match a.add(b):
@@ -3986,7 +4238,7 @@ struct Vf:
                     case None:
                         pass
                 let v = self.bit_term(" >> ", k, a, b)
-                let ab = self.bounds(a)
+                let ab = self.bounds_far(a, false)
                 if not k.signed():
                     match b.is_const():
                         case Some(c):
@@ -3999,6 +4251,14 @@ struct Vf:
                 if nonneg(ab):
                     self.assume(F.ge(v))
                     self.assume(F.le(v, a))
+                    # by at least the smallest amount it can be
+                    let bb = self.bounds_far(b, false)
+                    match (real_hi(ab.1), bb.0):
+                        case (Some(x), Some(c)):
+                            if 0 < c < 127:
+                                self.assume(F.le(v, Lin.konst(x >> c)))
+                        case _:
+                            pass
                 else:
                     match ab.1:
                         case Some(x):
@@ -4028,10 +4288,50 @@ struct Vf:
                                     pass
                     case None:
                         pass
-                return V.Int(self.bit_term(" << ", k, a, b))
+                let v = self.bit_term(" << ", k, a, b)
+                if b.is_const().is_none():
+                    self.shl_bounds(v, a, b, k)
+                return V.Int(v)
             case _:
                 return V.Int(self.fresh_int(self.op_name(" " + op.sym() + " ", a, b), k))
         return V.Int(self.lin(r, self.op_name(" " + op.sym() + " ", a, b)))
+
+    # `v` is `a << b` for a `b` that isn't a constant. Where `a >= 0` and the
+    # largest `a` shifted by the largest `b` fits in `k`, no bits are lost:
+    # `v == a * 2^b`, at least `a`, between the ends shifted (`1 << k > 0`).
+    # A fact for wherever `a` and `b` are in those bounds, so it holds in a
+    # `requires` that says so later in the same line too.
+    fn shl_bounds(ref self, v: Lin, a: Lin, b: Lin, k: IntTy):
+        let ab = self.bounds_far(a, true)
+        let bb = self.bounds_far(b, true)
+        match (ab.0, real_hi(ab.1), bb.0, real_hi(bb.1)):
+            case (Some(alo), Some(ahi), Some(blo), Some(bhi)):
+                if alo < 0 or blo < 0 or bhi >= i128(k.bits()) or bhi > 125:
+                    return
+                if ahi > 0 and ahi > (k.max() >> bhi):
+                    return
+                let one: i128 = 1
+                let (al, ah) = (Lin.konst(alo), Lin.konst(ahi))
+                let (bl, bh) = (Lin.konst(blo), Lin.konst(bhi))
+                self.defs.push(
+                    F.or_(
+                        [
+                            F.lt(a, al),
+                            F.lt(ah, a),
+                            F.lt(b, bl),
+                            F.lt(bh, b),
+                            F.and_(
+                                [
+                                    F.le(Lin.konst(alo * (one << blo)), v),
+                                    F.le(v, Lin.konst(ahi * (one << bhi))),
+                                    F.le(a, v)
+                                ]
+                            )
+                        ]
+                    )
+                )
+            case _:
+                pass
 
     # `a % c` for a constant `c`, which is `rest` (`a - c*(a / c)`): a value of
     # its own, between 0 and c (its range), equal to `rest`. As `rest` itself,
@@ -4081,6 +4381,7 @@ struct Vf:
             return m
         let q = Lin.atom(self.term(Term.Div(a, b), None))
         if is_pos:
+            self.div_below(a, b, q)
             let ab = self.bounds(a)
             if nonneg(ab):
                 self.assume(F.ge(q))
@@ -4094,6 +4395,35 @@ struct Vf:
                     case None:
                         pass
         return q
+
+    fn below_2_64(ref self, a: Lin) -> bool:
+        let m: i128 = 18446744073709551615
+        return self.holds(F.and_([F.ge(a), F.le(a, Lin.konst(m))]))
+
+    # `q` is `a / b` for `b >= 1`: where a product `c * b` made before is
+    # more than `a`, `q < c` (`i / ch < w * h` from `i < w * h * ch`).
+    fn div_below(ref self, a: Lin, b: Lin, q: Lin):
+        let bk = lin_key(b)
+        var i = len(self.muls) - 1
+        let stop = max(0, len(self.muls) - 32)
+        var tried = 0
+        while i >= stop and tried < 2:
+            let (x, y, p) = self.muls[i]
+            let (xk, yk, _) = self.mul_keys[i]
+            i -= 1
+            var c: Option[Lin] = None
+            if xk == bk:
+                c = Some(y)
+            elif yk == bk:
+                c = Some(x)
+            match c:
+                case Some(cl):
+                    tried += 1
+                    if self.holds(F.lt(a, p)):
+                        self.assume(F.lt(q, cl))
+                        return
+                case None:
+                    pass
 
     # `a op b` for a bit operation the prover doesn't model: unknown, but
     # the same each time (`1 << n` in a check and in a later claim).
@@ -4130,6 +4460,9 @@ struct Vf:
             case ExprKind.Float(x):
                 if e.ty == Ty.Float(FloatTy.F64):
                     return float_const(x)
+                # the `f32` nearest to it: `9.99999999` is 10.0
+                if e.ty == Ty.Float(FloatTy.F32):
+                    return float_const(float(f32(x)))
                 return self.fresh_val(e.ty, self.name_of(e))
             case ExprKind.Bool(b):
                 return V.Bool(F.from_bool(b))
@@ -4194,10 +4527,11 @@ struct Vf:
                     case (UnOp.Neg, Ty.Float(_)):
                         # exact: `below` and `above` trade places
                         match v:
-                            case V.Flt(t, nan, below, above):
+                            case V.Flt(t, nan, below, above, _):
                                 match (t.neg(), below.neg(), above.neg()):
                                     case (Some(nt), Some(nb), Some(na)):
-                                        return V.Flt(nt, nan, na, nb)
+                                        let ng = self.fresh_bool(self.name_of(e) + " < 0")
+                                        return V.Flt(nt, nan, na, nb, ng)
                                     case _:
                                         pass
                             case _:
@@ -4260,7 +4594,7 @@ struct Vf:
                                 let eq = bool_eq(a, b)
                                 f = eq if op == CmpOp.Eq else eq.not_()
                                 done = true
-                        case (V.Flt(_, _, _, _), V.Flt(_, _, _, _)):
+                        case (V.Flt(_, _, _, _, _), V.Flt(_, _, _, _, _)):
                             f = self.float_cmp(op, prev, v, self.name_of(e))
                             done = true
                         case _:
@@ -4454,11 +4788,41 @@ struct Vf:
                 var vals: [V] = []
                 for x in es:
                     vals.push(self.eval(x))
-                let c = self.ranged_content("[...]", vals)
                 let et = e.ty.elem()
+                let n = Lin.konst(i128(len(es)))
+                var lk: Option[str] = Some(self.info.ty_name(et) + "|")
+                var ints: [Lin] = []
+                for v in vals:
+                    match (lk, val_key(v)):
+                        case (Some(k0), Some(vk)):
+                            lk = Some(k0 + vk + ";")
+                        case _:
+                            lk = None
+                    match v:
+                        case V.Int(l):
+                            ints.push(l)
+                        case _:
+                            pass
+                match lk:
+                    case Some(k):
+                        match self.lits.get(k):
+                            case Some(c0):
+                                return V.Arr(c0, n)
+                            case None:
+                                pass
+                    case None:
+                        pass
+                let c = self.ranged_content("[...]", vals)
                 for i, v in enumerate(vals):
                     self.define_sel(c, Lin.konst(i128(i)), et, v)
-                return V.Arr(c, Lin.konst(i128(len(es))))
+                match lk:
+                    case Some(k):
+                        self.lits[k] = c
+                    case None:
+                        pass
+                if len(ints) == len(vals) and 0 < len(ints) <= 8:
+                    self.lit_vals[c] = ints
+                return V.Arr(c, n)
             case ExprKind.Repeat(elem, count):
                 let ev = self.eval(elem)
                 let nv = self.eval(count)
@@ -4506,10 +4870,19 @@ struct Vf:
                     case V.Int(res):
                         let f = in_range(res, k)
                         if (op == BinOp.Add or op == BinOp.Sub or op == BinOp.Mul) and e.checked:
+                            var goal = fits_goal(res, k)
+                            # (2^64 - 1)^2 < 2^128, past the prover's numbers
+                            if (
+                                k == IntTy.U128
+                                and op == BinOp.Mul
+                                and self.below_2_64(a)
+                                and self.below_2_64(b)
+                            ):
+                                goal = F.True
                             self.implicit_as(
                                 e.span,
                                 TAG_ARITH,
-                                fits_goal(res, k),
+                                goal,
                                 f,
                                 "overflow check",
                                 k.bits() < 128
@@ -4731,6 +5104,8 @@ struct Vf:
             case ConstVal.Float(x):
                 if c.ty == Ty.Float(FloatTy.F64):
                     return float_const(x)
+                if c.ty == Ty.Float(FloatTy.F32):
+                    return float_const(float(f32(x)))
                 return self.fresh_val(c.ty, c.name)
 
     # `a if c else b`, called `name` in messages
@@ -4796,35 +5171,38 @@ struct Vf:
     # zero keeps the order).
     fn float_cmp(ref self, op: CmpOp, a: V, b: V, name: str) -> F:
         match (a, b):
-            case (V.Flt(x, na, xb, xa), V.Flt(y, nb, yb, ya)):
+            case (V.Flt(x, na, xb, xa, xn), V.Flt(y, nb, yb, ya, yn)):
                 let r = self.fresh_bool(name)
                 # a NaN makes every comparison false but `!=`
                 let ok = F.and_([na.not_(), nb.not_()])
+                # `a <= b` keeps the sign: `0.0 <= a` says `a` isn't negative
+                let x_le = F.or_([xn, yn.not_()])
+                let y_le = F.or_([yn, xn.not_()])
                 # `a < b`, `b < a`
-                let lt = F.and_([F.le(x, yb), F.le(xa, y)])
-                let gt = F.and_([F.le(y, xb), F.le(ya, x)])
+                let lt = F.and_([F.le(x, yb), F.le(xa, y), x_le])
+                let gt = F.and_([F.le(y, xb), F.le(ya, x), y_le])
                 var yes = F.True
                 var no = F.True
                 match op:
                     case CmpOp.Ge:
-                        yes = F.le(y, x)
+                        yes = F.and_([F.le(y, x), y_le])
                         no = lt
                     case CmpOp.Gt:
                         yes = gt
-                        no = F.le(x, y)
+                        no = F.and_([F.le(x, y), x_le])
                     case CmpOp.Lt:
                         yes = lt
-                        no = F.le(y, x)
+                        no = F.and_([F.le(y, x), y_le])
                     case CmpOp.Le:
-                        yes = F.le(x, y)
+                        yes = F.and_([F.le(x, y), x_le])
                         no = gt
                     case CmpOp.Eq:
-                        yes = F.equal(x, y)
+                        yes = F.and_([F.equal(x, y), x_le, y_le])
                     case CmpOp.Ne:
                         pass
                 if op == CmpOp.Ne:
                     # not `!=`: equal, and neither is NaN
-                    self.defs.push(F.or_([r, F.and_([ok, F.equal(x, y)])]))
+                    self.defs.push(F.or_([r, F.and_([ok, F.equal(x, y), x_le, y_le])]))
                     return r
                 self.defs.push(F.or_([r.not_(), F.and_([ok, yes])]))
                 self.defs.push(F.or_([r, ok.not_(), no]))
@@ -5010,7 +5388,7 @@ struct Vf:
                     k.bits() < 128
                 )
                 return V.Int(l)
-            case (Ty.Int(k), Ty.Float(_), V.Flt(t, nan, _, _)):
+            case (Ty.Int(k), Ty.Float(_), V.Flt(t, nan, _, _, _)):
                 # in range and not NaN: checked (past 64 bits, always at
                 # runtime: the table says so)
                 if k.bits() > 64:
@@ -5026,8 +5404,64 @@ struct Vf:
                     # an integer: `y < float(n)` for n >= 1 means int(y) <= n - 1
                     let below = l.add_c(-1).unwrap_or(l) if b.0.unwrap() >= 1 else l
                     let above = l.add_c(1).unwrap_or(l) if b.1.unwrap() <= -1 else l
-                    return V.Flt(l, F.False, below, above)
+                    return V.Flt(l, F.False, below, above, F.lt(l, Lin.konst(0)))
                 return self.fresh_val(target, self.name_of(whole))
+            # exact up to 2^24
+            case (Ty.Float(FloatTy.F32), Ty.Int(_), V.Int(l)):
+                let b = self.bounds(l)
+                let m: i128 = 16777216
+                if b.0.is_some() and b.1.is_some() and -m <= b.0.unwrap() and b.1.unwrap() <= m:
+                    let below = l.add_c(-1).unwrap_or(l) if b.0.unwrap() >= 1 else l
+                    let above = l.add_c(1).unwrap_or(l) if b.1.unwrap() <= -1 else l
+                    return V.Flt(l, F.False, below, above, F.lt(l, Lin.konst(0)))
+                return self.fresh_val(target, self.name_of(whole))
+            # an `f32` is exactly an `f64`
+            case (
+                Ty.Float(FloatTy.F64),
+                Ty.Float(_),
+                _
+            ) | (Ty.Float(FloatTy.F32), Ty.Float(FloatTy.F32), _):
+                return v
+            # rounded to the nearest `f32`: `int` of it moves by at most 1
+            case (Ty.Float(FloatTy.F32), Ty.Float(FloatTy.F64), V.Flt(t, nan, _, _, ng)):
+                # `f32(9.5)`: the constant itself
+                match a.kind:
+                    case ExprKind.Float(x):
+                        return float_const(float(f32(x)))
+                    case ExprKind.Unary(UnOp.Neg, inner):
+                        match inner.kind:
+                            case ExprKind.Float(x):
+                                return float_const(float(f32(-x)))
+                            case _:
+                                pass
+                    case _:
+                        pass
+                let nm = self.name_of(whole)
+                let t2 = Lin.atom(self.new_atom("int(" + nm + ")", float_range()))
+                let ng2 = self.fresh_bool(nm + " < 0")
+                # (past 2^24 the steps between `f32`s are more than 1)
+                let m: i128 = 16777216
+                match (t.add_c(-1), t.add_c(1)):
+                    case (Some(lo), Some(hi)):
+                        self.defs.push(
+                            F.or_(
+                                [
+                                    F.lt(t, Lin.konst(-m)),
+                                    F.lt(Lin.konst(m), t),
+                                    F.and_([F.le(lo, t2), F.le(t2, hi)])
+                                ]
+                            )
+                        )
+                    case _:
+                        pass
+                # it keeps the order: 1.0 and -1.0 are `f32`s (a tiny
+                # negative value becomes -0.0)
+                let one = Lin.konst(1)
+                let m_one = Lin.konst(-1)
+                self.defs.push(F.or_([F.le(t, Lin.konst(0)), F.le(one, t2)]))
+                self.defs.push(F.or_([F.ge(t), F.le(t2, m_one)]))
+                self.defs.push(F.or_([ng2.not_(), ng]))
+                return V.Flt(t2, nan, t2, t2, ng2)
             case (Ty.Int(_), Ty.Float(_), _):
                 return self.fresh_val(target, self.name_of(whole))
             case (Ty.Int(_), Ty.Bool, V.Bool(b)):
@@ -5052,6 +5486,32 @@ struct Vf:
             case _:
                 let nm = self.name_of(whole)
                 return self.fresh_val(target, nm)
+
+    # `floor(y)`, `ceil(y)` or `round(y)` for `y` with `int(y) == t`: a whole
+    # number (`int` of it is exact) next to `t`, on the side the sign says
+    # (`int(floor(y)) >= 0` once `0.0 <= y`).
+    fn rounded(ref self, b: Builtin, t: Lin, nan: F, ng: F, name: str) -> V:
+        let r = Lin.atom(self.new_atom("int(" + name + ")", float_range()))
+        let (lo, hi) = (t.add_c(-1), t.add_c(1))
+        if lo.is_none() or hi.is_none():
+            return self.fresh_val(Ty.Float(FloatTy.F64), name)
+        let near_lo = F.and_([F.le(lo.unwrap(), r), F.le(r, t)])
+        let near_hi = F.and_([F.le(t, r), F.le(r, hi.unwrap())])
+        var rn = ng
+        if b == Builtin.Floor:
+            # toward -inf: below 0 only when `y` is
+            self.defs.push(F.or_([ng, F.equal(r, t)]))
+            self.defs.push(F.or_([ng.not_(), F.and_([near_lo, F.le(r, Lin.konst(-1))])]))
+        else:
+            if b == Builtin.Ceil:
+                self.defs.push(F.or_([ng.not_(), F.equal(r, t)]))
+                self.defs.push(F.or_([ng, near_hi]))
+            else:
+                self.defs.push(F.or_([ng.not_(), near_lo]))
+                self.defs.push(F.or_([ng, near_hi]))
+            # a whole number below 0 is at most -1
+            rn = F.and_([nan.not_(), F.le(r, Lin.konst(-1))])
+        return V.Flt(r, nan, r, r, rn)
 
     fn builtin(ref self, b: Builtin, recv: Option[Expr], args: [Arg], e: Expr) -> V:
         let n0 = self.nobl
@@ -5207,6 +5667,12 @@ struct Vf:
                         case _:
                             pass
                 return V.Int(self.fresh_len(self.name_of(e)))
+            case Builtin.Floor | Builtin.Ceil | Builtin.Round:
+                match vals[0]:
+                    case V.Flt(t, nan, _, _, ng):
+                        return self.rounded(b, t, nan, ng, self.name_of(e))
+                    case _:
+                        return self.fresh_val(e.ty, self.name_of(e))
             case Builtin.Abs:
                 match e.ty:
                     case Ty.Int(k):
@@ -5767,7 +6233,13 @@ fn div_goal(op: BinOp, a: Lin, b: Lin, k: IntTy) -> F:
             minus_one = c == -1
         case None:
             pass
-    if op == BinOp.Div and k.signed() and minus_one:
+    if op == BinOp.Div and k.signed() and minus_one and k.bits() == 128:
+        # `a - MIN` doesn't fit in the prover's 128-bit numbers
+        let b1 = b.add_c(1)
+        g.push(F.or_([F.le(Lin.konst(k.min() + 1), a), F.ne(b1.unwrap_or(b))]))
+        if b1.is_none():
+            g.push(F.B(ATOM_UNKNOWN, true))
+    elif op == BinOp.Div and k.signed() and minus_one:
         let am = a.sub(Lin.konst(k.min()))
         let b1 = b.add_c(1)
         g.push(F.or_([F.ne(am.unwrap_or(a)), F.ne(b1.unwrap_or(b))]))
@@ -5790,8 +6262,18 @@ fn val_eq(a: V, b: V) -> Option[F]:
             return Some(F.equal(x, y))
         case (V.Str(x, _), V.Str(y, _)):
             return Some(F.equal(x, y))
-        case (V.Flt(x, nx, bx, ax), V.Flt(y, ny, by, ay)):
-            return Some(F.and_([F.equal(x, y), F.equal(bx, by), F.equal(ax, ay), bool_eq(nx, ny)]))
+        case (V.Flt(x, nx, bx, ax, gx), V.Flt(y, ny, by, ay, gy)):
+            return Some(
+                F.and_(
+                    [
+                        F.equal(x, y),
+                        F.equal(bx, by),
+                        F.equal(ax, ay),
+                        bool_eq(nx, ny),
+                        bool_eq(gx, gy)
+                    ]
+                )
+            )
         case (V.Agg(xs), V.Agg(ys)):
             if len(xs) != len(ys):
                 return None
@@ -6036,6 +6518,101 @@ fn nonneg(b: (Option[i128], Option[i128])) -> bool:
         case None:
             return false
 
+# A bound past 2^126 may stand for a larger one (a `u128`'s range ends at
+# i128's largest value): not one to compute with.
+const EDGE: i128 = 85070591730234615865843651857942052864
+
+fn real_hi(h: Option[i128]) -> Option[i128]:
+    match h:
+        case Some(x):
+            if x >= EDGE:
+                return None
+        case None:
+            pass
+    return h
+
+fn real_lo(l: Option[i128]) -> Option[i128]:
+    match l:
+        case Some(x):
+            if x <= -EDGE:
+                return None
+        case None:
+            pass
+    return l
+
+# How far `prop_bounds` looks: values, facts, rounds.
+const PROP_ATOMS: int = 24
+const PROP_FACTS: int = 64
+const PROP_ROUNDS: int = 4
+
+# The linear facts in `f` about up to four values, each with whether it's
+# an equation (`l == 0`) or not (`l >= 0`).
+fn flat_lins(f: F, ref out: [(Lin, bool)]):
+    match f:
+        case F.Ge(l):
+            if 1 <= len(l.t) <= 4:
+                out.push((l, false))
+        case F.Eq(l2):
+            if 1 <= len(l2.t) <= 4:
+                out.push((l2, true))
+        case F.And(xs):
+            for x in xs:
+                flat_lins(x, ref out)
+        case _:
+            pass
+
+# `b` (the bounds of a value `a`), tightened by `k*a + rest >= 0` (or `== 0`
+# when `eq`) for `rest` in `r`.
+fn solve_bound(
+    k: i128,
+    eq: bool,
+    r: (Option[i128], Option[i128]),
+    b: (Option[i128], Option[i128])
+) -> (Option[i128], Option[i128]):
+    var lo = b.0
+    var hi = b.1
+    if k > 0:
+        # a >= -rest / k: at least -floor(rest_hi / k)
+        match r.1:
+            case Some(rh):
+                lo = max_opt(lo, neg_i128(rh / k))
+            case None:
+                pass
+        if eq:
+            # a == -rest / k: at most floor(-rest_lo / k)
+            match r.0:
+                case Some(rl):
+                    match neg_i128(rl):
+                        case Some(n):
+                            hi = min_opt(hi, Some(n / k))
+                        case None:
+                            pass
+                case None:
+                    pass
+    elif k < 0:
+        match neg_i128(k):
+            case Some(m):
+                # m*a <= rest: at most floor(rest_hi / m)
+                match r.1:
+                    case Some(rh):
+                        hi = min_opt(hi, Some(rh / m))
+                    case None:
+                        pass
+                if eq:
+                    # m*a == rest: at least -floor(-rest_lo / m)
+                    match r.0:
+                        case Some(rl):
+                            match neg_i128(rl):
+                                case Some(n):
+                                    lo = max_opt(lo, neg_i128(n / m))
+                                case None:
+                                    pass
+                        case None:
+                            pass
+            case None:
+                pass
+    return (lo, hi)
+
 # 2^k - 1 for the smallest k with 2^k > x (0 <= x < 2^62)
 fn ones_above(x: i128) -> i128:
     var p: i128 = 1
@@ -6116,7 +6693,9 @@ fn tighten_by(
 
 # Monotone locals: those a loop changes only by `x += c` (or only by `x -= c`)
 # with constants c >= 0, anywhere in its body. An overflow panics, so at the
-# start of every iteration and after the loop `x >= x0` (`x <= x0`).
+# start of every iteration and after the loop `x >= x0` (`x <= x0`). Arrays
+# and strings only grown (`xs.push(x)`, `xs.extend(ys)`, `xs.insert(i, x)`,
+# `xs += ys`) are too: their length.
 fn monotone(b: Block, cond: Option[Expr], info: ProgramInfo) -> [(int, int)]:
     var dirs: {int: int} = {}
     var other: {int: int} = {}
@@ -6147,6 +6726,12 @@ fn count_steps(b: Block, info: ProgramInfo, ref dirs: {int: int}, ref other: {in
                             case (ExprKind.Ident(_), Some(BinOp.Sub), ExprKind.Int(v)):
                                 if v >= 0:
                                     d = -1
+                            case (ExprKind.Ident(_), Some(BinOp.Add), _):
+                                match target.ty:
+                                    case Ty.Array(_) | Ty.Str:
+                                        d = 1
+                                    case _:
+                                        pass
                             case _:
                                 pass
                         let was = dirs.get(r).unwrap_or(d)
@@ -6156,12 +6741,52 @@ fn count_steps(b: Block, info: ProgramInfo, ref dirs: {int: int}, ref other: {in
                             dirs[r] = d
                     case None:
                         pass
+            case StmtKind.ExprStmt(e):
+                match grown(e):
+                    case Some(r):
+                        if dirs.get(r).unwrap_or(1) == 1:
+                            dirs[r] = 1
+                        else:
+                            note_mod(ref other, r, MOD_WHOLE)
+                        match e.kind:
+                            case ExprKind.MethodCall(_, _, _, args):
+                                for a in args:
+                                    mods_expr(a.expr, info, ref other)
+                            case _:
+                                pass
+                        continue
+                    case None:
+                        pass
             case _:
                 pass
         for e in stmt_exprs(s):
             mods_expr(e, info, ref other)
         for blk in stmt_blocks(s):
             count_steps(blk, info, ref dirs, ref other)
+
+# The local `e` grows, if it is `x.push(..)`, `x.extend(..)` or `x.insert(..)`
+# for a local `x`.
+fn grown(e: Expr) -> Option[int]:
+    match e.kind:
+        case ExprKind.MethodCall(recv, _, _, _):
+            match e.cres:
+                case CallRes.Builtin(
+                    Builtin.Push
+                ) | CallRes.Builtin(Builtin.Extend) | CallRes.Builtin(Builtin.Insert):
+                    match recv.kind:
+                        case ExprKind.Ident(_):
+                            match recv.res:
+                                case Res.Local(id):
+                                    return Some(id)
+                                case _:
+                                    pass
+                        case _:
+                            pass
+                case _:
+                    pass
+        case _:
+            pass
+    return None
 
 # The atoms that are the integer parts of `v`, a value just made by `fresh_val`.
 fn fresh_atoms(v: V) -> [int]:
