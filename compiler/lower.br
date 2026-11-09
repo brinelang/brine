@@ -3632,13 +3632,15 @@ struct Lower:
             case _:
                 return false
 
-    # `let d = r.f` or `let d = r[i].g`, where nothing in the rest of the
-    # block can change `r` or move it: `d` borrows the value, which `r` keeps
-    # alive, instead of retaining it and releasing it at the end. A `var d`
-    # too, when all it is ever given is such places (`d = q.f`) and nothing
-    # else changes it.
+    # `let d = r.f` or `let d = r[i].g`, where nothing can change `r` or move
+    # it until d's last use: `d` borrows the value, which `r` keeps alive,
+    # instead of retaining it and releasing it at the end (a reference held
+    # to the end would make the next change of `r[i]` copy it: v091#13). A
+    # `var d` too, when all it is ever given is such places (`d = q.f`) and
+    # nothing in the rest of the block changes them. (In debug builds too:
+    # unlike a move, a borrow leaves d and r their values for the debugger.)
     fn borrow_let(ref self, stmts: [Stmt], k: int) -> bool:
-        if not self.moves_ok():
+        if self.cx.lifted or len(self.cx.jx.act) > 0 or self.cx.twin != 0 or self.cx.fb.ends():
             return false
         let s = stmts[k]
         match s.kind:
@@ -3650,6 +3652,34 @@ struct Lower:
                 if not self.managed(ty) or init.ty != ty or not self.plain_local(d):
                     return false
                 var roots = [place_path(init).unwrap().0]
+                # the last statement r must keep, and whether only its
+                # conditions: an `if` whose blocks don't use d
+                var upto = len(stmts) - 1
+                var conds = false
+                if not mutable:
+                    upto = k
+                    for i in k + 1..len(stmts):
+                        if stmt_mentions(stmts[i], d):
+                            upto = i
+                    match stmts[upto].kind:
+                        case StmtKind.If(_, _):
+                            conds = not any(
+                                any(stmt_mentions(t, d) for t in b.stmts)
+                                for b in stmt_blocks(stmts[upto])
+                            )
+                        case _:
+                            pass
+                    # (a `ref` to d, or a place in d another variable borrows,
+                    # could outlive the statements d is in)
+                    var late = any(borrows_from(stmts[i], d) for i in k + 1..len(stmts))
+                    match self.fnd:
+                        case Some(f):
+                            late = late or any(ref_alias(t, d) for t in f.body.stmts)
+                        case None:
+                            return false
+                    if late:
+                        upto = len(stmts) - 1
+                        conds = false
                 if mutable:
                     for i in k + 1..len(stmts):
                         if not self.only_borrows(stmts[i], d, ref roots):
@@ -3662,7 +3692,7 @@ struct Lower:
                         case None:
                             return false
                 for r in roots:
-                    if r == d or not self.keeps_alive(stmts, k, r):
+                    if r == d or not self.keeps_alive(stmts, k, r, upto, conds):
                         return false
                 self.push_frame()
                 let v = self.expr(init)
@@ -3699,7 +3729,7 @@ struct Lower:
                 match self.view_parts(init):
                     case Some((parts, slots, ftys, roots)):
                         for r in roots:
-                            if r == d or not self.keeps_alive(stmts, k, r):
+                            if r == d or not self.keeps_alive(stmts, k, r, len(stmts) - 1, false):
                                 return false
                         self.push_frame()
                         let home = self.new_local(d, ty)
@@ -3714,7 +3744,7 @@ struct Lower:
                 match self.view_call_roots(init):
                     case Some(roots):
                         for r in roots:
-                            if r == d or not self.keeps_alive(stmts, k, r):
+                            if r == d or not self.keeps_alive(stmts, k, r, len(stmts) - 1, false):
                                 return false
                         self.push_frame()
                         let v = self.expr(init)
@@ -3871,8 +3901,9 @@ struct Lower:
                 return -1
 
     # Does variable `r` keep what is borrowed from it alive through the
-    # statements after `stmts[k]`?
-    fn keeps_alive(self, stmts: [Stmt], k: int, r: int) -> bool:
+    # statements after `stmts[k]`, to `stmts[upto]` (only its conditions
+    # when `conds`)?
+    fn keeps_alive(self, stmts: [Stmt], k: int, r: int, upto: int, conds: bool) -> bool:
         let rk = self.flocals[r].kind
         if rk == LocalKind.Var or rk == LocalKind.Let:
             if (
@@ -3884,8 +3915,11 @@ struct Lower:
                 return false
         elif rk != LocalKind.Param and rk != LocalKind.RefParam:
             return false
-        for i in k + 1..len(stmts):
-            if not self.keeps_root(stmts[i], r):
+        for i in k + 1..upto + 1:
+            if i == upto and conds:
+                if not self.keeps_root_flat(stmts[i], r):
+                    return false
+            elif not self.keeps_root(stmts[i], r):
                 return false
         match self.fnd:
             case Some(f):
@@ -9617,6 +9651,29 @@ fn stmt_mentions(s: Stmt, w: int) -> bool:
     for b in stmt_blocks(s):
         for t in b.stmts:
             if stmt_mentions(t, w):
+                return true
+    return false
+
+# `let e = d[i]` or `e = d.f` (a place in d, which e may borrow), here or in
+# a nested block
+fn borrows_from(s: Stmt, d: int) -> bool:
+    var v: Option[Expr] = None
+    match s.kind:
+        case StmtKind.Let(_, _, _, init, _):
+            v = Some(init)
+        case StmtKind.Assign(_, _, x):
+            v = Some(x)
+        case _:
+            pass
+    match v:
+        case Some(x):
+            if borrow_place(x) and place_path(x).unwrap().0 == d:
+                return true
+        case None:
+            pass
+    for b in stmt_blocks(s):
+        for t in b.stmts:
+            if borrows_from(t, d):
                 return true
     return false
 
