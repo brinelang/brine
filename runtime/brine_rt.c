@@ -336,6 +336,19 @@ static BR_NORETURN void br_oom(int64_t n, const char *loc) {
     if (loc) fprintf(stderr, "\n  --> %s", loc);
     fprintf(stderr, "\n");
     fflush(stderr);
+    /* for `brine run --json` (brine_panic_at) */
+    const char *rec = getenv("BRINE_PANIC_FILE");
+    FILE *rf = rec ? fopen(rec, "wb") : NULL;
+    if (rf) {
+        fputs(loc ? loc : "", rf);
+        fputc(0, rf);
+        if (n < 0)
+            fputs("out of memory: could not allocate more than 9223372036854775807 bytes", rf);
+        else
+            fprintf(rf, "out of memory: could not allocate %lld bytes", (long long)n);
+        fputc(0, rf);
+        fclose(rf);
+    }
     exit(101);
 }
 
@@ -2740,6 +2753,20 @@ void brine_eprint_sb(brine_sb *sb) {
     brine_sb_cat(sb, "\n", 1);
     brine_err_sb(sb);
 }
+/* `main` returned `Err`: sb is "error: <its message>"; for `brine run
+ * --json` a record too, with no location */
+void brine_main_err(brine_sb *sb) {
+    const char *rec = getenv("BRINE_PANIC_FILE");
+    FILE *rf = rec && sb->len >= 7 ? fopen(rec, "wb") : NULL;
+    if (rf) {
+        fputc(0, rf);
+        fputs("`main` returned an error: ", rf);
+        fwrite(sb->p + 7, 1, (size_t)(sb->len - 7), rf);
+        fputc(0, rf);
+        fclose(rf);
+    }
+    brine_eprint_sb(sb);
+}
 #endif
 
 /* ============================================================ misc */
@@ -2760,6 +2787,12 @@ double brine_clock(void) {
 #endif
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 const char *brine_arg(int64_t i) { return i >= 0 && i < br_argc ? br_argv[i] : NULL; }
+void brine_drop_args(int64_t n) {
+    if (n > 0 && br_argc > n) {
+        br_argc -= (int)n;
+        br_argv += n;
+    }
+}
 #endif
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 brine_arr *brine_args(void) {
@@ -5978,12 +6011,20 @@ static int64_t br_flen(FILE *f) {
     return back != 0 ? -2 : n;
 }
 
+static int br_kind(const char *p);
+
 /* All of the file at `path` (malloc'd, in *buf and *len, the block's size
  * in *capp), or false with the message in *err. */
 static bool br_slurp(brine_str *path, char **buf, size_t *len, size_t *capp, brine_str **err) {
     char *p = br_cstr(path);
     if (!p) {
         *err = br_strf("cannot read a path containing a NUL byte");
+        return false;
+    }
+    /* (Windows says "Permission denied", Linux opens it and fails to read) */
+    if (br_kind(p) == 2) {
+        *err = br_strf("cannot read %s: it is a directory, not a file", p);
+        free(p);
         return false;
     }
     FILE *f = br_open(p, "rb");

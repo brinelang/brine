@@ -9044,7 +9044,40 @@ fn oom_at(n: int, loc: ptr):
     stderr_text("\n")
     fflush(os_stdio(2))
     unlock(io_mu())
+    oom_record(n, loc)
     exit(i32(101))
+
+# The panic record (`panic_record`) of an out-of-memory panic, for `brine
+# run --json`: written without allocating, like the message.
+fn oom_record(n: int, loc: ptr):
+    let path = getenv(lit("BRINE_PANIC_FILE"))
+    if addr(path) == u64(0):
+        return
+    let f = os_fopen(path, "wb")
+    if addr(f) == u64(0):
+        return
+    let nul = stack_mem(8)
+    store_u8(nul, 0, u8(0))
+    if addr(loc) != 0:
+        fwrite(loc, u64(1), strlen(loc), f)
+    fwrite(nul, u64(1), u64(1), f)
+    file_text(f, "out of memory: could not allocate ")
+    if n < 0:
+        file_text(f, "more than 9223372036854775807")
+    else:
+        let b = stack_mem(24)
+        var i = 24
+        var v = n
+        while true:
+            i -= 1
+            store_u8(b, i, u8(48 + v % 10))
+            v /= 10
+            if v == 0:
+                break
+        fwrite(b + i, u64(1), u64(24 - i), f)
+    file_text(f, " bytes")
+    fwrite(nul, u64(1), u64(1), f)
+    fclose(f)
 
 # ` (1.5 GiB)` for n bytes, when that says more than the number
 fn oom_units(n: int):
@@ -13005,6 +13038,10 @@ fn os_slurp(path: ptr, out: ptr, err: ptr) -> bool:
     if addr(p) == 0:
         store_ptr(err, 0, os_msg("cannot read a path containing a NUL byte"))
         return false
+    # (Windows says "Permission denied", Linux opens it and fails to read)
+    if os_kind(p) == 2:
+        store_ptr(err, 0, os_msg(f"cannot read {str_of(path)}: it is a directory, not a file"))
+        return false
     let f = os_fopen(p, "rb")
     if addr(f) == 0:
         let e = os_strerror(os_errno())
@@ -15581,6 +15618,23 @@ fn brine_eprint_sb(sb: ptr):
     brine_sb_cat(sb, lit("\n"), 1)
     brine_err_sb(sb)
 
+# `main` returned `Err`: sb is "error: <its message>", for stderr. For
+# `brine run --json` it is a record (`panic_record`) too, with no location.
+fn brine_main_err(sb: ptr):
+    let path = getenv(lit("BRINE_PANIC_FILE"))
+    let n = load_i64(sb, SB_LEN)
+    if addr(path) != u64(0) and n >= 7:
+        let f = os_fopen(path, "wb")
+        if addr(f) != u64(0):
+            let nul = stack_mem(8)
+            store_u8(nul, 0, u8(0))
+            fwrite(nul, u64(1), u64(1), f)
+            file_text(f, "`main` returned an error: ")
+            fwrite(load_ptr(sb, SB_P) + 7, u64(1), u64(n - 7), f)
+            fwrite(nul, u64(1), u64(1), f)
+            fclose(f)
+    brine_eprint_sb(sb)
+
 # ------------------------------------------------------------ start and end
 # argument i (a C string), or null past the end
 fn brine_arg(i: int) -> ptr:
@@ -15588,6 +15642,15 @@ fn brine_arg(i: int) -> ptr:
     if i >= 0 and i < load_i64(pr, P_ARGC):
         return load_ptr(load_ptr(pr, P_ARGV), i * 8)
     return null_ptr()
+
+# A test runs as `<tests> --run <k>`: from then on `args()` doesn't show the
+# first n arguments, which are the runner's, not the test's.
+fn brine_drop_args(n: int):
+    let pr = proc_mem()
+    let c = load_i64(pr, P_ARGC)
+    if n > 0 and c > n:
+        store_i64(pr, P_ARGC, c - n)
+        store_ptr(pr, P_ARGV, load_ptr(pr, P_ARGV) + n * 8)
 
 # Splits a command line the way CommandLineToArgvW does: the arguments go
 # to d (len + 2 wide chars), argv[i] points at each. Our own copy because

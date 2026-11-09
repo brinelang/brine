@@ -61,7 +61,59 @@ fn read_source(path: str) -> Result[str, str]:
             return Ok(strip_bom(text.replace("\r\n", "\n")))
         case Err(e):
             # read_file's message already names the file
-            return Err(e)
+            return Err(e + bad_utf8_at(path))
+
+# Where a file stops being UTF-8 (RFC 3629), for read_file's "not valid UTF-8
+# text": `, at line 3, column 9 (byte 0xff)`, or "" if it is valid or unreadable.
+fn bad_utf8_at(path: str) -> str:
+    var b: [u8] = []
+    match os.read_bytes(path):
+        case Ok(x):
+            b = x
+        case Err(_):
+            return ""
+    let n = len(b)
+    var i = 0
+    var line = 1
+    var col = 1
+    while i < n:
+        let c = int(b[i])
+        var need = 0
+        var lo = 0x80
+        var hi = 0xBF
+        if c < 0x80:
+            need = 0
+        elif 0xC2 <= c <= 0xDF:
+            need = 1
+        elif 0xE0 <= c <= 0xEF:
+            need = 2
+            if c == 0xE0:
+                lo = 0xA0
+            elif c == 0xED:
+                hi = 0x9F
+        elif 0xF0 <= c <= 0xF4:
+            need = 3
+            if c == 0xF0:
+                lo = 0x90
+            elif c == 0xF4:
+                hi = 0x8F
+        else:
+            need = -1
+        var ok = need >= 0 and i + need < n
+        var k = 1
+        while ok and k <= need:
+            let d = int(b[i + k])
+            ok = (lo <= d <= hi) if k == 1 else (0x80 <= d <= 0xBF)
+            k += 1
+        if not ok:
+            return f", at line {line}, column {col} (byte 0x{c:02x})"
+        if c == 10:
+            line += 1
+            col = 1
+        else:
+            col += 1
+        i += need + 1
+    return ""
 
 # Notepad and others may start a UTF-8 file with a byte order mark
 fn strip_bom(text: str) -> str:
@@ -799,6 +851,53 @@ fn move_aside(out: str) -> bool:
             pass
     return os.rename(out, old).is_ok()
 
+# A file to write `out` as before renaming it over `out`: in its folder, with
+# its extension (a C compiler adds `.exe` to a name without one on Windows).
+fn tmp_beside(out: str) -> str:
+    let n = project.file_name(out).unwrap_or(out)
+    return out[:len(out) - len(n)] + f".{os.pid()}.{n}"
+
+# Renames `tmp` over `out`, and removes `tmp` either way. With `before` (the
+# hash `out` had when this build started; "" if it didn't exist), a build of
+# the same program by another brine wins: `out` is kept when it has the same
+# bytes already, or when it changed since and can't be replaced (Windows: it
+# runs). A C linker stamps the time into a program, so two builds differ.
+fn place(tmp: str, out: str, before: Option[str]) -> Result[(), Diag]:
+    if before.is_some() and file_exists(out) and file_hash(out) == file_hash(tmp):
+        match os.remove_file(tmp):
+            case _:
+                pass
+        return Ok(())
+    # the `.old` an earlier build moved aside goes once it no longer runs
+    # (Windows: it stays while it does)
+    if os.name() == "windows" and file_exists(out + ".old"):
+        match os.remove_file(out + ".old"):
+            case _:
+                pass
+    if os.rename(tmp, out).is_ok():
+        return Ok(())
+    # (Windows can't replace a running program, but it can move it away)
+    let moved = move_aside(out)
+    match os.rename(tmp, out):
+        case Ok(_):
+            return Ok(())
+        case Err(e):
+            match os.remove_file(tmp):
+                case _:
+                    pass
+            move_back(out, moved)
+            match before:
+                case Some(h):
+                    if file_exists(out) and file_hash(out) != h:
+                        return Ok(())
+                case None:
+                    pass
+            return Err(
+                diag.error("E0704", f"cannot write `{display_path(out)}`").note(e).with_help(
+                    "is the program still running? Stop it and build again, or build somewhere else with `-o`"
+                )
+            )
+
 # A link that failed puts the old build back.
 fn move_back(out: str, moved: bool):
     if moved and not file_exists(out):
@@ -1069,19 +1168,26 @@ fn compile_levels(
                 make_dirs(d)?
         case None:
             pass
+    # linked next to it and renamed over it, as a native link is: brines
+    # building the same program at once each start the one they made
+    # (v091#3: they wrote one file together and ran it half-written)
+    let tmp = tmp_beside(out_exe)
+    let before = file_hash(out_exe) if file_exists(out_exe) else ""
     var link = [cc]
     if plat.is_wasm():
         link.push(flags[0])
     link.extend(objs)
-    link.extend([rt_obj, "-o", out_exe])
+    link.extend([rt_obj, "-o", tmp])
     link.extend(libs)
-    let moved = move_aside(out_exe)
     match run_cc(link):
         case Ok(_):
             pass
         case Err(e):
-            move_back(out_exe, moved)
+            match os.remove_file(tmp):
+                case _:
+                    pass
             return Err(cc_failed("linking the program failed", e, out_exe))
+    place(tmp, out_exe, Some(before))?
     phase_time(t, "link")
     if plat == Platform.Web:
         web_files(dest)?
@@ -1142,20 +1248,7 @@ fn link_native(o: ObjFile, out_exe: str) -> Result[bool, Diag]:
             return Err(io_diag(e))
     if os.name() != "windows" and not runs_ok(["chmod", "+x", tmp]):
         return Err(diag.error("E0704", f"cannot make `{display_path(out_exe)}` executable"))
-    let moved = move_aside(out_exe)
-    match os.rename(tmp, out_exe):
-        case Ok(_):
-            pass
-        case Err(e):
-            match os.remove_file(tmp):
-                case _:
-                    pass
-            move_back(out_exe, moved)
-            return Err(
-                diag.error("E0704", f"cannot write `{display_path(out_exe)}`").note(e).with_help(
-                    "is the program still running? Stop it and build again, or build somewhere else with `-o`"
-                )
-            )
+    place(tmp, out_exe, None)?
     phase_time(t, "link")
     return Ok(true)
 
@@ -1204,17 +1297,26 @@ fn prune(obj_dir: str, keep: [str]):
 
 # A cache directory (brine-cache in the temp directory for files outside a
 # project, a project's target/cache) keeps what every build made, so it is
-# pruned (v09#25). Each build adds lines to its `uses.log`: `<entry> -` when
-# it starts using an entry and `<entry> <bytes>` when it is done. When the
-# entries listed add up to more than BRINE_CACHE_SIZE, the least recently used
-# lose their files (brine can't remove folders; empty ones cost nothing).
-# What the log doesn't list, such as what an older brine made, stays.
+# pruned (v09#25). Each build adds lines to its `uses.log`: `<entry> - <t>
+# <pid>` when it starts using an entry (a pin) and `<entry> <bytes> <t> <pid>`
+# when it is done with it, after the program it built has started (v091#3: a
+# prune between the build and the start deleted the program). An entry stays
+# while any build's pin is unreleased: several can use one at once. `<t>` is
+# `clock()`, which counts from the machine's start in every process, so the
+# pin of a brine that died expires. When the entries listed add up to more than
+# BRINE_CACHE_SIZE, the least recently used that no one pins lose their files
+# (brine can't remove folders; empty ones cost nothing). What the log doesn't
+# list, such as what an older brine made, stays. The log is only read or
+# written under `cache_lock`.
 const CACHE_LOG = "uses.log"
 
 const CACHE_DEFAULT = 2 * 1024 * 1024 * 1024
 
 # lines added between rewrites of the log, which keep one line per entry
 const CACHE_SLACK = 256
+
+# seconds after which a pin no longer counts (its brine died)
+const PIN_MAX = 6.0 * 3600.0
 
 # BRINE_CACHE_SIZE in bytes: `500M`, `2G`, `1T` or a number of bytes; 0 (or
 # `off`) for no limit. Unset or unreadable: 2G.
@@ -1278,40 +1380,147 @@ fn tree_clear(p: str):
     for f in os.list_dir(p).unwrap_or([]):
         tree_clear(project.join(p, f))
 
+# The lock on a cache's log. Appending isn't atomic everywhere (Windows' C
+# library seeks to the end, then writes), and a prune reads, decides, deletes
+# and rewrites, so every use of the log takes it. It is one token file in
+# `uses.lock`, renamed from `free` to `held-<pid>-<n>-<t>`: a rename is
+# atomic, so one process gets it. A holder that died is taken over after
+# LOCK_STALE seconds; two tokens (two first builds made one each) are noticed
+# by their holders, who drop theirs. None if it couldn't be had in 10 s: the
+# caller goes on without it (appending) or does nothing (pruning).
+const LOCK_DIR = "uses.lock"
+
+const LOCK_STALE = 60.0
+
+fn cache_lock(dir: str) -> Option[str]:
+    let ld = project.join(dir, LOCK_DIR)
+    if os.make_dir(ld).is_err():
+        return None
+    let free = project.join(ld, "free")
+    let t0 = clock()
+    var n = 0
+    while clock() - t0 < 10.0:
+        n += 1
+        let name = f"held-{os.pid()}-{n}-{int(clock())}"
+        let mine = project.join(ld, name)
+        var got = os.rename(free, mine).is_ok()
+        var held = false
+        for f in os.list_dir(ld).unwrap_or([]):
+            if not f.starts_with("held-") or f == name:
+                continue
+            let parts = f.split("-")
+            let age = clock() - float(parts[len(parts) - 1].to_int().unwrap_or(0))
+            if not got and (age > LOCK_STALE or age < -1.0):
+                # its holder died (or the machine restarted since)
+                got = os.rename(project.join(ld, f), mine).is_ok()
+            else:
+                held = true
+        if got and not held:
+            return Some(mine)
+        if got:
+            # someone else holds a second token: drop this one
+            match os.remove_file(mine):
+                case _:
+                    pass
+        elif not held and not file_exists(free):
+            match write_file(free, ""):
+                case _:
+                    pass
+        os.sleep(0.001 * float(min(n, 20)))
+    return None
+
+fn cache_unlock(lock: Option[str]):
+    match lock:
+        case Some(mine):
+            match project.parent(mine):
+                case Some(ld):
+                    match os.rename(mine, project.join(ld, "free")):
+                        case _:
+                            pass
+                case None:
+                    pass
+        case None:
+            pass
+
 fn log_lines(dir: str, lines: [str]):
+    if len(lines) == 0:
+        return
     match make_dirs(dir):
         case _:
             pass
+    let lock = cache_lock(dir)
     match os.append_bytes(project.join(dir, CACHE_LOG), ("\n".join(lines) + "\n").bytes()):
         case _:
             pass
+    cache_unlock(lock)
 
-# Before a build: its entries are in use, so a prune doesn't take them.
+fn now_mark() -> str:
+    return f"{int(clock())}"
+
+# Before a build: pin its entries, so a prune doesn't take them.
 # (objects only once they exist: a native build has none)
 fn cache_start(dir: str, exe: str):
     var lines: [str] = []
     for e in cache_entries(dir, exe):
         if not e.starts_with("obj-") or os.is_dir(project.join(dir, e)):
-            lines.push(e + " -")
-    if len(lines) > 0:
-        log_lines(dir, lines)
+            lines.push(f"{e} - {now_mark()} {os.pid()}")
+    log_lines(dir, lines)
 
-# After a build: record the sizes of its entries, then prune if needed.
+# Once a build is done with them (its program has started, or `build` wrote
+# it): record the sizes of its entries, which unpins them, then prune if needed.
 fn cache_done(dir: str, exe: str):
     var lines: [str] = []
     let mine = cache_entries(dir, exe)
     for e in mine:
         let p = project.join(dir, e)
         if os.is_dir(p):
-            lines.push(f"{e} {tree_size(p)}")
-    if len(lines) > 0:
-        log_lines(dir, lines)
+            lines.push(f"{e} {tree_size(p)} {now_mark()} {os.pid()}")
+    log_lines(dir, lines)
     prune_cache(dir, mine, cache_cap())
 
+# The bytes the entries `dir`'s log lists hold, by their latest sizes (what
+# pruning counts; what an older brine left isn't listed).
+fn cache_used(dir: str) -> int:
+    var size: {str: int} = {}
+    for l in read_file(project.join(dir, CACHE_LOG)).unwrap_or("").lines():
+        let parts = l.split(" ")
+        if len(parts) >= 2 and parts[0] != "#":
+            match parts[1].to_int():
+                case Some(n):
+                    size[parts[0]] = n
+                case None:
+                    pass
+    var total = 0
+    for _, n in size.items():
+        total += n
+    return total
+
+# `1.5 GiB`, `300 MiB`, `12 KiB`, `80 bytes`
+fn human_size(n: int) -> str:
+    for unit, name in [(1 << 40, "TiB"), (1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")]:
+        if n >= unit:
+            let tenths = n / (unit / 10)
+            return (
+                f"{tenths / 10} {name}"
+                if tenths % 10 == 0
+                else f"{tenths / 10}.{tenths % 10} {name}"
+            )
+    return f"{n} bytes"
+
 # The log is a header line `# <n>` (the entries when it was last rewritten)
-# then `<entry> <bytes or ->` lines, oldest first.
+# then `<entry> <bytes or -> <t>` lines, oldest first (an older brine wrote
+# no `<t>`).
 fn prune_cache(dir: str, mine: [str], cap: int):
     let log = project.join(dir, CACHE_LOG)
+    if not file_exists(log):
+        return
+    let lock = cache_lock(dir)
+    if lock.is_none():
+        return
+    prune_locked(dir, log, mine, cap)
+    cache_unlock(lock)
+
+fn prune_locked(dir: str, log: str, mine: [str], cap: int):
     var text = ""
     match read_file(log):
         case Ok(t):
@@ -1322,28 +1531,47 @@ fn prune_cache(dir: str, mine: [str], cap: int):
     var base = 0
     if len(ls) > 0 and ls[0].starts_with("# "):
         base = ls[0][2:].to_int().unwrap_or(0)
-    # newest first: each entry's latest size, and whether a build is still
-    # using it (its latest line is `-`, and recent)
+    let now = clock()
+    # newest first: each entry's latest size, and the pins on it that are
+    # still held: no later line of the same brine released them, and recent
     var order: [str] = []
     var size: {str: int} = {}
-    var busy: {str: bool} = {}
+    var since: {str: str} = {}
+    var pins: {str: [str]} = {}
+    # (entry, owner) pairs that a later line released
+    var released: {str: bool} = {}
     var i = len(ls) - 1
     while i >= 0:
-        let parts = ls[i].split(" ")
+        let line = ls[i]
+        let parts = line.split(" ")
         i -= 1
-        if len(parts) != 2 or parts[0] == "#" or ".." in parts[0]:
+        if len(parts) < 2 or len(parts) > 4 or parts[0] == "#" or ".." in parts[0]:
             continue
         let name = parts[0]
-        let first = name not in busy
+        let first = name not in pins
         if first:
             order.push(name)
-            busy[name] = parts[1] == "-" and i >= len(ls) - 1 - 2 * CACHE_SLACK
-        if name not in size:
-            match parts[1].to_int():
-                case Some(n):
-                    size[name] = n
-                case None:
-                    pass
+            pins[name] = []
+        let owner = parts[3] if len(parts) == 4 else ""
+        if parts[1] != "-":
+            if name not in size:
+                match parts[1].to_int():
+                    case Some(n):
+                        size[name] = n
+                        if len(parts) >= 3:
+                            since[name] = parts[2]
+                    case None:
+                        pass
+            released[f"{name} {owner}"] = true
+        elif len(parts) == 2:
+            # an older brine's mark: it counts while it is the latest, and recent
+            if first and i >= len(ls) - 1 - 2 * CACHE_SLACK:
+                pins[name].push(line)
+        elif f"{name} {owner}" not in released:
+            let age = now - float(parts[2].to_int().unwrap_or(0))
+            if -1.0 <= age <= PIN_MAX:
+                pins[name].push(line)
+            released[f"{name} {owner}"] = true
     var total = 0
     for name in order:
         total += size.get(name).unwrap_or(0)
@@ -1356,7 +1584,7 @@ fn prune_cache(dir: str, mine: [str], cap: int):
     while over and j >= 0 and total > cap:
         let name = order[j]
         j -= 1
-        if busy[name] or name in mine:
+        if len(pins[name]) > 0 or name in mine:
             continue
         tree_clear(project.join(dir, name))
         total -= size.get(name).unwrap_or(0)
@@ -1369,14 +1597,19 @@ fn prune_cache(dir: str, mine: [str], cap: int):
         k -= 1
         if name in gone or not os.is_dir(project.join(dir, name)):
             continue
+        let t = " " + since[name] if name in since else ""
         match size.get(name):
             case Some(n):
-                out.push(f"{name} {n}")
+                out.push(f"{name} {n}{t}")
             case None:
                 pass
-        # (a build that is still using it keeps it)
-        if busy[name] or name not in size:
-            out.push(f"{name} -")
+        # (the builds that still pin it keep their pins, oldest first)
+        var q = len(pins[name]) - 1
+        while q >= 0:
+            out.push(pins[name][q])
+            q -= 1
+        if len(pins[name]) == 0 and name not in size:
+            out.push(f"{name} -{t}")
     out[0] = f"# {len(out) - 1}"
     let tmp = f"{log}.{os.pid()}.tmp"
     if write_file(tmp, "\n".join(out) + "\n").is_ok():

@@ -710,7 +710,8 @@ test "brine run --json reports a panic like a build error":
         let o = brine_env(["run", "--json", f, "-q", "--", "seq"], {"BRINE_BACKEND": backend})
         assert o.code == 101, o.all()
         let ls = [l for l in o.out.lines() if l.starts_with("{")]
-        assert len(ls) == 1, o.all()
+        # the panic, then how the program ended
+        assert len(ls) == 2 and ls[1] == "{\"exit\":101}", o.all()
         let j = ls[0]
         assert j.starts_with(
             "{\"severity\":\"error\",\"code\":null,\"message\":\"index 2 is out of bounds for an array of length 2\",\"spans\":[{\"file\":\"tests/programs/panic_chain.br\",\"line\":9,\"column\":12,"
@@ -2967,6 +2968,187 @@ test "the build cache stays under its size limit":
         e["BRINE_CACHE_SIZE"] = cap
         assert brine_env(["run", d + "/a.br", "-q"], e).code == 0
     assert programs(cache) == ["a", "c"], f"{programs(cache)}"
+
+# v091#3: a program is pinned while it is built and run, so another run's
+# pruning can't remove it first (a cap of 1 byte prunes after every build)
+test "concurrent runs don't remove each other's programs":
+    let d = os.abs_path(scratch("cache-race")).unwrap().replace("\\\\?\\", "")
+    for i in 0..4:
+        write(d + f"/p{i}.br", f"fn main():\n    print({i})\n")
+    let cache = d + "/brine-cache"
+    # natively: different programs; through C: one program, built by each run
+    for backend in ["native", "c"]:
+        let env = {
+            "TMP": d,
+            "TEMP": d,
+            "TMPDIR": d,
+            "NO_COLOR": "1",
+            "BRINE_CACHE_SIZE": "1",
+            "BRINE_BACKEND": backend
+        }
+        var runs: [(int, int)] = []
+        for k in 0..8:
+            let i = k % 4 if backend == "native" else 0
+            match os.spawn([brine_exe(), "run", d + f"/p{i}.br", "-q"], env, true, false):
+                case Ok(h):
+                    runs.push((h, i))
+                case Err(e):
+                    panic(e)
+        for h, i in runs:
+            let code = os.wait(h)
+            let (o, e) = os.output(h)
+            assert code == 0 and o.strip() == f"{i}", f"{backend} p{i}.br: {code}\n{o}{e}"
+    # and once they are done, pruning removes them
+    let o = brine_env(
+        ["run", d + "/p1.br", "-q"],
+        {"TMP": d, "TEMP": d, "TMPDIR": d, "BRINE_CACHE_SIZE": "1"}
+    )
+    assert o.code == 0 and programs(cache) == ["p1"], f"{programs(cache)}"
+    # an entry two builds pin stays until both are done with it
+    assert os.make_dir(cache + "/shared/dev").is_ok()
+    write(cache + "/shared/dev/s.exe", "x")
+    let now = int(clock())
+    let small = {"TMP": d, "TEMP": d, "TMPDIR": d, "BRINE_CACHE_SIZE": "1"}
+    for pins, p, want in [
+        (f"shared - {now} 1\nshared - {now} 2\nshared 1 {now} 1\n", "p2", ["p2", "s"]),
+        (f"shared 1 {now} 2\n", "p3", ["p3"])
+    ]:
+        match read_file(cache + "/uses.log"):
+            case Ok(log):
+                write(cache + "/uses.log", log + pins)
+            case Err(e):
+                panic(e)
+        let r = brine_env(["run", d + f"/{p}.br", "-q"], small)
+        assert r.code == 0 and programs(cache) == want, f"{programs(cache)}"
+
+# v091#5: `brine test` builds the files `check` does, and a run that can't
+# test anything is a mistake, not a pass
+test "brine test runs the tests it is given, and says when there are none":
+    let d = scratch("test-set")
+    assert os.make_dir(d + "/p/src").is_ok()
+    write(d + "/p/brine.toml", "[package]\nname = \"p\"\nversion = \"0.1.0\"\n")
+    write(
+        d + "/p/src/main.br",
+        "fn main():\n    print(\"hi\")\n\ntest \"in main\":\n    assert len(args()) == 0, f\"{args()}\"\n"
+    )
+    write(d + "/p/src/extra.br", "test \"not imported\":\n    assert len(args()) == 7\n")
+    let o = brine(["test", d + "/p"])
+    assert o.code == 1 and "running 2 tests in 2 files" in o.out, o.all()
+    assert "test in main ... ok" in o.out and "1 passed; 1 failed" in o.out, o.all()
+    assert brine(["test", d + "/p", "main"]).code == 0
+    let none = brine(["test", d + "/p", "nope"])
+    assert none.code == 2 and "no test name contains `nope`" in none.err, none.all()
+    let two = brine(["test", d + "/p", "main", "extra"])
+    assert two.code == 2 and "takes one name filter" in two.err, two.all()
+    assert os.make_dir(d + "/plain").is_ok()
+    let dir = brine(["test", d + "/plain"])
+    assert dir.code == 2 and "is a folder, not a brine project" in dir.err, dir.all()
+    # --json: a failed test is a diagnostic, and a summary ends every run
+    let j = brine(["test", "--json", d + "/p"])
+    assert "not imported` failed: assertion failed: len(args()) == 7\",\"spans\":[{" in j.out, j.out
+    assert "{\"tests\":2,\"files\":2,\"passed\":1,\"failed\":1,\"filtered_out\":0," in j.out, j.out
+    write(d + "/none.br", "fn main():\n    print(1)\n")
+    let z = brine(["test", "--json", d + "/none.br"])
+    assert z.code == 0 and z.out.starts_with("{\"tests\":0,\"files\":0,"), z.all()
+    let h = brine(["test", d + "/none.br"])
+    assert "no tests in `" in h.out and "add one with `test \"name\":`" in h.out, h.all()
+    let hf = brine(["test", d + "/none.br", "nope"])
+    assert hf.code == 2 and "no test name contains `nope`: no tests in `" in hf.err, hf.all()
+
+# v091#9: an exit code the system can't keep is a panic, not another number
+test "exit codes that don't fit are a panic":
+    let d = scratch("exit-range")
+    write(d + "/big.br", "fn main():\n    exit(99999999999)\n")
+    write(d + "/ret.br", "fn main() -> int:\n    return -5000000000\n")
+    for f in ["big", "ret"]:
+        for backend in ["native", "c"]:
+            let o = brine_env(["run", d + f"/{f}.br", "-q"], {"BRINE_BACKEND": backend})
+            assert (
+                o.code == 101 and "panic: exit code out of range" in o.err
+            ), f"{f} {backend}: {o.all()}"
+
+# v091#9, #22: flags and `--json`
+test "flags take values only where they have one, and --json is all JSON":
+    let d = scratch("flags")
+    write(d + "/ok.br", "fn main():\n    print(1)\n")
+    let o = brine(["build", d + "/ok.br", "-o", "--json"])
+    assert o.code == 2 and "`-o` needs a value, but `--json` follows it" in o.out, o.all()
+    assert not file_exists(exe("--json"))
+    let f = brine(["check", "--json=false", d + "/ok.br"])
+    assert f.code == 2 and "`--json` takes no value" in f.err, f.all()
+    # Git Bash hands Windows programs `nul` for /dev/null
+    for null in ["/dev/null", "nul"]:
+        assert brine(["build", d + "/ok.br", "-q", "-o", null]).code == 0
+        assert "nul.exe" not in os.list_dir(".").unwrap_or([])
+    for args in [["--version"], ["version"], ["guide"], ["emit-ir", d + "/ok.br"], ["doctor"]]:
+        var cmd = ["--json"]
+        cmd.extend(args)
+        let j = brine(cmd)
+        assert j.code == 0 and j.out != "", f"{args}: {j.all()}"
+        for l in j.out.strip().lines():
+            assert l.starts_with("{") and l.ends_with("}"), f"{args}: {l}"
+    assert "{\"check\":\"build cache\"" in brine(["--json", "doctor"]).out
+    # a program built again leaves nothing beside it
+    write(d + "/two.br", "fn main():\n    print(2)\n")
+    for src in ["ok", "two"]:
+        assert brine(["build", d + f"/{src}.br", "-q", "-o", exe(d + "/x")]).code == 0
+    assert exec([exe(d + "/x")], {}).out == "2\n"
+    assert [n for n in os.list_dir(d).unwrap_or([]) if n.ends_with(".old")] == []
+
+# v091#22, R3: how `main` failed is JSON too, then how the program ended
+test "run --json reports every ending as JSON":
+    let d = scratch("run-json")
+    write(d + "/err.br", "fn main() -> Result[int, str]:\n    return Err(\"it broke\")\n")
+    write(
+        d + "/oom.br",
+        "fn main():\n    let n = len(args()) + 1 << 50\n    var xs = [0] * n\n    xs[0] = 1\n    print(xs[0])\n"
+    )
+    write(d + "/four.br", "fn main():\n    print(\"four\")\n    exit(4)\n")
+    for backend in ["native", "c"]:
+        let env = {"BRINE_BACKEND": backend}
+        let e = brine_env(["run", "--json", d + "/err.br", "-q"], env)
+        assert e.code == 1 and e.out.ends_with("{\"exit\":1}\n"), e.all()
+        assert e.out.starts_with(
+            "{\"severity\":\"error\",\"code\":null,\"message\":\"`main` returned an error: it broke\""
+        ), e.all()
+        let m = brine_env(["run", "--json", d + "/oom.br", "-q"], env)
+        assert m.code == 101 and m.out.ends_with("{\"exit\":101}\n"), m.all()
+        assert m.out.starts_with(
+            "{\"severity\":\"error\",\"code\":null,\"message\":\"out of memory: "
+        ), m.all()
+        let x = brine_env(["run", "--json", d + "/four.br", "-q"], env)
+        assert x.code == 4 and x.out == "four\n{\"exit\":4}\n", x.all()
+
+# v091#17, #22: where reading fails, and why
+test "reading a folder, or a file that isn't UTF-8, says what is wrong":
+    let d = scratch("read-why")
+    assert os.make_dir(d + "/sub").is_ok()
+    let show = "        case Ok(_):\n            print(\"read\")\n        case Err(e):\n            print(e)\n"
+    write(
+        d + "/main.br",
+        "fn main():\n    let p = args()[0]\n    match read_file(p):\n"
+        + show
+        + "    match os.read_bytes(p):\n"
+        + show
+    )
+    let why = f"cannot read {d}/sub: it is a directory, not a file\n"
+    for backend in ["native", "c"]:
+        let o = brine_env(
+            ["run", d + "/main.br", "-q", "--", d + "/sub"],
+            {"BRINE_BACKEND": backend}
+        )
+        assert o.code == 0 and o.out == why + why, f"{backend}: {o.all()}"
+    # `fmt` on a folder names the byte, and still checks the other files
+    assert os.make_dir(d + "/fmt").is_ok()
+    write(d + "/fmt/good.br", "fn main():\n    print(1)\n")
+    let bytes: [u8] = [
+        102, 110, 32, 109, 97, 105, 110, 40, 41, 58, 10, 32, 32, 32, 32, 112, 40, 34, 233, 34, 41,
+        10
+    ]
+    assert os.write_bytes(d + "/fmt/bad.br", bytes).is_ok()
+    let f = brine(["fmt", "--check", d + "/fmt"])
+    assert f.code != 0 and "not valid UTF-8 text, at line 2, column 8 (byte 0xe9)" in f.err, f.all()
+    assert "2 files checked" in f.err, f.all()
 
 # v09 §8: one JSON shape for every error, and every command says what it did
 test "--json errors have one shape":

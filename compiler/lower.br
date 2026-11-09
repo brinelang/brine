@@ -990,6 +990,10 @@ struct Lower:
             case Some(id):
                 let sig = self.info.fns[id]
                 let sym = self.info.fns[id].c_name
+                var main_span = Span(file=0, lo=0, hi=0)
+                for f in self.prog.modules[self.prog.main_module].fns:
+                    if f.id == id:
+                        main_span = f.name_span
                 if sig.ret == Ty.Unit:
                     self.cx.fb.call_void(sym, [])
                     code = self.cx.fb.konst(K.I32, 0)
@@ -1016,6 +1020,7 @@ struct Lower:
                                 let after_ok = self.cx.fb.label()
                                 self.cx.fb.br(is_err, after_ok)
                                 let n = self.ld(r, self.vfield_off(eid, ok_v, 0), ok)
+                                self.exit_range(self.cx.fb.conv(K.I64, n), main_span)
                                 let n32 = self.cx.fb.conv(K.I32, n)
                                 self.cx.fb.mov(code, n32)
                                 self.cx.fb.place(after_ok)
@@ -1025,13 +1030,14 @@ struct Lower:
                             self.sb_lit(sb, "error: ")
                             let fv = self.ld(r, self.vfield_off(eid, err_v, 0), err)
                             self.fmt_code(sb, fv, err, false)
-                            self.cx.fb.call_void("brine_eprint_sb", [sb])
+                            self.cx.fb.call_void("brine_main_err", [sb])
                             let one = self.cx.fb.konst(K.I32, 1)
                             self.cx.fb.mov(code, one)
                             self.cx.fb.place(skip)
                             self.release(r, sig.ret)
                         case _:
                             let c64 = self.cx.fb.call(K.I64, sym, [])
+                            self.exit_range(c64, main_span)
                             code = self.cx.fb.conv(K.I32, c64)
             case None:
                 code = self.cx.fb.konst(K.I32, 0)
@@ -1039,7 +1045,8 @@ struct Lower:
 
     fn gen_tests(ref self):
         let prog = self.prog
-        var tests: [(str, str)] = []
+        # (function, name, module)
+        var tests: [(str, str, str)] = []
         for m in prog.modules:
             let mm = mangle_module(m.name)
             for ti, t in enumerate(m.tests):
@@ -1050,7 +1057,7 @@ struct Lower:
                 self.gen_body(t, c, true)
                 let prefix = "" if m.name == prog.modules[prog.main_module].name else m.name + ": "
                 let name = prefix + t.test_name.unwrap_or("")
-                tests.push((c, name))
+                tests.push((c, name, m.name))
         self.fnd = None
         self.gen_streq()
         let saved = self.start_main()
@@ -1065,7 +1072,7 @@ struct Lower:
         let null = self.cx.fb.konst(K.Ptr, 0)
         let one64 = self.cx.fb.konst(K.I64, 1)
         let two64 = self.cx.fb.konst(K.I64, 2)
-        # --list
+        # --list: `<k>\t<module>\t<name>` lines
         let a1 = self.cx.fb.call(K.Ptr, "brine_arg", [one64])
         let has1 = self.cx.fb.cmp(Op.Ne, a1, null)
         self.cx.fb.brnot(has1, not_list)
@@ -1076,6 +1083,8 @@ struct Lower:
             let sb = self.sb_new()
             let iv = self.cx.fb.konst(K.I64, i)
             self.cx.fb.call_void("brine_sb_i64", [sb, iv])
+            self.sb_lit(sb, "\t")
+            self.sb_lit(sb, t.2)
             self.sb_lit(sb, "\t")
             self.sb_lit(sb, t.1)
             self.cx.fb.call_void("brine_print_sb", [sb])
@@ -1090,6 +1099,8 @@ struct Lower:
         let is_run = self.cx.fb.call(K.Bool, "br_streq", [a1b, rs])
         self.cx.fb.brnot(is_run, not_run)
         let k = self.cx.fb.call(K.I64, "br_atoi", [a2])
+        # `args()` in the test is the test's, not `--run k`
+        self.cx.fb.call_void("brine_drop_args", [two64])
         for i, t in enumerate(tests):
             let iv = self.cx.fb.konst(K.I64, i)
             let hit = self.cx.fb.cmp(Op.Eq, k, iv)
@@ -6427,6 +6438,7 @@ struct Lower:
             case Builtin.Exit:
                 let code0 = self.expr(args[0].expr)
                 let v = self.cx.fb.conv(K.I64, code0)
+                self.exit_range(v, e.span)
                 self.cx.fb.call_void("brine_exit", [v])
                 return self.unit()
             case Builtin.Panic:
@@ -7084,6 +7096,23 @@ struct Lower:
         self.cx.fb.rt(k, sym, args)
         self.cx.fb.unreachable()
         self.cx.fb.place(fast)
+
+    # An exit code (i64 `v`) the system would cut to 32 bits (Unix: 8) stops
+    # the program saying so, rather than exiting with what is left. `exit` and
+    # the end of `main` end a path for the verifier, so this is no new way to stop.
+    fn exit_range(ref self, v: int, span: Span):
+        let lo = self.cx.fb.konst(K.I64, -2147483648)
+        let hi = self.cx.fb.konst(K.I64, 4294967295)
+        let below = self.cx.fb.cmp(Op.Lt, v, lo)
+        let above = self.cx.fb.cmp(Op.Gt, v, hi)
+        let fits = self.cx.fb.label()
+        let bad = self.cx.fb.label()
+        self.cx.fb.br(below, bad)
+        self.cx.fb.brnot(above, fits)
+        self.cx.fb.place(bad)
+        let why = "exit code out of range: it must fit in 32 bits, and only 0 to 255 mean the same on every system"
+        self.panic_at(span, why)
+        self.cx.fb.place(fits)
 
     fn panic_at(ref self, span: Span, msg: str):
         let loc = self.loc(span)

@@ -704,6 +704,8 @@ double brine_clock(void);
 brine_arr *brine_args(void);
 /* argv[i] of `main` (NULL past the end), for the test runner */
 const char *brine_arg(int64_t i);
+void brine_drop_args(int64_t n);
+void brine_main_err(brine_sb *sb);
 /* files and processes: false means failure, with the message in the out string */
 bool brine_read_file(brine_str *path, brine_str **out);
 bool brine_write_file(brine_str *path, brine_str *text, brine_str **err);

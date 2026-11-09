@@ -232,6 +232,13 @@ fn out_text(s: str):
     elif s != "":
         print(s)
 
+# Text a command prints, or with `--json` one object `{"<key>": "<text>"}`.
+fn text_or_json(g: G, key: str, s: str):
+    if g.json:
+        print("{" + json_str(key) + ":" + json_str(s) + "}")
+    else:
+        out_text(s)
+
 fn err_text(s: str):
     if s.ends_with("\n"):
         eprint(s[:len(s) - 1])
@@ -349,7 +356,9 @@ struct Args:
         let global = ["--json", "--color", "-q", "--quiet"]
         for kv in self.flags:
             let k = kv.0
-            if k not in allowed and k not in global:
+            if k in allowed or k in global:
+                no_value(k, kv.1)?
+            else:
                 var all = allowed
                 all.extend(global)
                 var hint = ""
@@ -361,8 +370,23 @@ struct Args:
                 return Err(f"unknown option `{k}`{hint}")
         return Ok(())
 
+# The options that take a value (`-o out`, `--target=wasm`).
+const VALUE_FLAGS = ["--ranks", "--threads", "-o", "--color", "--target", "--timeout", "--base"]
+
+# An option that is on or off has no value: `--json=false` would turn it on.
+fn no_value(k: str, v: Option[str]) -> Result[(), str]:
+    match v:
+        case Some(x):
+            if k not in VALUE_FLAGS:
+                return Err(
+                    f"`{k}` takes no value (`{k}={x}`): write `{k}` to turn it on, or leave it out"
+                )
+        case None:
+            pass
+    return Ok(())
+
 fn parse_args(raw: [str]) -> Result[Args, str]:
-    let value_flags = ["--ranks", "--threads", "-o", "--color", "--target", "--timeout", "--base"]
+    let value_flags = VALUE_FLAGS
     var a = Args(pos=[], flags=[], rest=[])
     var i = 0
     while i < len(raw):
@@ -378,6 +402,10 @@ fn parse_args(raw: [str]) -> Result[Args, str]:
                     if s in value_flags:
                         if i + 1 >= len(raw):
                             return Err(f"`{s}` needs a value")
+                        # `-o --json` is a forgotten value, not a file named `--json`
+                        let v = raw[i + 1]
+                        if v.starts_with("-") and len(v) > 1 and v != "--":
+                            return Err(f"`{s}` needs a value, but `{v}` follows it")
                         a.flags.push((s, Some(raw[i + 1])))
                         i += 1
                     else:
@@ -394,12 +422,23 @@ fn main() -> int:
         case None:
             pass
     var a = Args(pos=[], flags=[], rest=[])
-    match parse_args(args()):
+    let raw = args()
+    var bad = ""
+    match parse_args(raw):
         case Ok(x):
             a = x
+            for f in ["--json", "-q", "--quiet"]:
+                match no_value(f, a.val(f)):
+                    case Err(e):
+                        bad = e
+                    case Ok(_):
+                        pass
         case Err(e):
-            eprint(f"error: {e}")
-            return 2
+            bad = e
+    if bad != "":
+        let jg = G(json="--json" in raw, color=false, quiet=false)
+        jg.error(bad)
+        return 2
     var color = false
     match a.val("--color"):
         case Some("always"):
@@ -413,9 +452,12 @@ fn main() -> int:
     let g = G(json=a.has("--json"), color=color, quiet=a.has("-q") or a.has("--quiet"))
     if len(a.pos) == 0:
         if a.has("--version") or a.has("-V"):
-            print(f"brine {VERSION}")
+            if g.json:
+                print("{\"version\":" + json_str(VERSION) + "}")
+            else:
+                print(f"brine {VERSION}")
         else:
-            out_text(help_text())
+            text_or_json(g, "help", help_text())
         return 0
     let cmd = a.pos[0]
     let rest = Args(pos=a.pos[1:], flags=a.flags, rest=a.rest)
@@ -426,12 +468,12 @@ fn main() -> int:
     if about != "":
         match usage(about):
             case Some(u):
-                out_text(u)
+                text_or_json(g, "help", u)
                 return 0
             case None:
                 match hidden_usage(about):
                     case Some(u):
-                        print(u)
+                        text_or_json(g, "help", u)
                         return 0
                     case None:
                         pass
@@ -462,7 +504,7 @@ fn main() -> int:
     elif cmd == "explain":
         r = explain.explain_cmd(first_pos(rest), g.json)
     elif cmd == "guide":
-        out_text(GUIDE)
+        text_or_json(g, "guide", GUIDE)
     elif cmd == "doctor":
         r = cmd_doctor(g)
     elif cmd == "lex":
@@ -479,7 +521,7 @@ fn main() -> int:
         else:
             print(f"brine {VERSION}")
     elif cmd == "help" or cmd == "--help" or cmd == "-h":
-        out_text(help_text())
+        text_or_json(g, "help", help_text())
     else:
         let cmds = [
             "new",
@@ -682,7 +724,8 @@ fn build(
     plat: Platform
 ) -> Result[Option[str], str]:
     let t0 = clock()
-    let fe = driver.frontend(
+    # the tests of a project are in all its files, as `check` sees them
+    let fe = driver.frontend_at(
         t.entry,
         FrontOpts(
             verify=true,
@@ -691,7 +734,8 @@ fn build(
             typed=t.typed,
             proven=t.proven,
             strict_rules=driver.strict_rules(profile == Profile.Release)
-        )
+        ),
+        whole_project(t) if tests else driver.on_disk()
     )
     g.diags(fe)
     if fe.has_errors():
@@ -717,10 +761,13 @@ fn build(
                 pass
         write_file(cp, driver.gen_c(fe, profile, tests, plat))?
         g.status("Wrote", display_path(cp))
+    # its cache entries stay pinned until the caller has started the program
+    # (`release`): a prune in between would delete it (v091#3)
     let cache = t.cache_dir()
     driver.cache_start(cache, exe)
     let built = driver.compile(code, exe, cache, profile, plat)
-    driver.cache_done(cache, exe)
+    if built.is_err():
+        driver.cache_done(cache, exe)
     match built:
         case Ok(ran):
             if ran or not tests:
@@ -742,6 +789,10 @@ fn build(
         case Err(d):
             g.diag_list([d], fe.sm)
             return Ok(None)
+
+# Unpins what `build` made, once its program has started, and prunes the cache.
+fn release(t: Target, exe: str):
+    driver.cache_done(t.cache_dir(), exe)
 
 # ================================================================ commands
 
@@ -784,19 +835,29 @@ fn cmd_build(g: G, a: Args) -> Result[int, str]:
     let plat = platform_of(a)?
     let t = resolve(g, first_pos(a))?.typed_if(a)
     var out: Option[str] = None
+    # `-o /dev/null` (Git Bash hands Windows programs `nul`): build, keep nothing
+    var discard = false
     match a.val("-o"):
         case Some(o):
             var p = o
             let n = project.file_name(p).unwrap_or("")
-            if driver.file_stem(p) == n and project.is_windows() and plat == Platform.Host:
+            if o.lower() in ["/dev/null", "nul", "nul:", "\\\\.\\nul"]:
+                discard = true
+            elif driver.file_stem(p) == n and project.is_windows() and plat == Platform.Host:
                 p = p + ".exe"
-            out = Some(p)
+            if not discard:
+                out = Some(p)
         case None:
             # single files build next to where you are, like a C compiler would
             if t.root.is_none():
                 out = Some(driver.out_file(t.name, plat))
     match build(g, t, profile_of(a), false, out, a.has("--emit-c"), plat)?:
         case Some(exe):
+            release(t, exe)
+            if discard:
+                if g.json:
+                    print("{\"built\":null}")
+                return Ok(0)
             if g.json:
                 print("{\"built\":" + json_str(display_path(exe)) + "}")
             else:
@@ -845,14 +906,23 @@ fn spawn_env(threads: Option[str]) -> {str: str}:
             pass
     return env
 
+# Why `path` didn't start (as `what`): when it is gone, say that it is.
+fn start_error(what: str, path: str, e: str) -> str:
+    if ("/" in path or "\\" in path) and not file_exists(path):
+        return f"could not start {what}: `{path}` does not exist"
+    return f"could not start {what}: {e}"
+
 # `launch` is the program (or the WebAssembly runner and the module).
 # `panics`, if not "": where a rank writes its panic (`panic_file`).
+# Once it has started, `t`'s cache entries for `exe` are released.
 fn run_exe(
     launch: [str],
     argv: [str],
     threads: Option[str],
     ranks: int,
-    panics: str
+    panics: str,
+    t: Target,
+    exe: str
 ) -> Result[int, str]:
     var cmd = launch
     cmd.extend(argv)
@@ -860,11 +930,13 @@ fn run_exe(
         var env = spawn_env(threads)
         if panics != "":
             env["BRINE_PANIC_FILE"] = panic_file(panics, 0, 1)
-        match os.spawn(cmd, env, false, true):
+        let sp = os.spawn(cmd, env, false, true)
+        release(t, exe)
+        match sp:
             case Ok(p):
                 return Ok(os.wait(p))
             case Err(e):
-                return Err("could not start " + launch[0] + ": " + e)
+                return Err(start_error(launch[0], launch[0], e))
     # the ranks share the machine: by default, each gets its share of the cores
     var th = threads
     if th.is_none() and getenv("BRINE_THREADS").is_none():
@@ -874,6 +946,7 @@ fn run_exe(
         case Ok(ps):
             ports = ps
         case Err(e):
+            release(t, exe)
             return Err(f"cannot reserve local ports: {e}")
     let peers = ",".join([f"127.0.0.1:{p}" for p in ports])
     # a rank that calls `exit` with an error code waits there for the others,
@@ -898,7 +971,9 @@ fn run_exe(
                 for k in kids:
                     os.kill(k)
                     os.wait(k)
-                return Err(f"could not start rank {r}: {e}")
+                release(t, exe)
+                return Err(start_error(f"rank {r} ({launch[0]})", launch[0], e))
+    release(t, exe)
     var codes: [Option[int]] = [None] * ranks
     # the first rank that failed: usually the cause, the others only lost it
     var first = -1
@@ -920,8 +995,8 @@ fn run_exe(
                         # (every 50 ms)
                         if first < 0 and tick % 10 == 0:
                             match read_file(f"{exits}.{i}"):
-                                case Ok(t):
-                                    match parse_int(t.strip()):
+                                case Ok(text):
+                                    match parse_int(text.strip()):
                                         case Some(c):
                                             if c != 0:
                                                 first = i
@@ -998,7 +1073,12 @@ fn cmd_run(g: G, a: Args) -> Result[int, str]:
             return Ok(1)
     var launch = [exe]
     if plat.is_wasm():
-        launch = driver.wasm_command(exe, t.cache_dir())?
+        match driver.wasm_command(exe, t.cache_dir()):
+            case Ok(l):
+                launch = l
+            case Err(e):
+                release(t, exe)
+                return Err(e)
     var argv = a.pos[1:] if len(a.pos) > 0 else []
     argv.extend(a.rest)
     if not g.quiet and not g.json:
@@ -1007,11 +1087,8 @@ fn cmd_run(g: G, a: Args) -> Result[int, str]:
         let verb = "Running"
         eprint(f"{c.bold()}{c.green()}{verb:>10}{c.reset()} {display_path(exe)}{extra}")
     # with --json, a panic is reported as a diagnostic too
-    var panics = ""
-    if g.json and not plat.is_wasm():
-        # (the build made the cache folder)
-        panics = project.join(t.cache_dir(), f"panic-{os.pid()}")
-    let code = run_exe(launch, argv, a.val("--threads"), ranks, panics)?
+    let panics = panic_base(t) if g.json and not plat.is_wasm() else ""
+    let code = run_exe(launch, argv, a.val("--threads"), ranks, panics, t, exe)?
     if panics != "":
         for r in 0..ranks:
             let f = panic_file(panics, r, ranks)
@@ -1029,6 +1106,9 @@ fn cmd_run(g: G, a: Args) -> Result[int, str]:
             g.error(f"the program crashed ({why})")
         case None:
             pass
+    # the last line: how the program ended, as `brine` exits
+    if g.json:
+        print(f"{{\"exit\":{exit_status(code)}}}")
     return Ok(code)
 
 fn panic_file(base: str, rank: int, ranks: int) -> str:
@@ -1100,6 +1180,7 @@ fn cmd_debug(g: G, a: Args) -> Result[int, str]:
         case Some(d):
             dbg = d
         case None:
+            release(t, exe)
             return Err(
                 "no debugger found (install gdb or lldb); the debug build is at " + display_path(
                     exe
@@ -1124,10 +1205,14 @@ fn cmd_debug(g: G, a: Args) -> Result[int, str]:
         let avoid = "settings set target.process.thread.step-avoid-regexp ^(brine_|br_)"
         cmd.extend(["-O", avoid, "-O", "breakpoint set -n panic_stop", "--", exe])
     cmd.extend(a.rest)
-    match os.spawn(cmd, {}, false, true):
+    let sp = os.spawn(cmd, {}, false, true)
+    match sp:
         case Ok(p):
-            return Ok(os.wait(p))
+            let code = os.wait(p)
+            release(t, exe)
+            return Ok(code)
         case Err(e):
+            release(t, exe)
             return Err(e)
 
 fn cmd_spec_diff(g: G, a: Args) -> Result[int, str]:
@@ -1271,6 +1356,22 @@ fn module_paths(dir: str, prefix: [str], ref out: [[str]]):
         else:
             module_paths(p, path, ref out)
 
+# A project's files, imported or not: its main file and every file next to it
+# and below, which `check` and `test` cover (v091#5). Only what the main file
+# imports for a lone file.
+fn whole_project(t: Target) -> driver.Source:
+    var at = driver.on_disk()
+    if t.root.is_none():
+        return at
+    var paths: [[str]] = []
+    module_paths(driver.dir_of(t.entry), [], ref paths)
+    let main_name = driver.file_stem(t.entry)
+    for p in paths:
+        if p == [main_name] or p == [rules.MODULE] or p[0] == rules.VOCAB:
+            continue
+        at.also.push(p)
+    return at
+
 fn cmd_check(g: G, a: Args) -> Result[int, str]:
     a.check_flags(["--report", "--typed", "--proven"])?
     let t = resolve(g, first_pos(a))?.typed_if(a)
@@ -1279,15 +1380,7 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
     # file next to it and below is checked, imported or not. A lone file may
     # be a module, but a `main` it has must be able to start a program.
     let whole = t.root.is_some()
-    var at = driver.on_disk()
-    if whole:
-        var paths: [[str]] = []
-        module_paths(driver.dir_of(t.entry), [], ref paths)
-        let main_name = driver.file_stem(t.entry)
-        for p in paths:
-            if p == [main_name] or p == [rules.MODULE] or p[0] == rules.VOCAB:
-                continue
-            at.also.push(p)
+    let at = whole_project(t)
     let fe = driver.frontend_at(
         t.entry,
         FrontOpts(
@@ -1349,6 +1442,9 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
                     + json_str(what)
                     + ",\"location\":"
                     + json_str(loc)
+                    + ",\"spans\":["
+                    + diag.span_entry(fe.sm, span, what, true)
+                    + "]"
                     + ",\"code\":"
                     + json_str(src)
                     + ",\"status\":"
@@ -1486,7 +1582,7 @@ fn cmd_rules(g: G, a: Args) -> Result[int, str]:
         case Some(rl):
             let base = rules_base(dir, a.val("--base"))?
             if a.has("--receipt"):
-                out_text(receipt(fe, rl, base))
+                text_or_json(g, "receipt", receipt(fe, rl, base))
                 return Ok(0 if rules_done(fe) else 1)
             return Ok(rules_report(g, fe, rl, base))
         case None:
@@ -1580,6 +1676,9 @@ fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.E
                 + json_str(r.approval)
                 + ",\"location\":"
                 + json_str(fe.sm.loc(r.head))
+                + ",\"spans\":["
+                + diag.span_entry(fe.sm, r.head, "the rule", true)
+                + "]"
                 + f",\"covers\":{len(r.covers)}"
                 + ",\"problems\":["
                 + ",".join(ds)
@@ -1865,15 +1964,28 @@ fn cmd_test(g: G, a: Args) -> Result[int, str]:
             pass
     # `brine test foo.br [filter]` or `brine test [filter]` inside a project
     var file: Option[str] = None
-    var filter: Option[str] = None
+    var filters = a.pos
     if len(a.pos) > 0:
         let f = a.pos[0]
         if f.ends_with(".br") or os.is_dir(f):
             file = Some(f)
-            if len(a.pos) > 1:
-                filter = Some(a.pos[1])
-        else:
-            filter = Some(f)
+            filters = a.pos[1:]
+            # a folder that is neither a project nor holds a main.br: `brine
+            # test tests` would otherwise test the project around it
+            if (
+                os.is_dir(f)
+                and not file_exists(project.join(f, "brine.toml"))
+                and not os.is_file(project.join(f, "main.br"))
+            ):
+                return Err(
+                    f"`{f}` is a folder, not a brine project (no brine.toml or main.br in it): `brine test` takes a project, a .br file, or a test name filter"
+                )
+    if len(filters) > 1:
+        let shown = ", ".join([f"`{x}`" for x in filters])
+        return Err(
+            f"`brine test` takes one name filter, but got {len(filters)}: {shown} (run it once per filter, or use a part of the name they share)"
+        )
+    let filter: Option[str] = Some(filters[0]) if len(filters) == 1 else None
     let t = resolve(g, file)?.typed_if(a)
     let profile = Profile.Release if a.has("--release") else Profile.Dev
     var exe = ""
@@ -1882,41 +1994,126 @@ fn cmd_test(g: G, a: Args) -> Result[int, str]:
             exe = x
         case None:
             return Ok(1)
-    var launch = [exe]
-    if plat.is_wasm():
-        launch = driver.wasm_command(exe, t.cache_dir())?
-    var lp = 0
+    let r = run_tests(g, t, exe, plat, filter, timeout)
+    release(t, exe)
+    return r
+
+# Where a run's panic record goes (with --json), or "" if there's nowhere to
+# put it: a project's cache folder only exists once something was cached.
+fn panic_base(t: Target) -> str:
+    match driver.make_dirs(t.cache_dir()):
+        case Ok(_):
+            return project.join(t.cache_dir(), f"panic-{os.pid()}")
+        case Err(_):
+            return ""
+
+# (index, module, name) of each test in a test executable, by `--list`.
+fn list_tests(launch: [str]) -> Result[[(str, str, str)], str]:
     var list_cmd = launch
     list_cmd.push("--list")
+    var lp = 0
     match os.spawn(list_cmd, {}, true, false):
         case Ok(p):
             lp = p
         case Err(e):
-            return Err(e)
+            return Err(start_error(launch[0], launch[0], e))
     let lrc = os.wait(lp)
     let (list, lerr) = os.output(lp)
     # (a WebAssembly runner can fail before the program starts)
     if lrc != 0:
         return Err(f"could not list the tests (exit code {lrc}):\n{lerr}{list}".strip())
-    var tests: [(str, str)] = []
+    var tests: [(str, str, str)] = []
     for l in list.lines():
-        match l.find("\t"):
-            case Some(i):
-                let name = l[i + 1:]
-                var keep = true
-                match filter:
-                    case Some(fl):
-                        keep = fl in name
-                    case None:
-                        pass
-                if keep:
-                    tests.push((l[:i], name))
+        let parts = l.split("\t")
+        if len(parts) >= 3:
+            tests.push((parts[0], parts[1], "\t".join(parts[2:])))
+    return Ok(tests)
+
+# Why a run found no test, when there are none at all: in which files it
+# looked, and the .br files next to a lone file that have tests but that it
+# doesn't import (so they weren't built).
+fn no_tests_hint(t: Target) -> str:
+    let how = "add one with `test \"name\":`"
+    match t.root:
+        case Some(_):
+            let n = len(whole_project(t).also) + 1
+            return f"no tests in the {n} file{plural(n)} of `{t.name}`; {how} in any of them"
+        case None:
+            pass
+    let others = untested_neighbors(t, {})
+    let me = display_path(t.entry)
+    if len(others) == 1:
+        let o = display_path(others[0])
+        return f"no tests in `{me}` or the modules it imports; `{o}` has tests, but `{me}` doesn't import it: `brine test {o}` runs them"
+    if len(others) > 1:
+        let list = ", ".join([f"`{display_path(o)}`" for o in others])
+        return f"no tests in `{me}` or the modules it imports; {list} have tests, but `{me}` doesn't import them: run `brine test <file>` for each"
+    return f"no tests in `{me}` or the modules it imports; {how}"
+
+# The .br files next to a lone file that look like they have tests and that
+# its build didn't include (`have`: the modules it has tests from).
+fn untested_neighbors(t: Target, have: {str: bool}) -> [str]:
+    var out: [str] = []
+    let dir = driver.dir_of(t.entry)
+    let d = dir if dir != "" else "."
+    for name in os.list_dir(d).unwrap_or([]):
+        let p = project.join(dir, name) if dir != "" else name
+        let stem = driver.file_stem(name)
+        if not name.ends_with(".br") or stem == driver.file_stem(t.entry) or stem in have:
+            continue
+        match read_file(p):
+            case Ok(text):
+                if any(l.starts_with("test \"") for l in text.lines()):
+                    out.push(p)
+            case Err(_):
+                pass
+    return out
+
+fn run_tests(
+    g: G,
+    t: Target,
+    exe: str,
+    plat: Platform,
+    filter: Option[str],
+    timeout: int
+) -> Result[int, str]:
+    var launch = [exe]
+    if plat.is_wasm():
+        launch = driver.wasm_command(exe, t.cache_dir())?
+    let listed = list_tests(launch)?
+    var tests: [(str, str)] = []
+    var modules: {str: bool} = {}
+    for idx, m, name in listed:
+        match filter:
+            case Some(fl):
+                if fl not in name:
+                    continue
             case None:
                 pass
+        tests.push((idx, name))
+        modules[m] = true
+    let n = len(tests)
+    let files = len(modules)
+    # a filter that matches nothing ran nothing: that is a mistake, not a pass
+    match filter:
+        case Some(fl):
+            if n == 0 and len(listed) == 0:
+                return Err(f"no test name contains `{fl}`: {no_tests_hint(t)}")
+            if n == 0:
+                let names = ", ".join([f"`{x.2}`" for x in listed[:min(5, len(listed))]])
+                let more = f", and {len(listed) - 5} more" if len(listed) > 5 else ""
+                return Err(
+                    f"no test name contains `{fl}`; the {len(listed)} test{plural(len(listed))}: {names}{more}"
+                )
+        case None:
+            pass
+    if not g.json and not g.quiet and n > 0:
+        print(f"running {n} test{plural(n)} in {files} file{plural(files)}")
     let me = os.exe_path()
     let t0 = clock()
-    let n = len(tests)
     let workers = min(os.cpu_count(), max(n, 1))
+    # with --json a failed test's panic is a diagnostic: each test writes it here
+    let panics = panic_base(t) if g.json and not plat.is_wasm() else ""
     # workers take jobs from the end of the queue; results are reported in order anyway
     var queue = [i for i in 0..n]
     var running: [Running] = []
@@ -1931,11 +2128,19 @@ fn cmd_test(g: G, a: Args) -> Result[int, str]:
             cmd.extend(["--run", idx])
             var env = spawn_env(Some("2"))
             env["BRINE"] = me
+            if panics != "":
+                env["BRINE_PANIC_FILE"] = f"{panics}.{k}"
             match os.spawn(cmd, env, true, false):
                 case Ok(p):
                     running.push(Running(k=k, name=name, handle=p, start=start))
                 case Err(e):
-                    results[k] = TestResult(k=k, name=name, ok=false, text=e, secs=clock() - start)
+                    results[k] = TestResult(
+                        k=k,
+                        name=name,
+                        ok=false,
+                        text=start_error(launch[0], launch[0], e),
+                        secs=clock() - start
+                    )
         var still: [Running] = []
         var finished = false
         for r in running:
@@ -1982,6 +2187,9 @@ fn cmd_test(g: G, a: Args) -> Result[int, str]:
                 + json_str(r.text)
                 + "}"
             )
+            if not r.ok:
+                let (d, sm) = test_diag(r, f"{panics}.{r.k}" if panics != "" else "")
+                print(diag.to_json(d, sm))
         elif not g.quiet or not r.ok:
             let st = (
                 f"{c.green()}ok{c.reset()}" if r.ok else f"{c.bold()}{c.red()}FAILED{c.reset()}"
@@ -1989,22 +2197,60 @@ fn cmd_test(g: G, a: Args) -> Result[int, str]:
             print(f"test {r.name} ... {st}")
         if not r.ok:
             failed.push((r.name, r.text))
-    if not g.json:
+    let passed = n - len(failed)
+    let secs = clock() - t0
+    if g.json:
+        print(
+            f"{{\"tests\":{n},\"files\":{files},\"passed\":{passed},\"failed\":{len(failed)},\"filtered_out\":{len(listed) - n},\"seconds\":{secs:.3f}}}"
+        )
+    else:
         for name, text in failed:
             print(f"\n---- {name} ----\n{text.rstrip()}")
-        let passed = n - len(failed)
         let res = (
             f"{c.green()}ok{c.reset()}"
             if len(failed) == 0
             else f"{c.bold()}{c.red()}FAILED{c.reset()}"
         )
+        let out = f"; {len(listed) - n} filtered out" if len(listed) > n else ""
         print(
-            f"\ntest result: {res}. {passed} passed; {len(failed)} failed; finished in {clock() - t0:.2f}s"
+            f"\ntest result: {res}. {passed} passed; {len(failed)} failed{out}; finished in {secs:.2f}s"
         )
-        if n == 0:
-            let m = " match the filter" if filter.is_some() else ""
-            print(f"(no tests{m}; add one with `test \"name\":`)")
+        if len(listed) == 0:
+            print(f"({no_tests_hint(t)})")
+        elif t.root.is_none():
+            var have: {str: bool} = {}
+            for _, m, _ in listed:
+                have[m] = true
+            let others = untested_neighbors(t, have)
+            if len(others) > 0:
+                let list = ", ".join([display_path(o) for o in others])
+                g.status(
+                    "Note",
+                    f"not run: the tests in {list}, which {display_path(t.entry)} doesn't import (`brine test <file>` runs them)"
+                )
     return Ok(0 if len(failed) == 0 else 1)
+
+# A failed test as a diagnostic: its panic (from `panic_file`, with its place
+# and call chain) when it panicked, else what it printed.
+fn test_diag(r: TestResult, panic_file: str) -> (Diag, SourceMap):
+    if panic_file != "":
+        match read_file(panic_file):
+            case Ok(rec):
+                match os.remove_file(panic_file):
+                    case _:
+                        pass
+                let (d, sm) = panic_diag(rec, -1)
+                var d2 = d
+                d2.msg = f"test `{r.name}` failed: {d.msg}"
+                return (d2, sm)
+            case Err(_):
+                pass
+    var d = diag.error("", f"test `{r.name}` failed")
+    let ls = r.text.rstrip().lines()
+    for l in ls[max(0, len(ls) - 20):]:
+        if l.strip() != "":
+            d = d.note(l.rstrip())
+    return (d, SourceMap.new())
 
 fn source_files(dir: str, ref out: [str]):
     var names: [str] = []
@@ -2054,7 +2300,15 @@ fn cmd_fmt(g: G, a: Args) -> Result[int, str]:
     var errors = 0
     for f in files:
         # CRLF line endings are kept, but a byte order mark is dropped
-        let raw = read_file(f)?.replace("\r\n", "\n")
+        var raw = ""
+        match read_file(f):
+            case Ok(t):
+                raw = t.replace("\r\n", "\n")
+            case Err(e):
+                # one file brine can't read doesn't stop the others
+                errors += 1
+                g.error(e + driver.bad_utf8_at(f))
+                continue
         let text = driver.strip_bom(raw)
         match fmt.format(text):
             case Ok(out):
@@ -2161,6 +2415,7 @@ fn cmd_doctor(g: G) -> Result[int, str]:
                         good = out.strip() == "499500"
                     case Err(_):
                         pass
+                release(t, exe)
                 let detail = (
                     "compiled and ran a parallel program"
                     if good
@@ -2177,6 +2432,20 @@ fn cmd_doctor(g: G) -> Result[int, str]:
                     )
                     and ok
                 )
+    # where builds go, and how full that is (a project has its own, in target/)
+    let cdir = project.join(os.temp_dir(), "brine-cache")
+    let cap = driver.cache_cap()
+    let limit = (
+        "no limit (BRINE_CACHE_SIZE=0)"
+        if cap == 0
+        else f"limit {driver.human_size(cap)} (BRINE_CACHE_SIZE)"
+    )
+    doctor_line(
+        g,
+        true,
+        "build cache",
+        f"{display_path(cdir)}: {driver.human_size(driver.cache_used(cdir))} used, {limit}"
+    )
     let dbg = find_debugger()
     let wasi = driver.find_wasi_cc()
     if g.json:
@@ -2280,7 +2549,7 @@ fn cmd_emit_c(g: G, a: Args) -> Result[int, str]:
         case Some(out):
             write_file(out, c)?
         case None:
-            out_text(c)
+            text_or_json(g, "c", c)
     return Ok(0)
 
 fn cmd_emit_ir(g: G, a: Args) -> Result[int, str]:
@@ -2306,5 +2575,5 @@ fn cmd_emit_ir(g: G, a: Args) -> Result[int, str]:
         case Some(out):
             write_file(out, t)?
         case None:
-            out_text(t)
+            text_or_json(g, "ir", t)
     return Ok(0)
