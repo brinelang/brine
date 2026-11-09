@@ -49,6 +49,16 @@ enum V:
     Flt(t: Lin, nan: F, below: Lin, above: Lin, neg: F)
     Opaque
 
+# The values of a check, kept until it is stated, to say why it fails if it
+# always does (E0614).
+enum Shown:
+    Nothing
+    Index(i: Lin, n: Lin)
+    Fit(l: Lin, k: IntTy)
+    Conv(l: Lin, k: IntTy)
+    Shift(b: Lin, k: IntTy)
+    Div(b: Lin, k: IntTy)
+
 enum Term:
     Sel(c: int, i: Lin)
     SelB(c: int, i: Lin)
@@ -1178,6 +1188,9 @@ fn new_vf(
         remaining=[],
         kept_proven=[],
         always=[],
+        shown=Shown.Nothing,
+        nones={},
+        map_lits={},
         nobl=0,
         test=false,
         must_prove=false,
@@ -1253,6 +1266,11 @@ struct Vf:
     kept_proven: [(Span, str)]
     # `assert`s that always fail
     always: [(Span, str)]
+    # the values of the next check stated, to explain it if it always fails
+    shown: Shown
+    # `let` locals that are always `None`, and those that are a map literal
+    nones: {int: bool}
+    map_lits: {int: Expr}
     # obligations stated so far (to see that an operation's check was)
     nobl: int
     # a `test` block: its `assert`s are its point, not checks to remove
@@ -1901,6 +1919,7 @@ struct Vf:
     # The same, where what holds afterwards is `fact`, which `goal` implies
     # (`fits_goal`); `exact` as for `kept_x`.
     fn implicit_as(ref self, span: Span, tag: int, goal: F, fact: F, what: str, exact: bool):
+        let shown = self.take_shown()
         if self.spec or not self.live:
             return
         self.nobl += 1
@@ -1912,7 +1931,7 @@ struct Vf:
                 self.given_up += 1
             self.failed[key(span, tag)] = true
             # (not when it gave up: showing it always fails would be harder)
-            if exact and not limited and self.refuted(span, what, goal):
+            if exact and not limited and self.refuted(span, what, goal, shown):
                 return
             self.remain(span, what, Some(goal))
         self.assume(fact)
@@ -1923,24 +1942,104 @@ struct Vf:
     # not contradict each other (code the prover sees can't run is fine).
     # Nothing is assumed after it, so what follows is still checked as if
     # it passed, instead of being proven from a contradiction.
-    fn refuted(ref self, span: Span, what: str, goal: F) -> bool:
+    fn refuted(ref self, span: Span, what: str, goal: F, shown: Shown) -> bool:
         if self.spec or not self.live or not self.holds_near(goal.not_()) or self.holds(F.False):
             return false
         var d = diag.error(
             "E0614",
             f"this {what} always fails"
         ).label(span, "this stops the program whenever it runs")
+        let (named, why) = self.explain(shown)
+        let vals = self.show_vals(named)
+        if vals != "":
+            d = d.note("here " + vals)
         if goal == F.False:
-            d = d.note("with the values used here, it can never pass")
+            if vals == "":
+                d = d.note("with the values used here, it can never pass")
         else:
             for n in self.known_facts_note(goal):
                 d = d.note(n)
             d = d.note("it passes only if " + self.show_f(goal) + ", which can't hold here")
-        self.diags.push(
-            d.with_help(
-                "fix the values it uses; if this line really can't run, make that visible to the prover (return before it, or a `requires` that rules the case out)"
-            )
+        self.diags.push(fail_help(d, why))
+        return true
+
+    fn take_shown(ref self) -> Shown:
+        let r = self.shown
+        self.shown = Shown.Nothing
+        return r
+
+    # The values in `sh`, by name, and what to do about them ("" for the
+    # general advice).
+    fn explain(self, sh: Shown) -> ([(str, Lin)], str):
+        match sh:
+            case Shown.Index(i, n):
+                var why = "an index runs from 0 to the length minus 1: check the index, or the length, this line uses"
+                match self.bounds(i).1:
+                    case Some(hi):
+                        if hi < 0:
+                            why = "brine has no negative indexes: `xs[-1]` isn't the last element, it is always out of bounds; write `xs[len(xs) - 1]`"
+                    case None:
+                        pass
+                return ([("index", i), ("length", n)], why)
+            case Shown.Fit(l, k):
+                return (
+                    [("result", l)],
+                    f"{a_ty(k)} holds {k.min()} to {k.max()}: compute in a wider type (convert the operands first, as in `i128(a) * i128(b)`), or change the values"
+                )
+            case Shown.Conv(l, k):
+                return (
+                    [("value", l)],
+                    f"{a_ty(k)} holds {k.min()} to {k.max()}: check the value before converting it, or keep it in a wider type"
+                )
+            case Shown.Shift(b, k):
+                return ([("shift", b)], f"{a_ty(k)} shifts by 0 to {k.bits() - 1} bits")
+            case Shown.Div(b, k):
+                if k.signed() and b.is_const() == Some(-1):
+                    return (
+                        [("divisor", b)],
+                        f"{k.min()} / -1 doesn't fit in {a_ty(k)}: check the value divided first"
+                    )
+                return ([("divisor", b)], "a divisor can't be 0: check it first")
+            case Shown.Nothing:
+                return ([], "")
+
+    # "the index is 7 and the length is 3": each value as a number where it
+    # is one, else as the source names it, with its bounds (those that are
+    # only a type's limits say nothing)
+    fn show_vals(self, vals: [(str, Lin)]) -> str:
+        var parts: [str] = []
+        for name, l in vals:
+            var v = self.show_lin(l)
+            let (lo, hi) = self.bounds(l)
+            let small: i128 = 4294967296
+            if lo.is_some() and lo == hi:
+                v = f"{lo.unwrap()}"
+            elif lo.is_some() and hi.is_some() and -small < lo.unwrap() and hi.unwrap() < small:
+                v += f" (from {lo.unwrap()} to {hi.unwrap()})"
+            elif lo.is_some() and -small < lo.unwrap() < small and lo.unwrap() != 0:
+                v += f" (at least {lo.unwrap()})"
+            elif hi.is_some() and -small < hi.unwrap() < small:
+                v += f" (at most {hi.unwrap()})"
+            parts.push(f"the {name} is {v}")
+        if len(parts) <= 1:
+            return "".join(parts)
+        return ", ".join(parts[:len(parts) - 1]) + " and " + parts[len(parts) - 1]
+
+    # A check, which the prover can't state, that fails whenever this line
+    # runs (`what` it is, `note` why it fails, `why` what to do): an E0614,
+    # unless the line can't run, or the prover isn't sure it can.
+    fn always_stops(ref self, span: Span, what: str, note: str, why: str) -> bool:
+        if self.spec or not self.live:
+            return false
+        self.nobl += 1
+        if self.holds(F.False) or self.limited:
+            return false
+        let d = (
+            diag.error("E0614", f"this {what} always fails")
+            .label(span, "this stops the program whenever it runs")
+            .note(note)
         )
+        self.diags.push(fail_help(d, why))
         return true
 
     # A check that stays at runtime: listed in `--report`, and an error where
@@ -2013,6 +2112,7 @@ struct Vf:
         let fits = in_range(l, k)
         match op:
             case BinOp.Add | BinOp.Sub | BinOp.Mul:
+                self.shown = Shown.Fit(l, k)
                 self.implicit_as(
                     span,
                     TAG_COMPOUND,
@@ -2022,10 +2122,13 @@ struct Vf:
                     k.bits() < 128
                 )
             case BinOp.Div:
+                self.shown = Shown.Div(b, k)
                 self.implicit(span, TAG_COMPOUND, div_goal(op, a, b, k), "division check")
             case BinOp.Mod:
+                self.shown = Shown.Div(b, k)
                 self.implicit(span, TAG_COMPOUND, div_goal(op, a, b, k), "remainder check")
             case BinOp.Shl | BinOp.Shr:
+                self.shown = Shown.Shift(b, k)
                 self.implicit(span, TAG_COMPOUND, shift_goal(b, k), "shift check")
             case _:
                 pass
@@ -2678,6 +2781,14 @@ struct Vf:
                         let to = self.local_name(s.locals[0])
                         self.rename_since(na, nc, from, to)
                         self.bind(s.locals[0], v)
+                        if not mutable:
+                            if self.is_none(init):
+                                self.nones[s.locals[0]] = true
+                            match init.kind:
+                                case ExprKind.Map(_):
+                                    self.map_lits[s.locals[0]] = init
+                                case _:
+                                    pass
                         match v:
                             case V.Int(l):
                                 if (
@@ -3892,10 +4003,11 @@ struct Vf:
                 match base:
                     case V.Arr(_, l):
                         let g = F.and_([F.ge(i), F.lt(i, l)])
+                        self.shown = Shown.Index(i, l)
                         self.implicit(e.span, TAG_INDEX, g, "index bounds check")
                     case _:
                         if not insert:
-                            self.map_key_check(b, e.span)
+                            self.map_key_check(b, idx, e.span)
                 p.push((Step.Index(i), e.ty))
                 return Some((r, p))
             case _:
@@ -5017,11 +5129,13 @@ struct Vf:
                     case V.Arr(c, l):
                         if not self.spec:
                             let g = F.and_([F.ge(i), F.lt(i, l)])
+                            self.shown = Shown.Index(i, l)
                             self.implicit(e.span, TAG_INDEX, g, "index bounds check")
                         return self.sel(c, i, e.ty)
                     case V.Str(l, sid):
                         if not self.spec:
                             let g = F.and_([F.ge(i), F.lt(i, l)])
+                            self.shown = Shown.Index(i, l)
                             self.implicit(e.span, TAG_INDEX, g, "index bounds check")
                         # the character at i, which the runtime checks starts
                         # there (see `edge` for where the prover knows one does)
@@ -5035,7 +5149,7 @@ struct Vf:
                         self.ascii_from(sid, r)
                         return V.Str(self.char_len(i, l), r)
                     case _:
-                        self.map_key_check(b, e.span)
+                        self.map_key_check(b, idx, e.span)
                         return self.fresh_val(e.ty, self.name_of(e))
             case ExprKind.Slice(b, lo, hi):
                 return self.slice(e, b, lo, hi)
@@ -5136,8 +5250,10 @@ struct Vf:
                 let b = self.as_int(bv, r.ty)
                 if (op == BinOp.Div or op == BinOp.Mod) and e.checked:
                     let what = "division check" if op == BinOp.Div else "remainder check"
+                    self.shown = Shown.Div(b, k)
                     self.implicit(e.span, TAG_ARITH, div_goal(op, a, b, k), what)
                 if (op == BinOp.Shl or op == BinOp.Shr) and e.checked:
+                    self.shown = Shown.Shift(b, k)
                     self.implicit(e.span, TAG_ARITH, shift_goal(b, k), "shift check")
                 let v = self.arith_val(op, a, b, k)
                 match v:
@@ -5153,6 +5269,7 @@ struct Vf:
                                 and self.below_2_64(b)
                             ):
                                 goal = F.True
+                            self.shown = Shown.Fit(res, k)
                             self.implicit_as(
                                 e.span,
                                 TAG_ARITH,
@@ -5688,6 +5805,19 @@ struct Vf:
         let r = self.convert_val(target, a, whole, v)
         if key != "":
             self.memo[key] = r
+        match (target, a.kind):
+            case (Ty.Int(_), ExprKind.Str(t)):
+                if never_int(t):
+                    let quoted = self.snippet(a.span)
+                    if self.always_stops(
+                        whole.span,
+                        Check.Number.what(),
+                        f"{quoted} isn't an integer",
+                        "`int` reads decimal digits, with an optional sign and `_` between digits; for text that may not be one, `s.to_int()` gives an `Option` to match on"
+                    ):
+                        return r
+            case _:
+                pass
         self.table_checks(whole.span, convert_stops(target, a.ty), n0)
         return r
 
@@ -5698,6 +5828,7 @@ struct Vf:
                 let widens = k.signed() == src.signed() and k.bits() >= src.bits()
                 if widens or (k.signed() and not src.signed() and k.bits() > src.bits()):
                     return V.Int(l)
+                self.shown = Shown.Conv(l, k)
                 self.implicit_as(
                     whole.span,
                     TAG_CONV,
@@ -6215,12 +6346,68 @@ struct Vf:
 
     # `m[k]` on a map panics when the key is missing (the prover doesn't
     # follow maps' keys).
-    fn map_key_check(ref self, m: Expr, span: Span):
+    fn map_key_check(ref self, m: Expr, key: Expr, span: Span):
         match m.ty:
             case Ty.Map(_, _):
+                if self.missing_key(m, key):
+                    let k = self.snippet(key.span)
+                    if self.always_stops(
+                        span,
+                        Check.MapKey.what(),
+                        f"the map never has the key {k}",
+                        "use a key the map has, or `m.get(k)`, which gives an `Option` to match on"
+                    ):
+                        return
                 self.remain_c(span, Check.MapKey)
             case _:
                 pass
+
+    # `m[key]` where `m` is a map literal (or a `let` of one), every key of
+    # it and `key` are literals, and `key` isn't one of them.
+    fn missing_key(self, m: Expr, key: Expr) -> bool:
+        var lit = m
+        match local_of(m):
+            case Some(id):
+                match self.map_lits.get(id):
+                    case Some(x):
+                        lit = x
+                    case None:
+                        return false
+            case None:
+                pass
+        let k = lit_key(key)
+        if k.is_none():
+            return false
+        match lit.kind:
+            case ExprKind.Map(kvs):
+                for kx, _ in kvs:
+                    match lit_key(kx):
+                        case Some(t):
+                            if t == k.unwrap():
+                                return false
+                        case None:
+                            return false
+                return true
+            case _:
+                return false
+
+    # `e` is `None` (of `Option`), or a `let` of it
+    fn is_none(self, e: Expr) -> bool:
+        match local_of(e):
+            case Some(id):
+                return id in self.nones
+            case None:
+                pass
+        match (e.kind, e.res, e.ty):
+            case (ExprKind.Ident(_), Res.Variant(_, vi), Ty.Enum(eid)):
+                let en = self.info.enums[eid]
+                return (
+                    en.origin.is_some()
+                    and self.info.enums[en.origin.unwrap().0].name == "Option"
+                    and en.variants[vi].name == "None"
+                )
+            case _:
+                return false
 
     # A runtime check that stays whether or not it's proven: listed in
     # `--report` unless proven; either way it holds afterwards.
@@ -6239,13 +6426,14 @@ struct Vf:
     # The same, where what holds afterwards is `fact`, which `goal` implies
     # (`fits_goal`).
     fn kept_as(ref self, span: Span, goal: F, fact: F, what: str, exact: bool, help: str):
+        let shown = self.take_shown()
         if self.spec or not self.live:
             return
         self.nobl += 1
         if self.holds(goal):
             self.kept_proven.push((span, what))
         else:
-            if exact and self.refuted(span, what, goal):
+            if exact and self.refuted(span, what, goal, shown):
                 return
             self.remain_h(span, what, Some(goal), help)
         self.assume(fact)
@@ -6329,7 +6517,19 @@ struct Vf:
                         self.fail(d, f)
             case None:
                 pass
-        if 0 <= id < len(self.stops) and self.stops[id]:
+        if (
+            sig.name == "unwrap"
+            and recv.is_some()
+            and self.is_none(recv.unwrap())
+            and self.always_stops(
+                e.span,
+                Check.Unwrap.what(),
+                "the value is always `None`",
+                "give it a value, or `match` on it and handle `None`"
+            )
+        ):
+            pass
+        elif 0 <= id < len(self.stops) and self.stops[id]:
             if self.rule != "":
                 self.stop_call(
                     e.span,
@@ -6695,6 +6895,67 @@ fn f_key(f: F) -> Option[str]:
             return None
 
 # `a / b` and `a % b` don't fail: no division by zero, nor `MIN / -1`.
+# The helps of an E0614: what's wrong with the values (`why`, if known),
+# and what to do if the line can't run.
+fn fail_help(d: Diag, why: str) -> Diag:
+    var r = d
+    if why != "":
+        r = r.with_help(why)
+    let pre = "fix the values it uses; " if why == "" else ""
+    return r.with_help(
+        pre
+        + "if this line really can't run, make that visible to the prover (return before it, or a `requires` that rules the case out)"
+    )
+
+# "an `i8`", "a `u8`"
+fn a_ty(k: IntTy) -> str:
+    let n = k.name()
+    return ("an `" if n.starts_with("i") else "a `") + n + "`"
+
+# `s` is text `int()` can never read: blanks around it, a sign, then decimal
+# digits with `_` only between two of them, as runtime/rt.br's `parse_128`
+# reads it. (Digits too many for the type fail too; they aren't flagged.)
+fn never_int(s: str) -> bool:
+    let b = s.bytes()
+    var i = 0
+    var e = len(b)
+    while i < e and int_blank(b[i]):
+        i += 1
+    while e > i and int_blank(b[e - 1]):
+        e -= 1
+    if i < e and (b[i] == u8(43) or b[i] == u8(45)):
+        i += 1
+    if i == e:
+        return true
+    let first = i
+    while i < e:
+        let c = b[i]
+        if c == u8(95) and i > first and i + 1 < e and is_digit_b(b[i + 1]):
+            i += 1
+            continue
+        if not is_digit_b(c):
+            return true
+        i += 1
+    return false
+
+fn int_blank(c: u8) -> bool:
+    return c == u8(32) or c == u8(10) or c == u8(13) or c == u8(9)
+
+fn is_digit_b(c: u8) -> bool:
+    return u8(48) <= c and c <= u8(57)
+
+# A literal key of a map: its text, tagged so `1` and `"1"` differ.
+fn lit_key(e: Expr) -> Option[str]:
+    match e.kind:
+        case ExprKind.Str(v):
+            return Some("s" + v)
+        case ExprKind.Int(v):
+            return Some(f"i{v}")
+        case ExprKind.Bool(v):
+            return Some(f"b{v}")
+        case _:
+            return None
+
 fn div_goal(op: BinOp, a: Lin, b: Lin, k: IntTy) -> F:
     var g = [F.ne(b)]
     var minus_one = true
