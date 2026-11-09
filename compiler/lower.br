@@ -3123,6 +3123,7 @@ struct Lower:
                 self.put_back(b.stmts, k)
                 or self.move_let(b.stmts, k)
                 or self.borrow_let(b.stmts, k)
+                or self.borrow_ctor(b.stmts, k)
             ):
                 k += 1
                 continue
@@ -3286,7 +3287,11 @@ struct Lower:
                     case Some(e):
                         self.push_frame()
                         # (a `__br` clone returns a part of a parameter, borrowed)
-                        let v = self.expr(e) if self.cx.bret else self.owned(e)
+                        var v = -1
+                        if self.cx.bret:
+                            v = self.bret_value(e)
+                        else:
+                            v = self.owned(e)
                         var r = -1
                         if self.cx.sret >= 0:
                             let lay = self.lay(e.ty)
@@ -3667,6 +3672,198 @@ struct Lower:
                 return true
             case _:
                 return false
+
+    # `let c = S(f=r, ...)` or `let c = (r, ...)`, where every counted part
+    # is a variable or a place in one (`r`, `r.f`, `r[i]`) that the rest of
+    # the block keeps alive and unchanged: `c` borrows those parts instead
+    # of retaining each and releasing them at the end. A view made per item
+    # of a `par` (a span over a shared buffer) then touches no count the
+    # threads share. Anything that takes `c` or a part of it still retains.
+    fn borrow_ctor(ref self, stmts: [Stmt], k: int) -> bool:
+        if not self.moves_ok():
+            return false
+        let s = stmts[k]
+        match s.kind:
+            case StmtKind.Let(mutable, pat, _, init, is_ref):
+                if mutable or is_ref or len(s.locals) != 1 or not is_name(pat):
+                    return false
+                let d = s.locals[0]
+                let ty = self.flocals[d].ty
+                if not self.managed(ty) or init.ty != ty or not self.plain_local(d):
+                    return false
+                match self.view_parts(init):
+                    case Some((parts, slots, ftys, roots)):
+                        for r in roots:
+                            if r == d or not self.keeps_alive(stmts, k, r):
+                                return false
+                        self.push_frame()
+                        let home = self.new_local(d, ty)
+                        if self.view_build(home, ty, parts, slots, ftys):
+                            self.add_local_home(home, ty, d)
+                        self.pop_frame()
+                        return true
+                    case None:
+                        pass
+                # `let c = span(buf, a, b)`, a call returning parts of its
+                # arguments borrowed (`bret_ok`) given only such places
+                match self.view_call_roots(init):
+                    case Some(roots):
+                        for r in roots:
+                            if r == d or not self.keeps_alive(stmts, k, r):
+                                return false
+                        self.push_frame()
+                        let v = self.expr(init)
+                        let own = self.claim(v)
+                        let home = self.new_local(d, ty)
+                        self.st(home, 0, ty, v)
+                        if own:
+                            self.add_local_home(home, ty, d)
+                        self.pop_frame()
+                        return true
+                    case None:
+                        return false
+            case _:
+                return false
+
+    # The variables a call's counted arguments come from, when it returns
+    # them borrowed (see `bret_ok`) and each is a variable or a place in one
+    # that the call leaves alone.
+    fn view_call_roots(ref self, e: Expr) -> Option[[int]]:
+        var id = -1
+        var items: [Expr] = []
+        match e.kind:
+            case ExprKind.Call(_, args):
+                match e.cres:
+                    case CallRes.Fn(f):
+                        id = f
+                    case _:
+                        return None
+                for a in args:
+                    items.push(a.expr)
+            case ExprKind.MethodCall(recv, _, _, args):
+                match e.cres:
+                    case CallRes.Fn(f):
+                        id = f
+                    case CallRes.Method(f):
+                        id = f
+                        items.push(recv)
+                    case _:
+                        return None
+                for a in args:
+                    items.push(a.expr)
+            case _:
+                return None
+        if (
+            not self.bret_ok(id)
+            or len(self.cx.nc_calls) > 0 and ranges.key(e.span) in self.cx.nc_calls
+        ):
+            return None
+        var roots: [int] = []
+        for x in items:
+            if self.managed(x.ty):
+                if not (local_of(x).is_some() or borrow_place(x)):
+                    return None
+                roots.push(place_path(x).unwrap().0)
+        if len(roots) == 0:
+            return None
+        for x in items:
+            for r in roots:
+                if not self.keeps_root_in(x, r):
+                    return None
+        return Some(roots)
+
+    # A struct or tuple literal whose counted parts are all variables or
+    # places in them, which change nothing they come from: its parts, the
+    # field each fills, the field types and the variables they come from.
+    fn view_parts(self, e: Expr) -> Option[([Expr], [int], [Ty], [int])]:
+        var parts: [Expr] = []
+        var slots: [int] = []
+        var ftys: [Ty] = []
+        match e.kind:
+            case ExprKind.Tuple(es):
+                match e.ty:
+                    case Ty.Tuple(ts):
+                        if len(ts) != len(es) or len(es) == 0:
+                            return None
+                        for i, x in enumerate(es):
+                            parts.push(x)
+                            slots.push(i)
+                        ftys = ts
+                    case _:
+                        return None
+            case ExprKind.Call(_, args) | ExprKind.MethodCall(_, _, _, args):
+                match e.cres:
+                    case CallRes.Ctor(sid):
+                        let fields = self.info.structs[sid].fields
+                        if len(args) != len(fields) or len(fields) == 0:
+                            return None
+                        slots = self.arg_slots(args, fields)
+                        for i, a in enumerate(args):
+                            if a.by_ref or slots[i] >= len(fields):
+                                return None
+                            parts.push(a.expr)
+                        for fd in fields:
+                            ftys.push(fd.1)
+                    case _:
+                        return None
+            case _:
+                return None
+        var roots: [int] = []
+        for i, x in enumerate(parts):
+            let ft = ftys[slots[i]]
+            if not self.managed(ft):
+                continue
+            if x.ty != ft or not (local_of(x).is_some() or borrow_place(x)):
+                return None
+            roots.push(place_path(x).unwrap().0)
+        if len(roots) == 0:
+            return None
+        for x in parts:
+            for r in roots:
+                if not self.keeps_root_in(x, r):
+                    return None
+        return Some((parts, slots, ftys, roots))
+
+    # Fill the memory at `home` (of type `ty`) from `view_parts`, borrowing
+    # the counted parts. When one of them came out as an owned temp after
+    # all, it owns them all instead: returns true, and `home` must be released.
+    fn view_build(ref self, home: int, ty: Ty, parts: [Expr], slots: [int], ftys: [Ty]) -> bool:
+        var vals: [int] = []
+        for x in parts:
+            vals.push(self.expr(x))
+        var owns = false
+        var claimed: [bool] = []
+        for i, v in enumerate(vals):
+            let c = self.managed(ftys[slots[i]]) and self.claim(v)
+            claimed.push(c)
+            owns = owns or c
+        for i, v0 in enumerate(vals):
+            var v = v0
+            let ft = ftys[slots[i]]
+            if owns and not claimed[i]:
+                v = self.own(v, ft)
+            self.st(home, self.field_off(ty, slots[i]), ft, v)
+        return owns
+
+    # A by-value call argument `S(f=r, ...)` (see `view_parts`) whose places
+    # nothing in the call changes: built borrowing its counted parts, since
+    # the call can't change them either. -1 when it doesn't qualify.
+    fn view_arg(ref self, e: Expr, items: [(Expr, bool)]) -> int:
+        if self.opts.debug:
+            return -1
+        match self.view_parts(e):
+            case Some((parts, slots, ftys, roots)):
+                for it in items:
+                    for r in roots:
+                        if it.1 and mentions_local(it.0, r) or not self.keeps_root_in(it.0, r):
+                            return -1
+                let lay = self.lay(e.ty)
+                let t = self.cx.fb.temp_mem(lay.size, lay.align)
+                if self.view_build(t, e.ty, parts, slots, ftys):
+                    return self.temp(t, e.ty)
+                return t
+            case None:
+                return -1
 
     # Does variable `r` keep what is borrowed from it alive through the
     # statements after `stmts[k]`?
@@ -5111,6 +5308,25 @@ struct Lower:
             case None:
                 return false
 
+    # `fixed_local`, or a field or array element of one (`p.lits`,
+    # `t.0[i]`): nothing can change it while the variable is in scope.
+    fn fixed_place(self, e: Expr) -> bool:
+        match e.kind:
+            case ExprKind.Field(b, _, _):
+                match b.ty:
+                    case Ty.Struct(_) | Ty.Tuple(_):
+                        return self.fixed_place(b)
+                    case _:
+                        return false
+            case ExprKind.Index(b, _):
+                match b.ty:
+                    case Ty.Array(_):
+                        return self.fixed_place(b)
+                    case _:
+                        return false
+            case _:
+                return self.fixed_local(e)
+
     # Does `p` match everything without binding anything?
     fn pat_trivial(self, p: Pattern) -> bool:
         match p.kind:
@@ -5938,7 +6154,12 @@ struct Lower:
             elif it.1:
                 cargs.push(self.lvalue(it.0))
             else:
-                cargs.push(self.value_arg(it.0, hold[i]))
+                var v = -1
+                if not hold[i]:
+                    v = self.view_arg(it.0, items)
+                if v < 0:
+                    v = self.value_arg(it.0, hold[i])
+                cargs.push(v)
         for i, it in enumerate(items):
             if late[i]:
                 cargs[base + i] = self.lvalue(it.0)
@@ -6017,7 +6238,11 @@ struct Lower:
                     match value:
                         case Some(e):
                             rets += 1
-                            if not self.bret_place(e, roots) and not self.const_expr(e):
+                            if (
+                                not self.bret_place(e, roots)
+                                and not self.const_expr(e)
+                                and not self.bret_view(e, roots)
+                            ):
                                 return false
                         case None:
                             return false
@@ -6047,6 +6272,30 @@ struct Lower:
                 if not self.bret_block(sb, ref roots, ref rets):
                     return false
         return true
+
+    # A struct or tuple literal whose counted parts all name parts of roots
+    # (`return Span(buf=buf, start=a)`): returned borrowing them.
+    fn bret_view(self, e: Expr, roots: {int: bool}) -> bool:
+        match self.view_parts(e):
+            case Some((parts, slots, ftys, _)):
+                for i, x in enumerate(parts):
+                    if self.managed(ftys[slots[i]]) and not self.bret_place(x, roots):
+                        return false
+                return true
+            case None:
+                return false
+
+    # The value a `__br` clone returns for `e`: borrowed, never owned.
+    fn bret_value(ref self, e: Expr) -> int:
+        match self.view_parts(e):
+            case Some((parts, slots, ftys, _)):
+                let lay = self.lay(e.ty)
+                let t = self.cx.fb.temp_mem(lay.size, lay.align)
+                if self.view_build(t, e.ty, parts, slots, ftys):
+                    panic("lowering: a borrowed result was given an owned part")
+                return t
+            case None:
+                return self.expr(e)
 
     # `e` names a part of a root (fields, tuple fields and array elements).
     fn bret_place(self, e: Expr, roots: {int: bool}) -> bool:
@@ -7188,7 +7437,7 @@ struct Lower:
                     v = self.cx.fb.call(K.Ptr, "brine_map_keys", [m])
                     ty = Ty.Array(kt)
                 case _:
-                    if self.fixed_local(iter):
+                    if self.fixed_place(iter):
                         # the variable keeps the array alive and unchanged
                         # for the whole loop: borrow it
                         return Dom.Arr(self.expr(iter), ty.elem())
