@@ -453,6 +453,11 @@ static void br_panic_claim(void) {
 #define BR_STACK_HELP "every thread has a 64 MB stack: check that the recursion ends, or make it a loop"
 #define BR_OOM_HELP "check where the size comes from (often a wrong count or length), or work on the data in smaller parts"
 
+#ifndef BRINE_RT_BR
+static void br_hang_up(double limit);
+static void br_world_failed(int64_t code);
+#endif
+
 #ifndef BRINE_RT_BR /* runtime/rt.br has it */
 /* `brine debug` stops here: the panic is printed, the frames that led to it
  * are still there */
@@ -513,6 +518,7 @@ static BR_NORETURN void br_panic_help(const char *loc, const char *msg, const ch
     }
     panic_stop();
     br_gpu_settle();
+    br_world_failed(101);
     exit(101);
 }
 
@@ -568,6 +574,9 @@ static BR_NORETURN void br_oom(int64_t n, const char *loc) {
         fputc(0, rf);
         fclose(rf);
     }
+#ifndef BRINE_RT_BR
+    br_world_failed(101);
+#endif
     exit(101);
 }
 
@@ -703,13 +712,13 @@ static void br_stack_leave(void) {
 
 #ifndef BRINE_RT_BR
 static void br_world_finish(const char *how);
-static void br_exit_record(int64_t code);
+static void br_exit_record(int64_t code, bool panicked);
 #endif
 #ifndef BRINE_RT_BR /* runtime/rt.br has these */
 void brine_exit(int64_t code) {
     br_flush();
     br_gpu_settle();
-    if (code != 0) br_exit_record(code);
+    if (code != 0) br_exit_record(code, false);
     /* like returning from `main`: every rank waits for the others */
     br_world_finish("it called `exit`");
     br_flush();
@@ -5098,6 +5107,8 @@ typedef struct {
 } br_peer;
 
 static br_peer *br_peers;
+/* whether the receivers run, and whether this rank hung up */
+static int br_peers_up, br_hung;
 
 #ifdef BR_WASM
 /* one rank: no peers to talk to */
@@ -5323,14 +5334,15 @@ static br_msg *br_recv(int64_t src, int64_t kind, const char *loc) {
 }
 
 /* `brine run` stops the other ranks when one fails; a rank in `exit` waits
-   for them first, so it says so in the file BRINE_EXIT_FILE named */
+   for them first, so it says so in the file BRINE_EXIT_FILE named (and a
+   rank that panics waits for them to hang up: "<code> panic") */
 static char *br_exit_file;
 
-static void br_exit_record(int64_t code) {
+static void br_exit_record(int64_t code, bool panicked) {
     if (!br_exit_file || br_size <= 1) return;
     FILE *f = fopen(br_exit_file, "wb");
     if (!f) return;
-    fprintf(f, "%lld", (long long)code);
+    fprintf(f, "%lld%s", (long long)code, panicked ? " panic" : "");
     fclose(f);
 }
 
@@ -5558,6 +5570,7 @@ static void br_world_init(void) {
         br_thread th;
         br_thread_start(&th, br_receiver, &br_peers[r]);
     }
+    br_peers_up = 1;
     free(hosts);
     free(ports);
 }
@@ -5590,6 +5603,48 @@ static void br_world_finish(const char *how) {
     done = true;
     br_coll(BR_OP_FINISH, how);
     br_barrier("<end of the program>");
+    /* every peer is at its end too and hangs up right after its own part of
+       the barrier: wait for it however busy the machine is, or it may read
+       this rank's leaving as a failure (only a peer machine that went away
+       takes the whole minute) */
+    br_hang_up(60.0);
+}
+
+/* Leaving: a process that exits with its connections open resets them (on
+ * Windows), and a reset throws away what the other side has received but
+ * not read yet, such as this rank's last message, which may say why it
+ * failed. So say that nothing more comes (the other side reads everything
+ * first) and wait until each peer has said the same, as it does when it
+ * leaves, for at most `limit` seconds. It allocates nothing: it also runs
+ * when memory ran out. */
+static void br_hang_up(double limit) {
+#ifndef BR_WASM
+    if (!br_peers_up || __atomic_exchange_n(&br_hung, 1, __ATOMIC_ACQ_REL)) return;
+    for (int64_t r = 0; r < br_size; r++)
+        if (r != br_rank)
+#ifdef _WIN32
+            shutdown(br_peers[r].sock, SD_SEND);
+#else
+            shutdown(br_peers[r].sock, SHUT_WR);
+#endif
+    double t0 = brine_clock();
+    while (brine_clock() - t0 < limit) {
+        bool open = false;
+        for (int64_t r = 0; r < br_size; r++)
+            if (r != br_rank && !__atomic_load_n(&br_peers[r].closed, __ATOMIC_ACQUIRE)) open = true;
+        if (!open) return;
+        br_sleep_ms(1);
+    }
+#endif
+}
+
+/* A rank that fails leaves like that too, after telling `brine run` (which
+ * stops the others then): its peers may not hang up until they are stopped. */
+static void br_world_failed(int64_t code) {
+    if (!br_peers_up || __atomic_load_n(&br_hung, __ATOMIC_ACQUIRE)) return;
+    br_exit_record(code, true);
+    /* (a peer busy elsewhere doesn't hold a failing rank for long) */
+    br_hang_up(2.0);
 }
 
 /* Messages are encoded from a type description string, which the compiler

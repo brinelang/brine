@@ -9202,6 +9202,7 @@ fn oom_at(n: int, loc: ptr):
     fflush(os_stdio(2))
     unlock(io_mu())
     oom_record(n, loc)
+    world_out_of_memory()
     exit(i32(101))
 
 # The panic record (`panic_record`) of an out-of-memory panic, for `brine
@@ -9611,7 +9612,8 @@ fn drop_rest_cold(h: ptr):
 
 # the world: rank, size, how many lower ranks share this machine (GPUs go
 # one per rank), the call this rank is in (operation, how many calls so
-# far, call site), the peers, and whether the end was reached
+# far, call site), the peers, whether the end was reached, whether the
+# receivers run, and whether this rank hung up
 const WD_RANK = 0
 const WD_SIZE = 8
 const WD_LOCAL = 16
@@ -9620,6 +9622,8 @@ const WD_SEQ = 32
 const WD_SITE = 40
 const WD_PEERS = 48
 const WD_DONE = 56
+const WD_UP = 64
+const WD_HUNG = 72
 
 # a peer: its locks and the queue's condition, its socket, the queue, set
 # when the connection closed, and the receiver's read buffer
@@ -9693,6 +9697,7 @@ const WS_FREEADDRINFO = 64
 const WS_CLOSESOCKET = 72
 const WS_SEND = 80
 const WS_RECV = 88
+const WS_SHUTDOWN = 96
 
 extern fn LoadLibraryA(name: ptr) -> ptr
 
@@ -9728,6 +9733,8 @@ extern fn freeaddrinfo(a: ptr)
 
 extern fn close(fd: i32) -> i32
 
+extern fn shutdown(s: i32, how: i32) -> i32
+
 extern fn send(s: i32, p: ptr, n: u64, flags: i32) -> int
 
 extern fn recv(s: i32, p: ptr, n: u64, flags: i32) -> int
@@ -9747,7 +9754,7 @@ extern fn exit(code: i32)
 extern fn strlen(s: ptr) -> u64
 
 fn wd() -> ptr:
-    return global_mem("world", 64)
+    return global_mem("world", 80)
 
 fn brine_world_rank() -> int:
     return load_i64(wd(), WD_RANK)
@@ -9860,10 +9867,10 @@ fn cur_site() -> ptr:
 # ---- sockets: a SOCKET on Windows, a file descriptor elsewhere; -1 is none
 
 fn ws(f: int) -> ptr:
-    return load_ptr(global_mem("world_ws", 96), f)
+    return load_ptr(global_mem("world_ws", 104), f)
 
 fn ws_start():
-    let t = global_mem("world_ws", 96)
+    let t = global_mem("world_ws", 104)
     let h = LoadLibraryA(lit("ws2_32.dll"))
     if addr(h) == 0:
         world_fail("brine: could not load ws2_32.dll\n")
@@ -9879,6 +9886,7 @@ fn ws_start():
     store_ptr(t, WS_CLOSESOCKET, GetProcAddress(h, lit("closesocket")))
     store_ptr(t, WS_SEND, GetProcAddress(h, lit("send")))
     store_ptr(t, WS_RECV, GetProcAddress(h, lit("recv")))
+    store_ptr(t, WS_SHUTDOWN, GetProcAddress(h, lit("shutdown")))
     # version 2.2 (WSADATA takes 408 bytes)
     let wsa = stack_mem(512)
     call_i32(ws(WS_STARTUP), u16(514), wsa)
@@ -9894,6 +9902,14 @@ fn sk_close(s: int):
         call_i32(ws(WS_CLOSESOCKET), u64(s))
     else:
         close(i32(s))
+
+# no more sending: the other side reads what was sent, then the end
+# (SD_SEND, SHUT_WR)
+fn sk_shutdown_send(s: int):
+    if os_is("windows"):
+        call_i32(ws(WS_SHUTDOWN), u64(s), i32(1))
+    else:
+        shutdown(i32(s), i32(1))
 
 fn sk_setopt(s: int, level: i32, name: i32, v: int):
     let p = stack_mem(8)
@@ -10442,6 +10458,7 @@ fn brine_x_world_init():
     for r in 0..size:
         if r != rank:
             thread_start(symbol("brine_x_world_receiver"), peer(r), th)
+    store_i64(w, WD_UP, 1)
     free(hosts)
     free(ports)
 
@@ -10466,15 +10483,16 @@ fn brine_world_barrier(loc: ptr):
 # The end of the program (returning from `main`, or `exit`): wait until
 # every rank gets there, so no rank leaves while others still talk to it.
 # `brine run` stops the other ranks when one fails; a rank in `exit` waits
-# for them first, so it says so in the file BRINE_EXIT_FILE named
-fn exit_record(code: int):
+# for them first, so it says so in the file BRINE_EXIT_FILE named (and a
+# rank that panics waits for them to hang up: "<code> panic")
+fn exit_record(code: int, panicked: bool):
     let path = load_ptr(global_mem("world_exit_file", 8), 0)
     if addr(path) == u64(0) or brine_world_size() <= 1:
         return
     let f = os_fopen(path, "wb")
     if addr(f) == u64(0):
         return
-    file_text(f, f"{code}")
+    file_text(f, f"{code} panic" if panicked else f"{code}")
     fclose(f)
 
 fn brine_x_world_finish(how: ptr):
@@ -10484,6 +10502,61 @@ fn brine_x_world_finish(how: ptr):
     store_i64(w, WD_DONE, 1)
     coll(OP_FINISH, how)
     barrier(lit("<end of the program>"))
+    # every peer is at its end too and hangs up right after its own part of
+    # the barrier: wait for it however busy the machine is, or it may read
+    # this rank's leaving as a failure (only a peer machine that went away
+    # takes the whole minute)
+    hang_up(60.0)
+
+# Leaving: a process that exits with its connections open resets them (on
+# Windows), and a reset throws away what the other side has received but
+# not read yet, such as this rank's last message, which may say why it
+# failed. So say that nothing more comes (the other side reads everything
+# first) and wait until each peer has said the same, as it does when it
+# leaves, for at most `limit` seconds. It allocates nothing: it also runs
+# when memory ran out.
+fn hang_up(limit: float):
+    let w = wd()
+    if load_i64(w, WD_UP) == 0 or atomic_xchg(w + WD_HUNG, 1) != 0:
+        return
+    let rank = load_i64(w, WD_RANK)
+    let size = load_i64(w, WD_SIZE)
+    for r in 0..size:
+        if r != rank:
+            sk_shutdown_send(load_i64(peer(r), PR_SOCK))
+    let t0 = brine_clock()
+    while brine_clock() - t0 < limit:
+        var open = false
+        for r in 0..size:
+            if r != rank and atomic_load(peer(r) + PR_CLOSED) == 0:
+                open = true
+        if not open:
+            return
+        sleep_ms(1)
+
+# A rank that fails leaves like that too, after telling `brine run` (which
+# stops the others then): its peers may not hang up until they are stopped.
+fn world_failed(code: int):
+    let w = wd()
+    if load_i64(w, WD_UP) == 0 or load_i64(w, WD_HUNG) != 0:
+        return
+    exit_record(code, true)
+    # (a peer busy elsewhere doesn't hold a failing rank for long)
+    hang_up(2.0)
+
+# The same when memory ran out, allocating nothing (the exit file holds the
+# path from the environment, as C's fopen takes it).
+fn world_out_of_memory():
+    let w = wd()
+    if load_i64(w, WD_UP) == 0 or load_i64(w, WD_HUNG) != 0:
+        return
+    let path = load_ptr(global_mem("world_exit_file", 8), 0)
+    if addr(path) != u64(0):
+        let f = fopen(path, lit("wb"))
+        if addr(f) != u64(0):
+            file_text(f, "101 panic")
+            fclose(f)
+    hang_up(2.0)
 
 # Messages are encoded from a type description string, which the compiler
 # derives from the static type: i = 64-bit int, 1/2/4/h = 8/16/32/128-bit
@@ -15416,6 +15489,7 @@ fn panic_help_cold(loc: ptr, msg: str, help: str):
     panic_record(c_text(loc), msg, fp, u64(0), help)
     panic_stop()
     brine_x_gpu_settle()
+    world_failed(101)
     exit(i32(101))
 
 fn help_line(help: str):
@@ -15782,7 +15856,7 @@ fn brine_exit(code: int):
     brine_flush()
     brine_x_gpu_settle()
     if code != 0:
-        exit_record(code)
+        exit_record(code, false)
     # like returning from `main`: every rank waits for the others
     brine_x_world_finish(lit("it called `exit`"))
     brine_flush()

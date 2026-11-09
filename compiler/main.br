@@ -975,7 +975,8 @@ fn run_exe(
             return Err(f"cannot reserve local ports: {e}")
     let peers = ",".join([f"127.0.0.1:{p}" for p in ports])
     # a rank that calls `exit` with an error code waits there for the others,
-    # so it writes the code to its file: that counts as failing
+    # so it writes the code to its file: that counts as failing (a rank that
+    # panics writes "<code> panic" there, as it waits for its peers to hang up)
     let exits = project.join(os.temp_dir(), f"brine-exit-{os.pid()}")
     var kids: [int] = []
     for r in 0..ranks:
@@ -1004,6 +1005,10 @@ fn run_exe(
     var first = -1
     var first_code = 0
     var failed_at = -1.0
+    # how long the others get: the peers of a rank that died or panicked
+    # wait for it forever, but a rank's `exit(n)` may be where the others
+    # are heading too, a moment later on a busy machine
+    var grace = 0.5
     var stopped = false
     var tick = 0
     while true:
@@ -1021,12 +1026,14 @@ fn run_exe(
                         if first < 0 and tick % 10 == 0:
                             match read_file(f"{exits}.{i}"):
                                 case Ok(text):
-                                    match parse_int(text.strip()):
+                                    let ws = text.split()
+                                    match parse_int(ws[0] if len(ws) > 0 else ""):
                                         case Some(c):
                                             if c != 0:
                                                 first = i
                                                 first_code = c
                                                 failed_at = clock()
+                                                grace = 0.5 if len(ws) > 1 else 2.0
                                         case None:
                                             pass
                                 case Err(_):
@@ -1035,7 +1042,7 @@ fn run_exe(
         if all(c.is_some() for c in codes):
             break
         # if one rank failed, the others would wait for it forever: stop them
-        if first >= 0 and clock() - failed_at > 0.5:
+        if first >= 0 and clock() - failed_at > grace:
             for i in 0..ranks:
                 if codes[i].is_none():
                     os.kill(kids[i])
