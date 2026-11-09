@@ -589,7 +589,13 @@ void brine_panic_ovf_u(const char *op, int64_t a, int64_t b, const char *loc) {
 void brine_panic_str(const char *loc, brine_str *msg) {
     char buf[1024];
     snprintf(buf, sizeof buf, "%.*s", (int)msg->len, msg->data);
-    br_panic_help(loc, buf, br_starts(buf, "unwrap() called on ") ? br_help(buf) : NULL);
+    br_panic_help(loc, buf, NULL);
+}
+/* `panic(...)` in the prelude (a failed `unwrap()`), which says how to avoid it */
+void brine_panic_prelude(const char *loc, brine_str *msg) {
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%.*s", (int)msg->len, msg->data);
+    br_panic_help(loc, buf, br_help(buf));
 }
 void brine_assert_fail(const char *loc, const char *src, brine_str *msg) {
     if (msg)

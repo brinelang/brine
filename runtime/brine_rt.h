@@ -134,6 +134,7 @@ BR_NORETURN void brine_panic_ovf(const char *op, const char *loc);
 BR_NORETURN void brine_panic_ovf_ab(const char *op, int64_t a, int64_t b, const char *loc);
 BR_NORETURN void brine_panic_ovf_u(const char *op, int64_t a, int64_t b, const char *loc);
 BR_NORETURN void brine_panic_str(const char *loc, brine_str *msg);
+BR_NORETURN void brine_panic_prelude(const char *loc, brine_str *msg);
 BR_NORETURN void brine_assert_fail(const char *loc, const char *src, brine_str *msg);
 BR_NORETURN void brine_panic_assert_i(const char *loc, const char *src, brine_str *msg, int64_t a, int64_t b);
 BR_NORETURN void brine_panic_assert_u(const char *loc, const char *src, brine_str *msg, uint64_t a, uint64_t b);
