@@ -575,7 +575,7 @@ static BR_NORETURN void br_oom(int64_t n, const char *loc) {
         fclose(rf);
     }
 #ifndef BRINE_RT_BR
-    br_hang_up(2.0);
+    br_world_failed(101);
 #endif
     exit(101);
 }
