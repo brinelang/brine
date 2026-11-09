@@ -747,8 +747,12 @@ fn index_of(xs: [int], target: int) -> int:
   default `HEAD`) by asking the prover, so `0 <= i < n` and `i >= 0 and i < n`
   are the same spec. It fails when one promises less: an `ensures` or
   `invariant` that no longer follows, or a `requires` that asks more of callers.
-  It also counts the runtime checks left before and after. Run it in CI against
-  the base branch, so a reviewer sees each weaker spec.
+  A renamed, moved or retyped function or struct is compared with what it was
+  (paired by name, body or fields, signature, or as the only one changed); one
+  removed with its promises, or a spec the prover can't compare (generic code,
+  new code that doesn't compile), counts as weaker. The diff comes before the
+  new code's errors. It also counts the runtime checks left before and after.
+  Run it in CI against the base branch, so a reviewer sees each weaker spec.
 
 ## Rules: RULES.br, what the program promises
 

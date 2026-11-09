@@ -452,7 +452,7 @@ from what brine knows that C doesn't (no aliasing, proven-away checks, race-free
 | `brine test [filter]` | Run `test "name":` blocks, each in its own process, in parallel. |
 | `brine fmt [--check]` | Canonical formatting. |
 | `brine rules [approve] [--explain] [--receipt] [--base <rev>]` | Which rules in RULES.br are proven and approved. `approve` records the owner's approval in RULES.lock; `--explain` renders the rules in plain English, mechanically; `--receipt` writes a pull-request summary. |
-| `brine spec-diff [--base <rev>]` | How every `requires`, `ensures` and struct `invariant` changed since a git revision, decided by the prover (weaker, stronger, or the same written another way), and the runtime checks left before and after. Exit 1 when a spec promises less. A proof only means what its spec says, so this is for review and CI: it shows when a change made the proofs pass by proving less. |
+| `brine spec-diff [--base <rev>]` | How every `requires`, `ensures` and struct `invariant` changed since a git revision, decided by the prover (weaker, stronger, or the same written another way), and the runtime checks left before and after. Renamed, moved and retyped items are compared with what they were. Exit 1 when a spec promises less, or may: a removed promise, or one the prover can't compare. A proof only means what its spec says, so this is for review and CI: it shows when a change made the proofs pass by proving less. |
 | `brine debug` | Debug build + launch gdb/lldb. |
 | `brine explain E0601` | Long-form explanation of any diagnostic. |
 | `brine guide` | Print the language quick reference (great for agents). |

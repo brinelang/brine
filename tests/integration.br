@@ -1897,6 +1897,95 @@ test "spec-diff finds specs that promise less":
     let none = brine(["spec-diff", e + "/main.br"])
     assert none.code == 2 and "the repository has no commits yet" in none.err, none.all()
 
+# Renaming must be no way past it, and the diff is shown when the build breaks.
+test "spec-diff follows renames and shows the diff when the build breaks":
+    let d = scratch("specdiff-rename")
+    let f = d + "/main.br"
+    let range = "struct Range:\n    lo: int\n    hi: int\n    invariant self.lo <= self.hi\n\n"
+    let half = "fn half(n: int) -> int:\n    requires n >= 0\n    ensures result >= 0\n    return n / 2\n\n"
+    let main = "fn main():\n    let r = Range(lo=0, hi=1)\n    print(half(8), r.hi)\n"
+    write(f, range + half + main)
+    git(d, ["init", "-q"])
+    git(d, ["add", "main.br"])
+    git(d, ["commit", "-q", "-m", "v1"])
+    let no_ens = half.replace("    ensures result >= 0\n", "")
+    # each change, and what it must say
+    let cases = [
+        (
+            range + half.replace("half", "halve") + main.replace("half", "halve"),
+            0,
+            "`half` is now `halve` (paired by its body)"
+        ),
+        (
+            range + no_ens.replace("half", "halve") + main.replace("half", "halve"),
+            1,
+            "weaker: `halve` no longer promises `result >= 0`"
+        ),
+        (
+            range
+            + no_ens.replace("n: int) -> int", "n: i64) -> i64")
+            + main.replace("half(8)", "half(i64(8))"),
+            1,
+            "weaker: `half` no longer promises `result >= 0`"
+        ),
+        (
+            (range + half + main)
+            .replace("Range", "Span")
+            .replace("    invariant self.lo <= self.hi\n", ""),
+            1,
+            "weaker: `Span` no longer keeps `self.lo <= self.hi`"
+        ),
+        (
+            range + main.replace("half(8)", "4"),
+            1,
+            "weaker: `half` was removed, and with it its promise `result >= 0`"
+        ),
+        (
+            range
+            + no_ens.replace("half(n: int) -> int", "half[T](n: T) -> T")
+            .replace("n >= 0", "true")
+            .replace("n / 2", "n")
+            + main,
+            1,
+            "`half` may no longer promise `result >= 0`: `half` is generic"
+        )
+    ]
+    for src, code, want in cases:
+        write(f, src)
+        let o = brine(["spec-diff", f])
+        assert o.code == code and want in o.out, src + "\n" + o.all()
+    # the weaker spec breaks a proof, or the code doesn't compile: the diff comes first
+    write(
+        f,
+        range + no_ens + main.replace("print(", "let h = half(8)\n    prove h >= 0\n    print(")
+    )
+    let p = brine(["spec-diff", f])
+    assert p.code == 1 and "weaker: `half` no longer promises `result >= 0`" in p.out, p.all()
+    assert "error[E0605]" in p.err and "the new code has 1 error" in p.err, p.all()
+    write(f, range + no_ens + main.replace("r.hi)", "r.hi + \"\")"))
+    let t = brine(["spec-diff", f])
+    assert (
+        t.code == 1
+        and "`half` may no longer promise `result >= 0`: the new code has errors" in t.out
+    ), t.all()
+    assert "error[E0" in t.err, t.all()
+    let j = brine(["spec-diff", f, "--json"])
+    assert "\"spans\":[{\"file\":" in j.out and "\"location\"" not in j.out, j.out
+    assert "\"severity\":\"error\"" in j.out and "\"errors\":1}" in j.out, j.out
+    # a rename in one module doesn't rename the same name in another
+    let m = scratch("specdiff-modules")
+    let kind = "enum Kind:\n    A\n    B\n\n"
+    write(m + "/a.br", kind + "fn pick(k: Kind) -> int:\n    requires k != Kind.B\n    return 0\n")
+    write(m + "/b.br", kind + "fn other() -> Kind:\n    return Kind.A\n")
+    write(m + "/main.br", "import a\nimport b\n\nfn main():\n    print(b.other() == b.Kind.A)\n")
+    git(m, ["init", "-q"])
+    git(m, ["add", "."])
+    git(m, ["commit", "-q", "-m", "v1"])
+    write(m + "/b.br", (kind + "fn other() -> Kind:\n    return Kind.A\n").replace("Kind", "Mode"))
+    write(m + "/main.br", "import a\nimport b\n\nfn main():\n    print(b.other() == b.Mode.A)\n")
+    let k = brine(["spec-diff", m + "/main.br"])
+    assert k.code == 0 and "no spec changes" in k.err, k.all()
+
 # `code@file:line` for each error and warning in `--json` output.
 fn diag_codes(o: Out) -> [str]:
     var out: [str] = []
