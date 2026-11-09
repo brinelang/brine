@@ -13,6 +13,7 @@ import diag
 from types import CallRes, Builtin, OsOp
 from ast import Expr, ExprKind, Stmt, StmtKind, Block, FnDecl, Program, Module, TypeExpr
 from ast import BinOp, CmpOp, UnOp, Arg, LetPat, RuleInfo, children, stmt_exprs, stmt_blocks
+from ast import module_name
 from info import ProgramInfo, PRELUDE, builtin_module
 import lexer
 from lexer import Tok
@@ -64,7 +65,10 @@ fn builtin_effect(b: Builtin) -> str:
 
 fn os_effect(op: OsOp) -> str:
     match op:
-        case OsOp.Name | OsOp.Arch | OsOp.Pid | OsOp.CpuCount | OsOp.ThreadCount:
+        # the build's own constants, the same on every run
+        case OsOp.Name | OsOp.Arch:
+            return ""
+        case OsOp.Pid | OsOp.CpuCount | OsOp.ThreadCount:
             return "environment"
         case OsOp.Sleep:
             return "clock"
@@ -283,23 +287,32 @@ fn module_index(prog: Program, name: str) -> int:
     for mi, m in enumerate(prog.modules):
         if m.name == name:
             return mi
+    # a file loaded under another name: RULES.br's `import m` is the main
+    # file when that is `m.br` (`brine check src/m.br`)
+    for mi, m in enumerate(prog.modules):
+        if (mi == 0 or m.name == MODULE) and mi < len(prog.import_targets):
+            for k, imp in enumerate(m.imports):
+                if module_name(imp.path) == name and k < len(prog.import_targets[mi]):
+                    return prog.import_targets[mi][k]
     return -1
 
-# The functions `path` names, from RULES.br: a module (all its functions), a
-# function `m.f`, a method `m.T.f`, or a name RULES.br defines or imports.
-fn resolve(prog: Program, rmi: int, path0: [str]) -> [int]:
-    var path = path0
+# `path` with RULES.br's import aliases and imported names spelled out.
+fn expand(prog: Program, rmi: int, path: [str]) -> [str]:
     for imp in prog.modules[rmi].imports:
         if imp.alias != "" and imp.alias == path[0]:
             var p = imp.path
             p.extend(path[1:])
-            path = p
-            break
+            return p
         if len(path) == 1 and any(nm.0 == path[0] for nm in imp.names):
             var p = imp.path
             p.push(path[0])
-            path = p
-            break
+            return p
+    return path
+
+# The functions `path` names, from RULES.br: a module (all its functions), a
+# function `m.f`, a method `m.T.f`, or a name RULES.br defines or imports.
+fn resolve(prog: Program, rmi: int, path0: [str]) -> [int]:
+    let path = expand(prog, rmi, path0)
     let whole = module_index(prog, ".".join(path))
     if whole >= 0:
         return [f.id for f in prog.modules[whole].fns]
@@ -386,11 +399,13 @@ fn scoped(
     main_dir: str
 ) -> Target:
     let ids = resolve(prog, rmi, path)
+    # `main` is the rules' main file, which may not be this program's; a module
+    # this program's main file is (`brine check src/m.br`) is
+    let via_main = expand(prog, rmi, path)[0] == "main"
     var out: [int] = []
     for id in ids:
         let mi = fn_mod[id] if 0 <= id < len(fn_mod) else -1
-        # `main` is the rules' main file, which isn't this program's
-        if mi < 0 or (used[mi] and (mi != 0 or is_main)):
+        if mi < 0 or (used[mi] and (mi != 0 or is_main or not via_main)):
             out.push(id)
     if len(ids) > 0:
         return Target(ids=out, elsewhere=len(out) == 0)
@@ -842,6 +857,7 @@ fn lock_check(ref out: Rules, prog: Program, sm: SourceMap, strict: bool):
     let fix = "if the rules' owner agrees with the change, they run `brine rules approve` and commit RULES.lock; otherwise undo it"
     let why = "RULES.lock records what an owner approved; CODEOWNERS on RULES.br, rules/ and RULES.lock keeps anyone else from changing them"
     var fresh: [str] = []
+    var fresh_at: [Span] = []
     for ri in 0..len(out.rules):
         let name = out.rules[ri].name
         let h = find_entry(now, "rule", name)
@@ -859,6 +875,7 @@ fn lock_check(ref out: Rules, prog: Program, sm: SourceMap, strict: bool):
                     )
             case None:
                 fresh.push(name)
+                fresh_at.push(out.rules[ri].head)
     for a in approved:
         if a.kind == "rule" and find_entry(now, "rule", a.name).is_none():
             out.removed.push(a.name)
@@ -910,15 +927,14 @@ fn lock_check(ref out: Rules, prog: Program, sm: SourceMap, strict: bool):
         let ws = len(fresh)
         let s = "" if ws == 1 else "s"
         let list = ", ".join([f"\"{x}\"" for x in fresh])
+        # at the new rules themselves, not the top of the file
+        var w = diag.warning("W0003", f"{ws} rule{s} not approved yet: {list}")
+        for sp in fresh_at[:min(3, len(fresh_at))]:
+            w = w.label(sp, "not approved yet")
         out.diags.push(
-            diag.warning("W0003", f"{ws} rule{s} not approved yet: {list}")
-            .label(top, "RULES.br")
-            .note(
+            w.note(
                 "new rules are proven like the others; approving them records that their owner agrees with them"
-            )
-            .with_help(
-                "once the owner has read them (`brine rules --explain`), they run `brine rules approve`"
-            )
+            ).with_help("once the owner has read them (`brine rules --explain`), they run `brine rules approve`")
         )
 
 # ---------------------------------------------------------------- verdicts
@@ -1201,10 +1217,18 @@ fn is_pass(s: Stmt) -> bool:
             return false
 
 fn article(s: str) -> str:
-    # a type like `u64` is read letter by letter: "a u64", "an f64", "an i32"
-    if len(s) > 1 and "0123456789".contains(s[1]):
+    if len(s) == 0:
+        return s
+    # read letter by letter: a type like `u64` ("a u64", "an f64"), a one-letter
+    # name (`T`) and an acronym ("an RTree", "a URL", "an HTTPClient")
+    if len(s) == 1 or "0123456789".contains(s[1]) or (is_upper(s[0]) and is_upper(s[1])):
         return ("an " if "aefhilmnorsx".contains(s[0].lower()) else "a ") + s
-    if len(s) > 0 and "aeiouAEIOU".contains(s[0]):
+    let w = s.lower()
+    # a vowel that sounds like a consonant: "a unit", "a user", "a one-off"
+    for p in ["uni", "use", "usu", "uti", "ura", "eu", "one"]:
+        if w.starts_with(p):
+            return "a " + s
+    if "aeiou".contains(w[0]) or w.starts_with("hour") or w.starts_with("honest"):
         return "an " + s
     return "a " + s
 
@@ -1271,16 +1295,38 @@ fn explain(src: str, m: Module) -> [str]:
                             + ", ".join(ws)
                             + "."
                         )
+                var listed: [str] = []
                 for path, _ in r.proven:
                     let shown = ".".join(path)
+                    listed.push(shown)
                     en.line(
                         0,
-                        f"Nothing {shown} does, or anything it calls, can stop the program, for any input."
+                        f"Nothing {shown} does, or anything it calls, can stop the program, for any input its `requires` allow."
+                    )
+                if len(listed) > 0:
+                    # the scope is easy to misread: hostile input still crashes
+                    # code that isn't listed, before or after it gets there
+                    en.line(
+                        0,
+                        "Only "
+                        + " and ".join(listed)
+                        + " and what "
+                        + ("it calls is" if len(listed) == 1 else "they call are")
+                        + " covered: code outside can still stop the program, on the same input."
                     )
                 # what the rule judges with, and what it judges
                 var code: [str] = []
                 var sc_names: [str] = []
-                collect_calls(t.body, ref sc_names)
+                # a method's type, from the rule's inputs: `b.half()` is `Box.half`
+                var types: {str: str} = {}
+                for p in t.params:
+                    match p.ty:
+                        case Some(TypeExpr.Named(tp, _, _)):
+                            if len(tp) > 0:
+                                types[p.name] = tp[len(tp) - 1]
+                        case _:
+                            pass
+                collect_calls(t.body, types, ref sc_names)
                 for nm in sc_names:
                     let base = nm.split(".")[len(nm.split(".")) - 1]
                     if (
@@ -1296,14 +1342,14 @@ fn explain(src: str, m: Module) -> [str]:
                 pass
     return en.out
 
-fn collect_calls(b: Block, ref out: [str]):
+fn collect_calls(b: Block, types: {str: str}, ref out: [str]):
     for s in b.stmts:
         for e in stmt_exprs(s):
-            collect_expr(e, ref out)
+            collect_expr(e, types, ref out)
         for sb in stmt_blocks(s):
-            collect_calls(sb, ref out)
+            collect_calls(sb, types, ref out)
 
-fn collect_expr(e: Expr, ref out: [str]):
+fn collect_expr(e: Expr, types: {str: str}, ref out: [str]):
     match e.kind:
         case ExprKind.Call(callee, _):
             match callee.kind:
@@ -1320,7 +1366,86 @@ fn collect_expr(e: Expr, ref out: [str]):
                             pass
                 case _:
                     pass
+        case ExprKind.MethodCall(recv, name, _, _):
+            # the program's methods, by type when the rule's inputs say it; a
+            # built-in one (`xs.push`, `o.unwrap()`) isn't the agent's code
+            var q = ""
+            match recv.kind:
+                case ExprKind.Ident(r):
+                    match types.get(r):
+                        case Some(tn):
+                            if is_upper(tn[0]) and tn not in ["Option", "Result"]:
+                                q = tn + "." + name
+                        case None:
+                            pass
+                case _:
+                    pass
+            if q == "" and name not in builtin_methods():
+                q = name
+            if q != "" and q not in out:
+                out.push(q)
         case _:
             pass
     for c in children(e):
-        collect_expr(c, ref out)
+        collect_expr(c, types, ref out)
+
+fn is_upper(c: str) -> bool:
+    return len(c) == 1 and "ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(c)
+
+# Methods of the built-in types and of the prelude's `Option` and `Result`.
+fn builtin_methods() -> [str]:
+    return [
+        "all",
+        "any",
+        "bytes",
+        "chars",
+        "clear",
+        "contains",
+        "count",
+        "ends_with",
+        "extend",
+        "find",
+        "first",
+        "get",
+        "index",
+        "insert",
+        "is_alnum",
+        "is_alpha",
+        "is_digit",
+        "is_err",
+        "is_none",
+        "is_ok",
+        "is_some",
+        "is_space",
+        "items",
+        "join",
+        "keys",
+        "lines",
+        "lower",
+        "lstrip",
+        "max",
+        "min",
+        "ok",
+        "pop",
+        "pow",
+        "product",
+        "push",
+        "remove",
+        "repeat",
+        "replace",
+        "reverse",
+        "rstrip",
+        "sort",
+        "sorted",
+        "split",
+        "starts_with",
+        "strip",
+        "sum",
+        "to_bits",
+        "to_float",
+        "to_int",
+        "unwrap",
+        "unwrap_or",
+        "upper",
+        "values"
+    ]

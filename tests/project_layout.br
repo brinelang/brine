@@ -1,0 +1,186 @@
+# End-to-end tests of how brine finds a program's files: imports, RULES.br,
+# and which files `check` treats as programs. Imported by integration.br, so
+# `brine test tests/integration.br` runs them; scratch files go to target/it/.
+
+struct Run:
+    code: int
+    out: str
+    err: str
+
+    fn all(self) -> str:
+        return self.out + self.err
+
+fn brine(args: [str]) -> Run:
+    var cmd = [getenv("BRINE").unwrap_or("brine")]
+    cmd.extend(args)
+    var h = 0
+    match os.spawn(cmd, {"NO_COLOR": "1"}, true, false):
+        case Ok(p):
+            h = p
+        case Err(msg):
+            panic(f"cannot run {cmd[0]}: {msg}")
+    let code = os.wait(h)
+    let (o, e) = os.output(h)
+    return Run(code=code, out=o.replace("\r\n", "\n"), err=e.replace("\r\n", "\n"))
+
+fn scratch(name: str) -> str:
+    let d = f"target/it/{name}-{os.pid()}"
+    mkdir(d)
+    return d
+
+fn mkdir(d: str):
+    match os.make_dir(d):
+        case _:
+            pass
+
+fn write(path: str, t: str):
+    match write_file(path, t):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+
+fn cd(d: str):
+    match os.set_cwd(d):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+
+fn count(s: str, part: str) -> int:
+    return len(s.split(part)) - 1
+
+test "rules, rules approve and check read the same RULES.br inside another project":
+    let d = scratch("nested-rules")
+    write(d + "/brine.toml", "[package]\nname = \"outer\"\n")
+    mkdir(d + "/src")
+    write(d + "/src/main.br", "fn main():\n    print(0)\n")
+    write(d + "/RULES.br", "rule \"outer\":\n    prove 1 + 1 == 2\n")
+    mkdir(d + "/inner")
+    write(
+        d + "/inner/main.br",
+        "fn clamp8(x: u64) -> u64:\n    ensures result <= 255\n    if x > 255:\n        return u64(255)\n    return x\n\nfn main():\n    print(clamp8(u64(300)))\n"
+    )
+    write(
+        d + "/inner/RULES.br",
+        "from main import clamp8\n\nrule \"a byte is at most 10\" for x: u64:\n    let r = clamp8(x)\n    prove r <= 10\n"
+    )
+    cd(d + "/inner")
+    let c = brine(["check", "main.br"])
+    assert c.code == 1 and "E0605" in c.err, c.all()
+    # not the outer project's RULES.br, whose rule is proven
+    let r = brine(["rules"])
+    assert r.code == 1 and "a byte is at most 10" in r.out and "done: no" in r.out, r.all()
+    assert "using RULES.br, for main.br" in r.err, r.all()
+    let x = brine(["rules", "--explain"])
+    assert "a byte is at most 10" in x.out and "outer" not in x.out, x.all()
+    let a = brine(["rules", "approve"])
+    assert a.code == 0 and file_exists("RULES.lock") and not file_exists("../RULES.lock"), a.all()
+    let w = brine(["check", "main.br"])
+    assert "W0003" not in w.err, w.all()
+    # without a main.br next to it, `rules` says so instead of using the outer one
+    cd("..")
+    mkdir("lone")
+    write("lone/RULES.br", "rule \"x\":\n    prove 1 + 1 == 2\n")
+    cd("lone")
+    let n = brine(["rules"])
+    assert n.code != 0 and "main.br" in n.all() and "outer" not in n.all(), n.all()
+
+test "imports are found from the importing file's directory too":
+    let d = scratch("import-dirs")
+    write(d + "/brine.toml", "[package]\nname = \"q\"\n")
+    mkdir(d + "/src")
+    mkdir(d + "/src/bin")
+    mkdir(d + "/src/core")
+    mkdir(d + "/bench")
+    write(d + "/src/main.br", "import util\n\nfn main():\n    print(util.twice(2))\n")
+    # util and its neighbour, found from src/ by the main file and from util.br
+    # by the others
+    write(
+        d + "/src/util.br",
+        "import more\n\nfn twice(x: int) -> int:\n    return more.add(x, x)\n"
+    )
+    write(d + "/src/more.br", "fn add(a: int, b: int) -> int:\n    return a + b\n")
+    write(d + "/src/core/store.br", "import keys\n\nfn get() -> int:\n    return keys.KEY\n")
+    write(d + "/src/core/keys.br", "const KEY = 7\n")
+    write(d + "/src/bin/tool.br", "import ..util\n\nfn main():\n    print(util.twice(3))\n")
+    write(
+        d + "/bench/b.br",
+        "import ..src.util\nimport ..src.core.store\n\nfn main():\n    print(util.twice(4), store.get())\n"
+    )
+    let c = brine(["check", d])
+    assert c.code == 0, c.all()
+    let t = brine(["run", d + "/src/bin/tool.br"])
+    assert t.code == 0 and t.out == "6\n", t.all()
+    let b = brine(["run", d + "/bench/b.br"])
+    assert b.code == 0 and b.out == "8 7\n", b.all()
+    # a missing module says where it was looked for
+    write(d + "/src/core/bad.br", "import nothere\n")
+    write(d + "/src/bin/bad.br", "import ..core.bad\n\nfn main():\n    pass\n")
+    let e = brine(["check", d + "/src/bin/bad.br"])
+    assert e.code == 1 and "E0701" in e.err and "the importing file's" in e.err, e.all()
+
+test "a module RULES.br imports is checked once":
+    let d = scratch("rules-dup")
+    write(d + "/brine.toml", "[package]\nname = \"dup\"\n")
+    mkdir(d + "/src")
+    write(d + "/src/main.br", "import m\n\nfn main():\n    print(m.get([1, 2], 1).unwrap_or(0))\n")
+    write(
+        d + "/src/m.br",
+        "fn get(a: [int], i: int) -> Option[int]:\n    ensures result.is_none() or result.unwrap() >= 0\n    if 0 <= i < len(a) and a[i] >= 0:\n        return Some(a[i])\n    return None\n"
+    )
+    write(d + "/RULES.br", "import m\n\nrule \"m never crashes\":\n    proven m\n")
+    # E0606 for each of the two calls in the `ensures`, once each
+    for args in [["check", d + "/src/m.br"], ["check", d]]:
+        let o = brine(args)
+        assert o.code == 1 and count(o.err, "error[E0606]") == 2, o.all()
+    # and the rule still covers m when it is the file being checked
+    write(d + "/src/m.br", "fn get(a: [int], i: int) -> Option[int]:\n    return Some(a[i])\n")
+    let p = brine(["check", d + "/src/m.br"])
+    assert p.code == 1 and count(p.err, "error[E0607]") == 1, p.all()
+
+test "check treats a lone file as a program as run does":
+    let d = scratch("check-main")
+    write(d + "/empty.br", "# nothing here yet\n")
+    write(d + "/main.br", "fn mian():\n    print(1)\n")
+    write(d + "/util.br", "fn helper() -> int:\n    return 1\n")
+    for f in ["/empty.br", "/main.br"]:
+        let o = brine(["check", d + f, "--json"])
+        assert o.code == 1 and "\"E0703\"" in o.out, o.all()
+        let r = brine(["run", d + f])
+        assert r.code != 0 and "E0703" in r.err, r.all()
+    # a module is still a module
+    let u = brine(["check", d + "/util.br"])
+    assert u.code == 0 and "checked as a module" in u.err, u.all()
+
+test "rules --explain names methods, scope and articles":
+    let d = scratch("explain")
+    write(
+        d + "/main.br",
+        "struct RTree:\n    n: int\n\n    fn half(self) -> int:\n        return self.n / 2\n\nfn get(xs: [int], i: int) -> int:\n    requires 0 <= i < len(xs)\n    return xs[i]\n\nfn main():\n    print(RTree(n=4).half(), get([1], 0))\n"
+    )
+    write(
+        d + "/RULES.br",
+        "from main import RTree\n\nrule \"half is small\" for t: RTree, u: u64, k: int:\n    requires t.n >= 0\n    let h = t.half()\n    prove h <= t.n\n\nrule \"get never crashes\":\n    proven main.get\n"
+    )
+    let x = brine(["rules", "--explain", d + "/main.br"])
+    assert x.code == 0, x.all()
+    assert "every t (an RTree)" in x.out and "every u (a u64)" in x.out, x.out
+    assert "every k (an int)" in x.out, x.out
+    assert "Code it checks (the agent's): RTree.half." in x.out, x.out
+    assert "for any input its `requires` allow" in x.out, x.out
+    assert "code outside can still stop the program" in x.out, x.out
+
+test "effects lines take extern, and os.name() is not the environment":
+    let d = scratch("effects")
+    write(
+        d + "/plat.br",
+        "fn sep() -> str:\n    return \"\\\\\" if os.name() == \"windows\" else \"/\"\n"
+    )
+    write(d + "/main.br", "import plat\n\nfn main():\n    print(plat.sep() != \"\")\n")
+    write(
+        d + "/RULES.br",
+        "rule \"plat is pure\":\n    effects plat: none\n\nrule \"main uses the console and C\":\n    effects main: console, extern\n"
+    )
+    let o = brine(["check", d + "/main.br"])
+    assert o.code == 0 and "Proven 2 rules" in o.err, o.all()

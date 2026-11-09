@@ -743,7 +743,7 @@ fn build(
     g.diags(fe)
     if fe.has_errors():
         return Ok(None)
-    rules_line(g, fe)
+    rules_line(g, fe, t.entry)
     let code = driver.gen_code(fe, profile, tests, plat)
     let stem = t.name + "-tests" if tests else t.name
     var exe = ""
@@ -1431,14 +1431,14 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
     let t0 = clock()
     # A project's main file starts a program, as for `brine run`, and every
     # file next to it and below is checked, imported or not. A lone file may
-    # be a module, but a `main` it has must be able to start a program.
+    # be a module (see is_program_file), but a `main` it has must start a program.
     let whole = t.root.is_some()
     let at = whole_project(t)
     let fe = driver.frontend_at(
         t.entry,
         FrontOpts(
             verify=true,
-            need_main=whole,
+            need_main=whole or is_program_file(t.entry),
             check_main=true,
             typed=t.typed,
             proven=t.proven,
@@ -1462,7 +1462,7 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
             )
         case None:
             pass
-    rules_line(g, fe)
+    rules_line(g, fe, t.entry)
     var proven = 0
     var remaining: [(diag.Span, str)] = []
     var kept: [(diag.Span, str)] = []
@@ -1551,9 +1551,14 @@ fn cmd_check(g: G, a: Args) -> Result[int, str]:
 # ================================================================ rules
 
 # `Proven 3 rules` after a build or check that proved them.
-fn rules_line(g: G, fe: Frontend):
+fn rules_line(g: G, fe: Frontend, entry: str):
     match fe.rules:
         case Some(rl):
+            if not rl.present:
+                let why = driver.rules_skipped(entry)
+                if why != "":
+                    g.status("Rules", why)
+                return
             var n = 0
             for r in rl.rules:
                 if r.applies:
@@ -1589,12 +1594,17 @@ fn cmd_rules(g: G, a: Args) -> Result[int, str]:
     if approve:
         pos = pos[1:]
     var file: Option[str] = Some(pos[0]) if len(pos) > 0 else None
-    if file.is_none() and project.find(os.cwd()).is_none():
-        # RULES.br next to a main file, outside a project, as `brine check main.br` finds it
-        if approve and driver.has_rules("."):
-            return rules_approve(g, ".", rules.FILE)
+    if file.is_none() and driver.has_rules(".") and not at_project_root():
+        # a RULES.br here that isn't the project's: it's about main.br next to
+        # it, as `brine check main.br` finds it, also inside another project
         if os.is_file("main.br"):
-            file = Some(".")
+            file = Some("main.br")
+        elif approve:
+            return rules_approve(g, ".", rules.FILE)
+        else:
+            return Err(
+                "the RULES.br here applies to `main.br` next to it, and there is none: pass the main file (`brine rules <file>`)"
+            )
     let t = resolve(g, file)?.typed_if(a)
     let dir = driver.rules_at(t.entry).dir
     if dir == "":
@@ -1602,6 +1612,9 @@ fn cmd_rules(g: G, a: Args) -> Result[int, str]:
             f"no RULES.br applies to `{display_path(t.entry)}`: a project's RULES.br is for the main files in its source folder (`src/`), and otherwise one next to the main file is (see `brine guide`, \"Rules\")"
         )
     let path = project.join(dir, rules.FILE)
+    if not g.json and not a.has("--receipt"):
+        # with nested projects, which RULES.br this is isn't obvious
+        g.status("Rules", f"using {display_path(path)}, for {display_path(t.entry)}")
     if approve:
         return rules_approve(g, dir, path)
     if a.has("--explain"):
@@ -1768,7 +1781,8 @@ fn rules_report(g: G, fe: Frontend, rl: rules.Rules, base: Option[(str, [rules.E
         return 0 if done else 1
     let c = g.c()
     let n = len(rl.rules)
-    print(f"{rules.FILE}: {n} rule{plural(n)}, {proven} proven")
+    let shown = display_path(project.join(rl.dir, rules.FILE))
+    print(f"{shown}: {n} rule{plural(n)}, {proven} proven")
     for ri, r in enumerate(rl.rules):
         let st = rule_status(fe, rl.rules[ri], probs[ri])
         var mark = f"{c.green()}✓ proven     {c.reset()}"
@@ -2630,3 +2644,24 @@ fn cmd_emit_ir(g: G, a: Args) -> Result[int, str]:
         case None:
             text_or_json(g, "ir", t)
     return Ok(0)
+
+# The current directory is a project's root (where brine.toml is).
+fn at_project_root() -> bool:
+    match project.find(os.cwd()):
+        case Some(Ok(pr)):
+            return driver.same_dir(pr.root, ".")
+        case _:
+            return false
+
+# A lone file `check` treats as a program, as `brine run` would: one named
+# main.br, or one with nothing a module could offer (no functions, no tests).
+# Any other file without `main` is checked as a module.
+fn is_program_file(entry: str) -> bool:
+    if driver.file_stem(entry) == "main":
+        return true
+    match read_file(entry):
+        case Ok(src):
+            let (m, _) = parser.parse_module(src, 0, "main")
+            return len(m.fns) == 0 and len(m.tests) == 0
+        case Err(_):
+            return false
