@@ -376,9 +376,11 @@ source ─► lexer (indentation-aware) ─► parser ─► AST
   never next to the `-o` output, skips the link). The cache (brine-cache in the
   temp directory for files outside a project, `target/cache` in one) is pruned:
   past `BRINE_CACHE_SIZE` (default `2G`; `500M`, `0` for no limit) the least
-  recently used outputs and objects are deleted, after each build, from the use
-  log `uses.log` there. What an older brine left in it isn't listed, so it stays
-  until the folder is deleted.
+  recently used outputs and objects are deleted, from the use log `uses.log`
+  there, once a build's program has started: until then its entries are pinned,
+  so concurrent runs don't delete each other's programs (a lock file guards the
+  log). What an older brine left in it isn't listed, so it stays until the
+  folder is deleted.
 * **CPU levels:** native x86-64 `--release` code checks the CPU once and runs its
   vector loops as SSE2, AVX2 or AVX-512 code. Through C, an x86-64 `--release`
   build compiles the program three times, for plain x86-64, x86-64-v3 (AVX2)
@@ -452,7 +454,7 @@ from what brine knows that C doesn't (no aliasing, proven-away checks, race-free
 | `brine run [file] [--ranks N] [--threads N] [-- args]` | Build and run. |
 | `brine build [--release\|--debug] [--emit-c]` | Build a native binary into `target/`. |
 | `brine check [--report] [--typed] [--proven]` | Type-check + verify, no codegen. Fastest feedback loop. `--typed` (or `typed = true` under `[check]` in brine.toml) requires a written type on every variable; `--proven` (or `proven = true`) requires every runtime check to be proven away. |
-| `brine test [filter]` | Run `test "name":` blocks, each in its own process, in parallel. |
+| `brine test [filter]` | Run `test "name":` blocks, each in its own process, in parallel: in every file of a project (the files `check` checks), or in a file and what it imports. A filter that matches no test is an error. |
 | `brine fmt [--check]` | Canonical formatting. |
 | `brine rules [approve] [--explain] [--receipt] [--base <rev>]` | Which rules in RULES.br are proven and approved. `approve` records the owner's approval in RULES.lock; `--explain` renders the rules in plain English, mechanically; `--receipt` writes a pull-request summary. |
 | `brine spec-diff [--base <rev>]` | How every `requires`, `ensures` and struct `invariant` changed since a git revision, decided by the prover (weaker, stronger, or the same written another way), and the runtime checks left before and after. Renamed, moved and retyped items are compared with what they were. Exit 1 when a spec promises less, or may: a removed promise, or one the prover can't compare. A proof only means what its spec says, so this is for review and CI: it shows when a change made the proofs pass by proving less. |

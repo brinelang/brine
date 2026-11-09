@@ -22,8 +22,9 @@ brine run --target wasm        # WebAssembly, run with Node.js (needs wasi-sdk, 
 brine build --target web -o d  # d/: index.html + brine.js + program.wasm, for a browser
 ```
 Add `--json` to any command for one JSON object per line; `brine run --json`
-also reports a panic that way, with the fields of a build error (`code` is
-`null`, the call chain is in `notes`). `brine fmt` leaves
+also reports a panic, running out of memory or `main`'s `Err` that way, with the
+fields of a build error (`code` is `null`, the call chain is in `notes`), and
+ends with `{"exit": N}`. `brine test --json` ends with a summary object. `brine fmt` leaves
 lines between `# fmt: off` and `# fmt: on` comments, and number tables written
 in rows that don't fit on one line, as they are.
 Builds are cached (`target/cache`; for files outside a project, brine-cache in
@@ -485,7 +486,8 @@ them: `print(x, end="")`), `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`
 `log`, `log2`, `log10`, `cbrt`, `pow(x, y)`, `hypot(x, y)` (on `float` or `f32`),
 `floor`, `ceil`, `round`, `clock()` (seconds),
 `args()` (the command-line arguments as `[str]`, without the program's name:
-`brine run app.br -- a b` gives `["a", "b"]`), `exit(code)`, `panic(msg)`,
+`brine run app.br -- a b` gives `["a", "b"]`), `exit(code)` (a code outside
+32 bits is a panic; only 0 to 255 mean the same everywhere), `panic(msg)`,
 `eprint(...)` (print to stderr), `ord(c)`, `chr(n)`, `enumerate(xs)`, `flush()`.
 On floats, `min` and `max` ignore a NaN (the other argument wins; both NaN gives
 NaN) and order `-0.0` below `0.0`, the same on every target.
