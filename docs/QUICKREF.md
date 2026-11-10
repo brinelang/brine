@@ -26,7 +26,8 @@ brine build --target web -o d  # d/: index.html + brine.js + program.wasm, for a
 Add `--json` to any command for one JSON object per line; `brine run --json`
 also reports a panic, running out of memory or `main`'s `Err` that way, with the
 fields of a build error (`code` is `null`, the call chain is in `notes`), and
-ends with `{"exit": N}`. `brine test --json` ends with a summary object. `brine fmt` leaves
+ends with `{"exit": N}`; the program's own output stays as it is. `brine test
+--json` ends with a summary object. `brine fmt` leaves
 lines between `# fmt: off` and `# fmt: on` comments, and number tables written
 in rows that don't fit on one line, as they are.
 Builds are cached (`target/cache`; for files outside a project, brine-cache in
@@ -55,8 +56,9 @@ WebAssembly runs on one thread (`par` runs in order, same results) and as one
 * Literals adapt to context: `let b: u8 = 200`, `let f: f32 = 1`,
   `let big: i128 = 10_000_000_000_000_000_000_000`. Integer literals go up to
   `u128`'s maximum (2^128 - 1); above `i128`'s maximum only a `u128` holds them.
-* `i128` and `u128` need a 64-bit target (they're a GCC/Clang feature). The prover
-  can't remove their overflow checks; those always run.
+* `i128` and `u128` need a 64-bit target. The prover removes their overflow
+  checks like those of other integers (`requires 0 <= a < 1_000_000` proves
+  `a + 1`), except for bounds at the very edge of their range.
 * Integer overflow, out-of-range conversions, division by zero and
   out-of-bounds indexing stop the program with a clear message (a *panic*),
   unless the compiler proved they can't happen, in which case the check is removed.
@@ -115,21 +117,25 @@ xs[i], xs[j] = xs[j], xs[i]     # every value is computed first, then stored
 lo, _ = bounds          # `_` drops a value
 var names: [str] = []   # annotate when the type can't be inferred
 let n: i32 = 7          # ...or whenever you like
-for i: int in 0..3:     # loop variables too: `for k: str, v: int in m.items():`
-    total += i
+for k: int in 0..3:     # loop variables too: `for k: str, v: int in m.items():`
+    total += k
 const LIMIT = 100       # compile-time constant (top level); untyped, it adapts
                         # like the literal: `x | LIMIT` with `x: u64` is fine
 const MASK = u64(0xff)  # conversions are computed (and checked) at compile time
 const BASE = [3, 4, 5, 6]       # read-only arrays too; `len(BASE)` is a constant
 ```
-In `x, y = ...` the places can't overlap, and an index can't read a variable
-the same line assigns (`i, xs[i] = ...` is error E0405): the result would
-depend on the order of the stores.
+In `x, y = ...` a variable or field can't be assigned twice, and an index can't
+read a variable the same line assigns (`i, xs[i] = ...` is error E0405): the
+result would depend on the order of the stores. Two elements of one array may
+turn out to be the same element (`xs[i], xs[j] = 1, 2` with `i == j`); then the
+stores run left to right, so the last one wins.
 
 Types are optional, Python style. To require them, put `typed = true` under
 `[check]` in brine.toml (or pass `--typed`): then every `let`, `var` and `for`
 variable needs a written type (error E0337 tells you which one to add).
-No shadowing: a name can be declared only once per function. `_` ignores a
+No shadowing: a name can't be declared again while it is in scope, even in an
+inner block (E0207). Separate `if`/`else` arms, one loop after another, and code
+after a block may reuse a name, since the first one has ended. `_` ignores a
 value (`let (q, _) = ...`, `for _ in 0..n:`); it may repeat and can't be read.
 
 ## Control flow
@@ -146,16 +152,16 @@ let sign = "neg" if x < 0 else "non-neg"   # conditional expression
 
 for i in 0..n:          # 0, 1, ..., n-1        (also: 0..=n, range(a, b, step))
     pass
-for x in xs:            # iterates over a snapshot of xs
+for v in xs:            # iterates over a snapshot of xs
     pass
-for i, x in enumerate(xs):  # unpack tuples: (0, xs[0]), (1, xs[1]), ...
+for i, v in enumerate(xs):  # unpack tuples: (0, xs[0]), (1, xs[1]), ...
     pass
 for i, (k, v) in enumerate(pairs):  # nested tuples too (also in comprehensions)
     pass
 for c in "héllo":       # each UTF-8 character, as a one-character str
     pass
-while k < n:
-    k += 1              # break / continue work as usual
+while j < n:
+    j += 1              # break / continue work as usual
 ```
 Comparisons chain: `0 <= i < n`. Logic is `and`, `or`, `not`.
 
@@ -180,8 +186,9 @@ fn main():
     d[0] = 1                         # changes `data`
 ```
 `let r = ref p.field` names a field the same way (`let b = ref self.board` in a
-method: no copy, and changes go to `self.board`). A reference names a variable or
-a field path, not an element (`ref xs[i]`) or a function's result.
+method: no copy, and changes go to `self.board`). A `let` reference names a
+variable or a field path, not an element (`let r = ref xs[i]`) or a function's
+result; an element can be passed to a `ref` parameter: `fill_one(ref xs[i])`.
 Arguments are passed by value (cheaply: arrays and strings are copy-on-write).
 `x = f(x)` (also `xs[i] = f(xs[i])`, `x = x.step()`) moves x's value into `f`, so
 an `f` that starts with `var t = x` changes it in place instead of copying it
@@ -336,7 +343,9 @@ fn main() -> Result[(), str]:           # an Err prints "error: ..." and exits w
     print(load("bit.txt")?)
     return Ok(())
 ```
-`main` may also return `Result[int, E]`: `Ok(n)` exits with code `n`.
+When `main` returns `Err(e)`, brine prints `error: ` and `e` to stderr and the
+program exits with code 1. `main` may also return `Result[int, E]`: `Ok(n)`
+exits with code `n`.
 
 `Option[T]` (`Some(value)`, `None`) and `Result[T, E]` (`Ok(value)`, `Err(error)`)
 are always available. Methods: `is_some()`, `is_none()`, `is_ok()`, `is_err()`,
@@ -371,12 +380,12 @@ xs.insert(0, 9)         # put 9 at index 0, shifting the rest right
 xs.extend([7, 8])       # append every element
 xs.sort()               # anything `<` works on; stable
 xs.reverse()
-xs.clear()
 print(len(xs), xs == [3, 1, 2], 3 in xs, xs.index(3))  # index: Option[int]
 print([3, 1, 3].index(3, 1))    # Some(2): searching from index 1 (0 to len, else a panic)
 print(xs.contains(3))   # the same as `3 in xs`
 print(xs[1:3], xs[:2], xs[2:])   # slices are copies; out of range panics
 let both = xs + [4, 5]  # a new array; `xs += ys` extends xs in place
+xs.clear()              # now empty: `xs[0]` here would be an error (E0614)
 ```
 There are no negative indexes: write `xs[len(xs) - 1]`. A statement can't both
 change a variable and read it elsewhere (`print(xs.pop(), xs)` is an error), so
@@ -407,6 +416,12 @@ long), so step through text with `i += len(s[i])` and compare with ASCII
 `"aé"[2]` and `"aé"[0:2]` panic. To look at single bytes (scanning backwards,
 peeking at a fixed offset of text that may not be ASCII), use `s.bytes()`.
 `for c in s` / `s.chars()` walk the characters.
+
+Escapes in string literals: `\n`, `\t`, `\r`, `\0`, `\\`, `\"`, `\'`, `\{` and `\}`
+(literal braces, also in f-strings, where `{{` and `}}` work too), and `\u{e9}`
+for any Unicode character by its hex code point. There is no `\xNN`: a `str` is
+UTF-8, so `"\u{ff}"` is `ÿ`, two bytes; write raw bytes as a `[u8]`
+(`let b: [u8] = [0xff, 0x01]`). Strings may also be written between `'` quotes.
 
 ```python
 let s = "hello, brine"
@@ -489,7 +504,8 @@ Keys can be integers, `bool`, `str`, enums, or arrays/tuples/structs of those
 them: `print(x, end="")`), `len`, `abs`, `min(a, b)`, `max(a, b)`, `sqrt`, `sin`, `cos`,
 `tan`, `asin`, `acos`, `atan`, `atan2(y, x)`, `sinh`, `cosh`, `tanh`, `exp`, `exp2`,
 `log`, `log2`, `log10`, `cbrt`, `pow(x, y)`, `hypot(x, y)` (on `float` or `f32`),
-`floor`, `ceil`, `round`, `clock()` (seconds),
+`floor`, `ceil`, `round` (these three return a float; `round` rounds halves away
+from zero: `round(2.5) == 3.0`, `round(-2.5) == -3.0`), `clock()` (seconds),
 `args()` (the command-line arguments as `[str]`, without the program's name:
 `brine run app.br -- a b` gives `["a", "b"]`), `exit(code)` (a code outside
 32 bits is a panic; only 0 to 255 mean the same everywhere), `panic(msg)`,
@@ -607,6 +623,11 @@ one no iteration writes. So in-place red-black sweeps work:
 par for i in 0..n:
     a[2 * i + 1] = 0.5 * (a[2 * i] + a[2 * i + 2])   # odd from even
 ```
+A `par` body also can't do what would happen in a different order on each run,
+even through a function it calls (E0503): write files (`write_file`,
+`append_file`, `os.write_bytes`, ...), run processes, read stdin, call `exit`
+or communicate with `world`. The full list is under Built-ins.
+
 Reductions are deterministic: same result bits on any machine and thread count.
 They fold leaves of 16 consecutive elements left to right, then combine the leaves
 in a balanced pairwise tree (so `par sum` of floats can differ in the last bits from
@@ -742,7 +763,27 @@ fn index_of(xs: [int], target: int) -> int:
   prover knows only what the invariants say; everything else it still knows. A
   call forgets only what the function may change in its `ref` arguments.
 * The prover handles linear integer arithmetic (`+ - ` and multiplication or
-  division by constants). It never accepts a false claim.
+  division by constants), plus products of bounded values (`x * y <= 100` when
+  `0 <= x <= 10` and `0 <= y <= 10`). It never accepts a false claim.
+* What the prover doesn't see, so a claim that depends on it fails however true
+  it is:
+  - a called function's body: it knows a call only through the function's
+    `requires` and `ensures`. A `bool` helper used as a guard
+    (`if is_digit(b):`) tells it nothing unless the helper says
+    `ensures result == (48 <= b <= 57)`;
+  - maps: nothing about their contents or length, so `k in m` in a spec can't
+    be proven;
+  - a fact about every element of an array (specs have no "for all"), or about
+    an element after `push`, `sort` or a loop that wrote many: a value read
+    back (`let (neg, w) = order[i]`) is then known only by its type. It does
+    know an element a line just wrote, or one a `requires` names
+    (`requires xs[0] >= 0`). Keep the fact next to the value, or test it
+    with an `if`.
+* A proof says that a function doesn't panic or break a spec when it returns,
+  not that it returns. Loops and recursion aren't proven to end, under `proven`
+  and in rules too, so a loop that follows links in input data (a chain of
+  pages in a file, which a hostile file can make a cycle) needs a bound you
+  write: `while page != 0 and steps < max_pages:`.
 * `brine check --report` lists the runtime checks that remain, `assert`s outside
   `test` blocks included, then the proven checks that still run (marked "proven,
   still runs"; a slice always checks its bounds). With `proven = true` under
@@ -770,8 +811,9 @@ fn index_of(xs: [int], target: int) -> int:
 ## Rules: RULES.br, what the program promises
 
 `RULES.br` says what the program must do: a project's (next to `brine.toml`) is
-for the main files in `src/`, and otherwise one next to the main file is. A rule
-about modules a program doesn't import isn't checked for that program, and a file
+for the main files in `src/`, and otherwise one next to the main file is. Building
+a program checks the rules about the modules it imports; `brine check` and
+`brine rules` check every rule, also one about a module nothing imports. A file
 elsewhere (`repros/`, `tools/`) has no rules. People write it; agents write the code that keeps it. **Every build,
 run, test and check proves every rule, or nothing is built.**
 
@@ -857,6 +899,9 @@ test "clamp keeps values in range":
 ```
 `test` is a keyword only at the start of a top-level line (and `case` only at
 the start of a line in a `match`), so both are fine as names elsewhere.
+In a project, `brine test` runs the tests of every `.br` file next to the main
+file and below, imported or not: the files `brine check` checks. `brine test
+file.br` runs the tests of that file and of the modules it imports.
 `brine test` runs each test in its own process, in parallel. `$BRINE` is set to the
 `brine` running the tests, so a test can run the compiler. A test that runs longer
 than 300 seconds is stopped and fails (`brine test --timeout <seconds>`; 0: no limit).

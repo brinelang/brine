@@ -1,0 +1,307 @@
+# The examples in the docs compile: every ```python block of the guide
+# (docs/QUICKREF.md), and every `brine explain` example marked `# error` (or
+# `# warning`) gives exactly the code it explains, once per marked line.
+#
+#   brine test tests/docs.br            from the repository root
+#
+# (tests/integration.br runs it too.) Scratch files go to target/it/
+
+fn brine_exe() -> str:
+    match getenv("BRINE"):
+        case Some(b):
+            return b
+        case None:
+            return "brine"
+
+# Runs brine; (exit code, stdout + stderr).
+fn brine(args: [str]) -> (int, str):
+    var cmd = [brine_exe()]
+    cmd.extend(args)
+    var h = 0
+    match os.spawn(cmd, {"NO_COLOR": "1"}, true, false):
+        case Ok(p):
+            h = p
+        case Err(msg):
+            panic(f"cannot run brine: {msg}")
+    let code = os.wait(h)
+    let (o, e) = os.output(h)
+    return (code, (o + e).replace("\r\n", "\n"))
+
+fn scratch(name: str) -> str:
+    let d = f"target/it/{name}-{os.pid()}"
+    match os.make_dir(d):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+    return d
+
+fn write(path: str, s: str):
+    match write_file(path, s):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+
+# Lines that start an item at the top level of a file.
+fn is_item(line: str) -> bool:
+    for k in [
+        "fn ",
+        "struct ",
+        "enum ",
+        "const ",
+        "import ",
+        "from ",
+        "extern ",
+        "test ",
+        "def ",
+        "class "
+    ]:
+        if line.starts_with(k):
+            return true
+    return false
+
+# A file made of an example: its items stay at the top level, everything else
+# goes into a `main` (after `setup`), unless the example has its own `main`.
+fn program(lines: [str], items: str, setup: [str]) -> str:
+    var top = items
+    var body = ""
+    for s in setup:
+        body += "    " + s + "\n"
+    var item = false
+    var has_main = false
+    for l in lines:
+        if l != "" and not l.starts_with(" "):
+            item = is_item(l)
+            if l.starts_with("fn main("):
+                has_main = true
+        if item:
+            top += l + "\n"
+        else:
+            body += ("    " + l).rstrip() + "\n"
+    if has_main:
+        return top
+    return top + "\nfn main() -> Result[(), str]:\n" + body + "    return Ok(())\n"
+
+# A block of files, each after a `# name.br` line (RULES.br and the modules
+# its rules name), written to `dir` with a main.br that imports the modules.
+# Returns that main.br.
+fn project(lines: [str], dir: str) -> str:
+    match os.make_dir(dir):
+        case Ok(_):
+            pass
+        case Err(e):
+            panic(e)
+    var files: {str: str} = {}
+    var cur = ""
+    for l in lines:
+        if l.starts_with("# ") and l.ends_with(".br"):
+            cur = l[2:]
+            files[cur] = ""
+        else:
+            files[cur] = files.get(cur, "") + l + "\n"
+    var main = ""
+    for name in files:
+        write(f"{dir}/{name}", files[name])
+        if name != "RULES.br" and name.ends_with(".br"):
+            main += "import " + name.replace(".br", "") + "\n"
+    write(f"{dir}/main.br", main + "\nfn main():\n    pass\n")
+    return f"{dir}/main.br"
+
+# Every code a `--json` check reported, in order.
+fn codes(out: str) -> [str]:
+    var cs: [str] = []
+    for line in out.lines():
+        match line.find("\"code\":\""):
+            case Some(i):
+                let rest = line[i + 8:]
+                match rest.find("\""):
+                    case Some(j):
+                        cs.push(rest[:j])
+                    case None:
+                        pass
+            case None:
+                pass
+    return cs
+
+# ---------------------------------------------------------------- the guide
+
+# What a guide block uses without defining it, by the block's first line:
+# (items, statements before it).
+fn guide_setup(first: str) -> (str, [str]):
+    if first.starts_with("let x = 10"):
+        return (
+            "",
+            [
+                "var u = 6",
+                "var v = 4",
+                "var xs = [1, 2]",
+                "let i = 0",
+                "let j = 1",
+                "let bounds = (1, 2)",
+                "var lo = 0"
+            ]
+        )
+    if first.starts_with("if x < 0"):
+        return (
+            "",
+            ["let x = 1", "let n = 3", "let xs = [1, 2]", "let pairs = [(\"a\", 1)]", "var j = 0"]
+        )
+    if first.starts_with("fn load("):
+        return ("fn parse_bit(s: str) -> Result[int, str]:\n    return Ok(0)\n\n", [])
+    if first.starts_with("match line.to_int()"):
+        return ("", ["let line = \" 42 \"", "let bytes: [u8] = [104, 105]"])
+    if first.starts_with("let ys = par"):
+        return (
+            "fn f(x: float) -> float:\n    return x\n\nfn ok(i: int) -> bool:\n    return i > 1\n\nfn work(k: int) -> int:\n    return k\n\n",
+            ["let xs = [1.0, 2.0]", "let n = 2"]
+        )
+    if first.starts_with("par for i in 0..n:"):
+        return ("", ["var a = [0.0] * 9", "let n = 4"])
+    if first.starts_with("test \"clamp"):
+        return (
+            "fn clamp(x: int, lo: int, hi: int) -> int:\n    return min(max(x, lo), hi)\n\n",
+            []
+        )
+    return ("", [])
+
+# Blocks that need files of their own (a RULES.br and the modules it names), and
+# the `os` module's list of signatures.
+fn guide_skip(first: str) -> bool:
+    return (
+        first.starts_with("# RULES.br")
+        or first.starts_with("import geometry")
+        or first.starts_with("os.list_dir(")
+    )
+
+test "every example in the guide compiles":
+    let d = scratch("guide")
+    var guide = ""
+    match read_file("docs/QUICKREF.md"):
+        case Ok(t):
+            guide = t.replace("\r\n", "\n")
+        case Err(e):
+            panic(e)
+    var block: [str] = []
+    var inside = false
+    var n = 0
+    var tried = 0
+    for line in guide.lines():
+        if not inside:
+            if line == "```python":
+                inside = true
+                block = []
+            continue
+        if line != "```":
+            block.push(line)
+            continue
+        inside = false
+        n += 1
+        if len(block) == 0 or guide_skip(block[0]):
+            continue
+        let (items, setup) = guide_setup(block[0])
+        let f = f"{d}/block{n}.br"
+        write(f, program(block, items, setup))
+        let (code, out) = brine(["check", f])
+        assert code == 0, f"the guide's block {n} (`{block[0].strip()}`) doesn't compile:\n{out}"
+        tried += 1
+    assert tried >= 20, f"only {tried} guide blocks found"
+
+# --------------------------------------------------------------- `explain`
+
+# Codes whose examples are commands, files or settings rather than code that
+# `brine check` can show failing on its own.
+fn explain_exempt(code: str) -> bool:
+    return code in [
+        "E0104",
+        "E0610",
+        "E0613",
+        "E0701",
+        "E0702",
+        "E0703",
+        "E0704",
+        "E0705",
+        "E0708",
+        "E0709",
+        "W0003",
+        "W0004",
+        "W0005"
+    ]
+
+# The options a code's example needs.
+fn explain_flags(code: str) -> [str]:
+    if code == "E0607":
+        return ["--proven"]
+    if code == "E0337":
+        return ["--typed"]
+    return []
+
+# The indented blocks of an explanation, without their indentation.
+fn examples(text: str) -> [[str]]:
+    var out: [[str]] = []
+    var cur: [str] = []
+    var blanks = 0
+    for l in text.lines():
+        if l.starts_with("    "):
+            if len(cur) > 0:
+                for _ in 0..blanks:
+                    cur.push("")
+            cur.push(l[4:])
+            blanks = 0
+        elif l.strip() == "":
+            blanks += 1
+        else:
+            if len(cur) > 0:
+                out.push(cur)
+            cur = []
+            blanks = 0
+    if len(cur) > 0:
+        out.push(cur)
+    return out
+
+test "every `brine explain` example gives its error":
+    let d = scratch("explain")
+    let (c0, index) = brine(["explain", "--json"])
+    assert c0 == 0, index
+    let all = codes(index)
+    assert len(all) > 80, index
+    var bad: [str] = []
+    for code in all:
+        let (c1, text) = brine(["explain", code])
+        assert c1 == 0, text
+        let blocks = examples(text)
+        if len(blocks) == 0:
+            bad.push(f"{code} has no example")
+            continue
+        var marked = 0
+        for b in blocks:
+            var wanted = 0
+            for l in b:
+                if "# error" in l or "# warning" in l:
+                    wanted += 1
+            if wanted == 0:
+                continue
+            marked += 1
+            var f = f"{d}/{code}_{marked}.br"
+            if b[0].starts_with("# ") and b[0].ends_with(".br"):
+                f = project(b, f"{d}/{code}_{marked}")
+            else:
+                write(f, program(b, "", []))
+            var args = ["check", "--json", f]
+            args.extend(explain_flags(code))
+            let (_, out) = brine(args)
+            # (an example's rules are new: not approved)
+            let got = [c for c in codes(out) if c != "W0003"]
+            var ok = len(got) == wanted
+            for g in got:
+                if g != code:
+                    ok = false
+            if not ok:
+                bad.push(
+                    f"{code}: an example marked `# error` or `# warning` {wanted} times gives {got}, not {wanted} x {code}:\n{out}"
+                )
+        if marked == 0 and not explain_exempt(code):
+            bad.push(
+                f"{code} has no example marked `# error` or `# warning` (or list it in explain_exempt)"
+            )
+    assert len(bad) == 0, "\n".join(bad)
