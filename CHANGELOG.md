@@ -5,6 +5,110 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) 
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-09
+Fixes for what twelve real projects found in 0.9.1 (the 0.9.1 stress lab).
+
+### Changed
+- `s[i]` on a `str` is the whole character that starts at byte `i` (`"aé"[1]`
+  is `"é"`), so every `str` stays valid UTF-8. An `i` inside a character
+  panics, as a slice there does. ASCII indexing is unchanged, but code that
+  walks a `str` one byte at a time with `s[i]` and `i += 1` now panics on
+  non-ASCII text: step with `i += len(s[i])`, or use `s.bytes()` for bytes.
+- `str.from_utf8`, `read_file`, arguments, environment variables and
+  directory names follow RFC 3629 exactly: overlong forms, surrogates and
+  code points past U+10FFFF are rejected (or, for text from outside the
+  program, replaced by U+FFFD).
+- `brine spec-diff --json` gives each finding a `spans` list in the shape of
+  diagnostics instead of a `location` string. `spec-diff` now follows
+  renames, signature changes and removed items, so renaming is no longer a
+  way past a spec gate; the diff is shown before any errors.
+- `brine test` builds every file of a project, as `check` does, and says
+  `running N tests in M files`. A filter that matches nothing, a second
+  filter, or a folder that isn't a project is an error, not an empty pass.
+- A value flag followed by another flag (`-o --json`) and a switch given a
+  value (`--json=false`) are errors. `--json` covers every command:
+  `run` ends with `{"exit":N}`, and `test`, `--version`, help, `guide`,
+  `emit-ir`, `emit-c` and `rules --receipt` print JSON.
+- An exit code outside the 32-bit range, from `exit` or `main`, is a panic
+  instead of a truncated code.
+- `" ".to_float()` is `None` and `float(" ")` panics: blank text is no number.
+- Imports not found from the main file's directory are found from the
+  importing file's own directory too (the main file's directory still comes
+  first). `rules` commands use the RULES.br `check` uses, and builds say when
+  a project's rules don't apply to a program outside its source folder.
+- `world`: collectives are matched by operation and order, not source line;
+  E0510 accepts rank-dependent branches that communicate the same way, and
+  code that only runs on a world of one. A bad `BRINE_RANK`,
+  `BRINE_WORLD_SIZE` or `BRINE_PEERS` is an error (exit 2). A rank that
+  calls `exit(n)` with an error code stops the others (after 2 s).
+- Runtime panics end with a line of help for the common cases (index out of
+  bounds, `unwrap` on `None`, division by zero, a missing map key, ...), a
+  failed `assert a == b` prints both sides, and a panic's call chain shows
+  inlined functions and each frame's call line, on AArch64 too.
+- Diagnostics: code written in Python, Rust, Go or C style (`vec![]`,
+  `Type::new()`, `fmt.Println`, `xs.sort(reverse=True)`, `List[int]`, ...)
+  gets E0115 or a help that says what brine writes, with a fix where the
+  fixed program checks. A long source line is shown in a 120-character
+  window. New warning W0006: a bare name in a `case` that was meant as a
+  constant or a variant. E0614 shows the values that make a check fail and
+  also catches `int("abc")`, `None.unwrap()` and a missing literal map key.
+- Failed proofs say what is missing in the code's own terms: a called
+  method's weak `ensures`, an `ensures` a return can never meet, the
+  element of a loop by the loop variable's name. W0005 names the checks the
+  prover gave up on, and `check --report` marks them.
+- `atan2` and `hypot` are correctly rounded and give the same bits on every
+  backend; they cost more (about 23 ns and 7 ns).
+- Constants: tuples in a constant array, untyped literals past `int`
+  (`const SIGN = 0x8000000000000000`), `i128(-big)` and 128-bit shifts in
+  constants are accepted.
+- Faster: release builds use jump tables for dense `match`es again (10x on
+  a bytecode loop), small functions that return a struct or tuple are
+  inlined (BLAKE2b-style code 2-4x), byte scans run 16 bytes at a time
+  (10x), `for j in 0..len(src): out[j] = src[j]` is one copy (20x), `par`
+  threads no longer contend on a shared array's count (2 threads were 9x
+  slower than 1), each thread gets its own heap for big blocks on Windows
+  (6-20x for allocating `par` jobs), a `let` of an element no longer
+  makes the next write copy the array, and 8- and 16-bit rotates are one
+  instruction.
+- Proving is about linear in a function's length (an `elif` chain of 6,400
+  arms took 3.6 GB), and past its limits the prover still proves what
+  plainly holds instead of failing true claims.
+- `os.sleep` on Windows sleeps about as long as asked (1 ms was 15.6 ms),
+  `read_file` keeps a big file in memory once, and `BRINE_GPU_LOG` and GPU
+  auto mode choose and explain better.
+
+### Fixed
+- Soundness: a value made on one path (a dead arm of `a if c else b`, a
+  sibling branch) could prove checks on other paths, so `--proven` code
+  could read out of bounds. A `u128` bound divided by a constant looked
+  real, so false claims were proven and conversion checks dropped. A
+  literal's element (`[p, q][i]`) bounded its index on every path.
+- Concurrent `brine run`s and builds no longer prune, overwrite or half-link
+  each other's programs and cache objects (on Windows, macOS and Linux, and
+  through C).
+- The compiler no longer overflows its stack on long chains like
+  `a + b + c + ...` (about 1,200 terms).
+- `--release` struct copies read padding as zero, not as an unset value
+  (`Mixed(tag: u8, w: u16)` printed a wrong `w`).
+- Struct invariants lock only the paths they read (E0406).
+- `brine debug` keeps gdb's backtrace and locals right at a panic, and
+  finishes when there is no terminal. A stack overflow on an Intel Mac
+  names its frames.
+- A rank that panics, runs out of memory or ends normally is no longer
+  reported wrongly as "stopped" by its peers on Windows.
+- `read_file` on a directory says it is a directory. `brine new` asks git
+  whether it is inside a repository. `fmt` names a byte that isn't UTF-8 and
+  where. `build -o /dev/null` (or `nul`) keeps nothing.
+- `BRINE_VERIFY_IR=1` accepts release builds made with `BRINE_SSA=0`. Out of
+  memory in `--release` reports an array's size as written.
+- `rules --explain` names methods, says what "proven" covers, and picks
+  "a"/"an" right; `effects m: extern` parses, and `os.name()` is no effect.
+  W0003 points at the rules not approved yet. `brine check` on a module
+  RULES.br imports no longer prints every error twice, and on a lone file
+  that can only be a program fails E0703 as `run` does.
+- The guide and `brine explain` no longer contradict the compiler; every
+  error code has an example, and the guide's examples are tested.
+
 ## [0.9.1] - 2026-11-08
 Fixes for what twelve real projects found in 0.9.0 (the 0.9.0 stress lab).
 
@@ -488,7 +592,8 @@ The first version.
 - The compiler is written in brine and builds itself; `bootstrap/brinec.c` builds it
   from scratch with only a C compiler.
 
-[Unreleased]: https://github.com/brinelang/brine/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/brinelang/brine/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/brinelang/brine/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/brinelang/brine/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/brinelang/brine/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/brinelang/brine/compare/v0.7.0...v0.8.0
