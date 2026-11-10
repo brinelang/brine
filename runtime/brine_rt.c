@@ -2296,8 +2296,9 @@ brine_arr *brine_arr_new(int64_t len, int64_t esz, brine_elem_fn rt, brine_elem_
 }
 /* An integer array kept as bytes (narrow.br), zeroed, with 16 more bytes
    than it needs for brine_bytes_rev and friends. It is never shared, so
-   never copied. */
-brine_arr *brine_bytes_new(int64_t len, const char *loc) {
+   never copied. Out of memory, it says what the array needs as written,
+   `esz` bytes an element, as a build that keeps it so would. */
+brine_arr *brine_bytes_new(int64_t len, int64_t esz, const char *loc) {
     if (len < 0) br_panicf(loc, "cannot create an array with negative length %lld", (long long)len);
     brine_arr *a = (brine_arr *)brine_alloc(sizeof(brine_arr));
     BR_LIVE(1);
@@ -2308,7 +2309,7 @@ brine_arr *brine_bytes_new(int64_t len, const char *loc) {
     a->retain = NULL;
     a->release = NULL;
     a->data = (char *)calloc((size_t)len + 16, 1);
-    if (!a->data) br_oom(len + 16, loc);
+    if (!a->data) br_oom(esz > 0 && len > INT64_MAX / esz ? -1 : len * esz, loc);
     return a;
 }
 /* A `[bool]` kept as bits (the compiler's pack.br): `len` elements in 64-bit
@@ -2325,7 +2326,8 @@ brine_arr *brine_bits_new(int64_t len, int64_t fill, const char *loc) {
     a->release = NULL;
     size_t bytes = (size_t)(len / 64 + 1) * 8;
     a->data = (char *)(fill ? malloc(bytes) : calloc(bytes, 1));
-    if (!a->data) br_oom((int64_t)bytes, loc);
+    /* (what `len` bools need as written, a byte each) */
+    if (!a->data) br_oom(len, loc);
     if (fill) memset(a->data, 0xff, bytes);
     return a;
 }

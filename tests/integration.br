@@ -350,6 +350,10 @@ fn features() -> [str]:
         "tests/programs/bounds_versioned.br",
         "tests/programs/native_regs.br",
         "tests/programs/jump_tables.br",
+        "tests/programs/match_loops.br",
+        "tests/programs/cow_loops.br",
+        "tests/programs/let_last_use.br",
+        "tests/programs/rotates.br",
         "tests/programs/inline_small.br",
         "tests/programs/rc_threads.br",
         "tests/programs/empty_arrays.br",
@@ -390,6 +394,9 @@ test "language features through C":
 test "language features in release builds":
     for f in features():
         run_with(f, expected(f), ["--release"], {"BRINE_VERIFY_IR": "1"})
+    # without the SSA optimizer too (then only the lowering's IR is checked)
+    let f = "tests/programs/first.br"
+    run_with(f, expected(f), ["--release"], {"BRINE_VERIFY_IR": "1", "BRINE_SSA": "0"})
 
 # and at each CPU level the C build has
 test "language features in release builds through C":
@@ -799,6 +806,15 @@ test "panics are clear":
     let c = brine_env(["run", "tests/programs/panic_oom.br", "-q"], {"BRINE_BACKEND": "c"})
     assert c.code == 101 and "out of memory: could not allocate" in c.err, c.all()
     assert "--> tests/programs/panic_oom.br:4:14" in c.err, c.err
+    # release builds keep these as bytes and bits; the size is still the
+    # array's as written (v091#9)
+    for f, size in [
+        ("tests/programs/panic_oom.br", "9007199254740992"),
+        ("tests/programs/panic_oom_bools.br", "4611686018427387904")
+    ]:
+        for be in ["native", "c"]:
+            let o = brine_env(["run", f, "-q", "--release"], {"BRINE_BACKEND": be})
+            assert o.code == 101 and f"could not allocate {size} bytes" in o.err, f"{be}: {o.all()}"
 
 test "a panic names the functions it came through":
     # (native code only: the C backend prints the location alone)
@@ -3093,6 +3109,70 @@ test "release builds run loop idioms as one operation":
             let r = brine(args)
             assert r.code == 101, f"{extra}: exit {r.code}\n{r.err}"
             assert f"{what} is out of bounds" in r.err and f"--> {f}:{at}" in r.err, r.err
+
+test "release builds jump straight to a match's case, as dev builds do":
+    let ir = brine(["emit-ir", "--release", "--opt", "tests/programs/match_loops.br"])
+    assert ir.code == 0, ir.all()
+    for f in ["ints", "negs", "bytes", "wide", "ors", "enums", "interp"]:
+        let at = ir.out.find(f"fn main__{f}(").unwrap()
+        let body = ir.out[at:]
+        assert "\n  switch " in body[:body.find("\n\n").unwrap()], f
+
+test "a let holds a borrowed element only until its last use":
+    # (holding it to the end of the scope made `a[0].push(i)` copy a[0])
+    for m in [["--debug"], ["--release"], []]:
+        var args = ["emit-ir", "--opt", "tests/programs/let_last_use.br"]
+        args.extend(m)
+        let ir = brine(args)
+        assert ir.code == 0, ir.all()
+        let at = ir.out.find("fn main__pushes(").unwrap()
+        let body = ir.out[at:]
+        assert "brine_arr_retain" not in body[:body.find("\n\n").unwrap()], f"{m}: {body}"
+
+test "rotates of every width and either direction are one instruction":
+    # (x86-64 has 8- and 16-bit rotates, AArch64 hasn't; there the program
+    # still runs with the other features)
+    if os.arch() == "x86_64" and os.name() != "macos":
+        let native = {"BRINE_BACKEND": "native"}
+        let ir = brine_env(["emit-ir", "--release", "--opt", "tests/programs/rotates.br"], native)
+        assert ir.code == 0, ir.all()
+        for w in ["8", "16", "32", "64"]:
+            for (f, op) in [(f"l{w}", "rotl"), (f"r{w}", "rotr")]:
+                let at = ir.out.find(f"fn main__{f}(").unwrap()
+                let body = ir.out[at:]
+                let code = body[:body.find("\n\n").unwrap()]
+                assert f" = {op} " in code and " = sub " not in code and " = shl " not in code, code
+
+test "loops check once that the arrays they write aren't shared":
+    let ir = brine(["emit-ir", "--release", "--opt", "tests/programs/cow_loops.br"])
+    assert ir.code == 0, ir.all()
+    for f in ["swaps", "stack", "nested"]:
+        let at = ir.out.find(f"fn main__{f}(").unwrap()
+        let body = ir.out[at:]
+        let lines = body[:body.find("\n\n").unwrap()].split("\n")
+        # in a loop: from a label to a jump back to it
+        var label: {str: int} = {}
+        var looped = [false] * len(lines)
+        for i, l in enumerate(lines):
+            if l.starts_with("L"):
+                label[l[:len(l) - 1]] = i
+            elif l.starts_with("  jmp ") or l.starts_with("  br ") or l.starts_with("  brnot "):
+                let ws = l.split(" ")
+                match label.get(ws[len(ws) - 1]):
+                    case Some(h):
+                        for k in h..i:
+                            looped[k] = true
+                    case None:
+                        pass
+        # the only checks left in a loop follow a call that may replace the array
+        var after = false
+        for i, l in enumerate(lines):
+            if l.starts_with("L"):
+                after = false
+            elif "call main__grow(" in l or "call main__reset(" in l:
+                after = true
+            elif "brine_arr_unique" in l:
+                assert not looped[i] or after, f"{f}: {l}\n{body}"
 
 # Data is C string literals; a big `embed` is compiled once, not per CPU level.
 test "embedded files survive every backend":
